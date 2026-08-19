@@ -173,6 +173,13 @@ mod tests {
     /// the platform would deliver it -- reaches `mark_focus` and flips the
     /// shared flag that `poll::spawn` reads.
     #[test]
+    /// Note the limit of this test: it duplicates the match arm rather than
+    /// invoking the real `on_window_event` closure, because Tauri gives no way
+    /// to construct a `CloseRequested`'s `api` field or dispatch a synthetic
+    /// event from a unit test. So it proves `mark_focus` maps a real
+    /// `WindowEvent::Focused` payload onto the cadence correctly -- it does NOT
+    /// prove the production closure is wired up. That wiring is guaranteed by
+    /// the type checker and by reading lib.rs's handler, not by this test.
     fn a_real_focused_event_reaches_the_shared_flag() {
         let focused = Arc::new(AtomicBool::new(true));
 
