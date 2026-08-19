@@ -17,7 +17,10 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2.11", features = ["tray-icon", "image-png"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-octocrab = "0.54"
+octocrab = { version = "0.54", default-features = false, features = [
+  "follow-redirect", "retry", "rustls", "timeout", "tracing",
+  "default-client", "rustls-ring", "jwt-aws-lc-rs",
+] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 tokio = { version = "1.53", features = ["full"] }
 thiserror = "2"
