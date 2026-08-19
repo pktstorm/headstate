@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { PR_FIXTURES } from "../fixtures/prs";
+import { PR_FIXTURES, prWithState } from "../fixtures/prs";
 import {
   applyFilters, awaitingReview, blockedByComments, deriveStats,
   isStale, needsAttention, readyToQueue, STALE_DAYS,
@@ -83,6 +83,46 @@ describe("applyFilters", () => {
       excludeLabels: ["dependencies"],
     });
     expect(out.map((p) => p.number)).toEqual([43]);
+  });
+
+  it("filters to only PRs that need attention", () => {
+    // PR_FIXTURES[1] (#43) is the only one with failing CI/conflicted merge.
+    const out = applyFilters(PR_FIXTURES, { needsAttentionOnly: true });
+    expect(out.map((p) => p.number)).toEqual([43]);
+  });
+
+  it("filters to only PRs in the merge queue", () => {
+    // PR_FIXTURES[2] (#7) is the only one with in_merge_queue: true.
+    const out = applyFilters(PR_FIXTURES, { inMergeQueueOnly: true });
+    expect(out.map((p) => p.number)).toEqual([7]);
+  });
+
+  /// `staleOnly` depends on wall-clock time via `isStale`. `applyFilters`
+  /// must thread an explicit `now` through rather than calling `new Date()`
+  /// internally, or this branch is untestable without depending on the
+  /// machine clock relative to the fixtures' `updated_at` values.
+  describe("staleOnly", () => {
+    const stale = prWithState("success", "mergeable", "approved", {
+      number: 100,
+      in_merge_queue: false,
+      updated_at: "2026-08-01T00:00:00Z",
+    });
+    const fresh = prWithState("success", "mergeable", "approved", {
+      number: 101,
+      in_merge_queue: false,
+      updated_at: "2026-08-19T00:00:00Z",
+    });
+    const now = new Date("2026-08-20T00:00:00Z");
+
+    it("keeps only PRs stale as of the given now", () => {
+      const out = applyFilters([stale, fresh], { staleOnly: true }, now);
+      expect(out.map((p) => p.number)).toEqual([100]);
+    });
+
+    it("excludes a PR that is not yet stale relative to now", () => {
+      const out = applyFilters([fresh], { staleOnly: true }, now);
+      expect(out).toEqual([]);
+    });
   });
 });
 

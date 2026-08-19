@@ -48,7 +48,11 @@ export function isStale(pr: PullRequest, now: Date, days = STALE_DAYS): boolean 
 const hasLabel = (pr: PullRequest, names: string[]) =>
   pr.labels.some((l) => names.includes(l.name));
 
-export function applyFilters(prs: PullRequest[], f: Filters): PullRequest[] {
+export function applyFilters(
+  prs: PullRequest[],
+  f: Filters,
+  now: Date = new Date(),
+): PullRequest[] {
   return prs.filter((pr) => {
     if (f.repo && pr.repo !== f.repo) return false;
     if (f.readyOnly && pr.is_draft) return false;
@@ -59,7 +63,7 @@ export function applyFilters(prs: PullRequest[], f: Filters): PullRequest[] {
     if (f.excludeLabels?.length && hasLabel(pr, f.excludeLabels)) return false;
     if (f.needsAttentionOnly && !needsAttention(pr)) return false;
     if (f.inMergeQueueOnly && !pr.in_merge_queue) return false;
-    if (f.staleOnly && !isStale(pr, new Date())) return false;
+    if (f.staleOnly && !isStale(pr, now)) return false;
     return true;
   });
 }
