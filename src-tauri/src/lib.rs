@@ -45,29 +45,39 @@ pub fn run() {
             let handle = app.handle().clone();
 
             // `read_token` shells out via `std::process::Command`, which
-            // blocks. `setup` runs as a plain synchronous closure before the
-            // async runtime takes over this task, so calling it directly
-            // here is safe -- it is not blocking a tokio worker.
+            // blocks -- fine here, because `setup` is a plain synchronous
+            // closure and is not occupying a tokio worker.
+            //
+            // `build_client` is different and must run inside the runtime.
+            // Octocrab builds a hyper/tower stack whose Buffer layer calls
+            // `tokio::spawn` during construction, so building it outside a
+            // reactor panics with "there is no reactor running" -- crashing
+            // the app on launch for every user who IS authenticated, which
+            // no unit test catches because tests always construct it from an
+            // async context. `block_on` enters Tauri's own runtime for the
+            // duration of the call.
             let (auth_state, gh_client) = match auth::read_token() {
-                Ok(token) => match auth::build_client(&token) {
-                    Ok(octocrab) => {
-                        let client = Arc::new(GitHubClient::new(octocrab));
-                        (
+                Ok(token) => {
+                    match tauri::async_runtime::block_on(async { auth::build_client(&token) }) {
+                        Ok(octocrab) => {
+                            let client = Arc::new(GitHubClient::new(octocrab));
+                            (
+                                AuthState {
+                                    ok: true,
+                                    message: String::new(),
+                                },
+                                Some(client),
+                            )
+                        }
+                        Err(e) => (
                             AuthState {
-                                ok: true,
-                                message: String::new(),
+                                ok: false,
+                                message: e.to_string(),
                             },
-                            Some(client),
-                        )
+                            None,
+                        ),
                     }
-                    Err(e) => (
-                        AuthState {
-                            ok: false,
-                            message: e.to_string(),
-                        },
-                        None,
-                    ),
-                },
+                }
                 // `AuthError`'s Display messages (including
                 // `GhNotLoggedIn`'s, which comes verbatim from `gh`'s own
                 // stderr) are already display-ready prose for a first-run
