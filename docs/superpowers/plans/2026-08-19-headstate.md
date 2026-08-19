@@ -332,11 +332,28 @@ def squircle_mask(size: int, radius_ratio: float = 0.2225) -> Image.Image:
 
 
 def crop_glyph(splash: Image.Image) -> Image.Image:
-    """Cut the branch mark out of the splash, above the wordmark."""
+    """Cut the branch mark out of the splash, above the wordmark.
+
+    The source splash is a flat, fully-opaque RGB(A) image -- there is no
+    transparency around the glyph. A naive crop therefore carries its own
+    near-black background rectangle as opaque pixels, which shows up as a
+    visible seam on the app icon and turns the tray silhouette into a solid
+    black square. Key the near-black background out to alpha=0 so only the
+    glyph strokes/nodes survive.
+    """
     w, h = splash.size
     # The mark sits centered in the upper ~62% of the 1600x1000 art.
     box = (int(w * 0.32), int(h * 0.13), int(w * 0.68), int(h * 0.66))
-    return splash.crop(box)
+    glyph = splash.crop(box).convert("RGBA")
+    px = glyph.load()
+    gw, gh = glyph.size
+    bg_thresh = 45  # max(r, g, b) below this is background, not glyph.
+    for y in range(gh):
+        for x in range(gw):
+            r, g, b, a = px[x, y]
+            if max(r, g, b) <= bg_thresh:
+                px[x, y] = (r, g, b, 0)
+    return glyph
 
 
 def make_app_icon(glyph: Image.Image) -> None:
@@ -575,7 +592,7 @@ runs:
         node-version: "24"
     - shell: bash
       run: corepack enable && yarn install --immutable
-    - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb2c1c2f0470a9fd848ead # stable
+    - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       with:
         toolchain: stable
         components: ${{ inputs.rust-components }}
