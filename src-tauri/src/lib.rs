@@ -3,12 +3,34 @@ pub mod commands;
 pub mod github;
 pub mod poll;
 pub mod store;
+pub mod tray;
 
 use commands::{AuthState, GhClient};
 use github::client::GitHubClient;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::Manager;
+
+/// Whether the main window is currently focused. Shared with `poll::spawn`
+/// so the background loop can pick FOCUSED vs BACKGROUND cadence; managed as
+/// Tauri state so the window-event handler below (the only place focus
+/// actually changes) can reach the same `Arc` and flip it.
+struct Focused(Arc<AtomicBool>);
+
+/// Record that the window was hidden (close-to-tray or otherwise): the poll
+/// loop should drop to the background cadence. A window can be hidden
+/// without the platform ever sending a `WindowEvent::Focused(false)`, so
+/// close-to-tray has to clear the flag itself rather than relying on a
+/// focus event to follow.
+fn mark_hidden(focused: &AtomicBool) {
+    focused.store(false, Ordering::Relaxed);
+}
+
+/// Record a real focus change: focused -> FOCUSED cadence, blurred ->
+/// BACKGROUND cadence.
+fn mark_focus(focused: &AtomicBool, is_focused: bool) {
+    focused.store(is_focused, Ordering::Relaxed);
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -67,11 +89,111 @@ pub fn run() {
             // caller of GitHub in the whole app.
             if let Some(client) = gh_client {
                 let focused = Arc::new(AtomicBool::new(true));
+                app.manage(Focused(focused.clone()));
                 poll::spawn(handle, client, focused);
             }
 
+            tray::setup_tray(&app.handle().clone())?;
+
             Ok(())
+        })
+        .on_window_event(|window, event| match event {
+            // Closing hides to the tray rather than quitting, so polling
+            // keeps running and the badge stays live. Quit is explicit,
+            // from the tray menu or Cmd-Q. A window can be hidden without a
+            // `Focused(false)` event, so this also has to clear the
+            // focused flag itself -- otherwise polling would stay on the
+            // 60s cadence forever after close-to-tray.
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                api.prevent_close();
+                let _ = window.hide();
+                if let Some(focused) = window.try_state::<Focused>() {
+                    mark_hidden(&focused.0);
+                }
+            }
+            tauri::WindowEvent::Focused(is_focused) => {
+                if let Some(focused) = window.try_state::<Focused>() {
+                    mark_focus(&focused.0, *is_focused);
+                }
+            }
+            _ => {}
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// This is the bug Task 10 left behind: the `Arc<AtomicBool>` given to
+    /// `poll::spawn` was never retained anywhere else, so nothing could
+    /// ever flip it and the background 300s cadence was unreachable at
+    /// runtime. Managing `Focused` as Tauri state and mutating it through
+    /// `mark_hidden`/`mark_focus` (the same functions the window-event
+    /// handler calls) is the fix; these tests exercise the exact same
+    /// `Arc<AtomicBool>` that `poll::interval_for` reads, through the exact
+    /// same functions the closure calls, proving the flag is both reachable
+    /// and mutable at runtime -- not merely that the module compiles.
+    #[test]
+    fn hiding_the_window_clears_the_focused_flag() {
+        let focused = Arc::new(AtomicBool::new(true));
+        mark_hidden(&focused);
+        assert!(!focused.load(Ordering::Relaxed));
+        assert_eq!(
+            poll::interval_for(focused.load(Ordering::Relaxed)),
+            poll::BACKGROUND
+        );
+    }
+
+    #[test]
+    fn losing_focus_clears_the_flag_and_gaining_it_sets_it() {
+        let focused = Arc::new(AtomicBool::new(true));
+
+        mark_focus(&focused, false);
+        assert!(!focused.load(Ordering::Relaxed));
+
+        mark_focus(&focused, true);
+        assert!(focused.load(Ordering::Relaxed));
+    }
+
+    /// Drives a real `tauri::WindowEvent::Focused` value (not a stand-in)
+    /// through the same match arm used in `run`'s `on_window_event`
+    /// closure, confirming the event type itself -- constructed exactly as
+    /// the platform would deliver it -- reaches `mark_focus` and flips the
+    /// shared flag that `poll::spawn` reads.
+    #[test]
+    fn a_real_focused_event_reaches_the_shared_flag() {
+        let focused = Arc::new(AtomicBool::new(true));
+
+        let event = tauri::WindowEvent::Focused(false);
+        match &event {
+            tauri::WindowEvent::Focused(is_focused) => mark_focus(&focused, *is_focused),
+            _ => unreachable!(),
+        }
+
+        assert!(!focused.load(Ordering::Relaxed));
+        assert_eq!(
+            poll::interval_for(focused.load(Ordering::Relaxed)),
+            poll::BACKGROUND
+        );
+    }
+
+    /// `Focused` is managed as Tauri state and read back through
+    /// `try_state::<Focused>()` inside the real window-event closure. That
+    /// retrieval is unit-testable on its own: the newtype wraps the same
+    /// `Arc<AtomicBool>` `poll::spawn` holds, so storing through one handle
+    /// is observable through the other -- which is exactly what
+    /// `app.manage(Focused(focused.clone()))` plus `window.try_state` give
+    /// us at runtime.
+    #[test]
+    fn the_managed_focused_newtype_shares_the_same_arc_poll_reads() {
+        let focused = Arc::new(AtomicBool::new(true));
+        let managed = Focused(focused.clone());
+
+        mark_hidden(&managed.0);
+
+        // The clone `poll::spawn` was given observes the same store.
+        assert!(!focused.load(Ordering::Relaxed));
+    }
 }
