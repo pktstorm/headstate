@@ -15,6 +15,8 @@ pub enum AuthError {
     GhNotLoggedIn(String),
     #[error("failed to run gh: {0}")]
     Io(#[from] std::io::Error),
+    #[error("failed to build the GitHub client: {0}")]
+    ClientBuild(octocrab::Error),
 }
 
 /// Parse `gh auth token` output. Split from the subprocess call so it can be
@@ -53,8 +55,24 @@ pub fn read_token() -> Result<String, AuthError> {
 pub fn build_client(token: &str) -> Result<octocrab::Octocrab, AuthError> {
     octocrab::Octocrab::builder()
         .personal_token(token.to_string())
+        // Octocrab's default is RetryConfig::Simple(3), which retries with
+        // `future::ready(())` -- no delay at all. On a 429 that means three
+        // more requests fired instantly at a server that just said "slow
+        // down", which is the opposite of what a rate limit asks for.
+        // HandleRateLimits reads GitHub's own retry headers and waits for the
+        // refresh window instead, falling back to min_wait_seconds when the
+        // headers are absent.
+        .add_retry_config(
+            octocrab::service::middleware::retry::RetryConfig::HandleRateLimits {
+                metrics: std::sync::Arc::new(
+                    octocrab::service::middleware::retry::NoOpRateLimitMetrics,
+                ),
+                max_retries: 3,
+                min_wait_seconds: 60,
+            },
+        )
         .build()
-        .map_err(|e| AuthError::GhNotLoggedIn(e.to_string()))
+        .map_err(AuthError::ClientBuild)
 }
 
 #[cfg(test)]
