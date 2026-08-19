@@ -1,4 +1,6 @@
-import { defineConfig } from "vite";
+// From "vitest/config", not "vite": the `test` block below is a Vitest key,
+// and Vite's own `defineConfig` rejects it.
+import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 

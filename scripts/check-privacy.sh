@@ -25,15 +25,47 @@ ALLOWED='octocat|pktstorm|tauri-apps|shadcn-ui|rust-lang|actions|dtolnay|Swatine
 # upstream repos; they are not a leak vector for private names.
 EXCLUDES=(':!scripts/check-privacy.sh' ':!yarn.lock' ':!src-tauri/Cargo.lock')
 
-urls=$(git grep -hoIE 'github\.com/[A-Za-z0-9][-A-Za-z0-9_.]*/[A-Za-z0-9][-A-Za-z0-9_.]+' \
-         -- "${EXCLUDES[@]}" 2>/dev/null \
-       | sed -E 's#.*github\.com/##' || true)
+# This gate is the only thing between a private repo name and a permanent
+# public leak, so it must never fail open. `git grep` exits 1 for "no match"
+# (expected, fine) and >=2 for a real error -- not a repo, corrupt index, bad
+# pathspec. A bare `|| true` swallows both, which would print "clean" while
+# having scanned nothing at all. Abort loudly instead.
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "ERROR: not inside a git work tree -- the privacy scan cannot run." >&2
+  echo "Refusing to report 'clean' for a scan that did not happen." >&2
+  exit 2
+fi
 
-refs=$(git grep -hoIE '[A-Za-z0-9][-A-Za-z0-9_.]*/[A-Za-z0-9][-A-Za-z0-9_.]+#[0-9]+' \
-         -- "${EXCLUDES[@]}" 2>/dev/null \
-       | sed -E 's/#[0-9]+$//' || true)
+scan() {
+  local out status
+  set +e
+  out=$(git grep -hoIE "$1" -- "${EXCLUDES[@]}")
+  status=$?
+  set -e
+  if [ "$status" -gt 1 ]; then
+    echo "ERROR: git grep failed (exit $status) -- the privacy scan is unreliable." >&2
+    exit 2
+  fi
+  printf '%s' "$out"
+}
 
-found=$(printf '%s\n%s\n' "$urls" "$refs" \
+# Three anchored forms. Anchoring is load-bearing: an earlier unanchored
+# `owner/repo` pattern matched ordinary prose (api/hooks.ts, read/write,
+# 5000/hour) and produced ~40 false positives. A gate that cries wolf is a
+# gate someone disables.
+#   1. https://github.com/<owner>/<repo>
+#   2. git@github.com:<owner>/<repo>   -- what `git remote -v` prints
+#   3. <owner>/<repo>#<number>         -- the PR/issue shorthand
+urls=$(scan 'github\.com/[A-Za-z0-9][-A-Za-z0-9_.]*/[A-Za-z0-9][-A-Za-z0-9_.]+' \
+       | sed -E 's#.*github\.com/##')
+
+ssh=$(scan 'git@github\.com:[A-Za-z0-9][-A-Za-z0-9_.]*/[A-Za-z0-9][-A-Za-z0-9_.]+' \
+      | sed -E 's#.*github\.com:##')
+
+refs=$(scan '[A-Za-z0-9][-A-Za-z0-9_.]*/[A-Za-z0-9][-A-Za-z0-9_.]+#[0-9]+' \
+       | sed -E 's/#[0-9]+$//')
+
+found=$(printf '%s\n%s\n%s\n' "$urls" "$ssh" "$refs" \
         | grep -vE '^[[:space:]]*$' \
         | grep -vE "^($ALLOWED)/" \
         | sort -u || true)

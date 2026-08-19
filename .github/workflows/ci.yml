@@ -32,7 +32,7 @@ jobs:
         working-directory: src-tauri
         run: cargo fmt --check
       - name: Typecheck
-        run: yarn tsc --noEmit
+        run: yarn tsc -b --force
       - name: ESLint
         run: yarn eslint .
       - name: Knip

@@ -13,7 +13,7 @@ version = 2
 # Each ignore is a deliberate, documented acceptance -- never a blanket mute.
 # The gate still fails on anything NEW, which is the whole point of having it.
 #
-# RUSTSEC-2025-0081/0093/0094/0097/0098: the unic-* Unicode crates are
+# RUSTSEC-2025-0075/0080/0081/0098/0100: the unic-* Unicode crates are
 # unmaintained (the whole open-i18n/rust-unic project is). They reach us only
 # through tauri-utils -> urlpattern, so we neither call them directly nor
 # choose their version, and RustSec lists no safe upgrade. These are

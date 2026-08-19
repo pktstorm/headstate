@@ -9,3 +9,7 @@ coverage/
 .yarn/*
 !.yarn/patches
 !.yarn/releases
+
+# tsc -b build-mode artifacts
+*.tsbuildinfo
+node_modules/.tmp/

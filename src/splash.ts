@@ -23,5 +23,8 @@ export function dismissSplash(doc: Document = document, fadeMs: number = FADE_MS
   // guarantees removal either way. Removal matters: a fixed inset-0 element
   // left in place swallows every click even at zero opacity.
   el.addEventListener("transitionend", remove, { once: true });
+  // Deliberately not cleared when `transitionend` wins the race: `remove` is
+  // idempotent, so the late timer is a harmless no-op. Do not copy this
+  // pattern for a callback that is not idempotent.
   setTimeout(remove, fadeMs + 100);
 }

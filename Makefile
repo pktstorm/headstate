@@ -21,7 +21,7 @@ lint-rust:
 	cd src-tauri && cargo clippy --all-targets -- -D warnings
 
 lint-ui:
-	yarn tsc --noEmit
+	yarn tsc -b --force
 	yarn eslint .
 	yarn knip
 

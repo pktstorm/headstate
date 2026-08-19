@@ -5,6 +5,12 @@
     "module": "ESNext",
     "skipLibCheck": true,
     "composite": true,
+    // composite implies emit, which collides with allowImportingTsExtensions.
+    // Declarations only: `tsc -b` still typechecks this project fully, and CI
+    // uses build mode so vite.config.ts is actually covered by the gate.
+    "emitDeclarationOnly": true,
+    "outDir": "./node_modules/.tmp/tsconfig-node",
+    "rootDir": ".",
 
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
