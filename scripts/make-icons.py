@@ -11,6 +11,14 @@ Two very different targets:
 * Tray icon: a template image. Pure black artwork plus alpha, no color at
   all. The `Template` filename suffix is what tells macOS to invert it for
   light/dark menu bars and highlight it on click.
+
+This script also writes a stable `icon-master.png` (the 1024x1024 app icon,
+identical to `icon.png` at the time this script runs). That's needed because
+the required next step, `yarn tauri icon src-tauri/icons/icon.png`, reads
+`icon.png` as its source and then overwrites that same path with its own
+512x512 render while generating the sized PNG/icns set. Since the brief
+requires `icon.png` itself to remain the 1024x1024 master, the `icons` Make
+target restores it from `icon-master.png` after `yarn tauri icon` runs.
 """
 
 import sys
@@ -83,6 +91,13 @@ def make_app_icon(glyph: Image.Image) -> None:
     ICONS.mkdir(parents=True, exist_ok=True)
     bg.save(ICONS / "icon.png")
     print(f"wrote {ICONS / 'icon.png'} ({CANVAS}x{CANVAS})")
+    # `yarn tauri icon src-tauri/icons/icon.png` (the required next step) reads
+    # this file and then OVERWRITES it with its own 512x512 render as part of
+    # generating the sized PNG/icns set. The brief requires icon.png to remain
+    # the 1024x1024 master, so stash a copy at a stable path the Makefile's
+    # `icons` target restores from after `yarn tauri icon` has run.
+    bg.save(ICONS / "icon-master.png")
+    print(f"wrote {ICONS / 'icon-master.png'} ({CANVAS}x{CANVAS}) -- 1024 master, restored over icon.png after `yarn tauri icon`")
 
 
 def make_tray_icons(glyph: Image.Image) -> None:
@@ -114,7 +129,12 @@ def main() -> int:
     glyph = crop_glyph(splash)
     make_app_icon(glyph)
     make_tray_icons(glyph)
-    print("\nNow run: yarn tauri icon src-tauri/icons/icon.png")
+    print(
+        "\nNow run: yarn tauri icon src-tauri/icons/icon.png"
+        "\nThen restore the 1024 master: cp src-tauri/icons/icon-master.png "
+        "src-tauri/icons/icon.png"
+        "\n(both steps are already wired into `make icons`)"
+    )
     return 0
 
 

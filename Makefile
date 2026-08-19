@@ -30,3 +30,5 @@ fmt:
 
 icons:
 	python3 scripts/make-icons.py
+	yarn tauri icon src-tauri/icons/icon.png
+	cp src-tauri/icons/icon-master.png src-tauri/icons/icon.png
