@@ -790,9 +790,24 @@ export default tseslint.config(
   "$schema": "https://unpkg.com/knip@6/schema.json",
   "entry": ["src/main.tsx", "vite.config.ts"],
   "project": ["src/**/*.{ts,tsx}"],
-  "ignoreDependencies": ["@tailwindcss/vite", "tailwindcss"]
+  "ignoreDependencies": [
+    "@tanstack/react-query",
+    "@tauri-apps/api",
+    "lucide-react",
+    "zustand",
+    "@testing-library/dom",
+    "@testing-library/react",
+    "tailwindcss"
+  ]
 }
 ```
+
+**Why the long `ignoreDependencies`:** these are installed in Task 1 but not
+imported until Tasks 8-20. Without the ignores, knip reports six unused
+dependencies and CI stays red from Task 4 until Task 20 -- and a permanently
+red gate is an ignored gate. `tailwindcss` is a genuine false positive: it is
+imported from CSS (`@import "tailwindcss"`), which knip does not follow.
+Verified: `yarn knip` exits 0 with this config against the Task 1-3 tree.
 
 `src-tauri/deny.toml`:
 
