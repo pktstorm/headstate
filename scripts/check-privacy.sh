@@ -8,12 +8,11 @@
 # text and defeating itself. An allow-list also catches owners nobody
 # thought to enumerate.
 #
-# Two patterns are scanned, both anchored so they cannot match ordinary
+# Three patterns are scanned, all anchored so they cannot match ordinary
 # prose. An earlier unanchored `owner/repo` pattern matched things like
 # `api/hooks.ts`, `read/write`, and `5000/hour` -- a gate that cries wolf
-# gets disabled, so anchoring is load-bearing, not tidiness.
-#   1. github.com/<owner>/<repo>   -- any GitHub URL
-#   2. <owner>/<repo>#<number>     -- the PR/issue shorthand
+# gets disabled, so anchoring is load-bearing, not tidiness. The patterns
+# themselves live at the scan() calls below.
 set -euo pipefail
 
 # The only repository owners this project legitimately references.
