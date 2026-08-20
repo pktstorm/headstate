@@ -82,6 +82,13 @@ scan() {
 urls=$(scan 'github\.com/[A-Za-z0-9][-A-Za-z0-9_.]*/[A-Za-z0-9][-A-Za-z0-9_.]+' \
        | sed -E 's#.*github\.com/##')
 
+# scp-style SSH remote to ANY host, not just github.com -- `git@host:owner/repo`
+# is exactly what `git remote -v` prints, so it is the likeliest shape to get
+# pasted into a README. Anchored on `git@`, a dotted host, and the `:` that
+# separates host from path, which ordinary prose does not produce.
+ssh_scp=$(scan 'git@[A-Za-z0-9][-A-Za-z0-9.]*\.[a-z]{2,}:[A-Za-z0-9][-A-Za-z0-9_.]*/[A-Za-z0-9][-A-Za-z0-9_.]+' \
+          | sed -E 's/^git@[^:]+://; s/\.git$//' || true)
+
 ssh=$(scan 'git@github\.com:[A-Za-z0-9][-A-Za-z0-9_.]*/[A-Za-z0-9][-A-Za-z0-9_.]+' \
       | sed -E 's#.*github\.com:##')
 
@@ -120,7 +127,7 @@ saas=$(scan '[A-Za-z0-9][-A-Za-z0-9]*\.(slack\.com|atlassian\.net)' \
 tickets=$(scan '[A-Z]{2,10}-[0-9]{2,}' \
           | grep -vE "^($ALLOWED_TICKET_PREFIX)-" || true)
 
-owner_matches=$(printf '%s\n%s\n%s\n%s\n%s\n' "$urls" "$ssh" "$refs" "$ghes" "$ssh_any" \
+owner_matches=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$urls" "$ssh" "$refs" "$ghes" "$ssh_any" "$ssh_scp" \
         | grep -vE '^[[:space:]]*$' \
         | grep -vE "^($ALLOWED)/" \
         | sort -u || true)
