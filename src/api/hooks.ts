@@ -105,7 +105,15 @@ export function useRefreshRequested(): void {
     let cancelled = false;
 
     listen("refresh-requested", () => {
-      qc.invalidateQueries({ queryKey: ["prs"] });
+      // `refreshNow()` directly, NOT `invalidateQueries`. Invalidating would
+      // re-run `usePullRequests`'s queryFn, which reads the SQLite snapshot
+      // first and only falls back to the network when that snapshot is
+      // empty. The poll loop writes a snapshot every tick, so it never is --
+      // meaning an invalidate would re-read the same rows the user is
+      // already looking at. "Refresh now" has to mean "ask GitHub now", or
+      // the user waits out the 60s/300s poll cadence while believing they
+      // just refreshed.
+      void refreshNow().then((prs) => qc.setQueryData(["prs"], prs));
     }).then((fn) => {
       if (cancelled) fn();
       else unlisten = fn;
