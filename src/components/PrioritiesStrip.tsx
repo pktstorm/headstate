@@ -14,6 +14,17 @@ import { needsAttention } from "@/lib/derive";
 /// The empty state is one quiet line, not a card: a strip that shouts when
 /// nothing is wrong stops being read -- and then it fails on the day it
 /// matters.
+/// Every reason, not just the first. A ternary here would report only
+/// "merge conflicts" for a PR that is also red -- so you would fix the
+/// rebase, come back, and only then discover CI was failing too. Two of the
+/// author's own open PRs were in exactly that state when this was written.
+function blockedReasons(pr: PullRequest): string[] {
+  const reasons: string[] = [];
+  if (pr.merge === "conflicted") reasons.push("merge conflicts");
+  if (pr.ci === "failure") reasons.push("CI failing");
+  return reasons;
+}
+
 export function PrioritiesStrip({ prs }: { prs: PullRequest[] }) {
   const blocked = prs.filter(needsAttention);
 
@@ -41,8 +52,7 @@ export function PrioritiesStrip({ prs }: { prs: PullRequest[] }) {
               {pr.title}
             </a>
             <span className="ml-2 text-xs text-[#8b949e]">
-              {pr.repo}#{pr.number} —{" "}
-              {pr.merge === "conflicted" ? "merge conflicts" : "CI failing"}
+              {pr.repo}#{pr.number} — {blockedReasons(pr).join(" and ")}
             </span>
           </li>
         ))}
