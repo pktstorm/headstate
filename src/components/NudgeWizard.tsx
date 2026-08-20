@@ -68,6 +68,7 @@ export function NudgeWizard({ prs }: { prs: PullRequest[] }) {
     setFilters({ readyOnly: true });
     setOpts({ annotate: true });
     setCopied(false);
+    setCopyFailed(false);
   };
 
   const handleOpenChange = (next: boolean) => {

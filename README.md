@@ -148,7 +148,7 @@ make dev          # yarn tauri dev — run the app locally, live reload
 make build         # yarn tauri build — produce a runnable .app / .dmg
 make test          # both suites below
 make test-rust     # cargo test (src-tauri)
-make test-ui       # yarn vitest run (130 tests)
+make test-ui       # yarn vitest run
 make lint          # both linters below
 make lint-rust     # cargo fmt --check && cargo clippy -D warnings
 make lint-ui       # yarn tsc -b --force && yarn eslint . && yarn knip
