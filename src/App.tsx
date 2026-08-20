@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { usePullRequests, useRefreshRequested, useStats } from "./api/hooks";
 import { Dashboard } from "./components/Dashboard";
 import { FilterBar } from "./components/FilterBar";
+import { NudgeWizard } from "./components/NudgeWizard";
 import { PrioritiesStrip } from "./components/PrioritiesStrip";
 import { PrList } from "./components/PrList";
 import { RepoSidebar } from "./components/RepoSidebar";
@@ -64,6 +65,9 @@ export default function App() {
           >
             Dashboard
           </Button>
+          <div className="ml-auto">
+            <NudgeWizard prs={prs} />
+          </div>
         </header>
 
         {view === "dashboard" ? (
