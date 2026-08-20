@@ -12,6 +12,12 @@ permissions:
 jobs:
   release:
     runs-on: macos-latest
+    # Hoisted to job level so the signing step's `if:` can test a plain env
+    # var. A step-level `if: secrets.X != ''` is not reliably evaluatable --
+    # the secrets context is not guaranteed available there, and the whole
+    # workflow fails to start rather than skipping the step.
+    env:
+      HAS_SIGNING_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup
@@ -79,7 +85,7 @@ jobs:
       # See CONTRIBUTING.md "Code signing" for the full checklist of what
       # to generate and where to add it.
       - name: Import Apple Developer Certificate
-        if: ${{ secrets.APPLE_CERTIFICATE != '' }}
+        if: env.HAS_SIGNING_CERT == 'true'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
