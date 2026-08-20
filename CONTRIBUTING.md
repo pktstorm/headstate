@@ -15,7 +15,10 @@ history, it's effectively permanent.
 
 CI enforces this on every push and PR via `scripts/check-privacy.sh`, which
 scans for `github.com/<owner>/<repo>` URLs, `git@github.com:<owner>/<repo>`
-SSH remotes, and `<owner>/<repo>#<number>` issue/PR shorthand.
+SSH remotes, `<owner>/<repo>#<number>` issue/PR shorthand, GitHub
+Enterprise Server URLs, `ssh://git@<host>/...git` clone URLs to any host,
+employer email addresses, Slack/Atlassian workspace URLs, and
+`PREFIX-NNNN`-shaped internal ticket IDs.
 
 This script is an **allow-list**, deliberately. A deny-list would have to
 spell out the very names it exists to keep out — putting them in the repo
@@ -34,6 +37,12 @@ Run the guard locally before you push:
 It should print `privacy check: clean`. If it doesn't, fix the reference
 (swap in synthetic data) rather than adding the real owner to the
 allow-list unless it's genuinely a public, legitimate dependency.
+
+The guard also refuses to run (exit 2) if you have **untracked files** in
+the working tree. `git grep`, which the guard uses, can only see tracked
+and staged content — an untracked file is invisible to it, so a "clean"
+result while one exists would be false. Run `git add` (or `git add -N` to
+stage without changing content) on any new files and re-run the guard.
 
 ## Workflow
 
