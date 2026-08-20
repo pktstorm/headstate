@@ -59,6 +59,23 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// Write the attention count onto the tray icon.
+///
+/// macOS renders `set_title` text beside the template glyph, which is how a
+/// monochrome template image signals a count without carrying colour. `None`
+/// clears it, so a resolved queue leaves a clean icon rather than a "0".
+///
+/// Failure here is non-fatal and deliberately silent-but-logged: a badge is
+/// an affordance, and losing it must never take down polling.
+pub fn set_badge(app: &AppHandle, needs_attention: u64) {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return;
+    };
+    if let Err(e) = tray.set_title(badge_text(needs_attention).as_deref()) {
+        eprintln!("headstate: failed to set tray badge: {e}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,22 +95,5 @@ mod tests {
     #[test]
     fn large_counts_are_capped() {
         assert_eq!(badge_text(150).as_deref(), Some("99+"));
-    }
-}
-
-/// Write the attention count onto the tray icon.
-///
-/// macOS renders `set_title` text beside the template glyph, which is how a
-/// monochrome template image signals a count without carrying colour. `None`
-/// clears it, so a resolved queue leaves a clean icon rather than a "0".
-///
-/// Failure here is non-fatal and deliberately silent-but-logged: a badge is
-/// an affordance, and losing it must never take down polling.
-pub fn set_badge(app: &AppHandle, needs_attention: u64) {
-    let Some(tray) = app.tray_by_id(TRAY_ID) else {
-        return;
-    };
-    if let Err(e) = tray.set_title(badge_text(needs_attention).as_deref()) {
-        eprintln!("headstate: failed to set tray badge: {e}");
     }
 }
