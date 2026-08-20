@@ -64,9 +64,14 @@ describe("percentile", () => {
   const ten = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
   it("takes p50", () => expect(percentile(ten, 0.5)).toBe(6));
   it("takes p90", () => expect(percentile(ten, 0.9)).toBe(10));
-  // floor(1 * 0.9) = 0 is in range, but floor(n*p) can equal n; clamp.
   it("does not read past the end on a single sample", () => {
     expect(percentile([7], 0.9)).toBe(7);
+  });
+  // p=1.0 is the ONLY input where floor(n*p) === n, so this is the case
+  // that actually exercises the clamp. Verified: removing the clamp leaves
+  // every other percentile test passing.
+  it("clamps at p100 instead of returning undefined", () => {
+    expect(percentile([1, 2, 3], 1.0)).toBe(3);
   });
   it("returns 0 for an empty series rather than NaN", () => {
     expect(percentile([], 0.5)).toBe(0);
