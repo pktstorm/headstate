@@ -55,6 +55,14 @@ query {
   }
 }"#;
 
+/// Days per request when fetching history.
+///
+/// Each day costs two `search` aliases, and the first chunk carries six
+/// more for the period comparisons, so this caps a request at 36 aliases --
+/// measured reliable at 5/5, comfortably under the ~44 where GitHub starts
+/// intermittently returning 502 Bad Gateway.
+pub const HISTORY_CHUNK_DAYS: i64 = 15;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeriodRanges {
     pub week_current: (String, String),
@@ -76,8 +84,20 @@ fn day(d: DateTime<Utc>) -> String {
 /// query rather than paginating merged PRs, which would take 6+ sequential
 /// requests at current volume.
 pub fn history_query(now: DateTime<Utc>, days: i64) -> String {
+    history_query_range(now, 0, days)
+}
+
+/// The day buckets for `start..start+len`, keeping alias indices absolute
+/// so a chunked fetch can merge results without renumbering.
+///
+/// GitHub 502s on a query carrying too many concurrent `search` aliases.
+/// Measured: 28-36 aliases succeed 5/5, 44-46 fail INTERMITTENTLY (44
+/// succeeded once then failed twice; 46 failed once then succeeded twice),
+/// and 60 fails outright. It is a server-side timeout, not a documented
+/// limit, so the fix is to stay well below it rather than retry into it.
+pub fn history_query_range(now: DateTime<Utc>, start: i64, len: i64) -> String {
     let mut q = String::from("query {\n");
-    for i in 0..days {
+    for i in start..start + len {
         let d = day(now - Duration::days(i));
         q.push_str(&format!(
             "  m{i}: search(query: \"is:pr author:@me is:merged merged:{d}\", type: ISSUE) {{ issueCount }}\n"
@@ -116,7 +136,13 @@ pub fn period_ranges(now: DateTime<Utc>) -> PeriodRanges {
 /// Built by appending inside the brace `history_query` already closed, so
 /// the two are never allowed to drift out of sync.
 pub fn history_query_with_periods(now: DateTime<Utc>, days: i64) -> String {
-    let base = history_query(now, days);
+    history_query_range_with_periods(now, 0, days)
+}
+
+/// The first chunk of a chunked fetch: day buckets plus the six period
+/// aliases, which ride along at no extra cost.
+pub fn history_query_range_with_periods(now: DateTime<Utc>, start: i64, len: i64) -> String {
+    let base = history_query_range(now, start, len);
     let inner = base
         .strip_suffix("}\n")
         .expect("history_query always ends with a closing brace and newline");
@@ -199,6 +225,35 @@ mod tests {
 
     // The combined query must stay valid GraphQL: exactly one top-level
     // brace pair, with the period aliases INSIDE it.
+    // GitHub 502s on too many concurrent search aliases, intermittently
+    // from ~44. A chunk must stay well under that: 15 days x 2 aliases,
+    // plus 6 period aliases in the first chunk, is 36.
+    #[test]
+    fn a_chunk_stays_under_the_alias_ceiling() {
+        let now = at("2026-08-20T14:00:00Z");
+        let first = history_query_range_with_periods(now, 0, HISTORY_CHUNK_DAYS);
+        let rest = history_query_range(now, HISTORY_CHUNK_DAYS, HISTORY_CHUNK_DAYS);
+        assert_eq!(first.matches("search(").count(), 36);
+        assert_eq!(rest.matches("search(").count(), 30);
+        assert!(
+            first.matches("search(").count() <= 40,
+            "too close to the 502 ceiling"
+        );
+    }
+
+    // Alias indices must be ABSOLUTE, or merging chunks would overwrite
+    // day 0 with day 15 and silently corrupt the series.
+    #[test]
+    fn chunk_alias_indices_are_absolute() {
+        let now = at("2026-08-20T14:00:00Z");
+        let rest = history_query_range(now, 15, 3);
+        assert!(rest.contains("m15: search"));
+        assert!(rest.contains("m17: search"));
+        assert!(!rest.contains("m0: search"));
+        // And the dates line up with the absolute index.
+        assert!(rest.contains("merged:2026-08-05"));
+    }
+
     #[test]
     fn combined_query_is_balanced_and_complete() {
         let q = history_query_with_periods(at("2026-08-20T14:00:00Z"), 3);

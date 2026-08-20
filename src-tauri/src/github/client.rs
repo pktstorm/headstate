@@ -5,7 +5,10 @@
 
 use super::map::{map_history, map_merged_detail, map_search};
 use super::model::{History, MergedDetail, PullRequest, Stats};
-use super::query::{history_query_with_periods, MERGED_DETAIL_QUERY, PRS_QUERY, STATS_QUERY};
+use super::query::{
+    history_query_range, history_query_range_with_periods, HISTORY_CHUNK_DAYS, MERGED_DETAIL_QUERY,
+    PRS_QUERY, STATS_QUERY,
+};
 use chrono::{DateTime, Duration, Utc};
 use octocrab::Octocrab;
 use serde_json::json;
@@ -70,10 +73,30 @@ impl GitHubClient {
         now: DateTime<Utc>,
         days: i64,
     ) -> Result<History, ClientError> {
-        let v: serde_json::Value = self
-            .octocrab
-            .graphql(&json!({ "query": history_query_with_periods(now, days) }))
-            .await?;
+        // Chunked because GitHub 502s on a query with too many concurrent
+        // `search` aliases -- see HISTORY_CHUNK_DAYS. The first chunk also
+        // carries the six period aliases, so a 30-day fetch is two requests
+        // and two rate-limit points rather than one request that fails.
+        let mut merged = serde_json::Map::new();
+        let mut start = 0;
+        while start < days {
+            let len = (days - start).min(HISTORY_CHUNK_DAYS);
+            let q = if start == 0 {
+                history_query_range_with_periods(now, start, len)
+            } else {
+                history_query_range(now, start, len)
+            };
+            let chunk: serde_json::Value = self.octocrab.graphql(&json!({ "query": q })).await?;
+            if let Some(obj) = chunk.as_object() {
+                // Alias indices are absolute, so chunks merge without
+                // renumbering and a later chunk cannot clobber an earlier.
+                for (k, val) in obj {
+                    merged.insert(k.clone(), val.clone());
+                }
+            }
+            start += len;
+        }
+        let v = serde_json::Value::Object(merged);
         let count = |k: &str| v[k]["issueCount"].as_u64().unwrap_or(0);
         Ok(History {
             points: map_history(&v, days, now),
@@ -271,5 +294,54 @@ mod tests {
             .fetch_merged_detail()
             .await
             .is_err());
+    }
+
+    // Exercises the real fetch path against the LIVE API, exactly as the
+    // Tauri commands do. #[ignore]d so CI never depends on network or a
+    // token; run manually with `cargo test --lib live_ -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn live_fetch_history_and_detail() {
+        let out = std::process::Command::new("gh")
+            .args(["auth", "token"])
+            .output()
+            .expect("gh auth token");
+        let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let c = GitHubClient::new(crate::auth::build_client(&token).unwrap());
+
+        let h = c.fetch_history(Utc::now(), 30).await.unwrap();
+        println!(
+            "POINTS={} WEEK={}/{} MONTH={}/{}",
+            h.points.len(),
+            h.week_current,
+            h.week_previous,
+            h.month_current,
+            h.month_previous
+        );
+        assert_eq!(h.points.len(), 30);
+        // Ascending by date: the chart plots time left to right.
+        assert!(h.points.windows(2).all(|w| w[0].date <= w[1].date));
+
+        let d = c.fetch_merged_detail().await.unwrap();
+        println!(
+            "SAMPLE={} LINES={} SIZES={} REPOS={} CYCLES={}",
+            d.sample_size,
+            d.additions + d.deletions,
+            d.pr_sizes.len(),
+            d.repo_counts.len(),
+            d.cycle_time_hours.len()
+        );
+        assert!(d.sample_size > 0);
+        // Both vectors must be sorted or percentile() silently lies.
+        assert!(
+            d.pr_sizes.windows(2).all(|w| w[0] <= w[1]),
+            "pr_sizes unsorted"
+        );
+        assert!(
+            d.cycle_time_hours.windows(2).all(|w| w[0] <= w[1]),
+            "cycle times unsorted"
+        );
+        // Repo counts descend, so the table's first row is the busiest.
+        assert!(d.repo_counts.windows(2).all(|w| w[0].merged >= w[1].merged));
     }
 }

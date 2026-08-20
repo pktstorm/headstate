@@ -28,9 +28,17 @@ A raw time series would page over merged PRs: at ~571 merged in a month and
 
 GraphQL `search` aliases were measured against the live API instead. A query
 carrying 28 aliases returned `cost: 1, remaining: 4931` -- **aliased search
-counts cost one point regardless of alias count.** A 30-day
-opened-and-merged series needs 60 aliases and therefore still costs 1 point
-in a single round trip.
+counts cost one point regardless of alias count.**
+
+There is, however, an undocumented ceiling on how many concurrent `search`
+aliases one query may carry. Measured against the live API: 28-36 aliases
+succeed 5/5; 44 and 46 fail INTERMITTENTLY (44 succeeded once then failed
+twice, 46 failed once then succeeded twice); 60 fails outright with a 502
+Bad Gateway. It is a server-side timeout rather than a documented limit, so
+the series is fetched in 15-day chunks (36 aliases including the period
+comparisons) instead of retrying into it. A 30-day range is therefore two
+requests and two points -- still far cheaper than the 6+ paginated requests
+a raw time series would need.
 
 This is the central design decision: it makes a daily chart cheaper than the
 snapshot query the app already runs, and removes pagination entirely.
@@ -40,7 +48,7 @@ snapshot query the app already runs, and removes pagination entirely.
 | Query | Points | Cadence |
 |---|---|---|
 | Existing PR snapshot | 2 | every 60s |
-| `HISTORY_QUERY` (60 aliases) | 1 | Stats view, cached 5 min |
+| `HISTORY_QUERY` (2 chunks at 30 days) | 2 | Stats view, cached 5 min |
 | `MERGED_DETAIL_QUERY` (100 PRs) | 1 | Stats view, cached 5 min |
 
 Against a 5000/hour budget this is immaterial. Both new queries run only

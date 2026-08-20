@@ -86,10 +86,16 @@ getting done, and whether that is improving.
 - **Merged by repository** — where the work actually landed, with each row
   a way back into that repo's filtered list.
 
-The whole view costs two GitHub rate-limit points and only fetches while it
-is open. The daily series uses one aliased query rather than paginating
-merged PRs: aliased searches cost a single point no matter how many aliases
-they carry, so thirty days of history is cheaper than one page of results.
+The view fetches only while it is open, and costs three GitHub rate-limit
+points at the 30-day range. The daily series uses aliased queries rather
+than paginating merged PRs: an aliased search costs a single point no
+matter how many aliases it carries, so a month of history is cheaper than
+one page of paginated results.
+
+The series is fetched in chunks of 15 days. GitHub returns 502 Bad Gateway
+on a query carrying too many concurrent search aliases — measured
+intermittently from around 44 — so requests stay well under that rather
+than retrying into a server-side timeout.
 
 **Filters and repo sidebar.** A sidebar of repos with open PR counts, plus a
 filter bar for labels, review state, and drafts.
