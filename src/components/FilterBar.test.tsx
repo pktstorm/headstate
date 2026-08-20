@@ -48,6 +48,13 @@ describe("FilterBar", () => {
     expect(useFilters.getState().filters.review).toBe("approved");
   });
 
+  it("selecting a sort option writes through the store", () => {
+    render(<FilterBar prs={PR_FIXTURES} />);
+    fireEvent.click(screen.getByText(/^Sort/));
+    fireEvent.click(screen.getByText("Oldest"));
+    expect(useFilters.getState().filters.sort).toBe("oldest");
+  });
+
   it("toggles draftsOnly", () => {
     render(<FilterBar prs={PR_FIXTURES} />);
     fireEvent.click(screen.getByText("Drafts only"));

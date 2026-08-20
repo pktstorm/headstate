@@ -32,23 +32,15 @@ describe("PrList", () => {
     expect(screen.getByText(/No pull requests/i)).toBeDefined();
   });
 
-  /// Deliberately passes the fixtures in the WRONG order. PR_FIXTURES is
-  /// already newest-first, so feeding it in unchanged would pass even against
-  /// a component that does no sorting at all -- the assertion would be
-  /// measuring the fixture, not the code.
-  it("orders newest first even when handed the list reversed", () => {
-    const oldestFirst = [...PR_FIXTURES].sort(
-      (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
-    );
-    render(<PrList prs={oldestFirst} />);
+  /// Sorting moved out of PrList and into `sortPrs` (src/lib/derive.ts) --
+  /// PrList now renders whatever order it's handed. The ordering test moved
+  /// with it; see derive.test.ts's "orders newest first even when handed
+  /// the list reversed".
+  it("renders PRs in the exact order it is given, without re-sorting", () => {
+    const reversed = [...PR_FIXTURES].reverse();
+    render(<PrList prs={reversed} />);
 
-    const rendered = screen
-      .getAllByRole("link")
-      .map((el) => el.textContent);
-    const expected = [...PR_FIXTURES]
-      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
-      .map((pr) => pr.title);
-
-    expect(rendered).toEqual(expected);
+    const rendered = screen.getAllByRole("link").map((el) => el.textContent);
+    expect(rendered).toEqual(reversed.map((pr) => pr.title));
   });
 });

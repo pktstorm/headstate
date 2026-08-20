@@ -1,4 +1,5 @@
 import type { PullRequest, ReviewState } from "@/types/pr";
+import type { Filters } from "@/lib/derive";
 import { useFilters } from "@/store/filters";
 import { Button } from "@/components/ui/button";
 import {
@@ -17,6 +18,13 @@ const REVIEW_OPTIONS: { value: ReviewState; label: string }[] = [
   { value: "changes_requested", label: "Changes requested" },
   { value: "review_required", label: "Review required" },
   { value: "none", label: "No reviews" },
+];
+
+const SORT_OPTIONS: { value: NonNullable<Filters["sort"]>; label: string }[] = [
+  { value: "newest", label: "Newest" },
+  { value: "oldest", label: "Oldest" },
+  { value: "recently-updated", label: "Recently updated" },
+  { value: "least-recently-updated", label: "Least recently updated" },
 ];
 
 /// Mirrors GitHub's `Label / Reviews` row from `<org>/<repo>/pulls`, plus
@@ -128,6 +136,31 @@ export function FilterBar({ prs }: { prs: PullRequest[] }) {
       >
         Drafts only
       </Button>
+
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          render={
+            <Button variant="ghost" size="sm">
+              Sort
+              {filters.sort && filters.sort !== "newest"
+                ? `: ${SORT_OPTIONS.find((opt) => opt.value === filters.sort)?.label}`
+                : ""}
+            </Button>
+          }
+        />
+        <DropdownMenuContent>
+          <DropdownMenuRadioGroup
+            value={filters.sort ?? "newest"}
+            onValueChange={(value) => setFilter("sort", value as Filters["sort"])}
+          >
+            {SORT_OPTIONS.map((opt) => (
+              <DropdownMenuRadioItem key={opt.value} value={opt.value}>
+                {opt.label}
+              </DropdownMenuRadioItem>
+            ))}
+          </DropdownMenuRadioGroup>
+        </DropdownMenuContent>
+      </DropdownMenu>
 
       <Button variant="ghost" size="sm" className="ml-auto" onClick={reset}>
         Clear filters

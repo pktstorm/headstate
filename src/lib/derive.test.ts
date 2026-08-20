@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { PR_FIXTURES, prWithState } from "../fixtures/prs";
 import {
   applyFilters, awaitingReview, blockedByComments, deriveStats,
-  isStale, needsAttention, readyToQueue, STALE_DAYS,
+  isStale, needsAttention, readyToQueue, sortPrs, STALE_DAYS,
 } from "./derive";
 
 const [approved, broken, checking] = PR_FIXTURES;
@@ -123,6 +123,53 @@ describe("applyFilters", () => {
       const out = applyFilters([fresh], { staleOnly: true }, now);
       expect(out).toEqual([]);
     });
+  });
+});
+
+describe("sortPrs", () => {
+  it("does not mutate its input", () => {
+    const original = [...PR_FIXTURES];
+    sortPrs(PR_FIXTURES, "oldest");
+    expect(PR_FIXTURES).toEqual(original);
+  });
+
+  /// Moved from PrList.test.tsx when sorting moved out of the component.
+  /// Deliberately passes the fixtures in the WRONG order: PR_FIXTURES is
+  /// already newest-first, so feeding it in unchanged would pass even
+  /// against a function that does nothing at all -- the assertion would be
+  /// measuring the fixture, not the code.
+  it("orders newest first even when handed the list reversed", () => {
+    const oldestFirst = [...PR_FIXTURES].sort(
+      (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
+    );
+    const sorted = sortPrs(oldestFirst, "newest");
+    expect(sorted.map((pr) => pr.title)).toEqual(
+      [...PR_FIXTURES]
+        .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+        .map((pr) => pr.title),
+    );
+  });
+
+  it("defaults to newest first when no sort is given", () => {
+    const oldestFirst = [...PR_FIXTURES].sort(
+      (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
+    );
+    expect(sortPrs(oldestFirst)).toEqual(sortPrs(oldestFirst, "newest"));
+  });
+
+  it("orders oldest first", () => {
+    const sorted = sortPrs(PR_FIXTURES, "oldest");
+    expect(sorted.map((pr) => pr.number)).toEqual([7, 43, 42]);
+  });
+
+  it("orders by most recently updated", () => {
+    const sorted = sortPrs(PR_FIXTURES, "recently-updated");
+    expect(sorted.map((pr) => pr.number)).toEqual([42, 43, 7]);
+  });
+
+  it("orders by least recently updated", () => {
+    const sorted = sortPrs(PR_FIXTURES, "least-recently-updated");
+    expect(sorted.map((pr) => pr.number)).toEqual([7, 43, 42]);
   });
 });
 

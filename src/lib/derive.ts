@@ -13,6 +13,7 @@ export interface Filters {
   needsAttentionOnly?: boolean;
   staleOnly?: boolean;
   inMergeQueueOnly?: boolean;
+  sort?: "newest" | "oldest" | "recently-updated" | "least-recently-updated";
 }
 
 /// Blocked on the author and nobody else: a real conflict, or failing CI.
@@ -66,6 +67,29 @@ export function applyFilters(
     if (f.staleOnly && !isStale(pr, now)) return false;
     return true;
   });
+}
+
+/// PrList used to hardcode newest-first internally; that hid the ordering
+/// from callers who need a different one (e.g. a future "least recently
+/// updated" nudge view) and made it untestable independent of rendering.
+/// Pure and non-mutating -- callers pass the result straight to PrList.
+export function sortPrs(prs: PullRequest[], sort: Filters["sort"] = "newest"): PullRequest[] {
+  const byCreated = (a: PullRequest, b: PullRequest) =>
+    new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+  const byUpdated = (a: PullRequest, b: PullRequest) =>
+    new Date(a.updated_at).getTime() - new Date(b.updated_at).getTime();
+
+  switch (sort) {
+    case "oldest":
+      return [...prs].sort(byCreated);
+    case "recently-updated":
+      return [...prs].sort((a, b) => -byUpdated(a, b));
+    case "least-recently-updated":
+      return [...prs].sort(byUpdated);
+    case "newest":
+    default:
+      return [...prs].sort((a, b) => -byCreated(a, b));
+  }
 }
 
 /// Five of the seven `Stats` fields come from the PR list already in
