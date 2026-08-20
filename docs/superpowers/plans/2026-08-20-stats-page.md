@@ -907,8 +907,10 @@ only one block is a latent bug):
 
 - [ ] **Step 2: Write the failing test**
 
-Recharts needs a non-zero layout box in jsdom; `ResponsiveContainer` reports
-0x0 and renders nothing. Give the container an explicit size in the test.
+VERIFIED: this project's `chart.tsx` seeds `INITIAL_DIMENSION = { width:
+320, height: 200 }`, so `ChartContainer` renders a real SVG under jsdom with
+no sized parent -- a spike confirmed an `<svg>` plus 2 `<path>` elements.
+No layout workaround is needed in these tests.
 
 ```tsx
 import { render, screen } from "@testing-library/react";
