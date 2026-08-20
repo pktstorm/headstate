@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { PR_FIXTURES, prWithState } from "../fixtures/prs";
 import { NudgeWizard } from "./NudgeWizard";
@@ -108,6 +108,43 @@ describe("NudgeWizard", () => {
 
     expect(fetchSpy).not.toHaveBeenCalled();
     vi.unstubAllGlobals();
+  });
+
+  /// A rejected clipboard write must NOT report success. `writeText` rejects
+  /// on a denied permission or an insecure context; a button that still says
+  /// "Copied!" leaves the user pasting whatever the clipboard held before,
+  /// with no reason to suspect it.
+  it("reports failure when the clipboard rejects", async () => {
+    const writeText = vi.fn().mockRejectedValue(new Error("denied"));
+    Object.assign(navigator, { clipboard: { writeText } });
+
+    openToPreview();
+    fireEvent.click(screen.getByRole("button", { name: /^copy$/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /copy failed/i })).toBeDefined();
+    });
+    expect(screen.queryByRole("button", { name: /copied!/i })).toBeNull();
+  });
+
+  /// With nothing selected the preview shows a placeholder sentence. Copying
+  /// then would put an empty string on the clipboard while the button claimed
+  /// success -- screen and clipboard disagreeing is the one thing this
+  /// feature cannot afford, so the button is disabled instead.
+  it("disables copy when the selection is empty", () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+
+    // A filter no fixture satisfies: drafts only AND green CI.
+    render(<NudgeWizard prs={[]} />);
+    fireEvent.click(screen.getByRole("button", { name: /request reviews/i }));
+    fireEvent.click(screen.getByRole("button", { name: /next/i }));
+    fireEvent.click(screen.getByRole("button", { name: /next/i }));
+
+    const copy = screen.getByRole("button", { name: /^copy$/i });
+    expect(copy.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(copy);
+    expect(writeText).not.toHaveBeenCalled();
   });
 
   it("resets to step 0 after closing", () => {

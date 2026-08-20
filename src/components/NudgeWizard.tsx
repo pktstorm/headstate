@@ -45,6 +45,7 @@ export function NudgeWizard({ prs }: { prs: PullRequest[] }) {
   const [filters, setFilters] = useState<Filters>({ readyOnly: true });
   const [opts, setOpts] = useState<NudgeOptions>({ annotate: true });
   const [copied, setCopied] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(false);
 
   const scoped = prs.filter(
     (pr) => selection.repos.length === 0 || selection.repos.includes(pr.repo),
@@ -80,9 +81,22 @@ export function NudgeWizard({ prs }: { prs: PullRequest[] }) {
     }));
   };
 
+  /// Only claim success once the clipboard actually accepted the text.
+  /// `writeText` rejects on a denied permission or an insecure context, and
+  /// a discarded promise would leave the button saying "Copied!" over a
+  /// clipboard that still holds whatever was there before -- the user pastes
+  /// the wrong thing into a team channel and has no reason to suspect it.
   const handleCopy = () => {
-    void navigator.clipboard.writeText(text);
-    setCopied(true);
+    navigator.clipboard.writeText(text).then(
+      () => {
+        setCopied(true);
+        setCopyFailed(false);
+      },
+      () => {
+        setCopyFailed(true);
+        setCopied(false);
+      },
+    );
   };
 
   return (
@@ -202,7 +216,14 @@ export function NudgeWizard({ prs }: { prs: PullRequest[] }) {
           {step < STEP_COUNT - 1 ? (
             <Button onClick={() => setStep((s) => s + 1)}>Next</Button>
           ) : (
-            <Button onClick={handleCopy}>{copied ? "Copied!" : "Copy"}</Button>
+            // Disabled when there is nothing to copy: the preview shows a
+            // placeholder sentence in that case, and copying would put an
+            // empty string on the clipboard while the button claimed
+            // success -- the screen and the clipboard disagreeing is the one
+            // thing this feature cannot afford.
+            <Button onClick={handleCopy} disabled={text.length === 0}>
+              {copyFailed ? "Copy failed" : copied ? "Copied!" : "Copy"}
+            </Button>
           )}
         </div>
       </DialogContent>
