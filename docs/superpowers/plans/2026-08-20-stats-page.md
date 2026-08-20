@@ -762,8 +762,8 @@ const history = {
 describe("DeltaCards", () => {
   it("shows the merged count and its week-over-week change", () => {
     render(<DeltaCards history={history} detail={undefined} />);
-    expect(screen.getByText("183")).toBeInTheDocument();
-    expect(screen.getByText("+66%")).toBeInTheDocument();
+    expect(screen.getByText("183")).toBeTruthy();
+    expect(screen.getByText("+66%")).toBeTruthy();
   });
 
   it("names the comparison window so the number is interpretable", () => {
@@ -773,7 +773,7 @@ describe("DeltaCards", () => {
 
   it("renders without a detail payload", () => {
     render(<DeltaCards history={history} detail={undefined} />);
-    expect(screen.getByText(/median cycle time/i)).toBeInTheDocument();
+    expect(screen.getByText(/median cycle time/i)).toBeTruthy();
   });
 
   it("shows median cycle time when detail is present", () => {
@@ -787,10 +787,15 @@ describe("DeltaCards", () => {
         }}
       />,
     );
-    expect(screen.getByText("2.0h")).toBeInTheDocument();
+    // Nearest-rank median of [0.5, 1.0, 2.0] is index floor(3*0.5)=1 -> 1.0h.
+    expect(screen.getByText("1.0h")).toBeTruthy();
   });
 });
 ```
+
+NOTE: this project has NO jest-dom. Assert with `toBeTruthy()` / `toBeNull()`
+/ `toBeDefined()`, matching the existing component tests. `toBeInTheDocument`
+throws "Invalid Chai property".
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -925,16 +930,16 @@ const points = [
 describe("ActivityChart", () => {
   it("offers the three range toggles", () => {
     render(<ActivityChart points={points} days={30} onDaysChange={() => {}} />);
-    expect(screen.getByRole("button", { name: "7d" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "14d" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "30d" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "7d" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "14d" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "30d" })).toBeTruthy();
   });
 
   it("marks the active range", () => {
     render(<ActivityChart points={points} days={14} onDaysChange={() => {}} />);
-    expect(screen.getByRole("button", { name: "14d" })).toHaveAttribute(
-      "aria-pressed", "true",
-    );
+    expect(
+      screen.getByRole("button", { name: "14d" }).getAttribute("aria-pressed"),
+    ).toBe("true");
   });
 
   it("reports a range change", async () => {
@@ -946,7 +951,7 @@ describe("ActivityChart", () => {
 
   it("shows an empty state rather than a broken axis", () => {
     render(<ActivityChart points={[]} days={30} onDaysChange={() => {}} />);
-    expect(screen.getByText(/no activity/i)).toBeInTheDocument();
+    expect(screen.getByText(/no activity/i)).toBeTruthy();
   });
 });
 ```
@@ -1102,24 +1107,24 @@ const detail = {
 describe("InsightCards", () => {
   it("shows median and p90 cycle time", () => {
     render(<InsightCards detail={detail} />);
-    expect(screen.getByText("2.0h")).toBeInTheDocument();
-    expect(screen.getByText(/4.0h/)).toBeInTheDocument();
+    expect(screen.getByText("2.0h")).toBeTruthy();
+    expect(screen.getByText(/4.0h/)).toBeTruthy();
   });
 
   it("shows total lines changed", () => {
     render(<InsightCards detail={detail} />);
-    expect(screen.getByText("59,139")).toBeInTheDocument();
+    expect(screen.getByText("59,139")).toBeTruthy();
   });
 
   it("shows review burden per PR", () => {
     render(<InsightCards detail={detail} />);
-    expect(screen.getByText("1.2")).toBeInTheDocument(); // 120 comments / 100 PRs
+    expect(screen.getByText("1.2")).toBeTruthy(); // 120 comments / 100 PRs
   });
 
   // sample_size 0 would divide by zero in every per-PR figure.
   it("renders dashes rather than NaN with no sample", () => {
     render(<InsightCards detail={{ ...detail, sample_size: 0, cycle_time_hours: [] }} />);
-    expect(screen.queryByText(/NaN/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/NaN/)).toBeNull();
   });
 });
 ```
@@ -1138,18 +1143,18 @@ const repos = [
 describe("RepoTable", () => {
   it("lists repos with counts", () => {
     render(<RepoTable repos={repos} />);
-    expect(screen.getByText("acme/alpha")).toBeInTheDocument();
-    expect(screen.getByText("48")).toBeInTheDocument();
+    expect(screen.getByText("acme/alpha")).toBeTruthy();
+    expect(screen.getByText("48")).toBeTruthy();
   });
 
   it("shows each repo's share of the total", () => {
     render(<RepoTable repos={repos} />);
-    expect(screen.getByText("80%")).toBeInTheDocument(); // 48 of 60
+    expect(screen.getByText("80%")).toBeTruthy(); // 48 of 60
   });
 
   it("shows an empty state", () => {
     render(<RepoTable repos={[]} />);
-    expect(screen.getByText(/no merged pull requests/i)).toBeInTheDocument();
+    expect(screen.getByText(/no merged pull requests/i)).toBeTruthy();
   });
 });
 ```
@@ -1322,14 +1327,14 @@ describe("StatsPage", () => {
     vi.mocked(useHistory).mockReturnValue({ data: undefined, isLoading: true } as never);
     vi.mocked(useMergedDetail).mockReturnValue({ data: undefined, isLoading: true } as never);
     render(<StatsPage />);
-    expect(screen.getByText(/loading/i)).toBeInTheDocument();
+    expect(screen.getByText(/loading/i)).toBeTruthy();
   });
 
   it("renders the delta cards once history arrives", () => {
     vi.mocked(useHistory).mockReturnValue({ data: history, isLoading: false } as never);
     vi.mocked(useMergedDetail).mockReturnValue({ data: undefined, isLoading: false } as never);
     render(<StatsPage />);
-    expect(screen.getByText("183")).toBeInTheDocument();
+    expect(screen.getByText("183")).toBeTruthy();
   });
 
   // The detail query is independent; the page must not block on it.
@@ -1339,7 +1344,7 @@ describe("StatsPage", () => {
       data: undefined, isLoading: false, isError: true,
     } as never);
     render(<StatsPage />);
-    expect(screen.getByText("183")).toBeInTheDocument();
+    expect(screen.getByText("183")).toBeTruthy();
   });
 });
 ```
