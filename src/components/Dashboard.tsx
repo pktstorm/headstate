@@ -63,13 +63,13 @@ export function Dashboard({
         label="Green, awaiting review"
         value={derived.awaiting_review}
         tone="success"
-        onClick={() => applyPreset({ ci: "success", review: "none", readyOnly: true })}
+        onClick={() => applyPreset({ awaitingReviewOnly: true })}
       />
       <StatCard
         label="Approved, needs queueing"
         value={derived.ready_to_queue}
         tone="success"
-        onClick={() => applyPreset({ ci: "success", review: "approved", readyOnly: true })}
+        onClick={() => applyPreset({ readyToQueueOnly: true })}
       />
       <StatCard
         label="Blocked by comments"
