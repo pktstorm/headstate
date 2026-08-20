@@ -85,6 +85,8 @@ pub struct RepoCount {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MergedDetail {
     pub cycle_time_hours: Vec<f64>,
+    /// additions+deletions per PR, sorted ascending for percentile lookup.
+    pub pr_sizes: Vec<u64>,
     pub additions: u64,
     pub deletions: u64,
     pub changed_files: u64,

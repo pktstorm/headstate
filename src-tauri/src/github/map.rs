@@ -121,6 +121,8 @@ pub fn map_merged_detail(v: &Value) -> MergedDetail {
     let nodes = v["merged"]["nodes"].as_array().unwrap_or(&empty);
     for n in nodes {
         d.sample_size += 1;
+        let size = n["additions"].as_u64().unwrap_or(0) + n["deletions"].as_u64().unwrap_or(0);
+        d.pr_sizes.push(size);
         d.additions += n["additions"].as_u64().unwrap_or(0);
         d.deletions += n["deletions"].as_u64().unwrap_or(0);
         d.changed_files += n["changedFiles"].as_u64().unwrap_or(0);
@@ -142,6 +144,7 @@ pub fn map_merged_detail(v: &Value) -> MergedDetail {
         }
     }
     d.cycle_time_hours.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    d.pr_sizes.sort_unstable();
     let mut rc: Vec<RepoCount> = repos
         .into_iter()
         .map(|(repo, merged)| RepoCount { repo, merged })
@@ -271,6 +274,8 @@ mod tests {
         assert_eq!(d.changed_files, 4);
         // Sorted ascending so percentile() can index directly.
         assert_eq!(d.cycle_time_hours, vec![0.5, 2.0]);
+        // additions+deletions per PR, ascending: 10+5=15 then 100+20=120.
+        assert_eq!(d.pr_sizes, vec![15, 120]);
         assert_eq!(
             d.repo_counts,
             vec![RepoCount {

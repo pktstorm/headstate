@@ -26,6 +26,13 @@ function Stat({
 /// "--" rather than NaN. The hints name the sample explicitly: these are
 /// aggregates over the last N merged PRs, not lifetime totals, and a reader
 /// who mistakes one for the other draws the wrong conclusion.
+///
+/// The third card shows PR SIZE rather than review burden. Review counts
+/// were checked against live data and came back 0 across the whole sample
+/// -- these are self-merged PRs, so a "reviews per PR" card is a permanent
+/// 0.0 that teaches nothing. Size has real spread (measured: 3 to 10,088
+/// lines, median 324) and speaks to whether generated PRs are staying
+/// reviewable, which is the question the review card was reaching for.
 export function InsightCards({ detail }: { detail: MergedDetail }) {
   const n = detail.sample_size;
   const lines = detail.additions + detail.deletions;
@@ -34,6 +41,8 @@ export function InsightCards({ detail }: { detail: MergedDetail }) {
   const median = percentile(detail.cycle_time_hours, 0.5);
   const p90 = percentile(detail.cycle_time_hours, 0.9);
   const hasTimes = detail.cycle_time_hours.length > 0;
+  const medianSize = percentile(detail.pr_sizes, 0.5);
+  const p90Size = percentile(detail.pr_sizes, 0.9);
 
   return (
     <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
@@ -52,12 +61,12 @@ export function InsightCards({ detail }: { detail: MergedDetail }) {
         }
       />
       <Stat
-        label="Review burden"
-        value={per(detail.comment_count)}
+        label="Median PR size"
+        value={n === 0 ? "--" : `${medianSize.toLocaleString()}`}
         hint={
           n === 0
             ? "no sample"
-            : `comments per PR · ${per(detail.review_count)} reviews`
+            : `lines · p90 ${p90Size.toLocaleString()} · ${per(detail.comment_count)} comments/PR`
         }
       />
     </div>

@@ -80,6 +80,8 @@ export interface RepoCount {
 /// `percentile()` can index it directly.
 export interface MergedDetail {
   cycle_time_hours: number[];
+  /// additions+deletions per PR, sorted ascending for percentile lookup.
+  pr_sizes: number[];
   additions: number;
   deletions: number;
   changed_files: number;

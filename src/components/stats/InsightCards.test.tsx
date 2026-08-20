@@ -5,6 +5,7 @@ import { InsightCards } from "./InsightCards";
 
 const detail: MergedDetail = {
   cycle_time_hours: [0.5, 1.0, 2.0, 4.0],
+  pr_sizes: [15, 120, 324, 900],
   additions: 50000,
   deletions: 9139,
   changed_files: 400,
@@ -27,9 +28,13 @@ describe("InsightCards", () => {
     expect(screen.getByText("59,139")).toBeTruthy();
   });
 
-  it("shows review burden per PR", () => {
+  // Review counts came back 0 across the whole live sample (self-merged
+  // PRs), so the third card reports size, which has real spread.
+  it("shows median PR size with p90 and comments in the hint", () => {
     render(<InsightCards detail={detail} />);
-    expect(screen.getByText("1.2")).toBeTruthy(); // 120 comments / 100 PRs
+    expect(screen.getByText("324")).toBeTruthy(); // p50 of pr_sizes
+    expect(screen.getByText(/p90 900/)).toBeTruthy();
+    expect(screen.getByText(/1\.2 comments\/PR/)).toBeTruthy();
   });
 
   // sample_size 0 would divide by zero in every per-PR figure.

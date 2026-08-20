@@ -15,6 +15,7 @@ const history: History = {
 
 const detail: MergedDetail = {
   cycle_time_hours: [0.5, 1.0, 2.0],
+  pr_sizes: [15, 120, 324, 900],
   additions: 0,
   deletions: 0,
   changed_files: 0,
