@@ -1,4 +1,4 @@
-use super::model::{Repo, Safety, Worktree};
+use super::model::{Repo, Safety, Upstream, Worktree};
 use std::path::Path;
 use std::process::Command;
 
@@ -130,6 +130,65 @@ pub fn worktree_safety(wt: &Worktree, default_branch: &str) -> Safety {
 /// worktrees the user was previously told not to delete, and it shrinks
 /// as they are deleted -- the call only fires for branches ancestry
 /// cannot resolve.
+/// How a checkout stands against its tracked upstream.
+///
+/// Uses `@{u}` rather than a hardcoded `origin/main`: repos differ
+/// (`master`, `develop`, a fork tracking `upstream`), and guessing the
+/// wrong ref reports confident nonsense.
+///
+/// Reads refs already on disk -- no fetch. The counts are as of the last
+/// fetch, which the UI says plainly rather than implying they are live.
+fn upstream_state(dir: &Path) -> Upstream {
+    // A detached HEAD has no upstream to compare against, and asking
+    // anyway yields an error that reads as a failure rather than as the
+    // "question does not apply" it actually is.
+    match git(dir, &["symbolic-ref", "--quiet", "HEAD"]) {
+        Ok(_) => {}
+        Err(_) => return Upstream::Detached,
+    }
+
+    // A local-only branch is normal, not a failure.
+    if git(dir, &["rev-parse", "--abbrev-ref", "@{u}"]).is_err() {
+        return Upstream::Untracked;
+    }
+
+    // One call for both numbers: left is upstream-only (behind), right is
+    // HEAD-only (ahead).
+    match git(dir, &["rev-list", "--left-right", "--count", "@{u}...HEAD"]) {
+        Ok(s) => {
+            let mut it = s.split_whitespace();
+            let behind = it.next().and_then(|v| v.parse::<u64>().ok());
+            let ahead = it.next().and_then(|v| v.parse::<u64>().ok());
+            match (ahead, behind) {
+                (Some(0), Some(0)) => Upstream::Current,
+                (Some(a), Some(0)) => Upstream::Ahead(a),
+                (Some(0), Some(b)) => Upstream::Behind(b),
+                (Some(a), Some(b)) => Upstream::Diverged(a, b),
+                // Unparsable output must not become a confident zero.
+                _ => Upstream::Unknown("could not read ahead/behind counts".into()),
+            }
+        }
+        Err(e) => Upstream::Unknown(e),
+    }
+}
+
+/// Order repos for the sidebar: most worktrees first.
+///
+/// Sorts by the count the sidebar actually SHOWS, which excludes the
+/// main checkout -- every repo has one, and ordering by the raw length
+/// would rank rows by a number nobody can see. Ties break by name so the
+/// list does not reshuffle between polls.
+///
+/// The point of this view is finding disks full of stale worktrees, and
+/// alphabetical order buries a repo with forty of them under one with
+/// one.
+fn sort_for_sidebar(repos: &mut [Repo]) {
+    repos.sort_by(|a, b| {
+        let count = |r: &Repo| r.worktrees.len().saturating_sub(1);
+        count(b).cmp(&count(a)).then_with(|| a.name.cmp(&b.name))
+    });
+}
+
 fn squash_merged(dir: &Path, default_branch: &str) -> Safety {
     match git(dir, &["cherry", default_branch, "HEAD"]) {
         Ok(s) => {
@@ -181,7 +240,7 @@ pub fn scan_dirs_fast(dirs: &[String]) -> Vec<Repo> {
     for base in dirs {
         collect_inner(Path::new(base), 0, &mut repos, false);
     }
-    repos.sort_by(|a, b| a.name.cmp(&b.name));
+    sort_for_sidebar(&mut repos);
     repos
 }
 
@@ -248,6 +307,12 @@ pub fn size_repo(repo_path: &str) -> Vec<(String, u64)> {
 /// merge date to one silently left the other behind.
 fn classify(w: &mut Worktree, repo: &Path, default_branch: &str) {
     w.safety = worktree_safety(w, default_branch);
+    // Only the main checkout: the other rows are answering "may I delete
+    // this?", and an extra git call each for a question nobody asked
+    // would cost scan time for nothing.
+    if w.is_main {
+        w.upstream = Some(upstream_state(Path::new(&w.path)));
+    }
     // Only for merged branches: an extra git call, and the date is
     // meaningless for anything else. 283 of 296 here are not merged.
     if w.safety.is_safe() {
@@ -304,7 +369,7 @@ pub fn scan_dirs(dirs: &[String]) -> Vec<Repo> {
     for base in dirs {
         collect_inner(Path::new(base), 0, &mut repos, true);
     }
-    repos.sort_by(|a, b| a.name.cmp(&b.name));
+    sort_for_sidebar(&mut repos);
     repos
 }
 
@@ -773,6 +838,277 @@ HEAD 8ed50a741e1696d1a0c9506f2e033cf2887bb144
 
     /// Both scan paths must classify identically.
     ///
+    /// The sidebar exists to find disks full of stale worktrees, so the
+    /// repo with the most must come first regardless of name.
+    #[test]
+    fn repos_sort_by_worktree_count_not_name() {
+        let mk = |name: &str, n: usize| Repo {
+            name: name.into(),
+            path: format!("/tmp/{name}"),
+            worktrees: vec![Worktree::default(); n],
+        };
+        // "zed" has the most but sorts last alphabetically -- the whole
+        // point. "alpha" has the fewest but would sort first by name.
+        let mut repos = vec![mk("alpha", 2), mk("zed", 9), mk("mid", 5)];
+        sort_for_sidebar(&mut repos);
+        let names: Vec<_> = repos.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["zed", "mid", "alpha"]);
+    }
+
+    /// Equal counts must not reshuffle between polls, or the list is
+    /// unreadable.
+    #[test]
+    fn equal_counts_break_ties_by_name() {
+        let mk = |name: &str, n: usize| Repo {
+            name: name.into(),
+            path: format!("/tmp/{name}"),
+            worktrees: vec![Worktree::default(); n],
+        };
+        let mut repos = vec![mk("charlie", 4), mk("alpha", 4), mk("bravo", 4)];
+        sort_for_sidebar(&mut repos);
+        let names: Vec<_> = repos.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "bravo", "charlie"]);
+    }
+
+    /// The sidebar shows the count EXCLUDING the main checkout, so the
+    /// sort must use that same number -- ordering rows by a figure nobody
+    /// can see produces a list that looks wrong.
+    #[test]
+    fn sorting_uses_the_count_the_sidebar_displays() {
+        let mk = |name: &str, n: usize| Repo {
+            name: name.into(),
+            path: format!("/tmp/{name}"),
+            worktrees: vec![Worktree::default(); n],
+        };
+        // A repo with only its main checkout displays 0 and must sort
+        // below one displaying 1.
+        let mut repos = vec![mk("only-main", 1), mk("has-one", 2)];
+        sort_for_sidebar(&mut repos);
+        assert_eq!(repos[0].name, "has-one");
+        // And a repo with no worktrees at all must not underflow.
+        let mut empty = vec![mk("empty", 0), mk("has-one", 2)];
+        sort_for_sidebar(&mut empty);
+        assert_eq!(empty[0].name, "has-one");
+    }
+
+    /// Upstream states, against real git rather than a stubbed helper --
+    /// `@{u}` resolution and rev-list's column order are exactly the
+    /// parts a hand-built fixture would get wrong.
+    fn upstream_fixture(f: impl Fn(&Path, &Path)) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ident = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+        let run_in = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .envs(ident)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        run_in(&remote, &["init", "-q", "--bare", "-b", "main"]);
+
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_in(&repo, &["init", "-q", "-b", "main"]);
+        run_in(&repo, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        run_in(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run_in(&repo, &["push", "-q", "-u", "origin", "main"]);
+
+        f(&repo, &remote);
+        (tmp, repo)
+    }
+
+    /// A checkout level with its upstream.
+    #[test]
+    fn a_current_checkout_reports_up_to_date() {
+        let (_t, repo) = upstream_fixture(|_, _| {});
+        assert_eq!(upstream_state(&repo), Upstream::Current);
+    }
+
+    /// Local commits not yet pushed.
+    #[test]
+    fn local_commits_report_ahead() {
+        let (_t, repo) = upstream_fixture(|repo, _| {
+            for m in ["a", "b"] {
+                Command::new("git")
+                    .arg("-C")
+                    .arg(repo)
+                    .args(["commit", "-q", "--allow-empty", "-m", m])
+                    .envs([
+                        ("GIT_AUTHOR_NAME", "octocat"),
+                        ("GIT_COMMITTER_NAME", "octocat"),
+                        ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+                        ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+                    ])
+                    .output()
+                    .unwrap();
+            }
+        });
+        assert_eq!(upstream_state(&repo), Upstream::Ahead(2));
+    }
+
+    /// The upstream moved and this checkout did not -- the state that
+    /// explains why everything below it is stale.
+    ///
+    /// Also pins rev-list's column order: `--left-right` puts the
+    /// upstream-only count first. Swapping the two would report "3 ahead"
+    /// for a checkout that is 3 behind, which is not merely wrong but
+    /// inverted.
+    #[test]
+    fn an_outdated_checkout_reports_behind() {
+        let (_t, repo) = upstream_fixture(|repo, remote| {
+            let ident = [
+                ("GIT_AUTHOR_NAME", "octocat"),
+                ("GIT_COMMITTER_NAME", "octocat"),
+                ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+                ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+            ];
+            // Advance the remote from a second clone, then fetch so the
+            // local ref knows about it without moving HEAD.
+            let other = repo.parent().unwrap().join("other");
+            Command::new("git")
+                .args([
+                    "clone",
+                    "-q",
+                    remote.to_str().unwrap(),
+                    other.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap();
+            for m in ["x", "y", "z"] {
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&other)
+                    .args(["commit", "-q", "--allow-empty", "-m", m])
+                    .envs(ident)
+                    .output()
+                    .unwrap();
+            }
+            Command::new("git")
+                .arg("-C")
+                .arg(&other)
+                .args(["push", "-q", "origin", "main"])
+                .output()
+                .unwrap();
+            Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["fetch", "-q", "origin"])
+                .output()
+                .unwrap();
+        });
+        assert_eq!(upstream_state(&repo), Upstream::Behind(3));
+    }
+
+    /// The upstream must come from `@{u}`, not a hardcoded `origin/main`.
+    ///
+    /// Repos differ -- `master`, `develop`, a fork tracking `upstream` --
+    /// and every other fixture here happens to use `origin/main`, so
+    /// hardcoding it would pass all of them. This one tracks a
+    /// differently-named branch on purpose: with `origin/main` hardcoded
+    /// the rev-list call fails and this reports Unknown instead of the
+    /// real count.
+    #[test]
+    fn the_upstream_is_the_tracked_branch_not_origin_main() {
+        let ident = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+        let run_in = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .envs(ident)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        // Default branch is `develop`, and `main` does not exist at all.
+        run_in(&remote, &["init", "-q", "--bare", "-b", "develop"]);
+
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_in(&repo, &["init", "-q", "-b", "develop"]);
+        run_in(&repo, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        run_in(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run_in(&repo, &["push", "-q", "-u", "origin", "develop"]);
+        run_in(&repo, &["commit", "-q", "--allow-empty", "-m", "local"]);
+
+        assert_eq!(upstream_state(&repo), Upstream::Ahead(1));
+    }
+
+    /// A local-only branch is normal, and distinctly NOT "up to date" --
+    /// a bare zero would read as current when nothing was ever compared.
+    #[test]
+    fn a_branch_with_no_upstream_says_so() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["commit", "-q", "--allow-empty", "-m", "base"],
+        ] {
+            Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(&args)
+                .envs([
+                    ("GIT_AUTHOR_NAME", "octocat"),
+                    ("GIT_COMMITTER_NAME", "octocat"),
+                    ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+                    ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+                ])
+                .output()
+                .unwrap();
+        }
+        assert_eq!(upstream_state(dir), Upstream::Untracked);
+    }
+
+    /// Detached HEAD has no upstream to compare against. It must report
+    /// that, not an error that reads as a failure.
+    #[test]
+    fn a_detached_head_reports_detached_not_an_error() {
+        let (_t, repo) = upstream_fixture(|repo, _| {
+            Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["checkout", "-q", "--detach", "HEAD"])
+                .output()
+                .unwrap();
+        });
+        assert_eq!(upstream_state(&repo), Upstream::Detached);
+    }
+
     /// The bug this fixes. A squash-merged branch is fully merged, but
     /// its tip is not an ancestor of main -- squash replays the work as
     /// a new commit with a new SHA. Ancestry alone therefore reports
