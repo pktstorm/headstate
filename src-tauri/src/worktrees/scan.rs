@@ -422,7 +422,7 @@ mod live {
             .iter()
             .map(|r| (r.worktrees.len().saturating_sub(1), r.name.as_str()))
             .collect();
-        top.sort_by(|a, b| b.0.cmp(&a.0));
+        top.sort_by_key(|a| std::cmp::Reverse(a.0));
         println!("TOP REPOS {:?}", &top[..top.len().min(4)]);
 
         let safe: Vec<&str> = repos
