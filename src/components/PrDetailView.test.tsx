@@ -10,11 +10,13 @@ const state = vi.hoisted(() => ({
 
 vi.mock("../api/hooks", () => ({
   usePrDetail: () => ({ ...state, error: "boom", refetch: vi.fn() }),
+  useActOnPr: () => vi.fn(() => Promise.resolve()),
 }));
 
 import { PrDetailView } from "./PrDetailView";
 
 const detail = (over: Partial<PrDetail> = {}): PrDetail => ({
+  id: "PR_test",
   number: 42,
   title: "Add retry to the fetch client",
   url: "https://github.com/octocat/hello-world/pull/42",
@@ -24,6 +26,7 @@ const detail = (over: Partial<PrDetail> = {}): PrDetail => ({
   author: "octocat",
   repo: "octocat/hello-world",
   head_ref: "feature/retry",
+  head_oid: "oid-detail",
   base_ref: "main",
   merge_status: "clean",
   review: "none",

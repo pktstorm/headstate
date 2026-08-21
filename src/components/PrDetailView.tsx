@@ -1,7 +1,10 @@
-import { ArrowLeft, Check, CircleDot, CircleSlash, ExternalLink, X } from "lucide-react";
+import { ArrowLeft, Bot, Check, CircleDot, CircleSlash, ExternalLink, X } from "lucide-react";
+import { toast } from "sonner";
 import { usePrDetail } from "../api/hooks";
+import { agentPrompt, toAgentContext } from "../lib/agentPrompt";
 import { relativeTime } from "../lib/time";
 import { Markdown } from "./Markdown";
+import { PrActions } from "./PrActions";
 import { QueryError, errorMessage } from "./QueryError";
 
 /// One check, with its outcome and a link to the run.
@@ -119,6 +122,8 @@ export function PrDetailView({
         </p>
       </div>
 
+      <PrActions pr={pr} />
+
       {pr.body.trim() ? (
         <div className="rounded-md border border-[#30363d] p-4">
           <Markdown>{pr.body}</Markdown>
@@ -162,15 +167,33 @@ export function PrDetailView({
         </div>
       ) : null}
 
-      <a
-        href={pr.url}
-        target="_blank"
-        rel="noreferrer noopener"
-        className="flex w-fit items-center gap-1.5 rounded border border-[#30363d] px-3 py-1.5 text-sm hover:bg-[#161b22]"
-      >
-        <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />
-        View on GitHub
-      </a>
+      <div className="flex items-center gap-2">
+        <a
+          href={pr.url}
+          target="_blank"
+          rel="noreferrer noopener"
+          className="flex w-fit items-center gap-1.5 rounded border border-[#30363d] px-3 py-1.5 text-sm hover:bg-[#161b22]"
+        >
+          <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />
+          View on GitHub
+        </a>
+        {/* Worth more here than on a row: this view has the per-check
+            names and URLs, so the prompt names the jobs that actually
+            failed rather than saying the checks were not loaded. */}
+        <button
+          type="button"
+          onClick={() =>
+            navigator.clipboard.writeText(agentPrompt(toAgentContext(pr))).then(
+              () => toast.success("Prompt copied — paste it to an agent"),
+              () => toast.error("Could not copy"),
+            )
+          }
+          className="flex w-fit items-center gap-1.5 rounded border border-[#30363d] px-3 py-1.5 text-sm hover:bg-[#161b22]"
+        >
+          <Bot className="h-3.5 w-3.5" aria-hidden="true" />
+          Copy for agent
+        </button>
+      </div>
     </div>
   );
 }

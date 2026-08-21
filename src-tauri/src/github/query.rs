@@ -1,5 +1,9 @@
-//! GraphQL query documents. All are read-only: no mutations, ever — this
-//! product performs no GitHub write operations.
+//! GraphQL query documents. Every document HERE is read-only -- a
+//! `search` or a `repository` lookup, never a mutation.
+//!
+//! Writes exist, and live in `mutate.rs`. Keeping them in a separate
+//! module is the point: this file stays auditable as pure reads, and the
+//! write surface is small enough to read in one sitting.
 
 use chrono::{DateTime, Duration, Utc};
 
@@ -20,8 +24,8 @@ query($q: String!, $reviewing: String!) {
     issueCount
     nodes {
       ... on PullRequest {
-        number title url isDraft createdAt updatedAt
-        headRefName baseRefName
+        id number title url isDraft createdAt updatedAt
+        headRefName headRefOid baseRefName
         author { login }
         repository { nameWithOwner }
         mergeable mergeStateStatus reviewDecision isInMergeQueue totalCommentsCount
@@ -35,8 +39,8 @@ query($q: String!, $reviewing: String!) {
     issueCount
     nodes {
       ... on PullRequest {
-        number title url isDraft createdAt updatedAt
-        headRefName baseRefName
+        id number title url isDraft createdAt updatedAt
+        headRefName headRefOid baseRefName
         author { login }
         repository { nameWithOwner }
         mergeable mergeStateStatus reviewDecision isInMergeQueue totalCommentsCount
@@ -256,10 +260,10 @@ pub const PR_DETAIL_QUERY: &str = r#"
 query($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
-      number title url state isDraft body
+      id number title url state isDraft body
       mergeable mergeStateStatus reviewDecision
       additions deletions changedFiles
-      headRefName baseRefName
+      headRefName headRefOid baseRefName
       createdAt updatedAt
       author { login }
       comments(first: 50) {

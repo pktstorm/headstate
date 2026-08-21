@@ -74,6 +74,9 @@ pub struct Label {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
+    /// GraphQL node ID, so a row can act without first opening the
+    /// detail view. Rides along in the list query at no extra cost.
+    pub id: String,
     pub number: u64,
     pub title: String,
     pub url: String,
@@ -86,6 +89,9 @@ pub struct PullRequest {
     /// merge until its base does, and is otherwise indistinguishable from
     /// one targeting the default branch.
     pub head_ref: String,
+    /// The head commit, so an "update branch" click can tell GitHub which
+    /// commit the user was actually looking at.
+    pub head_oid: String,
     pub base_ref: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -233,6 +239,9 @@ pub struct PrComment {
 /// would make every poll carry data almost none of the rows need.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PrDetail {
+    /// GraphQL node ID. Every mutation takes this rather than a number,
+    /// so the detail view is what makes a PR actionable.
+    pub id: String,
     pub number: u64,
     pub title: String,
     pub url: String,
@@ -242,6 +251,9 @@ pub struct PrDetail {
     pub author: String,
     pub repo: String,
     pub head_ref: String,
+    /// The head commit, so an "update branch" click can tell GitHub which
+    /// commit the user was actually looking at.
+    pub head_oid: String,
     pub base_ref: String,
     pub merge_status: MergeStateStatus,
     pub review: ReviewState,
@@ -263,6 +275,7 @@ mod attention_tests {
             .unwrap()
             .with_timezone(&Utc);
         PullRequest {
+            id: "PR_test".into(),
             number: 1,
             title: "t".into(),
             url: "u".into(),
@@ -270,6 +283,7 @@ mod attention_tests {
             author: "a".into(),
             is_draft: false,
             head_ref: "feature/x".into(),
+            head_oid: "deadbeef".into(),
             base_ref: "main".into(),
             created_at: t,
             updated_at: t,

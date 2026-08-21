@@ -465,11 +465,13 @@ mod tests {
 
     fn pr(repo: &str, number: u64, merge: MergeState) -> PullRequest {
         PullRequest {
+            id: "PR_test".into(),
             number,
             title: "Add retry to the fetch client".into(),
             url: format!("https://github.com/{repo}/pull/{number}"),
             repo: repo.into(),
             head_ref: "feature/x".into(),
+            head_oid: "deadbeef".into(),
             base_ref: "main".into(),
             author: "octocat".into(),
             is_draft: false,
@@ -652,6 +654,7 @@ mod tests {
             .unwrap()
             .with_timezone(&chrono::Utc);
         PullRequest {
+            id: "PR_test".into(),
             number,
             title: format!("PR {number}"),
             url: format!("https://github.com/{repo}/pull/{number}"),
@@ -659,6 +662,7 @@ mod tests {
             author: "someone".into(),
             is_draft: false,
             head_ref: "feature/x".into(),
+            head_oid: "deadbeef".into(),
             base_ref: "main".into(),
             created_at: t,
             updated_at: t,

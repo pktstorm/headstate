@@ -36,17 +36,29 @@ pub enum Safety {
     NeverPushed,
     /// Branch is not merged into the default branch.
     Unmerged,
+    /// Listed, but not yet classified. A transient state the UI shows as
+    /// a skeleton rather than as an answer -- distinct from `Unknown`,
+    /// which means the check ran and could not decide.
+    Pending,
     /// Git could not answer; never assume safe on an error.
     Unknown(String),
 }
 
-/// Defaults to `Unknown`, never `Safe`.
+/// Defaults to `Pending`, never `Safe`.
 ///
 /// A partially-constructed `Worktree` must not be deletable: the default
-/// is the value a bug is most likely to leave behind.
+/// is the value a bug is most likely to leave behind, and neither
+/// `Pending` nor `Unknown` is deletable.
 impl Default for Safety {
+    /// Not-yet-checked, which is NOT the same as checked-and-failed.
+    ///
+    /// This used to default to `Unknown("not yet classified")`, which the
+    /// UI rendered as "could not determine: not yet classified" -- a
+    /// failed check, in the same grey as a real failure. The fast listing
+    /// lands in ~2.6s and classification takes up to ~57s, so for most of
+    /// a minute every row claimed its safety check had failed.
     fn default() -> Self {
-        Safety::Unknown("not yet classified".into())
+        Safety::Pending
     }
 }
 
@@ -69,7 +81,53 @@ impl Safety {
             }
             Safety::NeverPushed => "never pushed — commits exist only here".into(),
             Safety::Unmerged => "branch not merged".into(),
+            Safety::Pending => "checking…".into(),
             Safety::Unknown(why) => format!("could not determine: {why}"),
+        }
+    }
+}
+
+/// How a checkout stands against its tracked upstream.
+///
+/// Separate from `Safety` on purpose: safety answers "may I delete
+/// this?", while this answers "is this current?". Folding them together
+/// would make the main checkout's row a safety verdict about a directory
+/// nobody is proposing to delete.
+///
+/// Comparison is against the last fetch -- reading refs already on disk,
+/// never the network. This is a local disk-usage view, and a scan that
+/// silently fetched 37 remotes would be both slow and surprising.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "n")]
+pub enum Upstream {
+    /// Level with the upstream as of the last fetch.
+    Current,
+    Ahead(u64),
+    Behind(u64),
+    /// Both sides moved: `.0` ahead, `.1` behind.
+    Diverged(u64, u64),
+    /// A local-only branch. Normal, not an error -- and distinctly not
+    /// "up to date", which is what a bare zero would imply.
+    Untracked,
+    /// No branch to compare, so the question does not apply.
+    Detached,
+    Unknown(String),
+}
+
+impl Upstream {
+    /// Display-ready prose, so the UI does not re-derive it.
+    pub fn reason(&self) -> String {
+        let commits = |n: &u64| format!("{n} commit{}", if *n == 1 { "" } else { "s" });
+        match self {
+            Upstream::Current => "up to date with upstream".into(),
+            Upstream::Ahead(n) => format!("{} ahead of upstream", commits(n)),
+            Upstream::Behind(n) => format!("{} behind upstream", commits(n)),
+            Upstream::Diverged(a, b) => {
+                format!("diverged: {} ahead, {} behind", commits(a), commits(b))
+            }
+            Upstream::Untracked => "no upstream — local only".into(),
+            Upstream::Detached => "detached HEAD".into(),
+            Upstream::Unknown(why) => format!("upstream unknown: {why}"),
         }
     }
 }
@@ -85,6 +143,12 @@ pub struct Worktree {
     pub safety: Safety,
     /// True for the repository's own checkout.
     pub is_main: bool,
+    /// How this checkout stands against its upstream. Only computed for
+    /// the main checkout today -- the other rows already answer the
+    /// question that matters for them (may I delete this?), and one git
+    /// call per worktree for a question nobody asked is not worth the
+    /// scan time.
+    pub upstream: Option<Upstream>,
     /// `YYYY-MM-DD` when this branch landed in the default branch.
     ///
     /// The date the work reached the default branch, NOT the branch tip's
@@ -92,4 +156,34 @@ pub struct Worktree {
     /// a branch written weeks before it merged, and the merge date is the
     /// one that answers "is this safe to forget about".
     pub merged_at: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The default must never be deletable. A partially-constructed
+    /// `Worktree` is what a bug leaves behind, and this is the one place
+    /// where getting it wrong deletes someone's work.
+    #[test]
+    fn the_default_safety_is_not_deletable() {
+        assert!(!Safety::default().is_safe());
+        assert_eq!(Safety::default(), Safety::Pending);
+    }
+
+    /// `Pending` and `Unknown` are different states and must stay
+    /// different.
+    ///
+    /// `Pending` means "not checked yet" and shows as a skeleton;
+    /// `Unknown` means "checked, could not decide" and shows as a
+    /// failure. Collapsing them is what made every unclassified row
+    /// claim its safety check had failed for the first minute of a scan.
+    #[test]
+    fn pending_reads_as_waiting_not_as_failure() {
+        assert_eq!(Safety::Pending.reason(), "checking…");
+        let unknown = Safety::Unknown("git exploded".into());
+        assert!(unknown.reason().contains("could not determine"));
+        assert_ne!(Safety::Pending.reason(), unknown.reason());
+        assert!(!Safety::Pending.is_safe());
+    }
 }

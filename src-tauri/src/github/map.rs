@@ -79,6 +79,7 @@ pub fn map_detail(v: &Value, repo: &str) -> PrDetail {
         .collect();
 
     PrDetail {
+        id: pr["id"].as_str().unwrap_or_default().to_string(),
         number: pr["number"].as_u64().unwrap_or(0),
         title: pr["title"].as_str().unwrap_or_default().to_string(),
         url: pr["url"].as_str().unwrap_or_default().to_string(),
@@ -91,6 +92,7 @@ pub fn map_detail(v: &Value, repo: &str) -> PrDetail {
             .to_string(),
         repo: repo.to_string(),
         head_ref: pr["headRefName"].as_str().unwrap_or_default().to_string(),
+        head_oid: pr["headRefOid"].as_str().unwrap_or_default().to_string(),
         base_ref: pr["baseRefName"].as_str().unwrap_or_default().to_string(),
         merge_status: merge_status(pr),
         review: review_state(pr),
@@ -179,6 +181,7 @@ fn labels(node: &Value) -> Vec<Label> {
 
 fn map_node(node: &Value) -> Option<PullRequest> {
     Some(PullRequest {
+        id: node["id"].as_str().unwrap_or_default().to_string(),
         number: node["number"].as_u64()?,
         title: node["title"].as_str()?.to_string(),
         url: node["url"].as_str()?.to_string(),
@@ -189,6 +192,7 @@ fn map_node(node: &Value) -> Option<PullRequest> {
             .to_string(),
         is_draft: node["isDraft"].as_bool().unwrap_or(false),
         head_ref: node["headRefName"].as_str().unwrap_or_default().to_string(),
+        head_oid: node["headRefOid"].as_str().unwrap_or_default().to_string(),
         base_ref: node["baseRefName"].as_str().unwrap_or_default().to_string(),
         created_at: ts(node, "createdAt")?,
         updated_at: ts(node, "updatedAt")?,

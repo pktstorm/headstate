@@ -2,13 +2,17 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useEffect, useState, useSyncExternalStore } from "react";
 import type { PullRequest } from "../types/pr";
+import type { PrActionName } from "./tauri";
 import {
   getCached,
+  actOnPrs,
+  updatePrBranch,
   getHistory,
   getMergedDetail,
   getCycleTrend,
   getPeriods,
   getPollInterval,
+  actOnPr,
   getPrDetail,
   getWorktreeDirs,
   classifyWorktrees,
@@ -262,6 +266,60 @@ export function useViewCadence(view: string): void {
     // the page.
     void setViewNeedsGithub(view !== "worktrees").catch(() => {});
   }, [view]);
+}
+
+/// Apply an action to a pull request, then refresh what it affected.
+///
+/// NOT optimistic. Every list mutation elsewhere updates locally first,
+/// but a merge either happened or did not, and showing a PR as merged
+/// before GitHub agreed would be a lie about a state the user cannot
+/// undo. The Rust side wakes the poll loop on success, so the list
+/// catches up within a tick rather than after the full interval.
+export function useActOnPr() {
+  const qc = useQueryClient();
+  return (
+    id: string,
+    repo: string,
+    number: number,
+    action: PrActionName,
+  ) =>
+    actOnPr(id, repo, number, action).then(() => {
+      void qc.invalidateQueries({ queryKey: ["pr-detail", repo, number] });
+      void qc.invalidateQueries({ queryKey: ["prs"] });
+      void qc.invalidateQueries({ queryKey: ["reviewing"] });
+    });
+}
+
+/// Merge the base branch into a pull request's head.
+///
+/// Invalidates the same keys as `useActOnPr`: the update changes CI
+/// state and mergeability, so a row left showing "behind" after a
+/// successful update would be stale in exactly the way the button was
+/// meant to fix.
+export function useUpdatePrBranch() {
+  const qc = useQueryClient();
+  return (id: string, repo: string, number: number, expectedHead: string) =>
+    updatePrBranch(id, repo, number, expectedHead).then(() => {
+      void qc.invalidateQueries({ queryKey: ["pr-detail", repo, number] });
+      void qc.invalidateQueries({ queryKey: ["prs"] });
+      void qc.invalidateQueries({ queryKey: ["reviewing"] });
+    });
+}
+
+/// Apply one action to several pull requests.
+///
+/// Invalidates once after the whole batch rather than per pull request:
+/// forty mutations would otherwise trigger forty refetches of the same
+/// list. Resolves with per-PR outcomes; it rejects only if the batch
+/// itself could not run.
+export function useActOnPrs() {
+  const qc = useQueryClient();
+  return (prs: [string, string, number][], action: PrActionName) =>
+    actOnPrs(prs, action).then((outcomes) => {
+      void qc.invalidateQueries({ queryKey: ["prs"] });
+      void qc.invalidateQueries({ queryKey: ["reviewing"] });
+      return outcomes;
+    });
 }
 
 /// One pull request's detail, fetched when the view opens.

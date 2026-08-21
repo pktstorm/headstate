@@ -10,6 +10,9 @@ import { useFilters } from "./store/filters";
 const mockPrs = vi.fn<() => PullRequest[]>(() => []);
 
 vi.mock("./api/hooks", () => ({
+  useActOnPr: () => () => Promise.resolve(),
+  useUpdatePrBranch: () => () => Promise.resolve(),
+  useActOnPrs: () => () => Promise.resolve([]),
   usePullRequests: () => ({ data: mockPrs(), isSuccess: true, isLoading: false }),
   usePollError: () => null,
   useRefreshRequested: () => undefined,

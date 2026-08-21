@@ -15,6 +15,8 @@ export interface Label {
 }
 
 export interface PullRequest {
+  /// GraphQL node ID, so a row can act without opening the detail view.
+  id: string;
   number: number;
   title: string;
   url: string;
@@ -23,6 +25,9 @@ export interface PullRequest {
   is_draft: boolean;
   /// The branch being merged, and the branch it merges into.
   head_ref: string;
+  /// The head commit the row was rendered from, so an "update branch"
+  /// click can tell GitHub which commit the user was looking at.
+  head_oid: string;
   base_ref: string;
   created_at: string;
   updated_at: string;
@@ -160,7 +165,21 @@ export type Safety =
   | { kind: "unpushed"; detail: number }
   | { kind: "never_pushed" }
   | { kind: "unmerged" }
+  /// Listed, but not yet classified. Distinct from `unknown`, which
+  /// means the check ran and could not decide.
+  | { kind: "pending" }
   | { kind: "unknown"; detail: string };
+
+/// How a checkout stands against its tracked upstream, as of the last
+/// fetch. Never live -- the scan reads refs on disk and does not fetch.
+export type Upstream =
+  | { kind: "current" }
+  | { kind: "ahead"; n: number }
+  | { kind: "behind"; n: number }
+  | { kind: "diverged"; n: [number, number] }
+  | { kind: "untracked" }
+  | { kind: "detached" }
+  | { kind: "unknown"; n: string };
 
 export interface Worktree {
   path: string;
@@ -174,6 +193,9 @@ export interface Worktree {
   /// the branch tip's own commit date -- those diverge for a branch
   /// written weeks before it merged.
   merged_at: string | null;
+  /// Only populated for the main checkout: the other rows already answer
+  /// the question that matters for them (may I delete this?).
+  upstream: Upstream | null;
 }
 
 export interface WorktreeRepo {
@@ -188,6 +210,9 @@ export interface WorktreeRepo {
 /// on a poll loop -- carrying a body and comments there would make every
 /// tick haul data almost no row needs.
 export interface PrDetail {
+  /// GraphQL node ID. Every mutation takes this rather than a number, so
+  /// a write can only follow a read of the thing being written.
+  id: string;
   number: number;
   title: string;
   url: string;
@@ -197,6 +222,9 @@ export interface PrDetail {
   author: string;
   repo: string;
   head_ref: string;
+  /// The head commit the row was rendered from, so an "update branch"
+  /// click can tell GitHub which commit the user was looking at.
+  head_oid: string;
   base_ref: string;
   merge_status: string;
   review: string;

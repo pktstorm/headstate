@@ -7,6 +7,7 @@ import type { CiState, Label, MergeState, PullRequest, ReviewState } from "../ty
 /// the happy path.
 export const PR_FIXTURES: PullRequest[] = [
   {
+    id: "PR_fixture0",
     number: 42,
     title: "Add retry to the fetch client",
     url: "https://github.com/octocat/hello-world/pull/42",
@@ -14,6 +15,7 @@ export const PR_FIXTURES: PullRequest[] = [
     author: "octocat",
     is_draft: false,
     head_ref: "feature/retry-client",
+    head_oid: "oid1",
     base_ref: "main",
     created_at: "2026-08-18T10:00:00Z",
     updated_at: "2026-08-18T12:00:00Z",
@@ -27,6 +29,7 @@ export const PR_FIXTURES: PullRequest[] = [
     unresolved_threads: 0,
   },
   {
+    id: "PR_fixture1",
     number: 43,
     title: "Fix flaky timezone test",
     url: "https://github.com/octocat/hello-world/pull/43",
@@ -34,6 +37,7 @@ export const PR_FIXTURES: PullRequest[] = [
     author: "octocat",
     is_draft: true,
     head_ref: "fix/flaky-test",
+    head_oid: "oid2",
     base_ref: "main",
     created_at: "2026-08-17T10:00:00Z",
     updated_at: "2026-08-17T10:30:00Z",
@@ -47,6 +51,7 @@ export const PR_FIXTURES: PullRequest[] = [
     unresolved_threads: 2,
   },
   {
+    id: "PR_fixture2",
     number: 7,
     title: "Bump the parser dependency",
     url: "https://github.com/octocat/spoon-knife/pull/7",
@@ -54,6 +59,7 @@ export const PR_FIXTURES: PullRequest[] = [
     author: "octocat",
     is_draft: false,
     head_ref: "stack/part-2",
+    head_oid: "oid3",
     base_ref: "stack/part-1",
     created_at: "2026-08-16T09:00:00Z",
     updated_at: "2026-08-16T09:00:00Z",
