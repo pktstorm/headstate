@@ -34,6 +34,8 @@ jobs:
           rust-components: clippy, rustfmt
       - name: Privacy guard
         run: ./scripts/check-privacy.sh
+      - name: Workflow shells
+        run: python3 scripts/check-workflow-shells.py
       - name: Rust formatting
         working-directory: src-tauri
         run: cargo fmt --check
