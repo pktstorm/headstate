@@ -1,6 +1,18 @@
-import { Check, CircleDot, GitPullRequest, MessageSquare, X } from "lucide-react";
+import {
+  Check,
+  CircleDot,
+  CircleSlash,
+  GitPullRequest,
+  MessageCircleWarning,
+  MessageSquare,
+  X,
+} from "lucide-react";
 import type { PullRequest } from "@/types/pr";
 import { labelForeground } from "@/lib/labels";
+import { PrKebab } from "@/components/PrKebab";
+import { prKey } from "@/components/BulkBar";
+import { useFilters } from "@/store/filters";
+import { needsAttention } from "@/lib/derive";
 import { relativeTime } from "@/lib/time";
 
 /// A check for green, an X for red, and an amber dot while CI is running.
@@ -23,7 +35,36 @@ function CiGlyph({ pr }: { pr: PullRequest }) {
       <CircleDot className="h-4 w-4 shrink-0 text-[#d29922]" aria-label="CI running" />
     );
   }
-  return null;
+  // `none` means the rollup came back null: no checks ran for this PR at
+  // all. That is NORMAL for a PR stacked on another branch -- most repos
+  // only run CI against the default branch -- so it is drawn muted, not
+  // as a warning. Rendering nothing made "no CI configured" identical to
+  // "checks have not reported yet", which is the same ambiguity #93 fixed
+  // for `pending`.
+  return (
+    <CircleSlash className="h-4 w-4 shrink-0 text-[#6e7681]" aria-label="No CI ran" />
+  );
+}
+
+/// `head → base` for every PR.
+///
+/// Always the full pair, so the row reads the same way whatever it
+/// targets. A PR whose base is NOT the default branch is stacked on
+/// another PR -- it cannot merge until its base does -- so the target is
+/// tinted to make that visible without changing the layout.
+///
+/// GitHub itself puts this in the PR header rather than the list row, so
+/// it stays on the muted metadata line rather than becoming a chip.
+function BranchPair({ pr }: { pr: PullRequest }) {
+  if (!pr.head_ref || !pr.base_ref) return null;
+  const stacked = pr.base_ref !== "main" && pr.base_ref !== "master";
+  return (
+    <span className="ml-2" title={`Merges ${pr.head_ref} into ${pr.base_ref}`}>
+      • <span className="font-mono">{pr.head_ref}</span>
+      <span className="mx-1">→</span>
+      <span className={`font-mono ${stacked ? "text-[#a371f7]" : ""}`}>{pr.base_ref}</span>
+    </span>
+  );
 }
 
 /// Review outcome, when GitHub has one.
@@ -56,12 +97,98 @@ function ReviewGlyph({ pr }: { pr: PullRequest }) {
   return null;
 }
 
-export function PrRow({ pr }: { pr: PullRequest }) {
+/// The PR glyph's colour and label.
+///
+/// It was unconditionally green, so a draft, a queued PR and a blocked one
+/// all looked identical -- the icon carried no information at all.
+///
+/// Precedence is most-blocking first, and the order is the real decision:
+/// a draft WITH merge conflicts should read as blocked, not as a benign
+/// draft. "Blocked" deliberately means what `needsAttention` already means
+/// (conflicts or failing CI), so the icon agrees with the priorities strip
+/// and the tray badge rather than inventing a fourth definition of broken.
+///
+/// Colour never carries the meaning alone: the label names the state for
+/// anyone who cannot distinguish these hues, matching how `CiGlyph`
+/// already labels its states.
+function prState(pr: PullRequest): { className: string; label: string } {
+  if (needsAttention(pr)) {
+    return { className: "text-[#f85149]", label: "Blocked" };
+  }
+  if (pr.in_merge_queue) {
+    return { className: "text-[#db6d28]", label: "In merge queue" };
+  }
+  if (pr.is_draft) {
+    return { className: "text-[#8b949e]", label: "Draft" };
+  }
+  // GitHub's own verdict, which `needsAttention` cannot express: a PR
+  // waiting on a required review is neither broken nor ready, and a PR
+  // whose base has moved needs an update rather than a fix. Both look
+  // identical to the conflicts-or-red-CI rule above.
+  if (pr.merge_status === "blocked") {
+    return { className: "text-[#d29922]", label: "Blocked on review" };
+  }
+  if (pr.merge_status === "behind") {
+    return { className: "text-[#d29922]", label: "Behind base branch" };
+  }
+  return { className: "text-[#3fb950]", label: "Open" };
+}
+
+export function PrRow({
+  pr,
+  onOpen,
+  canWrite = true,
+  selectable = false,
+}: {
+  pr: PullRequest;
+  onOpen?: () => void;
+  /// False on the review view: merging or closing someone else's pull
+  /// request is usually not yours to do.
+  canWrite?: boolean;
+  /// Show the bulk-selection checkbox. Off on the review view for the
+  /// same reason `canWrite` is: every bulk action is a write.
+  selectable?: boolean;
+}) {
+  const state = prState(pr);
+  const { checked, toggleChecked } = useFilters();
+  const key = prKey(pr);
   return (
-    <div className="flex gap-3 border-b border-[#30363d] px-4 py-3 last:border-b-0 hover:bg-[#161b22]">
+    // The row opens the detail view; the title anchor still opens GitHub,
+    // and stops propagation so a deliberate click on it is not hijacked.
+    <div
+      role={onOpen ? "button" : undefined}
+      tabIndex={onOpen ? 0 : undefined}
+      onClick={onOpen}
+      onKeyDown={(e) => {
+        if (onOpen && (e.key === "Enter" || e.key === " ")) {
+          e.preventDefault();
+          onOpen();
+        }
+      }}
+      className={`flex gap-3 border-b border-[#30363d] px-4 py-3 last:border-b-0 hover:bg-[#161b22] ${
+        onOpen ? "cursor-pointer" : ""
+      }`}
+    >
+      {selectable ? (
+        // Its own click target, stopping propagation so checking a row
+        // does not also open it.
+        <label
+          className="flex items-start pt-0.5"
+          onClick={(e) => e.stopPropagation()}
+          onKeyDown={(e) => e.stopPropagation()}
+        >
+          <span className="sr-only">Select #{pr.number}</span>
+          <input
+            type="checkbox"
+            checked={checked.includes(key)}
+            onChange={() => toggleChecked(key)}
+            className="h-4 w-4 cursor-pointer accent-[#1f6feb]"
+          />
+        </label>
+      ) : null}
       <GitPullRequest
-        className="mt-0.5 h-4 w-4 shrink-0 text-[#3fb950]"
-        aria-hidden="true"
+        className={`mt-0.5 h-4 w-4 shrink-0 ${state.className}`}
+        aria-label={state.label}
       />
       <div className="min-w-0 flex-1">
         <div className="flex flex-wrap items-center gap-2">
@@ -69,6 +196,7 @@ export function PrRow({ pr }: { pr: PullRequest }) {
             href={pr.url}
             target="_blank"
             rel="noreferrer"
+            onClick={(e) => e.stopPropagation()}
             className="font-semibold text-[#e6edf3] hover:text-[#4493f8]"
           >
             {pr.title}
@@ -104,6 +232,24 @@ export function PrRow({ pr }: { pr: PullRequest }) {
             <span className="ml-2 text-[#f85149]">• Conflicts</span>
           )}
           {pr.merge === "checking" && <span className="ml-2">• Checking mergeability</span>}
+          <BranchPair pr={pr} />
+          {/* Open review conversations on the current code. Deliberately
+              worded as a count, not "blocked": whether a repo requires
+              resolution before merging needs admin access on that repo,
+              so the row reports what it knows and lets the reader draw
+              the conclusion. Amber, not red -- unanswered questions are
+              not a failure. */}
+          {pr.unresolved_threads > 0 && (
+            <span
+              className="ml-2 inline-flex items-center gap-1 text-[#d29922]"
+              title={`${pr.unresolved_threads} review conversation${
+                pr.unresolved_threads === 1 ? "" : "s"
+              } not yet resolved`}
+            >
+              <MessageCircleWarning className="h-3 w-3" aria-hidden="true" />
+              {pr.unresolved_threads} unresolved
+            </span>
+          )}
           {pr.comment_count > 0 && (
             <span className="ml-2 inline-flex items-center gap-1">
               <MessageSquare className="h-3 w-3" aria-hidden="true" />
@@ -113,6 +259,7 @@ export function PrRow({ pr }: { pr: PullRequest }) {
         </div>
       </div>
       <div className="shrink-0 text-xs text-[#8b949e]">{pr.repo}</div>
+      <PrKebab pr={pr} canWrite={canWrite} />
     </div>
   );
 }

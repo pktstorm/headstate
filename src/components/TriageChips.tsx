@@ -1,7 +1,7 @@
 import type { PullRequest } from "@/types/pr";
 import type { Filters } from "@/lib/derive";
-import { deriveStats, isStale } from "@/lib/derive";
-import { useFilters } from "@/store/filters";
+import { deriveStats, hasUnresolvedThreads, isStale } from "@/lib/derive";
+import { useActiveFilters, useFilters } from "@/store/filters";
 
 /// Clickable counters above the list.
 ///
@@ -44,6 +44,13 @@ const CHIPS: {
     tone: "text-[#3fb950] border-[#3fb950]/40",
   },
   {
+    key: "unresolved",
+    label: "Unresolved comments",
+    preset: { unresolvedOnly: true },
+    count: (prs) => prs.filter(hasUnresolvedThreads).length,
+    tone: "text-[#d29922] border-[#d29922]/40",
+  },
+  {
     key: "stale",
     label: "Stale",
     preset: { staleOnly: true },
@@ -55,7 +62,8 @@ const CHIPS: {
 ];
 
 export function TriageChips({ prs, now = new Date() }: { prs: PullRequest[]; now?: Date }) {
-  const { filters, applyPreset } = useFilters();
+  const filters = useActiveFilters();
+  const { applyPreset } = useFilters();
   const active = CHIPS.filter((c) => c.count(prs, now) > 0);
   if (active.length === 0) return null;
 

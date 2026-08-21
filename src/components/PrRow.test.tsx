@@ -1,5 +1,7 @@
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { fireEvent, screen } from "@testing-library/react";
+import { renderWithQuery as render } from "@/test-utils";
+import { describe, expect, it, vi } from "vitest";
+
 import type { PullRequest } from "@/types/pr";
 import { PR_FIXTURES } from "@/fixtures/prs";
 import { PrRow } from "./PrRow";
@@ -67,5 +69,210 @@ describe("PrRow", () => {
     unmount();
     render(<PrRow pr={pr({ comment_count: 0 })} />);
     expect(screen.queryByText("0")).toBeNull();
+  });
+});
+
+describe("PrRow branch pair", () => {
+  it("shows source and target for every PR", () => {
+    render(<PrRow pr={pr({ head_ref: "ci_fix_2", base_ref: "main" })} />);
+    expect(screen.getByText("ci_fix_2")).toBeTruthy();
+    expect(screen.getByText("main")).toBeTruthy();
+    expect(screen.getByText("→")).toBeTruthy();
+  });
+
+  // A stacked PR cannot merge until its base does, and nothing else in
+  // the row says so.
+  it("tints the target when it is not the default branch", () => {
+    const { container } = render(
+      <PrRow pr={pr({ head_ref: "ci_fix_2", base_ref: "ci_fix_1" })} />,
+    );
+    const target = Array.from(container.querySelectorAll("span")).find(
+      (s) => s.textContent === "ci_fix_1",
+    );
+    expect(target?.className).toContain("#a371f7");
+  });
+
+  it("does not tint a PR targeting main or master", () => {
+    for (const base of ["main", "master"]) {
+      const { container, unmount } = render(
+        <PrRow pr={pr({ head_ref: "feature/x", base_ref: base })} />,
+      );
+      const target = Array.from(container.querySelectorAll("span")).find(
+        (s) => s.textContent === base,
+      );
+      expect(target?.className).not.toContain("#a371f7");
+      unmount();
+    }
+  });
+
+  // The mapper defaults these to "" when GitHub omits them; a row must
+  // not render a bare arrow.
+  it("renders nothing when the refs are missing", () => {
+    render(<PrRow pr={pr({ head_ref: "", base_ref: "" })} />);
+    expect(screen.queryByText("→")).toBeNull();
+  });
+});
+
+describe("PrRow no-CI state", () => {
+  // Normal for a stacked PR: most repos only run CI against the default
+  // branch. Previously identical to "checks have not reported yet".
+  it("distinguishes 'no CI ran' from every other CI state", () => {
+    render(<PrRow pr={pr({ ci: "none" })} />);
+    expect(screen.getByLabelText("No CI ran")).toBeTruthy();
+  });
+
+  it("does not show the no-CI glyph when CI actually ran", () => {
+    for (const ci of ["success", "failure", "pending"] as const) {
+      const { unmount } = render(<PrRow pr={pr({ ci })} />);
+      expect(screen.queryByLabelText("No CI ran")).toBeNull();
+      unmount();
+    }
+  });
+});
+
+describe("PrRow unresolved conversations", () => {
+  it("shows the count when conversations are open", () => {
+    render(<PrRow pr={pr({ unresolved_threads: 3 })} />);
+    expect(screen.getByText(/3 unresolved/)).toBeTruthy();
+  });
+
+  it("says conversation, singular, for one", () => {
+    render(<PrRow pr={pr({ unresolved_threads: 1 })} />);
+    expect(screen.getByTitle(/1 review conversation not yet resolved/)).toBeTruthy();
+  });
+
+  it("stays silent when everything is resolved", () => {
+    render(<PrRow pr={pr({ unresolved_threads: 0 })} />);
+    expect(screen.queryByText(/unresolved/)).toBeNull();
+  });
+
+  // Amber, not red: an unanswered question is not a failure, and the app
+  // cannot know whether the repo actually requires resolution to merge.
+  it("does not present unresolved conversations as an error", () => {
+    const { container } = render(<PrRow pr={pr({ unresolved_threads: 2 })} />);
+    const chip = Array.from(container.querySelectorAll("span")).find((s) =>
+      s.textContent?.includes("unresolved"),
+    );
+    expect(chip?.className).toContain("#d29922");
+    expect(chip?.className).not.toContain("#f85149");
+  });
+});
+
+describe("PrRow state icon", () => {
+  // It was unconditionally green, so the icon said nothing at all.
+  it("is green for a healthy open PR", () => {
+    const { container } = render(
+      <PrRow pr={pr({ ci: "success", merge: "mergeable", is_draft: false, in_merge_queue: false })} />,
+    );
+    expect(screen.getByLabelText("Open")).toBeTruthy();
+    expect(container.innerHTML).toContain("#3fb950");
+  });
+
+  it("is orange in the merge queue", () => {
+    render(<PrRow pr={pr({ ci: "success", merge: "mergeable", in_merge_queue: true })} />);
+    expect(screen.getByLabelText("In merge queue")).toBeTruthy();
+  });
+
+  it("is grey for a draft", () => {
+    render(<PrRow pr={pr({ ci: "success", merge: "mergeable", is_draft: true })} />);
+    expect(screen.getByLabelText("Draft")).toBeTruthy();
+  });
+
+  it("is red when blocked", () => {
+    render(<PrRow pr={pr({ ci: "failure", merge: "mergeable" })} />);
+    expect(screen.getByLabelText("Blocked")).toBeTruthy();
+  });
+
+  // The precedence decision: a draft that ALSO has conflicts is blocked,
+  // not a benign draft. Getting this backwards hides real problems.
+  it("prefers blocked over draft and queued", () => {
+    render(<PrRow pr={pr({ ci: "failure", is_draft: true, in_merge_queue: true })} />);
+    expect(screen.getByLabelText("Blocked")).toBeTruthy();
+    expect(screen.queryByLabelText("Draft")).toBeNull();
+  });
+
+  it("prefers queued over draft", () => {
+    render(
+      <PrRow pr={pr({ ci: "success", merge: "mergeable", is_draft: true, in_merge_queue: true })} />,
+    );
+    expect(screen.getByLabelText("In merge queue")).toBeTruthy();
+  });
+
+  // Colour must never be the only signal.
+  it("labels the state for anyone who cannot see the colour", () => {
+    for (const [p, label] of [
+      [{ ci: "success", merge: "mergeable" }, "Open"],
+      [{ merge: "conflicted" }, "Blocked"],
+      [{ ci: "success", merge: "mergeable", is_draft: true }, "Draft"],
+    ] as const) {
+      const { unmount } = render(<PrRow pr={pr(p)} />);
+      expect(screen.getByLabelText(label)).toBeTruthy();
+      unmount();
+    }
+  });
+});
+
+describe("PrRow merge-state nuance", () => {
+  // These two states are invisible to the conflicts-or-red-CI rule, which
+  // is exactly why mergeStateStatus is worth fetching.
+  it("distinguishes 'blocked on review' from broken and from ready", () => {
+    render(
+      <PrRow pr={pr({ ci: "success", merge: "mergeable", merge_status: "blocked" })} />,
+    );
+    expect(screen.getByLabelText("Blocked on review")).toBeTruthy();
+  });
+
+  it("shows when a branch is behind its base", () => {
+    render(
+      <PrRow pr={pr({ ci: "success", merge: "mergeable", merge_status: "behind" })} />,
+    );
+    expect(screen.getByLabelText("Behind base branch")).toBeTruthy();
+  });
+
+  // Real breakage still outranks GitHub's softer verdicts.
+  it("still prefers blocked-by-CI over blocked-on-review", () => {
+    render(<PrRow pr={pr({ ci: "failure", merge_status: "blocked" })} />);
+    expect(screen.getByLabelText("Blocked")).toBeTruthy();
+  });
+
+  it("treats clean as plain open", () => {
+    render(
+      <PrRow pr={pr({ ci: "success", merge: "mergeable", merge_status: "clean" })} />,
+    );
+    expect(screen.getByLabelText("Open")).toBeTruthy();
+  });
+});
+
+describe("PrRow click-through", () => {
+  it("opens the detail view when the row is clicked", () => {
+    const onOpen = vi.fn();
+    const { container } = render(<PrRow pr={pr()} onOpen={onOpen} />);
+    fireEvent.click(container.querySelector('[role="button"]') as Element);
+    expect(onOpen).toHaveBeenCalled();
+  });
+
+  // The title still goes to GitHub; clicking it must not be hijacked
+  // into opening the in-app view instead.
+  it("lets the title link through to GitHub without opening the detail", () => {
+    const onOpen = vi.fn();
+    render(<PrRow pr={pr()} onOpen={onOpen} />);
+    fireEvent.click(screen.getByRole("link", { name: pr().title }));
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it("is keyboard reachable", () => {
+    const onOpen = vi.fn();
+    const { container } = render(<PrRow pr={pr()} onOpen={onOpen} />);
+    const row = container.querySelector('[role="button"]') as Element;
+    expect(row.getAttribute("tabindex")).toBe("0");
+    fireEvent.keyDown(row, { key: "Enter" });
+    expect(onOpen).toHaveBeenCalled();
+  });
+
+  // Rows are not clickable everywhere, and a bare div must not claim a
+  // button role it cannot fulfil.
+  it("is not interactive without a handler", () => {
+    const { container } = render(<PrRow pr={pr()} />);
+    expect(container.querySelector('[role="button"]')).toBeNull();
   });
 });

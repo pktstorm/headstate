@@ -1,8 +1,8 @@
 //! Mapping from the raw GraphQL JSON to typed `PullRequest`s.
 
 use super::model::{
-    CiState, CycleTrend, HistoryPoint, Label, MergeState, MergedDetail, MergedPr, PullRequest,
-    RepoCount, ReviewState,
+    CheckRun, CiState, CycleTrend, HistoryPoint, Label, MergeState, MergeStateStatus, MergedDetail,
+    MergedPr, PrComment, PrDetail, PullRequest, RepoCount, ReviewState,
 };
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
@@ -19,6 +19,127 @@ fn ci_state(node: &Value) -> CiState {
         Some("PENDING") | Some("EXPECTED") => CiState::Pending,
         // No rollup at all means the repo runs no checks on this PR.
         _ => CiState::None,
+    }
+}
+
+/// One check's outcome, normalised.
+///
+/// CheckRun reports `conclusion` (SUCCESS/FAILURE/...) while
+/// StatusContext reports `state` (SUCCESS/PENDING/...). Both shapes reach
+/// here, and a null conclusion means the run has not finished.
+fn check_state(node: &Value) -> String {
+    let raw = node["conclusion"]
+        .as_str()
+        .or_else(|| node["state"].as_str())
+        .unwrap_or("PENDING");
+    match raw {
+        "SUCCESS" => "success",
+        "FAILURE" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "STARTUP_FAILURE" => "failure",
+        "PENDING" | "IN_PROGRESS" | "QUEUED" | "WAITING" | "EXPECTED" => "pending",
+        "NEUTRAL" | "SKIPPED" => "skipped",
+        other => other,
+    }
+    .to_string()
+}
+
+/// The detail payload for one pull request.
+pub fn map_detail(v: &Value, repo: &str) -> PrDetail {
+    let pr = &v["repository"]["pullRequest"];
+    let empty = vec![];
+
+    let checks = pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .map(|c| CheckRun {
+            // CheckRun uses `name`, StatusContext uses `context`.
+            name: c["name"]
+                .as_str()
+                .or_else(|| c["context"].as_str())
+                .unwrap_or("check")
+                .to_string(),
+            state: check_state(c),
+            url: c["detailsUrl"]
+                .as_str()
+                .or_else(|| c["targetUrl"].as_str())
+                .unwrap_or_default()
+                .to_string(),
+        })
+        .collect();
+
+    let comments = pr["comments"]["nodes"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .map(|c| PrComment {
+            author: c["author"]["login"].as_str().unwrap_or("ghost").to_string(),
+            created_at: c["createdAt"].as_str().unwrap_or_default().to_string(),
+            body: c["body"].as_str().unwrap_or_default().to_string(),
+        })
+        .collect();
+
+    PrDetail {
+        id: pr["id"].as_str().unwrap_or_default().to_string(),
+        number: pr["number"].as_u64().unwrap_or(0),
+        title: pr["title"].as_str().unwrap_or_default().to_string(),
+        url: pr["url"].as_str().unwrap_or_default().to_string(),
+        state: pr["state"].as_str().unwrap_or("OPEN").to_lowercase(),
+        is_draft: pr["isDraft"].as_bool().unwrap_or(false),
+        body: pr["body"].as_str().unwrap_or_default().to_string(),
+        author: pr["author"]["login"]
+            .as_str()
+            .unwrap_or("ghost")
+            .to_string(),
+        repo: repo.to_string(),
+        head_ref: pr["headRefName"].as_str().unwrap_or_default().to_string(),
+        head_oid: pr["headRefOid"].as_str().unwrap_or_default().to_string(),
+        base_ref: pr["baseRefName"].as_str().unwrap_or_default().to_string(),
+        merge_status: merge_status(pr),
+        review: review_state(pr),
+        additions: pr["additions"].as_u64().unwrap_or(0),
+        deletions: pr["deletions"].as_u64().unwrap_or(0),
+        changed_files: pr["changedFiles"].as_u64().unwrap_or(0),
+        unresolved_threads: unresolved_threads(pr),
+        comment_count: pr["comments"]["totalCount"].as_u64().unwrap_or(0),
+        comments,
+        checks,
+    }
+}
+
+/// Open review conversations on the current code.
+///
+/// Both filters matter: a resolved thread needs no action, and an outdated
+/// one hangs off a line that has since changed, so counting either would
+/// nag the author about work already finished.
+fn unresolved_threads(node: &Value) -> u64 {
+    node["reviewThreads"]["nodes"]
+        .as_array()
+        .map(|threads| {
+            threads
+                .iter()
+                .filter(|t| {
+                    !t["isResolved"].as_bool().unwrap_or(false)
+                        && !t["isOutdated"].as_bool().unwrap_or(false)
+                })
+                .count() as u64
+        })
+        .unwrap_or(0)
+}
+
+/// GitHub's merge-readiness summary.
+///
+/// Unrecognised and absent values both become `Unknown` rather than
+/// guessing: a merge button must never be enabled on a state we do not
+/// understand.
+fn merge_status(node: &Value) -> MergeStateStatus {
+    match node["mergeStateStatus"].as_str() {
+        Some("CLEAN") => MergeStateStatus::Clean,
+        Some("DIRTY") => MergeStateStatus::Dirty,
+        Some("BLOCKED") => MergeStateStatus::Blocked,
+        Some("UNSTABLE") => MergeStateStatus::Unstable,
+        Some("BEHIND") => MergeStateStatus::Behind,
+        Some("DRAFT") => MergeStateStatus::Draft,
+        _ => MergeStateStatus::Unknown,
     }
 }
 
@@ -60,6 +181,7 @@ fn labels(node: &Value) -> Vec<Label> {
 
 fn map_node(node: &Value) -> Option<PullRequest> {
     Some(PullRequest {
+        id: node["id"].as_str().unwrap_or_default().to_string(),
         number: node["number"].as_u64()?,
         title: node["title"].as_str()?.to_string(),
         url: node["url"].as_str()?.to_string(),
@@ -69,14 +191,19 @@ fn map_node(node: &Value) -> Option<PullRequest> {
             .unwrap_or("unknown")
             .to_string(),
         is_draft: node["isDraft"].as_bool().unwrap_or(false),
+        head_ref: node["headRefName"].as_str().unwrap_or_default().to_string(),
+        head_oid: node["headRefOid"].as_str().unwrap_or_default().to_string(),
+        base_ref: node["baseRefName"].as_str().unwrap_or_default().to_string(),
         created_at: ts(node, "createdAt")?,
         updated_at: ts(node, "updatedAt")?,
         ci: ci_state(node),
         merge: merge_state(node),
+        merge_status: merge_status(node),
         review: review_state(node),
         in_merge_queue: node["isInMergeQueue"].as_bool().unwrap_or(false),
         labels: labels(node),
         comment_count: node["totalCommentsCount"].as_u64().unwrap_or(0),
+        unresolved_threads: unresolved_threads(node),
     })
 }
 
@@ -309,6 +436,197 @@ mod tests {
 
     /// GitHub computes mergeability lazily and returns UNKNOWN right after a
     /// push. Mapping that to Conflicted would show a false "needs rebase".
+    fn node_with_threads(threads: serde_json::Value) -> serde_json::Value {
+        json!({"authored": {"nodes": [{
+            "number": 1, "title": "t", "url": "u", "isDraft": false,
+            "headRefName": "f", "baseRefName": "main",
+            "createdAt": "2026-08-20T00:00:00Z", "updatedAt": "2026-08-20T00:00:00Z",
+            "author": {"login": "a"}, "repository": {"nameWithOwner": "acme/a"},
+            "mergeable": "MERGEABLE", "reviewDecision": null,
+            "isInMergeQueue": false, "totalCommentsCount": 0,
+            "labels": {"nodes": []}, "commits": {"nodes": []},
+            "reviewThreads": {"nodes": threads}
+        }]}})
+    }
+
+    #[test]
+    fn counts_only_open_conversations() {
+        let v = node_with_threads(json!([
+            {"isResolved": false, "isOutdated": false},
+            {"isResolved": false, "isOutdated": false},
+            {"isResolved": true, "isOutdated": false},
+        ]));
+        assert_eq!(map_search(&v)[0].unresolved_threads, 2);
+    }
+
+    /// An outdated thread hangs off a line that has since changed, so the
+    /// author has nothing left to answer. Counting it would nag about work
+    /// already done -- and unlike a resolved thread, nobody clicked
+    /// anything to dismiss it.
+    #[test]
+    fn outdated_threads_do_not_count() {
+        let v = node_with_threads(json!([
+            {"isResolved": false, "isOutdated": true},
+            {"isResolved": false, "isOutdated": false},
+        ]));
+        assert_eq!(map_search(&v)[0].unresolved_threads, 1);
+    }
+
+    #[test]
+    fn no_threads_means_zero_not_a_panic() {
+        assert_eq!(
+            map_search(&node_with_threads(json!([])))[0].unresolved_threads,
+            0
+        );
+        // And a PR from a query that never selected the field at all.
+        let v = json!({"authored": {"nodes": [{
+            "number": 1, "title": "t", "url": "u", "isDraft": false,
+            "headRefName": "f", "baseRefName": "main",
+            "createdAt": "2026-08-20T00:00:00Z", "updatedAt": "2026-08-20T00:00:00Z",
+            "author": {"login": "a"}, "repository": {"nameWithOwner": "acme/a"},
+            "mergeable": "MERGEABLE", "reviewDecision": null,
+            "isInMergeQueue": false, "totalCommentsCount": 0,
+            "labels": {"nodes": []}, "commits": {"nodes": []}
+        }]}});
+        assert_eq!(map_search(&v)[0].unresolved_threads, 0);
+    }
+
+    #[test]
+    fn normalises_both_check_shapes() {
+        // CheckRun reports `conclusion`; StatusContext reports `state`.
+        assert_eq!(check_state(&json!({"conclusion": "SUCCESS"})), "success");
+        assert_eq!(check_state(&json!({"state": "SUCCESS"})), "success");
+        assert_eq!(check_state(&json!({"conclusion": "TIMED_OUT"})), "failure");
+        assert_eq!(check_state(&json!({"state": "PENDING"})), "pending");
+        assert_eq!(check_state(&json!({"conclusion": "SKIPPED"})), "skipped");
+        // A null conclusion means the run has not finished.
+        assert_eq!(check_state(&json!({"conclusion": null})), "pending");
+    }
+
+    /// An unmodelled value passes through rather than being coerced into
+    /// "success", which would claim a green check that does not exist.
+    #[test]
+    fn an_unknown_check_state_is_never_success() {
+        assert_eq!(
+            check_state(&json!({"conclusion": "ACTION_REQUIRED"})),
+            "ACTION_REQUIRED"
+        );
+    }
+
+    #[test]
+    fn maps_a_detail_payload() {
+        let v = json!({"repository": {"pullRequest": {
+            "number": 42, "title": "Add retry", "url": "u", "state": "OPEN",
+            "isDraft": false, "body": "the description",
+            "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+            "reviewDecision": "APPROVED",
+            "additions": 100, "deletions": 20, "changedFiles": 3,
+            "headRefName": "feature", "baseRefName": "main",
+            "author": {"login": "octocat"},
+            "comments": {"totalCount": 2, "nodes": [
+                {"author": {"login": "octocat"}, "createdAt": "2026-08-20T10:00:00Z", "body": "hi"}
+            ]},
+            "reviewThreads": {"nodes": [
+                {"isResolved": false, "isOutdated": false},
+                {"isResolved": true, "isOutdated": false}
+            ]},
+            "commits": {"nodes": [{"commit": {"statusCheckRollup": {
+                "state": "SUCCESS",
+                "contexts": {"nodes": [
+                    {"name": "build", "conclusion": "SUCCESS", "detailsUrl": "b"},
+                    {"context": "legacy", "state": "FAILURE", "targetUrl": "l"}
+                ]}
+            }}}]}
+        }}});
+        let d = map_detail(&v, "octocat/hello-world");
+        assert_eq!(d.number, 42);
+        assert_eq!(d.repo, "octocat/hello-world");
+        assert_eq!(d.body, "the description");
+        assert_eq!(d.state, "open");
+        assert_eq!(d.merge_status, MergeStateStatus::Clean);
+        assert_eq!(d.unresolved_threads, 1, "resolved threads must not count");
+        assert_eq!(d.checks.len(), 2);
+        assert_eq!(d.checks[0].name, "build");
+        assert_eq!(d.checks[1].name, "legacy", "StatusContext uses `context`");
+        assert_eq!(d.checks[1].state, "failure");
+        assert_eq!(d.comments[0].author, "octocat");
+    }
+
+    /// A PR with no checks, no comments and a null author must not panic:
+    /// the mapper's rule is that one odd payload never blanks the view.
+    #[test]
+    fn a_sparse_detail_payload_is_survivable() {
+        let v = json!({"repository": {"pullRequest": {"number": 1}}});
+        let d = map_detail(&v, "octocat/hello-world");
+        assert_eq!(d.number, 1);
+        assert_eq!(d.author, "ghost");
+        assert!(d.checks.is_empty());
+        assert!(d.comments.is_empty());
+    }
+
+    #[test]
+    fn maps_every_merge_state_status_we_model() {
+        for (raw, want) in [
+            ("CLEAN", MergeStateStatus::Clean),
+            ("DIRTY", MergeStateStatus::Dirty),
+            ("BLOCKED", MergeStateStatus::Blocked),
+            ("UNSTABLE", MergeStateStatus::Unstable),
+            ("BEHIND", MergeStateStatus::Behind),
+            ("DRAFT", MergeStateStatus::Draft),
+        ] {
+            let v = json!({"mergeStateStatus": raw});
+            assert_eq!(merge_status(&v), want, "for {raw}");
+        }
+    }
+
+    /// A value we do not model must never masquerade as mergeable: the
+    /// merge button keys off Clean, so guessing here would enable it on a
+    /// PR GitHub would reject.
+    #[test]
+    fn unrecognised_merge_status_is_unknown_never_clean() {
+        assert_eq!(
+            merge_status(&json!({"mergeStateStatus": "HAS_HOOKS"})),
+            MergeStateStatus::Unknown
+        );
+        assert_eq!(
+            merge_status(&json!({"mergeStateStatus": null})),
+            MergeStateStatus::Unknown
+        );
+        assert_eq!(merge_status(&json!({})), MergeStateStatus::Unknown);
+    }
+
+    /// Branch refs ride along in the existing query at no extra cost, and
+    /// distinguish a stacked PR -- which cannot merge until its base does
+    /// -- from one targeting the default branch.
+    #[test]
+    fn maps_the_branch_pair() {
+        let prs = map_search(&fixture());
+        assert_eq!(prs[0].head_ref, "feature/retry-client");
+        assert_eq!(prs[0].base_ref, "main");
+        // The stacked one: base is another feature branch.
+        let stacked = prs.iter().find(|p| p.number == 7).unwrap();
+        assert_eq!(stacked.head_ref, "stack/part-2");
+        assert_eq!(stacked.base_ref, "stack/part-1");
+    }
+
+    /// A node missing the fields must not panic -- the mapper's rule is
+    /// that one malformed PR never blanks the list.
+    #[test]
+    fn missing_branch_refs_map_to_empty_strings() {
+        let v = json!({"authored": {"nodes": [{
+            "number": 1, "title": "t", "url": "u", "isDraft": false,
+            "createdAt": "2026-08-20T00:00:00Z", "updatedAt": "2026-08-20T00:00:00Z",
+            "author": {"login": "a"}, "repository": {"nameWithOwner": "acme/a"},
+            "mergeable": "MERGEABLE", "reviewDecision": null,
+            "isInMergeQueue": false, "totalCommentsCount": 0,
+            "labels": {"nodes": []}, "commits": {"nodes": []}
+        }]}});
+        let prs = map_search(&v);
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0].head_ref, "");
+        assert_eq!(prs[0].base_ref, "");
+    }
+
     #[test]
     fn unknown_mergeable_maps_to_checking_never_conflicted() {
         let pr = map_search(&fixture())

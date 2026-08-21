@@ -15,20 +15,45 @@ export interface Label {
 }
 
 export interface PullRequest {
+  /// GraphQL node ID, so a row can act without opening the detail view.
+  id: string;
   number: number;
   title: string;
   url: string;
   repo: string;
   author: string;
   is_draft: boolean;
+  /// The branch being merged, and the branch it merges into.
+  head_ref: string;
+  /// The head commit the row was rendered from, so an "update branch"
+  /// click can tell GitHub which commit the user was looking at.
+  head_oid: string;
+  base_ref: string;
   created_at: string;
   updated_at: string;
   ci: CiState;
   merge: MergeState;
+  /// GitHub's own merge-readiness summary.
+  ///
+  /// Richer than `merge`, which only distinguishes conflicts. `clean` is
+  /// what makes a merge button honest: any other value means GitHub would
+  /// reject or block the merge. Inlined rather than exported as a named
+  /// type, since nothing imports the name.
+  merge_status:
+    | "clean"
+    | "dirty"
+    | "blocked"
+    | "unstable"
+    | "behind"
+    | "draft"
+    | "unknown";
   review: ReviewState;
   in_merge_queue: boolean;
   labels: Label[];
   comment_count: number;
+  /// Review conversations still open on the current code. Resolved and
+  /// outdated threads are excluded.
+  unresolved_threads: number;
 }
 
 /// `merged_week`/`merged_month` are real. The other five derived fields
@@ -125,4 +150,92 @@ export interface CycleTrend {
   current_count: number;
   previous_count: number;
   sampled: boolean;
+}
+
+/// Why a worktree can or cannot be removed.
+///
+/// An enum rather than a boolean because the UI has to explain itself:
+/// "3 uncommitted files" is actionable where a greyed-out button is not.
+/// `never_pushed` is the dangerous one -- 52 of 295 worktrees on this
+/// machine have no upstream, so their commits exist nowhere else.
+export type Safety =
+  | { kind: "safe" }
+  | { kind: "main_checkout" }
+  | { kind: "dirty"; detail: number }
+  | { kind: "unpushed"; detail: number }
+  | { kind: "never_pushed" }
+  | { kind: "unmerged" }
+  /// Listed, but not yet classified. Distinct from `unknown`, which
+  /// means the check ran and could not decide.
+  | { kind: "pending" }
+  | { kind: "unknown"; detail: string };
+
+/// How a checkout stands against its tracked upstream, as of the last
+/// fetch. Never live -- the scan reads refs on disk and does not fetch.
+export type Upstream =
+  | { kind: "current" }
+  | { kind: "ahead"; n: number }
+  | { kind: "behind"; n: number }
+  | { kind: "diverged"; n: [number, number] }
+  | { kind: "untracked" }
+  | { kind: "detached" }
+  | { kind: "unknown"; n: string };
+
+export interface Worktree {
+  path: string;
+  branch: string;
+  head: string;
+  size_bytes: number | null;
+  safety: Safety;
+  is_main: boolean;
+  /// `YYYY-MM-DD` when this branch landed in the default branch, when it
+  /// can be determined. The date the work REACHED the default branch, not
+  /// the branch tip's own commit date -- those diverge for a branch
+  /// written weeks before it merged.
+  merged_at: string | null;
+  /// Only populated for the main checkout: the other rows already answer
+  /// the question that matters for them (may I delete this?).
+  upstream: Upstream | null;
+}
+
+export interface WorktreeRepo {
+  name: string;
+  path: string;
+  worktrees: Worktree[];
+}
+
+/// Everything the detail view renders.
+///
+/// Separate from `PullRequest`, which is a list row fetched 100 at a time
+/// on a poll loop -- carrying a body and comments there would make every
+/// tick haul data almost no row needs.
+export interface PrDetail {
+  /// GraphQL node ID. Every mutation takes this rather than a number, so
+  /// a write can only follow a read of the thing being written.
+  id: string;
+  number: number;
+  title: string;
+  url: string;
+  state: string;
+  is_draft: boolean;
+  body: string;
+  author: string;
+  repo: string;
+  head_ref: string;
+  /// The head commit the row was rendered from, so an "update branch"
+  /// click can tell GitHub which commit the user was looking at.
+  head_oid: string;
+  base_ref: string;
+  merge_status: string;
+  review: string;
+  additions: number;
+  deletions: number;
+  changed_files: number;
+  unresolved_threads: number;
+  comment_count: number;
+  comments: { author: string; created_at: string; body: string }[];
+  /// `state` is `success`, `failure`, `pending`, `skipped`, or a raw
+  /// GitHub value when unmodelled -- never coerced to success. Inlined
+  /// rather than exported types, since nothing imports the names.
+  checks: { name: string; state: string; url: string }[];
 }

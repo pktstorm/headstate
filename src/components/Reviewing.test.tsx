@@ -16,6 +16,10 @@ vi.mock("../api/hooks", async (orig) => {
     usePollError: () => null,
     useRefreshRequested: () => undefined,
     useTruncation: () => null,
+  useViewCadence: () => undefined,
+  usePollState: () => "idle",
+  usePollInterval: () => ({ seconds: 120, set: () => Promise.resolve(120) }),
+  useWorktreeDirs: () => ({ dirs: [], set: () => Promise.resolve([]) }),
     useReviewing: () => ({ data: reviewing, isLoading: false }),
     usePeriods: () => ({ data: undefined, isLoading: true, isError: false, refetch: () => {} }),
     useHistory: () => ({ data: undefined, isLoading: true, isError: false, refetch: () => {} }),
@@ -34,17 +38,43 @@ function renderApp() {
   );
 }
 
-describe("Awaiting your review", () => {
-  it("shows the incoming count in the sidebar", () => {
-    useFilters.setState({ filters: {}, view: "list" } as never);
+describe("PRs to review", () => {
+  it("shows the incoming count on the view switcher", () => {
+    useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {} }, view: "my-prs", panel: "list" } as never);
     renderApp();
-    expect(screen.getByRole("button", { name: /awaiting your review/i })).toBeTruthy();
+    // The switcher heads the sidebar and badges the count; the old
+    // bottom-pinned entry is gone.
+    expect(screen.getByRole("button", { name: /my pull requests/i })).toBeTruthy();
   });
 
   it("lists the incoming PRs on its own view", () => {
-    useFilters.setState({ filters: {}, view: "reviewing" } as never);
+    useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {} }, view: "to-review", panel: "list" } as never);
     renderApp();
     expect(screen.getByText("Someone else's PR")).toBeTruthy();
+  });
+
+  // Full parity: the review view gets the same sidebar, filters and
+  // status rendering, driven by the reviewing list rather than my own.
+  it("scopes the repo sidebar to the reviewing list", () => {
+    useFilters.setState({
+      filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {} },
+      view: "to-review",
+      panel: "list",
+    } as never);
+    renderApp();
+    // The reviewing fixture is one PR in octocat/hello-world; the
+    // authored fixtures span two repos and must not appear here.
+    expect(screen.queryByText("octocat/spoon-knife")).toBeNull();
+  });
+
+  it("offers filters on the review view, not just a flat list", () => {
+    useFilters.setState({
+      filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {} },
+      view: "to-review",
+      panel: "list",
+    } as never);
+    renderApp();
+    expect(screen.getByLabelText(/search pull requests/i)).toBeTruthy();
   });
 
   // The constraint that matters: `needsAttention` means "blocked on YOU as
@@ -52,7 +82,7 @@ describe("Awaiting your review", () => {
   // problem to fix, and must not inflate the strip, the chips, or the
   // tray badge.
   it("does not let another author's red CI reach the priorities strip", () => {
-    useFilters.setState({ filters: {}, view: "list" } as never);
+    useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {} }, view: "my-prs", panel: "list" } as never);
     renderApp();
     expect(screen.queryByText("Someone else's PR")).toBeNull();
   });

@@ -8,6 +8,9 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  PrDetail,
+  Worktree,
+  WorktreeRepo,
   CycleTrend,
   History,
   MergedDetail,
@@ -33,6 +36,104 @@ export const refreshNow = () => invoke<PullRequest[]>("refresh_now");
 /// `Stats.merged_week`/`merged_month` are real; the other five fields
 /// always come back zero today. Does not persist to SQLite.
 export const getStats = () => invoke<Stats>("get_stats");
+
+/// Repos and their worktrees, WITHOUT safety classification.
+///
+/// ~800ms for 37 repos and 295 worktrees; safe to block a view on.
+export const listWorktrees = () => invoke<WorktreeRepo[]>("list_worktrees");
+
+/// Classify one repo's worktrees. Four git calls each, ~16s across all
+/// 295 -- so this is per repo, filling in as results arrive.
+export const classifyWorktrees = (repoPath: string) =>
+  invoke<Worktree[]>("classify_worktrees", { repoPath });
+
+/// Apply an action to a pull request.
+///
+/// Rejects with GitHub's own message on refusal -- "base branch was
+/// modified" is display-ready and more useful than a substitute.
+export const actOnPr = (
+  id: string,
+  repo: string,
+  number: number,
+  action: PrActionName,
+) => invoke<void>("act_on_pr", { id, repo, number, action });
+
+/// Merge the base branch into a pull request's head -- GitHub's "Update
+/// branch" button.
+///
+/// Separate from `actOnPr` because it needs `expectedHead`: GitHub
+/// refuses if the branch moved since the row was rendered, so a stale
+/// click reports an error rather than updating a commit the user never
+/// saw. Pass the `head_oid` from the same row that showed the button.
+export const updatePrBranch = (
+  id: string,
+  repo: string,
+  number: number,
+  expectedHead: string,
+) => invoke<void>("update_pr_branch", { id, repo, number, expectedHead });
+/// One pull request's outcome in a batch. `error` is null on success.
+export interface BatchOutcome {
+  repo: string;
+  number: number;
+  error: string | null;
+}
+
+/// Apply one action to several pull requests.
+///
+/// Returns an outcome per pull request rather than throwing on the first
+/// rejection: partial failure is the normal case for a batch, and a
+/// single verdict would hide the rejections.
+export const actOnPrs = (
+  prs: [string, string, number][],
+  action: PrActionName,
+) => invoke<BatchOutcome[]>("act_on_prs", { prs, action });
+
+/// The actions the backend accepts. A union rather than `string`, so a
+/// typo is a compile error instead of a runtime "unknown action".
+export type PrActionName =
+  | "merge"
+  | "close"
+  | "reopen"
+  | "draft"
+  | "ready"
+  | "enqueue"
+  | "dequeue";
+
+/// Everything the detail view shows for one pull request. Cost 1.
+export const getPrDetail = (repo: string, number: number) =>
+  invoke<PrDetail>("get_pr_detail", { repo, number });
+
+/// Disk sizes for one repo's worktrees, as `[path, bytes]` pairs.
+///
+/// A full tree walk -- ~13s for 147 worktrees -- so it is a separate
+/// query from listing and classification, and arrives last.
+export const sizeWorktrees = (repoPath: string) =>
+  invoke<[string, number][]>("size_worktrees", { repoPath });
+
+/// Remove a worktree. Rejects anything not provably safe; the gate is
+/// re-evaluated on the Rust side rather than trusted from the last scan.
+export const removeWorktree = (repoPath: string, worktreePath: string) =>
+  invoke<void>("remove_worktree", { repoPath, worktreePath });
+
+/// Tell the poll loop whether the active view needs live PR data.
+export const setViewNeedsGithub = (needs: boolean) =>
+  invoke<void>("set_view_needs_github", { needs });
+
+/// Directories scanned for git checkouts. Defaults to `~/code`.
+export const getWorktreeDirs = () => invoke<string[]>("get_worktree_dirs");
+
+/// Replace the scanned directories. Rejects paths that are not
+/// directories, so a typo fails here rather than yielding an empty view.
+export const setWorktreeDirs = (dirs: string[]) =>
+  invoke<string[]>("set_worktree_dirs", { dirs });
+
+/// The configured focused poll interval, in seconds.
+export const getPollInterval = () => invoke<number>("get_poll_interval");
+
+/// Set the poll interval. Returns the value actually applied, which may be
+/// clamped -- the UI shows what the backend accepted, not what was asked.
+export const setPollInterval = (secs: number) =>
+  invoke<number>("set_poll_interval", { secs });
 
 /// PRs awaiting the user's review. Rides along in the same GraphQL
 /// document as the authored list, so it costs no extra rate limit.

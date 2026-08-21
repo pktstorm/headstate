@@ -1,0 +1,1423 @@
+use super::model::{Repo, Safety, Upstream, Worktree};
+use std::path::Path;
+use std::process::Command;
+
+/// Run a git command in a directory, returning stdout on success.
+fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// Parse `git worktree list --porcelain`.
+///
+/// Blank-line-delimited records of `worktree`/`HEAD`/`branch`. A record
+/// without a branch is detached HEAD, which is still a real worktree
+/// occupying real disk -- so it is kept, with an empty branch, rather
+/// than dropped.
+pub fn parse_porcelain(out: &str) -> Vec<Worktree> {
+    let mut all = Vec::new();
+    let mut cur = Worktree::default();
+
+    for line in out.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            if !cur.path.is_empty() {
+                all.push(std::mem::take(&mut cur));
+            }
+            cur.path = p.to_string();
+        } else if let Some(h) = line.strip_prefix("HEAD ") {
+            cur.head = h.to_string();
+        } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
+            cur.branch = b.to_string();
+        }
+    }
+    if !cur.path.is_empty() {
+        all.push(cur);
+    }
+
+    // The first record is always the main checkout.
+    if let Some(first) = all.first_mut() {
+        first.is_main = true;
+        first.safety = Safety::MainCheckout;
+    }
+    all
+}
+
+/// Classify a worktree.
+///
+/// The order is the design: the DANGEROUS conditions are checked before
+/// the merely-inconvenient ones, so a worktree that is both unmerged and
+/// never-pushed reports the fact that matters. Any git failure yields
+/// `Unknown`, never `Safe`.
+pub fn worktree_safety(wt: &Worktree, default_branch: &str) -> Safety {
+    if wt.is_main {
+        return Safety::MainCheckout;
+    }
+    let dir = Path::new(&wt.path);
+    if !dir.is_dir() {
+        return Safety::Unknown("directory is missing".into());
+    }
+
+    match git(dir, &["status", "--porcelain"]) {
+        Ok(s) => {
+            let n = s.lines().filter(|l| !l.trim().is_empty()).count() as u64;
+            if n > 0 {
+                return Safety::Dirty(n);
+            }
+        }
+        Err(e) => return Safety::Unknown(e),
+    }
+
+    // No upstream means nothing was ever pushed: these commits exist only
+    // here. Checked BEFORE merge status, because a branch name that looks
+    // merged tells you nothing about commits that never left the machine.
+    if git(dir, &["rev-parse", "--abbrev-ref", "@{u}"]).is_err() {
+        return Safety::NeverPushed;
+    }
+
+    match git(dir, &["log", "--oneline", "@{u}.."]) {
+        Ok(s) => {
+            let n = s.lines().filter(|l| !l.trim().is_empty()).count() as u64;
+            if n > 0 {
+                return Safety::Unpushed(n);
+            }
+        }
+        Err(e) => return Safety::Unknown(e),
+    }
+
+    if wt.branch.is_empty() {
+        return Safety::Unknown("detached HEAD".into());
+    }
+
+    // Ancestry is the cheap answer, but it only sees fast-forward and
+    // merge-commit merges. A squash-merge replays the branch as a NEW
+    // commit with a new SHA, so the original tip is never an ancestor --
+    // and squash is the default on these repos. Measured across every
+    // repo on this machine: ancestry alone found 10 of 157 merged
+    // worktrees, calling the other 147 unmerged. Those 147 are exactly
+    // the ones filling the disk this view exists to reclaim.
+    if git(
+        dir,
+        &["merge-base", "--is-ancestor", "HEAD", default_branch],
+    )
+    .is_ok()
+    {
+        return Safety::Safe;
+    }
+    squash_merged(dir, default_branch)
+}
+
+/// Whether every commit on this branch already exists upstream as an
+/// equivalent patch.
+///
+/// `git cherry` compares patch-ids rather than SHAs, marking each commit
+/// `+` (not upstream) or `-` (an equivalent patch is upstream) -- which
+/// is precisely what a squash-merge produces. All `-` means merged.
+///
+/// Only reached when the ancestry check has already failed, so this adds
+/// one git call per *unmerged-looking* worktree, not per worktree.
+///
+/// Measured on a real 289-worktree tree: the scan goes from 16.0s to
+/// 29.7s while `safe` goes from 6 to 122. That cost buys back 116
+/// worktrees the user was previously told not to delete, and it shrinks
+/// as they are deleted -- the call only fires for branches ancestry
+/// cannot resolve.
+/// How a checkout stands against its tracked upstream.
+///
+/// Uses `@{u}` rather than a hardcoded `origin/main`: repos differ
+/// (`master`, `develop`, a fork tracking `upstream`), and guessing the
+/// wrong ref reports confident nonsense.
+///
+/// Reads refs already on disk -- no fetch. The counts are as of the last
+/// fetch, which the UI says plainly rather than implying they are live.
+fn upstream_state(dir: &Path) -> Upstream {
+    // A detached HEAD has no upstream to compare against, and asking
+    // anyway yields an error that reads as a failure rather than as the
+    // "question does not apply" it actually is.
+    match git(dir, &["symbolic-ref", "--quiet", "HEAD"]) {
+        Ok(_) => {}
+        Err(_) => return Upstream::Detached,
+    }
+
+    // A local-only branch is normal, not a failure.
+    if git(dir, &["rev-parse", "--abbrev-ref", "@{u}"]).is_err() {
+        return Upstream::Untracked;
+    }
+
+    // One call for both numbers: left is upstream-only (behind), right is
+    // HEAD-only (ahead).
+    match git(dir, &["rev-list", "--left-right", "--count", "@{u}...HEAD"]) {
+        Ok(s) => {
+            let mut it = s.split_whitespace();
+            let behind = it.next().and_then(|v| v.parse::<u64>().ok());
+            let ahead = it.next().and_then(|v| v.parse::<u64>().ok());
+            match (ahead, behind) {
+                (Some(0), Some(0)) => Upstream::Current,
+                (Some(a), Some(0)) => Upstream::Ahead(a),
+                (Some(0), Some(b)) => Upstream::Behind(b),
+                (Some(a), Some(b)) => Upstream::Diverged(a, b),
+                // Unparsable output must not become a confident zero.
+                _ => Upstream::Unknown("could not read ahead/behind counts".into()),
+            }
+        }
+        Err(e) => Upstream::Unknown(e),
+    }
+}
+
+/// Order repos for the sidebar: most worktrees first.
+///
+/// Sorts by the count the sidebar actually SHOWS, which excludes the
+/// main checkout -- every repo has one, and ordering by the raw length
+/// would rank rows by a number nobody can see. Ties break by name so the
+/// list does not reshuffle between polls.
+///
+/// The point of this view is finding disks full of stale worktrees, and
+/// alphabetical order buries a repo with forty of them under one with
+/// one.
+fn sort_for_sidebar(repos: &mut [Repo]) {
+    repos.sort_by(|a, b| {
+        let count = |r: &Repo| r.worktrees.len().saturating_sub(1);
+        count(b).cmp(&count(a)).then_with(|| a.name.cmp(&b.name))
+    });
+}
+
+fn squash_merged(dir: &Path, default_branch: &str) -> Safety {
+    match git(dir, &["cherry", default_branch, "HEAD"]) {
+        Ok(s) => {
+            let mut saw_commit = false;
+            for line in s.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                saw_commit = true;
+                if line.starts_with('+') {
+                    return Safety::Unmerged;
+                }
+            }
+            // No output means no commits relative to the default branch.
+            // That is a branch with nothing on it, not a merged one --
+            // reporting Safe here would greenlight deleting a worktree
+            // whose state we never actually established.
+            if saw_commit {
+                Safety::Safe
+            } else {
+                Safety::Unmerged
+            }
+        }
+        // Any git failure yields Unknown, never Safe.
+        Err(e) => Safety::Unknown(e),
+    }
+}
+
+/// The repository's default branch, falling back to `main`.
+fn default_branch(repo: &Path) -> String {
+    git(
+        repo,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    )
+    .ok()
+    .and_then(|s| s.trim().rsplit('/').next().map(str::to_string))
+    .filter(|s| !s.is_empty())
+    .unwrap_or_else(|| "main".to_string())
+}
+
+/// Repos and their worktrees, WITHOUT classifying safety.
+///
+/// Fast: one `git worktree list` per repo. Classification is four git
+/// calls per worktree, which across 295 worktrees takes ~15s -- far too
+/// long to block a view on. The UI lists first and classifies after.
+pub fn scan_dirs_fast(dirs: &[String]) -> Vec<Repo> {
+    let mut repos = Vec::new();
+    for base in dirs {
+        collect_inner(Path::new(base), 0, &mut repos, false);
+    }
+    sort_for_sidebar(&mut repos);
+    repos
+}
+
+/// Bytes on disk for a directory tree.
+///
+/// Walks rather than shelling out to `du`: one subprocess per worktree
+/// across 296 of them is a lot of process churn for a number, and this
+/// skips symlinks so a link into another tree is not counted twice.
+///
+/// Unreadable entries are skipped rather than failing the whole
+/// measurement -- a permission error on one file should not turn a real
+/// size into "unknown".
+fn dir_size(path: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let Ok(meta) = e.metadata() else { continue };
+            if meta.is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                stack.push(e.path());
+            } else {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
+/// Sizes for one repo's worktrees, keyed by path.
+///
+/// A separate pass from classification: ~60ms per worktree, so ~18s
+/// across all 296 here. The UI fills these in after the list and the
+/// safety states are already on screen.
+pub fn size_repo(repo_path: &str) -> Vec<(String, u64)> {
+    let dir = Path::new(repo_path);
+    let Ok(list) = git(dir, &["worktree", "list", "--porcelain"]) else {
+        return Vec::new();
+    };
+    parse_porcelain(&list)
+        .into_iter()
+        .map(|w| {
+            let bytes = dir_size(Path::new(&w.path));
+            (w.path, bytes)
+        })
+        .collect()
+}
+
+/// When a branch's tip landed in the default branch.
+///
+/// The first commit on an ancestry path from the tip to the default
+/// branch is the one that brought it in. Only meaningful for a merged
+/// branch, so callers skip it otherwise -- it is an extra `git log` per
+/// worktree, and 283 of the 296 here are not merged.
+/// Classify a worktree and, when merged, date it.
+///
+/// The single place both scan paths go through: `classify_repo` and
+/// `collect_inner` previously each had their own copy, and adding the
+/// merge date to one silently left the other behind.
+fn classify(w: &mut Worktree, repo: &Path, default_branch: &str) {
+    w.safety = worktree_safety(w, default_branch);
+    // Only the main checkout: the other rows are answering "may I delete
+    // this?", and an extra git call each for a question nobody asked
+    // would cost scan time for nothing.
+    if w.is_main {
+        w.upstream = Some(upstream_state(Path::new(&w.path)));
+    }
+    // Only for merged branches: an extra git call, and the date is
+    // meaningless for anything else. 283 of 296 here are not merged.
+    if w.safety.is_safe() {
+        w.merged_at = merged_date(repo, &w.head, default_branch);
+    }
+}
+
+fn merged_date(repo: &Path, head: &str, default_branch: &str) -> Option<String> {
+    let range = format!("{head}..{default_branch}");
+    let out = git(
+        repo,
+        &[
+            "log",
+            "--format=%cs",
+            "--ancestry-path",
+            "--reverse",
+            &range,
+        ],
+    )
+    .ok()?;
+    let first = out.lines().next()?.trim();
+    (!first.is_empty()).then(|| first.to_string())
+}
+
+/// Classify one repo's worktrees. Called per repo so the UI can fill in
+/// results as they arrive rather than waiting for all 37.
+pub fn classify_repo(repo_path: &str) -> Vec<Worktree> {
+    let dir = Path::new(repo_path);
+    let Ok(list) = git(dir, &["worktree", "list", "--porcelain"]) else {
+        return Vec::new();
+    };
+    let branch = default_branch(dir);
+    parse_porcelain(&list)
+        .into_iter()
+        .map(|mut w| {
+            classify(&mut w, dir, &branch);
+            w
+        })
+        .collect()
+}
+
+/// Every repo with its worktrees fully classified, in one pass.
+///
+/// Only the live test uses this: production lists first and classifies
+/// per repo, because classifying all 295 worktrees takes ~16s where
+/// listing takes ~800ms.
+#[cfg(test)]
+///
+/// One level deep by design: `~/code/enclave/enc-api` is found via
+/// `~/code/enclave`. Walking arbitrarily deep would descend into the
+/// worktrees themselves and into `node_modules`.
+pub fn scan_dirs(dirs: &[String]) -> Vec<Repo> {
+    let mut repos = Vec::new();
+    for base in dirs {
+        collect_inner(Path::new(base), 0, &mut repos, true);
+    }
+    sort_for_sidebar(&mut repos);
+    repos
+}
+
+fn collect_inner(dir: &Path, depth: usize, out: &mut Vec<Repo>, with_safety: bool) {
+    if depth > 2 || !dir.is_dir() {
+        return;
+    }
+    // A `.git` DIRECTORY is a real checkout; a `.git` FILE is a worktree
+    // pointing back at one. That distinction is load-bearing: worktrees
+    // are commonly created as SIBLINGS of the repo, so treating every
+    // `.git` as a repo made this scan call `git worktree list` 216 times
+    // -- each returning the same 152 entries -- and take over ten minutes
+    // instead of seconds. Measured on this machine.
+    if dir.join(".git").is_file() {
+        return; // a worktree; its own repo will report it
+    }
+    if dir.join(".git").is_dir() {
+        if let Ok(list) = git(dir, &["worktree", "list", "--porcelain"]) {
+            let branch = default_branch(dir);
+            let worktrees = parse_porcelain(&list)
+                .into_iter()
+                .map(|mut w| {
+                    if with_safety {
+                        classify(&mut w, dir, &branch);
+                    }
+                    w
+                })
+                .collect();
+            out.push(Repo {
+                name: dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                path: dir.to_string_lossy().into_owned(),
+                worktrees,
+            });
+        }
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir()
+            && !p
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+        {
+            collect_inner(&p, depth + 1, out, with_safety);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = "\
+worktree /home/u/code/enc-api
+HEAD 3d2216e643c827fb1dfad5c3fa58d9a14421e236
+branch refs/heads/main
+
+worktree /home/u/code/enc-api-35b
+HEAD 48fa2124c6fd90bc07881e32037db99ce5b194c4
+branch refs/heads/chore-remove-dead
+
+worktree /home/u/code/enc-api-detached
+HEAD 8ed50a741e1696d1a0c9506f2e033cf2887bb144
+";
+
+    #[test]
+    fn parses_every_record() {
+        let w = parse_porcelain(SAMPLE);
+        assert_eq!(w.len(), 3);
+        assert_eq!(w[1].path, "/home/u/code/enc-api-35b");
+        assert_eq!(w[1].branch, "chore-remove-dead");
+        assert_eq!(w[1].head, "48fa2124c6fd90bc07881e32037db99ce5b194c4");
+    }
+
+    /// The first record is the repository's own checkout, and deleting it
+    /// would destroy the repo rather than a worktree.
+    #[test]
+    fn the_first_record_is_the_main_checkout_and_is_never_safe() {
+        let w = parse_porcelain(SAMPLE);
+        assert!(w[0].is_main);
+        assert_eq!(w[0].safety, Safety::MainCheckout);
+        assert!(!w[0].safety.is_safe());
+        assert!(!w[1].is_main);
+    }
+
+    /// A detached-HEAD worktree still occupies real disk, so it must be
+    /// listed rather than silently dropped for lacking a branch.
+    #[test]
+    fn keeps_detached_head_worktrees() {
+        let w = parse_porcelain(SAMPLE);
+        assert_eq!(w[2].branch, "");
+        assert_eq!(w[2].head, "8ed50a741e1696d1a0c9506f2e033cf2887bb144");
+    }
+
+    #[test]
+    fn empty_output_yields_nothing() {
+        assert!(parse_porcelain("").is_empty());
+    }
+
+    /// Only `Safe` is deletable. Everything else must be disabled in the
+    /// UI rather than warned past.
+    #[test]
+    fn nothing_but_safe_is_deletable() {
+        for s in [
+            Safety::MainCheckout,
+            Safety::Dirty(3),
+            Safety::Unpushed(2),
+            Safety::NeverPushed,
+            Safety::Unmerged,
+            Safety::Unknown("x".into()),
+        ] {
+            assert!(!s.is_safe(), "{s:?} must not be deletable");
+        }
+        assert!(Safety::Safe.is_safe());
+    }
+
+    /// A default-constructed value must never be safe: it is what a bug
+    /// is most likely to leave behind.
+    #[test]
+    fn the_default_safety_is_not_safe() {
+        assert!(!Safety::default().is_safe());
+        assert!(!Worktree::default().safety.is_safe());
+    }
+
+    /// THE regression that made this scan take ten minutes.
+    ///
+    /// Worktrees are commonly created as SIBLINGS of the repo, each with
+    /// a `.git` FILE. Treating every `.git` as a repository meant calling
+    /// `git worktree list` once per worktree -- 216 times on this
+    /// machine, each returning the same 152 entries.
+    #[test]
+    fn a_worktree_sibling_is_not_mistaken_for_a_repository() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path();
+
+        // A REAL repository, so `git worktree list` actually succeeds --
+        // a synthetic .git directory would fail for both the buggy and
+        // the fixed code, making the test pass vacuously.
+        let repo = base.join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        // Identity comes from the environment rather than the source:
+        // any email-shaped literal trips the privacy guard, which does
+        // not special-case test fixtures and should not.
+        let ident = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["commit", "-q", "--allow-empty", "-m", "init"],
+        ] {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(&args)
+                .envs(ident)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} failed");
+        }
+
+        // A real worktree, created as a SIBLING -- the layout that made
+        // the scan quadratic.
+        let wt = base.join("proj-feature");
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "add", "-q", "-b", "feature"])
+            .arg(&wt)
+            .envs(ident)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(ok, "git worktree add failed");
+        assert!(
+            wt.join(".git").is_file(),
+            "a worktree's .git must be a file"
+        );
+
+        let found = scan_dirs_fast(&[base.to_string_lossy().into_owned()]);
+        let names: Vec<&str> = found.iter().map(|r| r.name.as_str()).collect();
+        assert!(
+            names.contains(&"proj"),
+            "the real repo must be found: {names:?}"
+        );
+        assert!(
+            !names.contains(&"proj-feature"),
+            "a worktree must not be listed as its own repository: {names:?}"
+        );
+    }
+
+    /// A repo whose worktree is merged, pushed and clean -- the only
+    /// state in which a merge date exists.
+    fn merged_worktree_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ident = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+        let run_in = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .envs(ident)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        run_in(&remote, &["init", "-q", "--bare", "-b", "main"]);
+
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_in(&repo, &["init", "-q", "-b", "main"]);
+        run_in(&repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        run_in(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run_in(&repo, &["push", "-q", "-u", "origin", "main"]);
+
+        let wt = tmp.path().join("proj-done");
+        run_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--track",
+                "-b",
+                "done",
+                wt.to_str().unwrap(),
+                "main",
+            ],
+        );
+        run_in(&wt, &["push", "-q", "-u", "origin", "done"]);
+        // Advance main so there IS an ancestry path to date.
+        run_in(&repo, &["commit", "-q", "--allow-empty", "-m", "two"]);
+        run_in(&repo, &["push", "-q", "origin", "main"]);
+        (tmp, repo, wt)
+    }
+
+    /// A branch whose work landed on `main` as a SQUASH commit.
+    ///
+    /// This is the shape the real repos use, and the one ancestry cannot
+    /// see: the branch's change is applied to `main` as a brand-new
+    /// commit with its own SHA, so the branch tip is not an ancestor of
+    /// `main` even though every line of its work is there.
+    ///
+    /// Real git throughout -- a hand-built fixture would let the check
+    /// pass for the wrong reason, which is exactly the failure this test
+    /// exists to catch.
+    fn squash_merged_fixture(
+        squash: bool,
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ident = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+        let run_in = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .envs(ident)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        run_in(&remote, &["init", "-q", "--bare", "-b", "main"]);
+
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_in(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        run_in(&repo, &["add", "-A"]);
+        run_in(&repo, &["commit", "-q", "-m", "base"]);
+        run_in(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run_in(&repo, &["push", "-q", "-u", "origin", "main"]);
+
+        // The branch does its work in a worktree and pushes it.
+        let wt = tmp.path().join("proj-feature");
+        run_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--track",
+                "-b",
+                "feature",
+                wt.to_str().unwrap(),
+                "main",
+            ],
+        );
+        std::fs::write(wt.join("feature.txt"), "the change\n").unwrap();
+        run_in(&wt, &["add", "-A"]);
+        run_in(&wt, &["commit", "-q", "-m", "add the feature"]);
+        run_in(&wt, &["push", "-q", "-u", "origin", "feature"]);
+
+        if squash {
+            // What "Squash and merge" does: the same content lands on
+            // main as a NEW commit. Note this is NOT a merge commit and
+            // NOT a fast-forward -- the branch tip stays unreachable.
+            std::fs::write(repo.join("feature.txt"), "the change\n").unwrap();
+            run_in(&repo, &["add", "-A"]);
+            run_in(&repo, &["commit", "-q", "-m", "add the feature (#1)"]);
+        } else {
+            // Genuinely unmerged: main moves on without the change.
+            std::fs::write(repo.join("other.txt"), "unrelated\n").unwrap();
+            run_in(&repo, &["add", "-A"]);
+            run_in(&repo, &["commit", "-q", "-m", "something else"]);
+        }
+        run_in(&repo, &["push", "-q", "origin", "main"]);
+        (tmp, repo, wt)
+    }
+
+    /// A real repo with one worktree, for the deletion tests.
+    ///
+    /// Real git throughout: a synthetic fixture would let the gate pass
+    /// for the wrong reason, and this is the one place where a vacuous
+    /// test could cost someone their work.
+    fn repo_with_worktree(
+        name: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        let ident = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+        let run = |args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .envs(ident)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} failed");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        let wt = tmp.path().join(name);
+        run(&["worktree", "add", "-q", "-b", name, wt.to_str().unwrap()]);
+        (tmp, repo, wt)
+    }
+
+    /// A worktree with no upstream is NEVER safe, even when its branch
+    /// points at the same commit as the default branch. 52 of 296
+    /// worktrees on this machine are in exactly this state.
+    #[test]
+    fn refuses_a_worktree_that_was_never_pushed() {
+        let (_t, repo, wt) = repo_with_worktree("feature");
+        let err = remove_worktree(repo.to_str().unwrap(), wt.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("never pushed"), "{err}");
+        assert!(wt.is_dir(), "the worktree must still exist");
+    }
+
+    /// The other half of the gate: a genuinely safe worktree MUST be
+    /// removable, or the feature is a list of things you cannot act on.
+    ///
+    /// Builds a real remote so the branch has an upstream and is merged,
+    /// which is what "safe" actually requires.
+    #[test]
+    fn removes_a_worktree_that_is_merged_clean_and_pushed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ident = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+        let run_in = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .envs(ident)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        // A bare "remote" to push to.
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        run_in(&remote, &["init", "-q", "--bare", "-b", "main"]);
+
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_in(&repo, &["init", "-q", "-b", "main"]);
+        run_in(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        run_in(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run_in(&repo, &["push", "-q", "-u", "origin", "main"]);
+
+        // A worktree on a branch that IS main: merged by definition.
+        let wt = tmp.path().join("proj-done");
+        run_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--track",
+                "-b",
+                "done",
+                wt.to_str().unwrap(),
+                "main",
+            ],
+        );
+        run_in(&wt, &["push", "-q", "-u", "origin", "done"]);
+
+        assert!(wt.is_dir());
+        remove_worktree(repo.to_str().unwrap(), wt.to_str().unwrap())
+            .expect("a merged, clean, pushed worktree must be removable");
+        assert!(!wt.exists(), "the directory must be gone");
+
+        // And git's own bookkeeping must agree, which is why this uses
+        // `git worktree remove` rather than deleting the directory.
+        let list = git(&repo, &["worktree", "list", "--porcelain"]).unwrap();
+        assert!(!list.contains("proj-done"), "git still lists it: {list}");
+    }
+
+    /// Both scan paths must classify identically.
+    ///
+    /// The sidebar exists to find disks full of stale worktrees, so the
+    /// repo with the most must come first regardless of name.
+    #[test]
+    fn repos_sort_by_worktree_count_not_name() {
+        let mk = |name: &str, n: usize| Repo {
+            name: name.into(),
+            path: format!("/tmp/{name}"),
+            worktrees: vec![Worktree::default(); n],
+        };
+        // "zed" has the most but sorts last alphabetically -- the whole
+        // point. "alpha" has the fewest but would sort first by name.
+        let mut repos = vec![mk("alpha", 2), mk("zed", 9), mk("mid", 5)];
+        sort_for_sidebar(&mut repos);
+        let names: Vec<_> = repos.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["zed", "mid", "alpha"]);
+    }
+
+    /// Equal counts must not reshuffle between polls, or the list is
+    /// unreadable.
+    #[test]
+    fn equal_counts_break_ties_by_name() {
+        let mk = |name: &str, n: usize| Repo {
+            name: name.into(),
+            path: format!("/tmp/{name}"),
+            worktrees: vec![Worktree::default(); n],
+        };
+        let mut repos = vec![mk("charlie", 4), mk("alpha", 4), mk("bravo", 4)];
+        sort_for_sidebar(&mut repos);
+        let names: Vec<_> = repos.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "bravo", "charlie"]);
+    }
+
+    /// The sidebar shows the count EXCLUDING the main checkout, so the
+    /// sort must use that same number -- ordering rows by a figure nobody
+    /// can see produces a list that looks wrong.
+    #[test]
+    fn sorting_uses_the_count_the_sidebar_displays() {
+        let mk = |name: &str, n: usize| Repo {
+            name: name.into(),
+            path: format!("/tmp/{name}"),
+            worktrees: vec![Worktree::default(); n],
+        };
+        // A repo with only its main checkout displays 0 and must sort
+        // below one displaying 1.
+        let mut repos = vec![mk("only-main", 1), mk("has-one", 2)];
+        sort_for_sidebar(&mut repos);
+        assert_eq!(repos[0].name, "has-one");
+        // And a repo with no worktrees at all must not underflow.
+        let mut empty = vec![mk("empty", 0), mk("has-one", 2)];
+        sort_for_sidebar(&mut empty);
+        assert_eq!(empty[0].name, "has-one");
+    }
+
+    /// Upstream states, against real git rather than a stubbed helper --
+    /// `@{u}` resolution and rev-list's column order are exactly the
+    /// parts a hand-built fixture would get wrong.
+    fn upstream_fixture(f: impl Fn(&Path, &Path)) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ident = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+        let run_in = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .envs(ident)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        run_in(&remote, &["init", "-q", "--bare", "-b", "main"]);
+
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_in(&repo, &["init", "-q", "-b", "main"]);
+        run_in(&repo, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        run_in(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run_in(&repo, &["push", "-q", "-u", "origin", "main"]);
+
+        f(&repo, &remote);
+        (tmp, repo)
+    }
+
+    /// A checkout level with its upstream.
+    #[test]
+    fn a_current_checkout_reports_up_to_date() {
+        let (_t, repo) = upstream_fixture(|_, _| {});
+        assert_eq!(upstream_state(&repo), Upstream::Current);
+    }
+
+    /// Local commits not yet pushed.
+    #[test]
+    fn local_commits_report_ahead() {
+        let (_t, repo) = upstream_fixture(|repo, _| {
+            for m in ["a", "b"] {
+                Command::new("git")
+                    .arg("-C")
+                    .arg(repo)
+                    .args(["commit", "-q", "--allow-empty", "-m", m])
+                    .envs([
+                        ("GIT_AUTHOR_NAME", "octocat"),
+                        ("GIT_COMMITTER_NAME", "octocat"),
+                        ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+                        ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+                    ])
+                    .output()
+                    .unwrap();
+            }
+        });
+        assert_eq!(upstream_state(&repo), Upstream::Ahead(2));
+    }
+
+    /// The upstream moved and this checkout did not -- the state that
+    /// explains why everything below it is stale.
+    ///
+    /// Also pins rev-list's column order: `--left-right` puts the
+    /// upstream-only count first. Swapping the two would report "3 ahead"
+    /// for a checkout that is 3 behind, which is not merely wrong but
+    /// inverted.
+    #[test]
+    fn an_outdated_checkout_reports_behind() {
+        let (_t, repo) = upstream_fixture(|repo, remote| {
+            let ident = [
+                ("GIT_AUTHOR_NAME", "octocat"),
+                ("GIT_COMMITTER_NAME", "octocat"),
+                ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+                ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+            ];
+            // Advance the remote from a second clone, then fetch so the
+            // local ref knows about it without moving HEAD.
+            let other = repo.parent().unwrap().join("other");
+            Command::new("git")
+                .args([
+                    "clone",
+                    "-q",
+                    remote.to_str().unwrap(),
+                    other.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap();
+            for m in ["x", "y", "z"] {
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&other)
+                    .args(["commit", "-q", "--allow-empty", "-m", m])
+                    .envs(ident)
+                    .output()
+                    .unwrap();
+            }
+            Command::new("git")
+                .arg("-C")
+                .arg(&other)
+                .args(["push", "-q", "origin", "main"])
+                .output()
+                .unwrap();
+            Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["fetch", "-q", "origin"])
+                .output()
+                .unwrap();
+        });
+        assert_eq!(upstream_state(&repo), Upstream::Behind(3));
+    }
+
+    /// The upstream must come from `@{u}`, not a hardcoded `origin/main`.
+    ///
+    /// Repos differ -- `master`, `develop`, a fork tracking `upstream` --
+    /// and every other fixture here happens to use `origin/main`, so
+    /// hardcoding it would pass all of them. This one tracks a
+    /// differently-named branch on purpose: with `origin/main` hardcoded
+    /// the rev-list call fails and this reports Unknown instead of the
+    /// real count.
+    #[test]
+    fn the_upstream_is_the_tracked_branch_not_origin_main() {
+        let ident = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+        let run_in = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .envs(ident)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        // Default branch is `develop`, and `main` does not exist at all.
+        run_in(&remote, &["init", "-q", "--bare", "-b", "develop"]);
+
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_in(&repo, &["init", "-q", "-b", "develop"]);
+        run_in(&repo, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        run_in(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run_in(&repo, &["push", "-q", "-u", "origin", "develop"]);
+        run_in(&repo, &["commit", "-q", "--allow-empty", "-m", "local"]);
+
+        assert_eq!(upstream_state(&repo), Upstream::Ahead(1));
+    }
+
+    /// A local-only branch is normal, and distinctly NOT "up to date" --
+    /// a bare zero would read as current when nothing was ever compared.
+    #[test]
+    fn a_branch_with_no_upstream_says_so() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["commit", "-q", "--allow-empty", "-m", "base"],
+        ] {
+            Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(&args)
+                .envs([
+                    ("GIT_AUTHOR_NAME", "octocat"),
+                    ("GIT_COMMITTER_NAME", "octocat"),
+                    ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+                    ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+                ])
+                .output()
+                .unwrap();
+        }
+        assert_eq!(upstream_state(dir), Upstream::Untracked);
+    }
+
+    /// Detached HEAD has no upstream to compare against. It must report
+    /// that, not an error that reads as a failure.
+    #[test]
+    fn a_detached_head_reports_detached_not_an_error() {
+        let (_t, repo) = upstream_fixture(|repo, _| {
+            Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["checkout", "-q", "--detach", "HEAD"])
+                .output()
+                .unwrap();
+        });
+        assert_eq!(upstream_state(&repo), Upstream::Detached);
+    }
+
+    /// The bug this fixes. A squash-merged branch is fully merged, but
+    /// its tip is not an ancestor of main -- squash replays the work as
+    /// a new commit with a new SHA. Ancestry alone therefore reports
+    /// Unmerged forever.
+    ///
+    /// Measured on real repos before this fix: ancestry found 10 of 157
+    /// merged worktrees and called the other 147 unmerged. Those 147 are
+    /// exactly the ones filling the disk this view exists to reclaim.
+    #[test]
+    fn a_squash_merged_branch_is_recognised_as_merged() {
+        let (_t, repo, _wt) = squash_merged_fixture(true);
+
+        // The premise: ancestry genuinely cannot see this merge. If this
+        // assertion ever fails the fixture stopped reproducing the bug,
+        // and the test below would pass for the wrong reason.
+        let anc = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["merge-base", "--is-ancestor", "feature", "origin/main"])
+            .output()
+            .unwrap();
+        assert!(
+            !anc.status.success(),
+            "fixture no longer reproduces a squash merge"
+        );
+
+        let wts = classify_repo(repo.to_str().unwrap());
+        let found = wts
+            .iter()
+            .find(|w| w.path.contains("proj-feature"))
+            .expect("worktree not found");
+        assert_eq!(
+            found.safety,
+            Safety::Safe,
+            "a squash-merged branch must be safe to remove"
+        );
+    }
+
+    /// The other half: the looser check must not start calling genuinely
+    /// unmerged work merged. Deleting one of these destroys commits that
+    /// exist nowhere else.
+    #[test]
+    fn a_genuinely_unmerged_branch_is_still_unmerged() {
+        let (_t, repo, _wt) = squash_merged_fixture(false);
+        let wts = classify_repo(repo.to_str().unwrap());
+        let found = wts
+            .iter()
+            .find(|w| w.path.contains("proj-feature"))
+            .expect("worktree not found");
+        assert_eq!(found.safety, Safety::Unmerged);
+    }
+
+    /// `git cherry` prints nothing for a branch with no commits relative
+    /// to the default. That is a branch with nothing on it, not a merged
+    /// one -- treating empty output as "merged" would greenlight
+    /// deleting a worktree whose state was never established.
+    #[test]
+    fn an_empty_branch_is_not_reported_merged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let ident = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["commit", "-q", "--allow-empty", "-m", "base"],
+        ] {
+            Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(&args)
+                .envs(ident)
+                .output()
+                .unwrap();
+        }
+        // HEAD == main, so `git cherry main HEAD` emits nothing at all.
+        assert_eq!(squash_merged(dir, "main"), Safety::Unmerged);
+    }
+
+    /// Any git failure yields Unknown, never Safe -- the invariant the
+    /// whole classifier is built on.
+    #[test]
+    fn a_git_failure_in_the_squash_check_is_unknown_not_safe() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Not a git repo at all, so `git cherry` fails outright.
+        match squash_merged(tmp.path(), "main") {
+            Safety::Unknown(_) => {}
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    /// They each had their own copy of the logic, and adding the merge
+    /// date to one silently left the other returning None -- which is how
+    /// this shipped broken the first time.
+    #[test]
+    fn both_scan_paths_classify_the_same_way() {
+        // A MERGED worktree, so merged_at is actually populated -- with a
+        // never-pushed one both paths return None and the comparison
+        // proves nothing. Checked: with the drift re-introduced and an
+        // unmerged fixture, this test passed vacuously.
+        let (_t, repo, wt) = merged_worktree_fixture();
+        let _ = &wt;
+        let base = repo.parent().unwrap().to_string_lossy().into_owned();
+
+        let via_scan = scan_dirs(std::slice::from_ref(&base));
+        let scanned = via_scan
+            .iter()
+            .find(|r| r.name == "proj")
+            .expect("repo not found");
+        let via_classify = classify_repo(repo.to_str().unwrap());
+
+        assert_eq!(scanned.worktrees.len(), via_classify.len());
+        for (a, b) in scanned.worktrees.iter().zip(via_classify.iter()) {
+            assert_eq!(a.safety, b.safety, "safety differs for {}", a.path);
+            assert_eq!(
+                a.merged_at, b.merged_at,
+                "merge date differs for {}",
+                a.path
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_the_main_checkout() {
+        let (_t, repo, _wt) = repo_with_worktree("feature");
+        let err = remove_worktree(repo.to_str().unwrap(), repo.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("main checkout"), "{err}");
+        assert!(repo.is_dir());
+    }
+
+    #[test]
+    fn refuses_a_path_that_is_not_a_worktree_of_this_repo() {
+        let (_t, repo, _wt) = repo_with_worktree("feature");
+        let err = remove_worktree(repo.to_str().unwrap(), "/tmp/somewhere-else").unwrap_err();
+        assert!(err.contains("not a worktree"), "{err}");
+    }
+
+    /// Uncommitted work blocks removal even when everything else passes.
+    #[test]
+    fn refuses_a_dirty_worktree() {
+        let (_t, repo, wt) = repo_with_worktree("feature");
+        std::fs::write(wt.join("scratch.txt"), "unsaved work").unwrap();
+        let err = remove_worktree(repo.to_str().unwrap(), wt.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("uncommitted"), "{err}");
+        assert!(wt.join("scratch.txt").exists(), "the file must survive");
+    }
+
+    #[test]
+    fn reasons_are_display_ready_and_pluralised() {
+        assert_eq!(Safety::Dirty(1).reason(), "1 uncommitted file");
+        assert_eq!(Safety::Dirty(3).reason(), "3 uncommitted files");
+        assert_eq!(Safety::Unpushed(1).reason(), "1 unpushed commit");
+        assert!(Safety::NeverPushed.reason().contains("only here"));
+    }
+}
+
+#[cfg(test)]
+mod live {
+    use super::*;
+
+    /// Scans the real `~/code`. Read-only -- it runs git queries and
+    /// deletes nothing. Run manually:
+    /// `cargo test --lib live_scan -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_scan_classifies_real_worktrees() {
+        let home = std::env::var("HOME").unwrap();
+        let base = format!("{home}/code");
+        let t = std::time::Instant::now();
+        let fast = scan_dirs_fast(std::slice::from_ref(&base));
+        println!(
+            "FAST listing: {} repos, {} worktrees in {:?}",
+            fast.len(),
+            fast.iter().map(|r| r.worktrees.len()).sum::<usize>(),
+            t.elapsed()
+        );
+
+        let t = std::time::Instant::now();
+        let repos = scan_dirs(std::slice::from_ref(&base));
+        let elapsed = t.elapsed();
+
+        let total: usize = repos.iter().map(|r| r.worktrees.len()).sum();
+        println!("REPOS={} WORKTREES={total} in {elapsed:?}", repos.len());
+
+        let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+        for w in repos.iter().flat_map(|r| &r.worktrees) {
+            let k = match &w.safety {
+                Safety::Safe => "safe",
+                Safety::MainCheckout => "main",
+                Safety::Dirty(_) => "dirty",
+                Safety::Unpushed(_) => "unpushed",
+                Safety::NeverPushed => "never_pushed",
+                Safety::Unmerged => "unmerged",
+                Safety::Pending => "pending",
+                Safety::Unknown(_) => "unknown",
+            };
+            *counts.entry(k).or_default() += 1;
+        }
+        println!("SAFETY {counts:?}");
+
+        // What the sidebar will show: repos, and removable counts.
+        let mut top: Vec<(usize, &str)> = repos
+            .iter()
+            .map(|r| (r.worktrees.len().saturating_sub(1), r.name.as_str()))
+            .collect();
+        top.sort_by_key(|a| std::cmp::Reverse(a.0));
+        println!("TOP REPOS {:?}", &top[..top.len().min(4)]);
+
+        let safe: Vec<&str> = repos
+            .iter()
+            .flat_map(|r| &r.worktrees)
+            .filter(|w| w.safety.is_safe())
+            .map(|w| w.path.rsplit('/').next().unwrap_or(""))
+            .take(4)
+            .collect();
+        println!("SAFE SAMPLE {safe:?}");
+
+        // Merge dates on the safe ones, and sizes for one repo.
+        let dated: Vec<(&str, &str)> = repos
+            .iter()
+            .flat_map(|r| &r.worktrees)
+            .filter(|w| w.safety.is_safe())
+            .filter_map(|w| {
+                w.merged_at
+                    .as_deref()
+                    .map(|d| (w.path.rsplit('/').next().unwrap_or(""), d))
+            })
+            .take(4)
+            .collect();
+        println!("MERGED DATES {dated:?}");
+
+        if let Some(r) = repos.iter().max_by_key(|r| r.worktrees.len()) {
+            let t = std::time::Instant::now();
+            let sizes = size_repo(&r.path);
+            let total: u64 = sizes.iter().map(|(_, b)| b).sum();
+            println!(
+                "SIZED {} worktrees of {} in {:?}, total {:.1} GB",
+                sizes.len(),
+                r.name,
+                t.elapsed(),
+                total as f64 / 1024.0 / 1024.0 / 1024.0
+            );
+            assert!(sizes.iter().any(|(_, b)| *b > 0), "sizes must be populated");
+        }
+
+        assert!(!repos.is_empty(), "expected repos under ~/code");
+        // The main checkout of every repo must be classified as such --
+        // deleting one would destroy the repository.
+        for r in &repos {
+            assert!(
+                r.worktrees.first().is_some_and(|w| w.is_main),
+                "{} has no main checkout",
+                r.name
+            );
+        }
+    }
+}
+
+/// Remove a worktree, refusing anything not provably safe.
+///
+/// **The only destructive operation Headstate performs on local disk.**
+/// It deletes files that may be the only copy of work, so the bar is
+/// higher than for the GitHub mutations: the safety gate is RE-EVALUATED
+/// here rather than trusted from the scan. A scan is a snapshot, and the
+/// user may have started editing in the seconds since -- 24 of 296
+/// worktrees on this machine are dirty at any moment.
+///
+/// Uses `git worktree remove`, never `rm -rf`: git updates its own
+/// administrative files, where a raw delete leaves a stale entry making
+/// the repo report a worktree that no longer exists.
+pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> Result<(), String> {
+    let repo = Path::new(repo_path);
+    let target = Path::new(worktree_path);
+
+    let list = git(repo, &["worktree", "list", "--porcelain"])
+        .map_err(|e| format!("could not list worktrees: {e}"))?;
+    let known = parse_porcelain(&list);
+
+    // Compare CANONICAL paths. Git reports what it resolved, which may
+    // differ from what the caller holds when any component is a symlink
+    // -- on macOS /var is a link to /private/var, so a naive string
+    // compare fails for anything under a temp directory. Falling back to
+    // the raw path keeps a non-existent target comparable rather than
+    // erroring here.
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let target_canon = canon(target);
+    let wt = known
+        .iter()
+        .find(|w| canon(Path::new(&w.path)) == target_canon)
+        .ok_or_else(|| "not a worktree of this repository".to_string())?;
+
+    if wt.is_main {
+        return Err("refusing to remove the repository's main checkout".into());
+    }
+
+    // Re-check RIGHT NOW, not from the scan.
+    let branch = default_branch(repo);
+    let safety = worktree_safety(wt, &branch);
+    if !safety.is_safe() {
+        return Err(format!("not safe to remove: {}", safety.reason()));
+    }
+
+    // No `--force`. The gate above already established the tree is clean,
+    // so needing force here would mean the gate was wrong -- and forcing
+    // past it is precisely how unpushed work is lost.
+    git(repo, &["worktree", "remove", worktree_path])
+        .map(|_| ())
+        .map_err(|e| format!("git refused: {e}"))
+}

@@ -20,6 +20,7 @@
 
 mod cache;
 mod schema;
+pub mod settings;
 
 pub use cache::{load_snapshot, save_snapshot};
 pub use schema::{open_db, StoreError};
@@ -30,7 +31,9 @@ use schema::migrate;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github::model::{CiState, Label, MergeState, PullRequest, ReviewState};
+    use crate::github::model::{
+        CiState, Label, MergeState, MergeStateStatus, PullRequest, ReviewState,
+    };
     use chrono::Utc;
 
     fn db() -> rusqlite::Connection {
@@ -41,16 +44,21 @@ mod tests {
 
     fn sample() -> PullRequest {
         PullRequest {
+            id: "PR_test".into(),
             number: 42,
             title: "Add retry to the fetch client".into(),
             url: "https://github.com/octocat/hello-world/pull/42".into(),
             repo: "octocat/hello-world".into(),
+            head_ref: "feature/x".into(),
+            head_oid: "deadbeef".into(),
+            base_ref: "main".into(),
             author: "octocat".into(),
             is_draft: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             ci: CiState::Success,
             merge: MergeState::Mergeable,
+            merge_status: MergeStateStatus::Clean,
             review: ReviewState::Approved,
             in_merge_queue: false,
             labels: vec![Label {
@@ -58,6 +66,7 @@ mod tests {
                 color: "d73a4a".into(),
             }],
             comment_count: 2,
+            unresolved_threads: 0,
         }
     }
 

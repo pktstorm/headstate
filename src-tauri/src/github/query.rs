@@ -1,5 +1,9 @@
-//! GraphQL query documents. All are read-only: no mutations, ever — this
-//! product performs no GitHub write operations.
+//! GraphQL query documents. Every document HERE is read-only -- a
+//! `search` or a `repository` lookup, never a mutation.
+//!
+//! Writes exist, and live in `mutate.rs`. Keeping them in a separate
+//! module is the point: this file stays auditable as pure reads, and the
+//! write surface is small enough to read in one sitting.
 
 use chrono::{DateTime, Duration, Utc};
 
@@ -20,11 +24,13 @@ query($q: String!, $reviewing: String!) {
     issueCount
     nodes {
       ... on PullRequest {
-        number title url isDraft createdAt updatedAt
+        id number title url isDraft createdAt updatedAt
+        headRefName headRefOid baseRefName
         author { login }
         repository { nameWithOwner }
-        mergeable reviewDecision isInMergeQueue totalCommentsCount
+        mergeable mergeStateStatus reviewDecision isInMergeQueue totalCommentsCount
         labels(first: 20) { nodes { name color } }
+        reviewThreads(first: 20) { nodes { isResolved isOutdated } }
         commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
       }
     }
@@ -33,11 +39,13 @@ query($q: String!, $reviewing: String!) {
     issueCount
     nodes {
       ... on PullRequest {
-        number title url isDraft createdAt updatedAt
+        id number title url isDraft createdAt updatedAt
+        headRefName headRefOid baseRefName
         author { login }
         repository { nameWithOwner }
-        mergeable reviewDecision isInMergeQueue totalCommentsCount
+        mergeable mergeStateStatus reviewDecision isInMergeQueue totalCommentsCount
         labels(first: 20) { nodes { name color } }
+        reviewThreads(first: 20) { nodes { isResolved isOutdated } }
         commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
       }
     }
@@ -238,6 +246,43 @@ pub fn cycle_trend_query(now: DateTime<Utc>) -> String {
         r.week_current.0, r.week_current.1, r.week_previous.0, r.week_previous.1
     )
 }
+
+/// Everything the detail view shows, in one request.
+///
+/// Measured at cost 1 including per-check contexts. Fetched on open
+/// rather than in the poll loop: it is per-PR and only needed while the
+/// view is on screen.
+///
+/// Deliberately no file diff and no commit history. Headstate is for
+/// deciding and acting; reviewing code belongs in GitHub or an editor,
+/// and fetching a diff here would cost far more than a point.
+pub const PR_DETAIL_QUERY: &str = r#"
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      id number title url state isDraft body
+      mergeable mergeStateStatus reviewDecision
+      additions deletions changedFiles
+      headRefName headRefOid baseRefName
+      createdAt updatedAt
+      author { login }
+      comments(first: 50) {
+        totalCount
+        nodes { author { login } createdAt body }
+      }
+      reviewThreads(first: 20) { nodes { isResolved isOutdated } }
+      commits(last: 1) {
+        nodes { commit { statusCheckRollup {
+          state
+          contexts(first: 20) { nodes {
+            ... on CheckRun { name conclusion detailsUrl }
+            ... on StatusContext { context state targetUrl }
+          } }
+        } } }
+      }
+    }
+  }
+}"#;
 
 #[cfg(test)]
 mod tests {

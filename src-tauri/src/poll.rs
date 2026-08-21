@@ -8,14 +8,50 @@
 use crate::github::client::{ClientError, GitHubClient};
 use crate::github::model::{needs_attention_count, CiState, MergeState, PullRequest};
 use crate::store::{open_db, save_snapshot};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Notify;
 
-pub const FOCUSED: Duration = Duration::from_secs(60);
-pub const BACKGROUND: Duration = Duration::from_secs(300);
+/// Default focused cadence, in seconds.
+///
+/// Two minutes rather than one: PR state rarely changes minute-to-minute,
+/// and the shipped query costs 6 rate-limit points, so halving the rate
+/// halves the spend for no practical loss of freshness.
+pub const DEFAULT_FOCUSED_SECS: u64 = 120;
+
+/// Floor on the configured interval.
+///
+/// 60s, not 30: the shipped query costs 6 rate-limit points, so a 30s
+/// cadence would spend 720/hour and a 60s one spends 360. Both are
+/// survivable against a 5000/hour budget, but the app should not be able
+/// to consume a seventh of the user's own `gh` allowance on a setting they
+/// picked without knowing the cost.
+///
+/// The budget test asserts against THIS value rather than the default, so
+/// a user choosing the fastest allowed setting still cannot blow through
+/// the guard.
+pub const MIN_FOCUSED_SECS: u64 = 60;
+pub const MAX_FOCUSED_SECS: u64 = 3600;
+
+/// Backgrounded polling is 5x the focused interval: the window is hidden,
+/// so freshness matters less, but the tray badge must not go stale for
+/// long. Proportional rather than separately configurable -- one knob is
+/// enough, and two invites inconsistent pairs.
+pub const BACKGROUND_MULTIPLIER: u64 = 5;
+
+pub const FOCUSED: Duration = Duration::from_secs(DEFAULT_FOCUSED_SECS);
+pub const BACKGROUND: Duration = Duration::from_secs(DEFAULT_FOCUSED_SECS * BACKGROUND_MULTIPLIER);
+
+/// Clamp a user-supplied interval into the allowed range.
+///
+/// Extracted so it is testable: a Tauri command is a public surface, and
+/// an unbounded value here would either hammer GitHub or effectively stop
+/// polling.
+pub fn clamp_interval(secs: u64) -> u64 {
+    secs.clamp(MIN_FOCUSED_SECS, MAX_FOCUSED_SECS)
+}
 
 /// #22: how long after a poll to fire the one-shot targeted re-poll for
 /// PRs still stuck on `MergeState::Checking`. GitHub computes mergeability
@@ -24,16 +60,24 @@ pub const BACKGROUND: Duration = Duration::from_secs(300);
 /// waiting a full tick.
 pub const RECHECK_DELAY: Duration = Duration::from_secs(5);
 
-/// 60s focused / 300s backgrounded. At 2 rate-limit points per poll, focused
-/// cadence is ~120 points/hour against a 5000/hour budget -- see the cadence
-/// test below, which exists so a future change to "every 5 seconds" fails CI
-/// rather than silently competing with the user's own `gh` usage.
-pub fn interval_for(focused: bool) -> Duration {
-    if focused {
-        FOCUSED
+/// The cadence for the current window state, given a configured interval.
+///
+/// The shipped query costs 6 rate-limit points (see the budget test), so
+/// the default 120s focused cadence spends ~180 points/hour against a
+/// 5000/hour budget. The test asserts the FLOOR, not the default, so no
+/// reachable setting can blow the budget.
+pub fn interval_for_secs(focused: bool, configured_secs: u64) -> Duration {
+    let secs = clamp_interval(configured_secs);
+    Duration::from_secs(if focused {
+        secs
     } else {
-        BACKGROUND
-    }
+        secs * BACKGROUND_MULTIPLIER
+    })
+}
+
+/// The default cadence, for callers with no configured value.
+pub fn interval_for(focused: bool) -> Duration {
+    interval_for_secs(focused, DEFAULT_FOCUSED_SECS)
 }
 
 /// True if any PR is still waiting on GitHub's lazy mergeability
@@ -245,11 +289,30 @@ pub const FETCH_TIMEOUT: Duration = Duration::from_secs(90);
 ///    was delayed up to a full interval (300s when backgrounded).
 pub struct Waker(pub Arc<Notify>);
 
+/// The configured focused interval, in seconds.
+///
+/// Shared rather than passed once, so changing the setting takes effect on
+/// the NEXT tick instead of requiring a relaunch. Paired with the `Waker`:
+/// after a change the loop is woken so a shortened interval applies
+/// immediately rather than after the old, longer sleep expires.
+pub struct PollInterval(pub Arc<AtomicU64>);
+
+/// Whether the active view needs live GitHub data.
+///
+/// `false` while the user is looking at local worktrees, which need no
+/// PR data at all. The loop drops to the BACKGROUND cadence rather than
+/// stopping: the tray badge must not go stale while the window sits open
+/// on another view, and the badge staying honest is the stated reason
+/// polling lives in Rust at all.
+pub struct ViewNeedsGithub(pub Arc<AtomicBool>);
+
 pub fn spawn(
     app: AppHandle,
     client: Arc<GitHubClient>,
     focused: Arc<AtomicBool>,
     waker: Arc<Notify>,
+    interval_secs: Arc<AtomicU64>,
+    view_needs_github: Arc<AtomicBool>,
 ) {
     tauri::async_runtime::spawn(async move {
         let mut previous: Vec<PullRequest> = Vec::new();
@@ -257,6 +320,7 @@ pub fn spawn(
             // `timeout` collapses a hang into the Err arm the loop already
             // handles, so a wedged request costs one tick instead of the
             // rest of the session.
+            let _ = app.emit("poll-state", "fetching");
             let fetched =
                 match tokio::time::timeout(FETCH_TIMEOUT, client.fetch_prs_with_total()).await {
                     Ok(res) => res,
@@ -304,13 +368,25 @@ pub fn spawn(
                     }
                 }
             }
+            // The bar shows FETCHING only while a request is genuinely in
+            // flight. Inferring it from `isFetching` would miss the tray
+            // path, which bypasses the queryFn -- so the loop that knows
+            // says so directly.
+            let _ = app.emit("poll-state", "idle");
+
             // Whichever comes first: the cadence elapsing, or someone
             // asking for a refresh. `Notify` stores one permit, so a
             // request that arrives mid-fetch is not lost -- the next
             // `notified()` returns immediately rather than waiting out a
             // full interval.
             tokio::select! {
-                _ = tokio::time::sleep(interval_for(focused.load(Ordering::Relaxed))) => {}
+                _ = tokio::time::sleep(interval_for_secs(
+                    // A view that does not show PR data polls at the
+                    // background rate even when the window is focused.
+                    focused.load(Ordering::Relaxed)
+                        && view_needs_github.load(Ordering::Relaxed),
+                    interval_secs.load(Ordering::Relaxed),
+                )) => {}
                 _ = waker.notified() => {}
             }
         }
@@ -320,6 +396,7 @@ pub fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github::model::MergeStateStatus;
 
     /// `notify_one` stores a permit when nobody is waiting, so a refresh
     /// requested WHILE a fetch is in flight is not lost -- the next
@@ -388,27 +465,105 @@ mod tests {
 
     fn pr(repo: &str, number: u64, merge: MergeState) -> PullRequest {
         PullRequest {
+            id: "PR_test".into(),
             number,
             title: "Add retry to the fetch client".into(),
             url: format!("https://github.com/{repo}/pull/{number}"),
             repo: repo.into(),
+            head_ref: "feature/x".into(),
+            head_oid: "deadbeef".into(),
+            base_ref: "main".into(),
             author: "octocat".into(),
             is_draft: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             ci: CiState::Success,
             merge,
+            merge_status: MergeStateStatus::Clean,
             review: ReviewState::Approved,
             in_merge_queue: false,
             labels: Vec::<Label>::new(),
             comment_count: 0,
+            unresolved_threads: 0,
         }
     }
 
     #[test]
     fn polls_faster_when_focused() {
-        assert_eq!(interval_for(true), std::time::Duration::from_secs(60));
-        assert_eq!(interval_for(false), std::time::Duration::from_secs(300));
+        assert_eq!(
+            interval_for(true),
+            Duration::from_secs(DEFAULT_FOCUSED_SECS)
+        );
+        assert_eq!(
+            interval_for(false),
+            Duration::from_secs(DEFAULT_FOCUSED_SECS * BACKGROUND_MULTIPLIER)
+        );
+    }
+
+    #[test]
+    fn the_default_cadence_is_two_minutes() {
+        assert_eq!(DEFAULT_FOCUSED_SECS, 120);
+        assert_eq!(interval_for(true), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn a_configured_interval_is_honoured() {
+        assert_eq!(interval_for_secs(true, 300), Duration::from_secs(300));
+        // Background stays proportional.
+        assert_eq!(
+            interval_for_secs(false, 300),
+            Duration::from_secs(300 * BACKGROUND_MULTIPLIER)
+        );
+    }
+
+    /// A Tauri command is a public surface. Without a floor, `0` would
+    /// busy-loop against GitHub; without a ceiling, a huge value would
+    /// effectively stop polling while the UI still claimed to be live.
+    #[test]
+    fn a_configured_interval_is_clamped() {
+        assert_eq!(clamp_interval(0), MIN_FOCUSED_SECS);
+        assert_eq!(clamp_interval(1), MIN_FOCUSED_SECS);
+        assert_eq!(clamp_interval(u64::MAX), MAX_FOCUSED_SECS);
+        assert_eq!(clamp_interval(120), 120, "a normal value passes through");
+        assert_eq!(
+            interval_for_secs(true, 0),
+            Duration::from_secs(MIN_FOCUSED_SECS)
+        );
+    }
+
+    /// A view that shows no PR data polls at the BACKGROUND rate even
+    /// when the window is focused -- but still polls, so the tray badge
+    /// does not go stale while the user cleans up worktrees.
+    #[test]
+    fn a_non_github_view_uses_the_background_cadence() {
+        let secs = 120;
+        // Read through atomics so the `focused && needs_github` the loop
+        // actually evaluates cannot be constant-folded away.
+        let focused = AtomicBool::new(true);
+        let needs_github = AtomicBool::new(true);
+        let effective = || {
+            interval_for_secs(
+                focused.load(Ordering::Relaxed) && needs_github.load(Ordering::Relaxed),
+                secs,
+            )
+        };
+
+        let fast = effective();
+        assert_eq!(fast, Duration::from_secs(secs));
+
+        // Focused, but on a view that shows no PR data.
+        needs_github.store(false, Ordering::Relaxed);
+        let on_worktrees = effective();
+
+        // Same as being unfocused...
+        focused.store(false, Ordering::Relaxed);
+        needs_github.store(true, Ordering::Relaxed);
+        assert_eq!(on_worktrees, effective());
+
+        // ...slower than focused, and never stopped: the tray badge must
+        // not go stale while the window sits on another view.
+        assert!(on_worktrees > fast);
+        assert!(on_worktrees.as_secs() > 0, "must not stop");
     }
 
     /// Budget guard for BOTH cadences, with the per-poll cost derived from
@@ -422,12 +577,34 @@ mod tests {
     /// assertion kept passing.
     #[test]
     fn both_cadences_stay_well_inside_the_rate_limit() {
-        // GraphQL bills one point per `search` in the document.
-        let cost = crate::github::query::PRS_QUERY.matches("search(").count() as u64;
-        assert!(cost > 0, "PRS_QUERY must contain at least one search");
+        let q = crate::github::query::PRS_QUERY;
+        assert!(
+            q.contains("search("),
+            "PRS_QUERY must contain at least one search"
+        );
+        // Cost is driven by NESTED CONNECTIONS, not the search count.
+        // Measured against the live API: labels, statusCheckRollup and
+        // reviewThreads each cost a point PER SEARCH and are additive, so
+        // three connections across two searches is 6 -- what the shipped
+        // query actually costs. (An earlier comment here claimed 2; that
+        // was measured on a stripped-down query, not the real one.)
+        //
+        // Occurrences, not presence: dropping a connection from a single
+        // search has to move this number.
+        let cost = ["labels(", "statusCheckRollup", "reviewThreads("]
+            .iter()
+            .map(|c| q.matches(c).count() as u64)
+            .sum::<u64>();
+        assert_eq!(
+            cost, 6,
+            "PRS_QUERY cost changed; re-measure against the live API"
+        );
 
+        // The FLOOR, not the default: a user picking the fastest allowed
+        // setting must still be inside budget, or this guard only protects
+        // people who never touch the setting.
         for focused in [true, false] {
-            let per_hour = 3600 / interval_for(focused).as_secs();
+            let per_hour = 3600 / interval_for_secs(focused, MIN_FOCUSED_SECS).as_secs();
             let points = per_hour * cost;
             assert!(
                 points < 500,
@@ -477,20 +654,26 @@ mod tests {
             .unwrap()
             .with_timezone(&chrono::Utc);
         PullRequest {
+            id: "PR_test".into(),
             number,
             title: format!("PR {number}"),
             url: format!("https://github.com/{repo}/pull/{number}"),
             repo: repo.to_string(),
             author: "someone".into(),
             is_draft: false,
+            head_ref: "feature/x".into(),
+            head_oid: "deadbeef".into(),
+            base_ref: "main".into(),
             created_at: t,
             updated_at: t,
             ci,
             merge,
+            merge_status: MergeStateStatus::Clean,
             review: crate::github::model::ReviewState::None,
             in_merge_queue: false,
             labels: vec![],
             comment_count: 0,
+            unresolved_threads: 0,
         }
     }
 

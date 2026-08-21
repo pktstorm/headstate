@@ -2,15 +2,29 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useEffect, useState, useSyncExternalStore } from "react";
 import type { PullRequest } from "../types/pr";
+import type { PrActionName } from "./tauri";
 import {
   getCached,
+  actOnPrs,
+  updatePrBranch,
   getHistory,
   getMergedDetail,
   getCycleTrend,
   getPeriods,
+  getPollInterval,
+  actOnPr,
+  getPrDetail,
+  getWorktreeDirs,
+  classifyWorktrees,
+  listWorktrees,
+  removeWorktree,
+  sizeWorktrees,
   getReviewing,
   getStats,
   refreshNow,
+  setPollInterval,
+  setViewNeedsGithub,
+  setWorktreeDirs,
 } from "./tauri";
 
 /// The PR list. Seeded from the SQLite snapshot so the first paint shows
@@ -208,6 +222,215 @@ export function useCycleTrend() {
     queryFn: getCycleTrend,
     staleTime: 5 * 60 * 1000,
   });
+}
+
+/// Whether the poll loop is currently fetching.
+///
+/// Emitted by the Rust loop rather than inferred from `isFetching`: the
+/// tray refresh path calls `refreshNow` outside the queryFn, so the query
+/// flag never flips for it. The loop that knows is the one that says.
+export function usePollState(): "idle" | "fetching" {
+  const [state, setState] = useState<"idle" | "fetching">("idle");
+
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    listen<string>("poll-state", (e) => {
+      setState(e.payload === "fetching" ? "fetching" : "idle");
+    }).then(
+      (fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      },
+      () => {},
+    );
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  return state;
+}
+
+/// Keep the poll cadence in step with the active view.
+///
+/// The worktrees view needs no GitHub data, so the loop drops to the
+/// background rate while it is open. It does NOT stop: the tray badge
+/// would silently go stale, and the badge staying honest while the window
+/// is not being watched is the reason polling lives in Rust.
+export function useViewCadence(view: string): void {
+  useEffect(() => {
+    // Tolerate a host without the command, as the other listeners do:
+    // cadence is an optimisation, and failing to set it must not break
+    // the page.
+    void setViewNeedsGithub(view !== "worktrees").catch(() => {});
+  }, [view]);
+}
+
+/// Apply an action to a pull request, then refresh what it affected.
+///
+/// NOT optimistic. Every list mutation elsewhere updates locally first,
+/// but a merge either happened or did not, and showing a PR as merged
+/// before GitHub agreed would be a lie about a state the user cannot
+/// undo. The Rust side wakes the poll loop on success, so the list
+/// catches up within a tick rather than after the full interval.
+export function useActOnPr() {
+  const qc = useQueryClient();
+  return (
+    id: string,
+    repo: string,
+    number: number,
+    action: PrActionName,
+  ) =>
+    actOnPr(id, repo, number, action).then(() => {
+      void qc.invalidateQueries({ queryKey: ["pr-detail", repo, number] });
+      void qc.invalidateQueries({ queryKey: ["prs"] });
+      void qc.invalidateQueries({ queryKey: ["reviewing"] });
+    });
+}
+
+/// Merge the base branch into a pull request's head.
+///
+/// Invalidates the same keys as `useActOnPr`: the update changes CI
+/// state and mergeability, so a row left showing "behind" after a
+/// successful update would be stale in exactly the way the button was
+/// meant to fix.
+export function useUpdatePrBranch() {
+  const qc = useQueryClient();
+  return (id: string, repo: string, number: number, expectedHead: string) =>
+    updatePrBranch(id, repo, number, expectedHead).then(() => {
+      void qc.invalidateQueries({ queryKey: ["pr-detail", repo, number] });
+      void qc.invalidateQueries({ queryKey: ["prs"] });
+      void qc.invalidateQueries({ queryKey: ["reviewing"] });
+    });
+}
+
+/// Apply one action to several pull requests.
+///
+/// Invalidates once after the whole batch rather than per pull request:
+/// forty mutations would otherwise trigger forty refetches of the same
+/// list. Resolves with per-PR outcomes; it rejects only if the batch
+/// itself could not run.
+export function useActOnPrs() {
+  const qc = useQueryClient();
+  return (prs: [string, string, number][], action: PrActionName) =>
+    actOnPrs(prs, action).then((outcomes) => {
+      void qc.invalidateQueries({ queryKey: ["prs"] });
+      void qc.invalidateQueries({ queryKey: ["reviewing"] });
+      return outcomes;
+    });
+}
+
+/// One pull request's detail, fetched when the view opens.
+///
+/// Not part of the poll loop: it is per-PR and only wanted while on
+/// screen. Kept briefly so reopening the same PR is instant, but short
+/// enough that CI state is not stale on return.
+export function usePrDetail(repo: string | undefined, number: number | undefined) {
+  return useQuery({
+    queryKey: ["pr-detail", repo, number],
+    queryFn: () => getPrDetail(repo as string, number as number),
+    enabled: Boolean(repo && number),
+    staleTime: 30_000,
+  });
+}
+
+/// Repos with worktrees. Listing only -- see `useWorktreeSafety`.
+///
+/// `staleTime` is short but non-zero: the set changes when the user
+/// creates or removes a worktree, not on a timer, so refetching on every
+/// mount would spend a second of subprocess work for nothing.
+export function useWorktrees() {
+  return useQuery({
+    queryKey: ["worktrees"],
+    queryFn: listWorktrees,
+    staleTime: 30_000,
+  });
+}
+
+/// Safety for one repo's worktrees, fetched only when that repo is
+/// selected -- classifying all 37 up front would take ~16s.
+export function useWorktreeSafety(repoPath: string | undefined) {
+  return useQuery({
+    queryKey: ["worktree-safety", repoPath],
+    queryFn: () => classifyWorktrees(repoPath as string),
+    enabled: Boolean(repoPath),
+    staleTime: 30_000,
+  });
+}
+
+/// Disk sizes for one repo's worktrees, keyed by path.
+///
+/// The slowest of the three passes (~13s for 147 worktrees), so it is
+/// last: the list appears, then safety, then sizes. Sizes change only
+/// when the tree does, so they are cached for longer than the rest.
+export function useWorktreeSizes(repoPath: string | undefined) {
+  return useQuery({
+    queryKey: ["worktree-sizes", repoPath],
+    queryFn: async () => {
+      const pairs = await sizeWorktrees(repoPath as string);
+      return new Map(pairs);
+    },
+    enabled: Boolean(repoPath),
+    staleTime: 5 * 60 * 1000,
+  });
+}
+
+/// Remove a worktree, then refresh both queries.
+///
+/// Deliberately NOT optimistic. Every other mutation in this app updates
+/// locally first, but this one deletes files: showing a row as gone
+/// before the deletion succeeded would be a lie about the filesystem, and
+/// the failure case here is "your work is still there", which the user
+/// needs to see rather than have hidden.
+export function useRemoveWorktree() {
+  const qc = useQueryClient();
+  return (repoPath: string, worktreePath: string) =>
+    removeWorktree(repoPath, worktreePath).then(() => {
+      void qc.invalidateQueries({ queryKey: ["worktrees"] });
+      void qc.invalidateQueries({ queryKey: ["worktree-safety", repoPath] });
+    });
+}
+
+/// Directories scanned for git checkouts, and a way to change them.
+///
+/// The mutation can FAIL -- a path that is not a directory is rejected by
+/// the backend -- so this surfaces the error rather than swallowing it,
+/// unlike the interval setting which only clamps.
+export function useWorktreeDirs() {
+  const qc = useQueryClient();
+  const query = useQuery({
+    queryKey: ["worktree-dirs"],
+    queryFn: getWorktreeDirs,
+    staleTime: Infinity,
+  });
+  const set = (dirs: string[]) =>
+    setWorktreeDirs(dirs).then((applied) => {
+      qc.setQueryData(["worktree-dirs"], applied);
+      return applied;
+    });
+  return { dirs: query.data ?? [], set };
+}
+
+/// The poll interval setting, and a way to change it.
+///
+/// The value is authoritative on the Rust side, which owns the running
+/// loop -- the mutation returns what was actually applied after clamping,
+/// so the UI can never show a value the backend rejected.
+export function usePollInterval() {
+  const qc = useQueryClient();
+  const query = useQuery({
+    queryKey: ["poll-interval"],
+    queryFn: getPollInterval,
+    staleTime: Infinity,
+  });
+  const set = (secs: number) =>
+    setPollInterval(secs).then((applied) => {
+      qc.setQueryData(["poll-interval"], applied);
+      return applied;
+    });
+  return { seconds: query.data, set };
 }
 
 /// PRs awaiting the user's review.

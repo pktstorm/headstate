@@ -15,6 +15,35 @@ pub enum CiState {
     None,
 }
 
+/// GitHub's own summary of whether a PR can merge right now.
+///
+/// Richer than `MergeState`, which only distinguishes conflicts: this
+/// separates "ready" from "blocked on a required review" from "checks
+/// failing" -- the difference between a merge button that works and one
+/// that lies.
+///
+/// Live distribution across 25 open PRs when this was added: Clean 11,
+/// Dirty 7, Unstable 7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MergeStateStatus {
+    /// Mergeable now.
+    Clean,
+    /// Merge conflicts.
+    Dirty,
+    /// A required review or check is missing.
+    Blocked,
+    /// Non-required checks are failing.
+    Unstable,
+    /// The base has moved ahead; needs updating.
+    Behind,
+    /// Draft PRs cannot merge.
+    Draft,
+    /// Still being computed, or a state we do not model.
+    #[default]
+    Unknown,
+}
+
 /// Three states, not two. `Checking` exists because GitHub computes
 /// mergeability lazily and reports UNKNOWN until it finishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,12 +54,15 @@ pub enum MergeState {
     Checking,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewState {
     Approved,
     ChangesRequested,
     ReviewRequired,
+    /// No verdict. The default, so a partially-built value never claims
+    /// an approval that does not exist.
+    #[default]
     None,
 }
 
@@ -42,20 +74,46 @@ pub struct Label {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
+    /// GraphQL node ID, so a row can act without first opening the
+    /// detail view. Rides along in the list query at no extra cost.
+    pub id: String,
     pub number: u64,
     pub title: String,
     pub url: String,
     pub repo: String,
     pub author: String,
     pub is_draft: bool,
+    /// The branch being merged, and the branch it merges into.
+    ///
+    /// Carried for the list row: a PR stacked on another branch cannot
+    /// merge until its base does, and is otherwise indistinguishable from
+    /// one targeting the default branch.
+    pub head_ref: String,
+    /// The head commit, so an "update branch" click can tell GitHub which
+    /// commit the user was actually looking at.
+    pub head_oid: String,
+    pub base_ref: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub ci: CiState,
     pub merge: MergeState,
+    /// GitHub's own merge-readiness summary. See `MergeStateStatus`.
+    pub merge_status: MergeStateStatus,
     pub review: ReviewState,
     pub in_merge_queue: bool,
     pub labels: Vec<Label>,
     pub comment_count: u64,
+    /// Review conversations still open on the current code.
+    ///
+    /// Resolved threads are excluded, and so are OUTDATED ones -- a thread
+    /// on a line that has since changed is not something the author still
+    /// has to answer, and counting it would nag about work already done.
+    ///
+    /// Deliberately a count of open conversations, not a claim that the PR
+    /// is blocked: whether a repo REQUIRES resolution before merging lives
+    /// in `requiresConversationResolution`, which needs admin access on
+    /// that repository and is unreadable for most of them.
+    pub unresolved_threads: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,6 +214,58 @@ pub fn needs_attention_count(prs: &[PullRequest]) -> u64 {
     prs.iter().filter(|p| p.needs_attention()).count() as u64
 }
 
+/// One CI check on a pull request.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CheckRun {
+    pub name: String,
+    /// `success`, `failure`, `pending`, or the raw value when unmodelled.
+    pub state: String,
+    /// Where to see the run itself. Empty when GitHub gives none.
+    pub url: String,
+}
+
+/// One comment on a pull request.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PrComment {
+    pub author: String,
+    pub created_at: String,
+    pub body: String,
+}
+
+/// Everything the detail view renders.
+///
+/// A separate type from `PullRequest`: that one is a LIST row fetched 100
+/// at a time on a 2-minute loop, and adding a body and comments to it
+/// would make every poll carry data almost none of the rows need.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PrDetail {
+    /// GraphQL node ID. Every mutation takes this rather than a number,
+    /// so the detail view is what makes a PR actionable.
+    pub id: String,
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub state: String,
+    pub is_draft: bool,
+    pub body: String,
+    pub author: String,
+    pub repo: String,
+    pub head_ref: String,
+    /// The head commit, so an "update branch" click can tell GitHub which
+    /// commit the user was actually looking at.
+    pub head_oid: String,
+    pub base_ref: String,
+    pub merge_status: MergeStateStatus,
+    pub review: ReviewState,
+    pub additions: u64,
+    pub deletions: u64,
+    pub changed_files: u64,
+    pub unresolved_threads: u64,
+    pub comment_count: u64,
+    pub comments: Vec<PrComment>,
+    pub checks: Vec<CheckRun>,
+}
+
 #[cfg(test)]
 mod attention_tests {
     use super::*;
@@ -165,20 +275,26 @@ mod attention_tests {
             .unwrap()
             .with_timezone(&Utc);
         PullRequest {
+            id: "PR_test".into(),
             number: 1,
             title: "t".into(),
             url: "u".into(),
             repo: "acme/repo".into(),
             author: "a".into(),
             is_draft: false,
+            head_ref: "feature/x".into(),
+            head_oid: "deadbeef".into(),
+            base_ref: "main".into(),
             created_at: t,
             updated_at: t,
             ci,
             merge,
+            merge_status: MergeStateStatus::Clean,
             review: ReviewState::None,
             in_merge_queue: false,
             labels: vec![],
             comment_count: 0,
+            unresolved_threads: 0,
         }
     }
 

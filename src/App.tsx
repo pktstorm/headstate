@@ -5,20 +5,26 @@ import {
   usePullRequests,
   useRefreshRequested,
   useReviewing,
+  useViewCadence,
   useTruncation,
 } from "./api/hooks";
 import { FilterBar } from "./components/FilterBar";
 import { NudgeWizard } from "./components/NudgeWizard";
 import { PrioritiesStrip } from "./components/PrioritiesStrip";
+import { PrDetailView } from "./components/PrDetailView";
+import { BulkBar } from "./components/BulkBar";
 import { PrList } from "./components/PrList";
+import { ReviewChips } from "./components/ReviewChips";
 import { TriageChips } from "./components/TriageChips";
+import { WorktreeSidebar } from "./components/WorktreeSidebar";
+import { WorktreesPage } from "./components/WorktreesPage";
 import { QueryError, errorMessage } from "./components/QueryError";
 import { RepoSidebar } from "./components/RepoSidebar";
+import { StatusBar } from "./components/StatusBar";
 import { StatsPage } from "./components/StatsPage";
 import { applyFilters, hasActiveFilters, sortPrs } from "./lib/derive";
 import { shortcutFor } from "./lib/shortcuts";
-import { relativeTime } from "./lib/time";
-import { useFilters } from "./store/filters";
+import { useActiveFilters, useFilters } from "./store/filters";
 
 /// The assembled app shell. `AuthGate` already wraps this component once in
 /// `main.tsx` -- it is not repeated here, so there is exactly one
@@ -33,11 +39,13 @@ export default function App() {
     refetch,
     dataUpdatedAt,
   } = usePullRequests();
-  const { filters, view } = useFilters();
+  const filters = useActiveFilters();
+  const { view, panel, selectedPr, selectPr } = useFilters();
 
   // The tray's "Refresh now" menu item only emits `refresh-requested`; this
   // is what actually makes it do anything (see the hook's own comment).
   useRefreshRequested();
+  useViewCadence(view);
   const truncatedTotal = useTruncation();
   const { data: reviewing = [] } = useReviewing();
 
@@ -71,7 +79,11 @@ export default function App() {
   // Sorting was moved out of PrList in M3 -- it renders exactly the order
   // it's handed, so the sort dropdown in FilterBar is inert unless this
   // call site applies it.
-  const visible = sortPrs(applyFilters(prs, filters), filters.sort);
+  // The list the active view operates on. Everything downstream --
+  // sidebar counts, filters, the strip -- reads this rather than `prs`,
+  // so the two views share every component instead of duplicating them.
+  const source = view === "to-review" ? reviewing : prs;
+  const visible = sortPrs(applyFilters(source, filters), filters.sort);
 
   // The priorities strip is scoped to the selected repo, matching the page
   // it sits on: on `octocat/hello-world` you want that repo's blocked PRs,
@@ -82,7 +94,9 @@ export default function App() {
   // blocked on you stays blocked whether or not you happen to be filtering
   // by label, so a label filter must not hide it -- but a repo selection is
   // a change of page, and the strip should follow.
-  const scopedForStrip = filters.repo ? prs.filter((pr) => pr.repo === filters.repo) : prs;
+  const scopedForStrip = filters.repo
+    ? source.filter((pr) => pr.repo === filters.repo)
+    : source;
 
   // `repo` is navigation, not a filter (see the store's `reset`), so it
   // does not count -- an empty repo page should still explain itself.
@@ -92,8 +106,13 @@ export default function App() {
   // that survive whatever filter is already active, which would make some
   // combinations unreachable.
   return (
-    <div className="flex h-screen bg-[#0d1117] text-[#e6edf3]">
-      <RepoSidebar prs={prs} reviewingCount={reviewing.length} />
+    <div className="flex h-screen flex-col bg-[#0d1117] text-[#e6edf3]">
+      <div className="flex min-h-0 flex-1">
+      {view === "worktrees" ? (
+        <WorktreeSidebar viewCounts={{ "to-review": reviewing.length }} />
+      ) : (
+        <RepoSidebar prs={source} viewCounts={{ "to-review": reviewing.length }} />
+      )}
       <main className="flex-1 overflow-auto">
         <header className="flex items-center gap-2 border-b border-[#30363d] px-4 py-3">
           {/* View selection lives in the sidebar ("Stats", pinned to its
@@ -101,36 +120,38 @@ export default function App() {
               already where you choose what you are looking at, and a tab row
               repeated above every page competed with it. */}
           <h1 className="text-sm font-semibold">
-            {view === "dashboard"
-              ? "Stats"
-              : view === "reviewing"
-                ? "Awaiting your review"
-                : "Pull requests"}
+            {view === "to-review"
+              ? "Pull requests to review"
+              : view === "worktrees"
+                ? "Worktrees"
+                : panel === "stats"
+                  ? "Stats"
+                  : "Pull requests"}
           </h1>
-          {/* Freshness. `dataUpdatedAt` rather than `isFetching`: the tray
-              path calls refreshNow + setQueryData outside the queryFn, so
-              isFetching never flips for it, but setQueryData does advance
-              this on both paths. */}
-          {dataUpdatedAt > 0 && view !== "dashboard" ? (
-            <span className="ml-3 text-xs text-[#8b949e]">
-              Updated {relativeTime(new Date(dataUpdatedAt).toISOString())}
-            </span>
-          ) : null}
           <div className="ml-auto">
-            {/* scopedRepo skips the wizard's "which repositories?" step:
-                selecting a repo in the sidebar already answers it. */}
-            <NudgeWizard prs={prs} scopedRepo={filters.repo} />
+            {/* PR views only: composing a list of pull requests needing
+                review is meaningless on a page about local directories. */}
+            {view !== "worktrees" ? (
+              // scopedRepo skips the wizard's "which repositories?" step:
+              // selecting a repo in the sidebar already answers it.
+              <NudgeWizard prs={source} scopedRepo={filters.repo} />
+            ) : null}
           </div>
         </header>
 
-        {view === "reviewing" ? (
+        {selectedPr && view !== "worktrees" ? (
           <div className="p-4">
-            {/* Sorted newest-first like the main list. No filter bar: these
-                are other people's PRs, and the triage predicates here are
-                about the author's own work. */}
-            <PrList prs={sortPrs(reviewing, "newest")} hasFilters={false} />
+            <PrDetailView
+              repo={selectedPr.repo}
+              number={selectedPr.number}
+              onBack={() => selectPr(null)}
+            />
           </div>
-        ) : view === "dashboard" ? (
+        ) : view === "worktrees" ? (
+          <div className="p-4">
+            <WorktreesPage />
+          </div>
+        ) : panel === "stats" ? (
           <div className="p-4">
             {/* No priorities strip here: Stats is a read-only summary of the
                 whole account, and the strip is a triage surface that belongs
@@ -140,12 +161,20 @@ export default function App() {
           </div>
         ) : (
           <div className="p-4">
-            <PrioritiesStrip prs={scopedForStrip} />
+            {/* Only for My PRs: the strip means "blocked on YOU as
+                author", and someone else's red CI is not yours to fix. The
+                review view gets its own attention rule below. */}
+            {view === "my-prs" ? <PrioritiesStrip prs={scopedForStrip} /> : null}
             {/* Counts come from the same predicates the chips apply, so a
                 chip can never open a list that disagrees with its number.
                 Scoped to the sidebar selection like the strip above. */}
-            <TriageChips prs={scopedForStrip} />
-            <FilterBar prs={prs} />
+            {view === "my-prs" ? <TriageChips prs={scopedForStrip} /> : null}
+            {view === "to-review" ? <ReviewChips prs={scopedForStrip} /> : null}
+            <FilterBar prs={source} />
+            {/* Fed the UNFILTERED list on purpose: selection is keyed by
+                repo#number, so narrowing a filter after selecting must
+                not shrink the batch out from under the user. */}
+            {view === "my-prs" ? <BulkBar prs={source} /> : null}
             {isLoading ? (
               // `get_cached` returns `[]` both for "never polled" and for
               // "authenticated, first poll (~3s) still in flight" -- an
@@ -173,12 +202,19 @@ export default function App() {
               <PrList
                 prs={visible}
                 hasFilters={hasActiveFilters(filters)}
-                total={truncatedTotal ?? undefined}
+                total={view === "my-prs" ? (truncatedTotal ?? undefined) : undefined}
+                onOpen={(pr) => selectPr({ repo: pr.repo, number: pr.number })}
+                canWrite={view === "my-prs"}
+                selectable={view === "my-prs"}
               />
             )}
           </div>
         )}
       </main>
+      </div>
+      {/* Pinned below both the sidebar and the list, so it reads as the
+          window's status rather than the list's. */}
+      <StatusBar updatedAt={dataUpdatedAt} />
     </div>
   );
 }
