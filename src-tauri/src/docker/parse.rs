@@ -90,7 +90,7 @@ fn parse_created(s: &str) -> String {
 /// Treating them as powers of 1024 would overstate every size by 7% per
 /// order of magnitude, and this number is what a reclaim estimate is
 /// built from.
-pub fn parse_size(s: &str) -> u64 {
+pub(super) fn parse_size(s: &str) -> u64 {
     let s = s.trim();
     let (num, mult) = if let Some(n) = s.strip_suffix("GB") {
         (n, 1_000_000_000.0)
