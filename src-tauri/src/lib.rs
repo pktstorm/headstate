@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod commands;
+pub mod docker;
 pub mod github;
 pub mod poll;
 pub mod store;
