@@ -1439,11 +1439,8 @@ HEAD 8ed50a741e1696d1a0c9506f2e033cf2887bb144
 
         // The fixture's branch is genuinely unmerged, so a bulk call
         // naming it must refuse rather than delete.
-        let outcomes = remove_worktrees_with_progress(
-            repo_s,
-            &[wt.to_string_lossy().into_owned()],
-            |_, _| {},
-        );
+        let outcomes =
+            remove_worktrees_with_progress(repo_s, &[wt.to_string_lossy().into_owned()], |_, _| {});
         assert_eq!(outcomes.len(), 1);
         assert!(
             outcomes[0].error.is_some(),
