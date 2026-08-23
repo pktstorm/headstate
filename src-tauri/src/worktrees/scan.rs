@@ -1439,7 +1439,11 @@ HEAD 8ed50a741e1696d1a0c9506f2e033cf2887bb144
 
         // The fixture's branch is genuinely unmerged, so a bulk call
         // naming it must refuse rather than delete.
-        let outcomes = remove_worktrees(repo_s, &[wt.to_string_lossy().into_owned()]);
+        let outcomes = remove_worktrees_with_progress(
+            repo_s,
+            &[wt.to_string_lossy().into_owned()],
+            |_, _| {},
+        );
         assert_eq!(outcomes.len(), 1);
         assert!(
             outcomes[0].error.is_some(),
@@ -1456,12 +1460,13 @@ HEAD 8ed50a741e1696d1a0c9506f2e033cf2887bb144
         let (_t, repo, wt) = squash_merged_fixture(false);
         let repo_s = repo.to_str().unwrap();
 
-        let outcomes = remove_worktrees(
+        let outcomes = remove_worktrees_with_progress(
             repo_s,
             &[
                 "/nonexistent/path".to_string(),
                 wt.to_string_lossy().into_owned(),
             ],
+            |_, _| {},
         );
         assert_eq!(outcomes.len(), 2, "every input must get an outcome");
         assert!(outcomes.iter().all(|o| o.error.is_some()));
@@ -1880,10 +1885,6 @@ pub struct RemovalOutcome {
 /// repository's administrative files, so parallel removals in one repo
 /// contend on the same lock -- and at a few hundred milliseconds each
 /// the wall-clock saving would not repay the risk of interleaved writes.
-pub fn remove_worktrees(repo_path: &str, worktree_paths: &[String]) -> Vec<RemovalOutcome> {
-    remove_worktrees_with_progress(repo_path, worktree_paths, |_, _| {})
-}
-
 /// Remove worktrees, reporting after each one.
 ///
 /// Removal is sequential at a few hundred milliseconds each, so ~100
