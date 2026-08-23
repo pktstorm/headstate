@@ -13,10 +13,16 @@ const deleteBranch = vi.hoisted(() =>
     () => Promise.resolve(),
   ),
 );
+const reviewPr = vi.fn(() => Promise.resolve());
+
 vi.mock("../api/hooks", () => ({
   usePrDetail: () => ({ ...state, error: "boom", refetch: vi.fn() }),
   useActOnPr: () => vi.fn(() => Promise.resolve()),
   useDeleteHeadBranch: () => deleteBranch,
+  useReviewPr: () => reviewPr,
+  // The detail view treats undefined as "we could not ask", which is
+  // deliberately NOT the same as "this is mine" -- see ReviewBox.
+  useViewer: () => ({ data: undefined }),
 }));
 
 import { PrDetailView } from "./PrDetailView";
@@ -136,11 +142,34 @@ describe("PrDetailView", () => {
     expect(screen.getByText(/could not load this pull request/i)).toBeTruthy();
   });
 
-  // Deliberately absent: reviewing code belongs in GitHub or an editor.
-  it("does not pretend to offer a diff or a comment box", () => {
+  // This DELIBERATELY reverses an earlier assertion. The old test read
+  // "does not pretend to offer a diff or a comment box", encoding the
+  // v1 stance that reviewing belongs in GitHub. The comment box is now
+  // the point -- approving was the most common reviewer action and the
+  // one thing that still forced a trip to the browser.
+  //
+  // The diff genuinely stays absent: rendering one well is a different
+  // product, and the GitHub link remains the way there.
+  it("offers a review box but still no diff", () => {
     view();
-    expect(screen.queryByRole("textbox")).toBeNull();
+    expect(screen.getByRole("textbox")).toBeTruthy();
     expect(screen.getByRole("link", { name: /view on github/i })).toBeTruthy();
+    expect(screen.queryByText(/^@@/)).toBeNull();
+  });
+
+  it("submits a review through the hook", async () => {
+    view();
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "looks good" } });
+    fireEvent.click(screen.getByRole("button", { name: /^comment$/i }));
+    await waitFor(() =>
+      expect(reviewPr).toHaveBeenCalledWith(
+        "PR_test",
+        "octocat/hello-world",
+        42,
+        "comment",
+        "looks good",
+      ),
+    );
   });
 
   // 31 of the last 60 merged PRs on a real account still held a live
