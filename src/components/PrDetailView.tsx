@@ -1,6 +1,12 @@
 import { ArrowLeft, Trash2, Bot, Check, CircleDot, CircleSlash, ExternalLink, X } from "lucide-react";
 import { toast } from "sonner";
-import { useDeleteHeadBranch, usePrDetail, useReviewPr, useViewer } from "../api/hooks";
+import {
+  useCommentOnPr,
+  useDeleteHeadBranch,
+  usePrDetail,
+  useReviewPr,
+  useViewer,
+} from "../api/hooks";
 import { useState } from "react";
 import type { ReviewVerdictName } from "../api/tauri";
 import { agentPrompt, toAgentContext } from "../lib/agentPrompt";
@@ -65,6 +71,7 @@ export function PrDetailView({
   const { data: pr, isLoading, isError, error, refetch } = usePrDetail(repo, number);
   const deleteBranch = useDeleteHeadBranch();
   const review = useReviewPr();
+  const comment = useCommentOnPr();
   // Undefined until the login lands, and undefined FOREVER if it fails.
   // ReviewBox reads that as "might not be mine" rather than "is mine",
   // so a failed viewer fetch never silently removes the approve button.
@@ -147,8 +154,23 @@ export function PrDetailView({
         onSubmit={(verdict, body) => {
           setReviewing(verdict);
           const done = () => setReviewing(null);
-          const label = verdict === "approve" ? "Approved" : verdict === "request_changes" ? "Changes requested on" : "Commented on";
-          review(pr.id, pr.repo, pr.number, verdict, body).then(
+          const label =
+            verdict === "approve"
+              ? "Approved"
+              : verdict === "request_changes"
+                ? "Changes requested on"
+                : "Commented on";
+          // "Comment" posts a CONVERSATION comment, not a COMMENT
+          // review. They are different nodes: addComment creates an
+          // IssueComment, addPullRequestReview creates a
+          // PullRequestReview with state COMMENTED. The list above
+          // renders IssueComments -- so routing this through the review
+          // mutation would post something the user then could not see.
+          const submit =
+            verdict === "comment"
+              ? comment(pr.id, pr.repo, pr.number, body)
+              : review(pr.id, pr.repo, pr.number, verdict, body);
+          submit.then(
             () => {
               done();
               toast.success(`${label} ${pr.repo}#${pr.number}`);

@@ -14,12 +14,14 @@ const deleteBranch = vi.hoisted(() =>
   ),
 );
 const reviewPr = vi.fn(() => Promise.resolve());
+const commentOnPr = vi.fn(() => Promise.resolve());
 
 vi.mock("../api/hooks", () => ({
   usePrDetail: () => ({ ...state, error: "boom", refetch: vi.fn() }),
   useActOnPr: () => vi.fn(() => Promise.resolve()),
   useDeleteHeadBranch: () => deleteBranch,
   useReviewPr: () => reviewPr,
+  useCommentOnPr: () => commentOnPr,
   // The detail view treats undefined as "we could not ask", which is
   // deliberately NOT the same as "this is mine" -- see ReviewBox.
   useViewer: () => ({ data: undefined }),
@@ -59,7 +61,15 @@ function view(over: Partial<PrDetail> = {}) {
 }
 
 describe("PrDetailView", () => {
-  beforeEach(() => Object.assign(state, { data: undefined, isLoading: false, isError: false }));
+  beforeEach(() => {
+    Object.assign(state, { data: undefined, isLoading: false, isError: false });
+    // The mutation mocks are module-level, so without this a later test
+    // sees calls made by an earlier one -- which is exactly how the
+    // "not called" assertion below failed while passing in isolation.
+    reviewPr.mockClear();
+    commentOnPr.mockClear();
+    deleteBranch.mockClear();
+  });
 
   it("shows the title, number and branch pair", () => {
     view();
@@ -157,19 +167,35 @@ describe("PrDetailView", () => {
     expect(screen.queryByText(/^@@/)).toBeNull();
   });
 
-  it("submits a review through the hook", async () => {
+  it("submits a verdict through the review hook", async () => {
     view();
-    fireEvent.change(screen.getByRole("textbox"), { target: { value: "looks good" } });
-    fireEvent.click(screen.getByRole("button", { name: /^comment$/i }));
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "needs work" } });
+    fireEvent.click(screen.getByRole("button", { name: /request changes/i }));
     await waitFor(() =>
       expect(reviewPr).toHaveBeenCalledWith(
         "PR_test",
         "octocat/hello-world",
         42,
-        "comment",
-        "looks good",
+        "request_changes",
+        "needs work",
       ),
     );
+  });
+
+  // "Comment" must post a CONVERSATION comment, not a COMMENT review.
+  // They are different GraphQL nodes -- addComment makes an IssueComment,
+  // addPullRequestReview makes a PullRequestReview with state COMMENTED
+  // -- and the comment list in this view renders IssueComments. Routing
+  // it through the review mutation would post something the user could
+  // then not see in the list right above the box.
+  it("posts a plain comment through addComment, not as a review", async () => {
+    view();
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "looks good" } });
+    fireEvent.click(screen.getByRole("button", { name: /^comment$/i }));
+    await waitFor(() =>
+      expect(commentOnPr).toHaveBeenCalledWith("PR_test", "octocat/hello-world", 42, "looks good"),
+    );
+    expect(reviewPr).not.toHaveBeenCalled();
   });
 
   // 31 of the last 60 merged PRs on a real account still held a live
