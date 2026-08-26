@@ -1138,7 +1138,10 @@ pub async fn count_reviewing(client: State<'_, GhClient>) -> Result<u64, String>
 }
 
 #[tauri::command]
-pub async fn get_reviewing(client: State<'_, GhClient>) -> Result<Vec<PullRequest>, String> {
+pub async fn get_reviewing(
+    app: AppHandle,
+    client: State<'_, GhClient>,
+) -> Result<Vec<PullRequest>, String> {
     // TEMPORARY DIAGNOSTIC LOGGING (v3.5.3). Brackets the whole
     // command, so the log distinguishes the three ways To review can
     // appear stuck: the command was never invoked (no start line), it
@@ -1147,7 +1150,22 @@ pub async fn get_reviewing(client: State<'_, GhClient>) -> Result<Vec<PullReques
     log::info!("[diag] cmd get_reviewing start");
     let started = std::time::Instant::now();
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
-    let out = client.fetch_reviewing().await.map_err(|e| e.to_string());
+    let out = client
+        .fetch_reviewing_with_shortfall()
+        .await
+        .map(|(prs, short)| {
+            // Tell the UI when the list is SHORT. The 100 -> 50 fallback
+            // returns fewer pull requests than exist and everything
+            // downstream presented that as complete -- the v3.5.3 log
+            // caught 50 shown against a count of 62, with twelve gone
+            // silently. Emitted even when zero, so a recovered fetch
+            // clears a banner an earlier one raised.
+            if let Err(e) = app.emit("reviewing-short", short) {
+                log::warn!("failed to emit reviewing-short: {e}");
+            }
+            prs
+        })
+        .map_err(|e| e.to_string());
     log::info!(
         "[diag] cmd get_reviewing end {}ms {}",
         started.elapsed().as_millis(),

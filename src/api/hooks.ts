@@ -96,12 +96,7 @@ export function usePullRequests() {
 
   return useQuery({
     queryKey: ["prs"],
-    queryFn: timed("prs", async () => {
-      const cached = await getCached();
-      // Show the cache immediately; the poll loop supplies fresh data.
-      if (cached.length > 0) return cached;
-      return refreshNow();
-    }),
+    queryFn: PRS_FN,
     staleTime: Infinity,
   });
 }
@@ -322,6 +317,23 @@ export function useViewCadence(view: string): void {
 /// Costs one extra request per write (2 rate-limit points against
 /// 5000/hour). It stays NON-OPTIMISTIC: the row disappears because GitHub
 /// says it is gone, never because we assumed the write succeeded.
+/// Query functions, defined ONCE at module scope.
+///
+/// `timed()` returns a new function on every call, so wrapping inline
+/// in a hook body handed TanStack a different `queryFn` identity each
+/// render. Hoisting is correct regardless of whether that ever caused
+/// a refetch: a queryFn is configuration, and rebuilding it per render
+/// is the kind of thing that bites later even when it is currently
+/// harmless.
+const REVIEWING_FN = timed("reviewing", getReviewing);
+const REVIEWING_COUNT_FN = timed("reviewing-count", countReviewing);
+const PRS_FN = timed("prs", async () => {
+  const cached = await getCached();
+  // Show the cache immediately; the poll loop supplies fresh data.
+  if (cached.length > 0) return cached;
+  return refreshNow();
+});
+
 async function refreshPrs(qc: QueryClient): Promise<void> {
   try {
     qc.setQueryData(["prs"], await refreshNow());
@@ -874,7 +886,7 @@ export function useNotifyPrefs() {
 export function useReviewing(enabled = true) {
   return useQuery({
     queryKey: ["reviewing"],
-    queryFn: timed("reviewing", getReviewing),
+    queryFn: REVIEWING_FN,
     // Only the view that RENDERS these pull requests fetches them. It
     // used to run on every view -- including Docker and Worktrees, which
     // show none -- purely so a sidebar badge could display its length.
@@ -894,7 +906,7 @@ export function useReviewing(enabled = true) {
 export function useReviewingCount() {
   return useQuery({
     queryKey: ["reviewing-count"],
-    queryFn: timed("reviewing-count", countReviewing),
+    queryFn: REVIEWING_COUNT_FN,
     staleTime: 60_000,
   });
 }
@@ -932,6 +944,43 @@ export function useIncomplete(): number {
   }, []);
 
   return refused;
+}
+
+/// How many pull requests the review list is MISSING, or 0.
+///
+/// The 100 -> 50 fallback returns a short list and everything
+/// downstream presented it as complete. The v3.5.3 diagnostic log
+/// caught the consequence on a real machine: 50 pull requests shown
+/// against a count of 62, with twelve gone and nothing to say so. That
+/// is almost certainly the "numbers are off" report -- the sidebar
+/// badge and the panel come from different queries, and only one of
+/// them got truncated.
+///
+/// Advisory, like `useTruncation` and `useIncomplete`: the pull
+/// requests that arrived are real, so the list is shown and annotated
+/// rather than replaced with an error.
+export function useReviewShortfall(): number {
+  const [short, setShort] = useState(0);
+
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    listen<number>("reviewing-short", (e) => setShort(e.payload)).then(
+      (fn) => {
+        if (cancelled) safeUnlisten(fn);
+        else unlisten = fn;
+      },
+      // Same tolerance as the other advisories: a notice must not break
+      // the page when the event bridge is absent.
+      () => {},
+    );
+    return () => {
+      cancelled = true;
+      safeUnlisten(unlisten);
+    };
+  }, []);
+
+  return short;
 }
 
 export function useTruncation(): number | null {

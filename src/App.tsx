@@ -9,6 +9,7 @@ import {
   useViewCadence,
   useTruncation,
   useIncomplete,
+  useReviewShortfall,
   usePollError,
 } from "./api/hooks";
 import { useReviewingDiag } from "./api/diag";
@@ -68,6 +69,7 @@ export default function App() {
   useViewCadence(view);
   const truncatedTotal = useTruncation();
   const refusedFields = useIncomplete();
+  const reviewShortfall = useReviewShortfall();
   const pollError = usePollError();
   // The LIST only where it is rendered. The badge below uses a count
   // query instead, so Docker and Worktrees no longer fetch 100 pull
@@ -305,6 +307,18 @@ export default function App() {
                 {refusedFields === 1 ? "" : "s"} on the last refresh, so some pull
                 requests may be missing details or absent. It usually recovers on
                 the next one.
+              </p>
+            ) : null}
+            {/* The 100 -> 50 fallback returns a SHORT list, and this is
+                the only thing that says so. Without it the panel shows
+                50 pull requests under a sidebar badge reading 62, with
+                nothing to explain the gap -- which is what "the numbers
+                are off" was describing. */}
+            {view === "to-review" && reviewShortfall > 0 ? (
+              <p className="mb-3 rounded-md border border-[#d29922]/40 bg-[#d29922]/5 px-4 py-2 text-xs text-[#d29922]">
+                {reviewShortfall} pull request{reviewShortfall === 1 ? " is" : "s are"}{" "}
+                missing from this list — GitHub could not answer the full query, so
+                it was retried for fewer. Refreshing usually returns the rest.
               </p>
             ) : null}
             <FilterBar prs={source} />
