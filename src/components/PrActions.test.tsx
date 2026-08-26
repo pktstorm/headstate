@@ -38,6 +38,37 @@ const pr = (over: Partial<PrDetail> = {}): PrDetail => ({
 });
 
 describe("PrActions", () => {
+  /// Close is irreversible from here -- `inverseOf` gives it no undo --
+  /// and it sits beside "Back to list", where a bare "Close" reads as
+  /// "close this view". Both halves of that fix are asserted: the words
+  /// and the destructive styling.
+  it("names the close action so it cannot be read as closing the view", () => {
+    render(<PrActions pr={pr()} />);
+    expect(screen.queryByRole("button", { name: "Close" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Close PR" })).toBeTruthy();
+  });
+
+  it("styles close destructively, unlike its neutral neighbours", () => {
+    render(<PrActions pr={pr()} />);
+    const close = screen.getByRole("button", { name: "Close PR" });
+    const neutral = screen.getByRole("button", { name: "Convert to draft" });
+    expect(close.className).toContain("f85149");
+    expect(neutral.className).not.toContain("f85149");
+  });
+
+  /// The button and the toast need DIFFERENT words. Reusing the button
+  /// label lowercased -- which is what the code did before -- produces
+  /// "octocat/hello-world#42 - close pr".
+  it("reports the close in past tense, not as the button's label", async () => {
+    render(<PrActions pr={pr()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Close PR" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close pull request" }));
+    await waitFor(() => expect(toastSuccess).toHaveBeenCalled());
+    const msg = toastSuccess.mock.calls[0][0] as string;
+    expect(msg).toContain("closed");
+    expect(msg).not.toContain("close pr");
+  });
+
   beforeEach(() => {
     actFn.mockClear();
     actFn.mockImplementation(() => Promise.resolve());
@@ -58,14 +89,14 @@ describe("PrActions", () => {
   // Closing loses review context and is rare, so it earns a dialog.
   it("confirms before closing", () => {
     render(<PrActions pr={pr()} />);
-    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close PR" }));
     expect(actFn).not.toHaveBeenCalled();
     expect(screen.getByRole("dialog")).toBeTruthy();
   });
 
   it("closes only after confirmation", () => {
     render(<PrActions pr={pr()} />);
-    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close PR" }));
     fireEvent.click(
       within(screen.getByRole("dialog")).getByRole("button", { name: /close pull request/i }),
     );
@@ -74,7 +105,7 @@ describe("PrActions", () => {
 
   it("cancelling closes nothing", () => {
     render(<PrActions pr={pr()} />);
-    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close PR" }));
     fireEvent.click(screen.getByRole("button", { name: /cancel/i }));
     expect(actFn).not.toHaveBeenCalled();
   });

@@ -34,9 +34,26 @@ function unavailable(pr: PrDetail, action: PrActionName): string | null {
   }
 }
 
+/// What the TOAST says, as a verb phrase.
+///
+/// Separate from `LABEL` because the button and the sentence want
+/// different words: the button says "Close PR" so it cannot be mistaken
+/// for closing the view (it sits beside "Back to list"), while the toast
+/// says "closed" -- `LABEL[action].toLowerCase()` would render "close pr".
+const VERB: Record<PrActionName, string> = {
+  merge: "merged",
+  close: "closed",
+  reopen: "reopened",
+  draft: "converted to draft",
+  ready: "marked ready for review",
+  enqueue: "added to merge queue",
+  dequeue: "removed from merge queue",
+};
+
+/// What the BUTTON says.
 const LABEL: Record<PrActionName, string> = {
   merge: "Merge",
-  close: "Close",
+  close: "Close PR",
   reopen: "Reopen",
   draft: "Convert to draft",
   ready: "Mark ready for review",
@@ -55,7 +72,7 @@ export function PrActions({ pr }: { pr: PrDetail }) {
       () => {
         setBusy(null);
         const back = inverseOf(action);
-        toast.success(`${pr.repo}#${pr.number} — ${LABEL[action].toLowerCase()}`, {
+        toast.success(`${pr.repo}#${pr.number} — ${VERB[action]}`, {
           // Only for actions with a true inverse. Merge and close are
           // deliberately absent -- see `inverseOf`.
           action: back
@@ -67,7 +84,7 @@ export function PrActions({ pr }: { pr: PrDetail }) {
                     () => {
                       setBusy(null);
                       toast.success(
-                        `${pr.repo}#${pr.number} — ${LABEL[back].toLowerCase()}`,
+                        `${pr.repo}#${pr.number} — ${VERB[back]}`,
                       );
                     },
                     (e: unknown) => {
@@ -87,7 +104,7 @@ export function PrActions({ pr }: { pr: PrDetail }) {
         // GitHub's refusal text is the useful part: "base branch was
         // modified" tells the user what to do, where a generic message
         // does not.
-        toast.error(`Could not ${LABEL[action].toLowerCase()} #${pr.number}`, {
+        toast.error(`Could not ${VERB[action]} #${pr.number}`, {
           description: typeof e === "string" ? e : undefined,
         });
       },
@@ -109,6 +126,10 @@ export function PrActions({ pr }: { pr: PrDetail }) {
       {offered.map((action) => {
         const why = unavailable(pr, action);
         const primary = action === "merge";
+        // Closing a pull request is destructive and irreversible from
+        // here (`inverseOf` deliberately gives close no undo), so it is
+        // the one action that must not look like its neutral neighbours.
+        const destructive = action === "close";
         return (
           <button
             key={action}
@@ -121,7 +142,9 @@ export function PrActions({ pr }: { pr: PrDetail }) {
                 ? "border border-[#30363d] text-[#8b949e] opacity-50"
                 : primary
                   ? "bg-[#238636] font-medium text-white hover:bg-[#2ea043]"
-                  : "border border-[#30363d] text-[#e6edf3] hover:bg-[#161b22]"
+                  : destructive
+                    ? "border border-[#f85149]/40 text-[#f85149] hover:bg-[#f85149]/10"
+                    : "border border-[#30363d] text-[#e6edf3] hover:bg-[#161b22]"
             }`}
           >
             {busy === action ? "Working…" : LABEL[action]}

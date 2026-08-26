@@ -1,6 +1,6 @@
 import { emit } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import {
   usePullRequests,
   useRefreshRequested,
@@ -12,6 +12,7 @@ import {
   usePollError,
 } from "./api/hooks";
 import { useReviewingDiag } from "./api/diag";
+import { useScrollReset } from "./lib/scrollReset";
 import { FilterBar } from "./components/FilterBar";
 import { NudgeWizard } from "./components/NudgeWizard";
 import { PrioritiesStrip } from "./components/PrioritiesStrip";
@@ -50,6 +51,16 @@ export default function App() {
   } = usePullRequests();
   const filters = useActiveFilters();
   const { view, panel, selectedPr, selectPr, applyPreset } = useFilters();
+  // The main panel is the scroll container for every view, so the reset
+  // hangs off it rather than off each page.
+  const mainRef = useRef<HTMLElement>(null);
+  // Every axis that changes WHAT is rendered, and nothing that merely
+  // changes the data within it. A poll tick refreshing the same list
+  // must not scroll the user away from what they are reading.
+  useScrollReset(
+    mainRef,
+    `${view}|${panel}|${filters.repo ?? ""}|${selectedPr ? `${selectedPr.repo}#${selectedPr.number}` : ""}`,
+  );
 
   // The tray's "Refresh now" menu item only emits `refresh-requested`; this
   // is what actually makes it do anything (see the hook's own comment).
@@ -186,7 +197,7 @@ export default function App() {
       ) : (
         <RepoSidebar prs={source} viewCounts={{ "to-review": reviewingCount }} />
       )}
-      <main className="flex-1 overflow-auto">
+      <main ref={mainRef} className="flex-1 overflow-auto">
         <header className="flex items-center gap-2 border-b border-[#30363d] px-4 py-3">
           {/* View selection lives in the sidebar ("Stats", pinned to its
               bottom) rather than as a per-page tab pair here: the sidebar is
