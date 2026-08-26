@@ -36,6 +36,7 @@ import {
   removeWorktrees,
   sizeWorktrees,
   getReviewing,
+  getCachedReviewing,
   countReviewing,
   getStats,
   refreshNow,
@@ -326,6 +327,7 @@ export function useViewCadence(view: string): void {
 /// is the kind of thing that bites later even when it is currently
 /// harmless.
 const REVIEWING_FN = timed("reviewing", getReviewing);
+const CACHED_REVIEWING_FN = timed("reviewing-cached", getCachedReviewing);
 const REVIEWING_COUNT_FN = timed("reviewing-count", countReviewing);
 const PRS_FN = timed("prs", async () => {
   const cached = await getCached();
@@ -884,7 +886,27 @@ export function useNotifyPrefs() {
 /// about the queue the user is the bottleneck for -- the largest gap for a
 /// daily driver. Same 60s staleness as the authored list.
 export function useReviewing(enabled = true) {
-  return useQuery({
+  // The cached list, read from SQLite and never from GitHub. Its own
+  // query so it resolves in milliseconds while the live one runs --
+  // folding the cache into the live queryFn instead would let a cached
+  // result satisfy `staleTime` and leave the list permanently stale.
+  //
+  // The measurements on #328 are what make this the fix rather than a
+  // workaround: the live query cannot be made meaningfully faster (a
+  // bare 25-item search already costs 6.2s, and every field trim
+  // measured as noise), so the win has to come from not blocking the
+  // panel on it.
+  const cached = useQuery({
+    queryKey: ["reviewing-cached"],
+    queryFn: CACHED_REVIEWING_FN,
+    enabled,
+    // Read once per mount. The live query is what keeps the view
+    // current; re-reading the cache would only ever show older data.
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+
+  const live = useQuery({
     queryKey: ["reviewing"],
     queryFn: REVIEWING_FN,
     // Only the view that RENDERS these pull requests fetches them. It
@@ -895,6 +917,28 @@ export function useReviewing(enabled = true) {
     enabled,
     staleTime: 60_000,
   });
+
+  // Live data the moment it exists; the cache only until then. Note
+  // `live.data` is checked rather than `live.isSuccess`, so a refetch
+  // still in flight keeps showing the previous LIVE list rather than
+  // falling back to a staler cached one.
+  const data = live.data ?? cached.data;
+
+  return {
+    ...live,
+    data,
+    // Loading only when there is genuinely nothing to show. With a warm
+    // cache the panel paints immediately, which is the whole point --
+    // the reported complaint was an empty view for over a minute.
+    isLoading: data === undefined && (live.isLoading || cached.isLoading),
+    // True while the live query runs, INCLUDING when the cache is
+    // already painted. This drives the "refreshing" indicator, which is
+    // the other half of the complaint: "no indication that it is
+    // blocked".
+    isRefreshing: live.isFetching,
+    /// Whether what is on screen came from disk rather than GitHub.
+    isFromCache: live.data === undefined && cached.data !== undefined,
+  };
 }
 
 

@@ -86,6 +86,8 @@ export default function App() {
     isError: reviewingError,
     error: reviewingErr,
     refetch: refetchReviewing,
+    isRefreshing: reviewingRefreshing,
+    isFromCache: reviewingFromCache,
   } = reviewingQuery;
   // TEMPORARY DIAGNOSTIC LOGGING (v3.5.3).
   useReviewingDiag({
@@ -319,6 +321,16 @@ export default function App() {
                 {reviewShortfall} pull request{reviewShortfall === 1 ? " is" : "s are"}{" "}
                 missing from this list — GitHub could not answer the full query, so
                 it was retried for fewer. Refreshing usually returns the rest.
+              </p>
+            ) : null}
+            {/* The other half of the reported complaint: "no indication
+                that it is blocked". The list now paints from the cache
+                immediately, so without this the user would be looking
+                at stale data with nothing to say it was being
+                refreshed. */}
+            {view === "to-review" && reviewingRefreshing && reviewingFromCache ? (
+              <p className="mb-3 rounded-md border border-[#30363d] bg-[#161b22] px-4 py-2 text-xs text-[#8b949e]">
+                Showing the last saved list — checking GitHub for changes…
               </p>
             ) : null}
             <FilterBar prs={source} />
