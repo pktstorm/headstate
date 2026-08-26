@@ -278,6 +278,18 @@ query($owner: String!, $repo: String!, $number: Int!) {
         nodes { author { login } createdAt body }
       }
       reviewThreads(first: 20) { nodes { isResolved isOutdated } }
+      # The VIEWER's own latest review, which is a different question
+      # from `reviewDecision`. The decision is the pull request's
+      # aggregate state: it reads CHANGES_REQUESTED when someone else
+      # blocked it, and REVIEW_REQUIRED when a second approval is
+      # outstanding -- neither of which tells the user whether THEIR
+      # click landed. Approving and then seeing an unchanged button is
+      # the reported confusion, so the answer has to be per-viewer.
+      #
+      # `latestReviews` returns one review per reviewer, so a small page
+      # covers any realistic pull request and the viewer's entry is
+      # found by matching login.
+      latestReviews(first: 20) { nodes { state author { login } } }
       commits(last: 1) {
         nodes { commit { statusCheckRollup {
           state

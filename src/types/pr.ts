@@ -239,6 +239,13 @@ export interface PrDetail {
   base_ref: string;
   merge_status: string;
   review: string;
+  /// Every reviewer's latest review state, keyed by login.
+  ///
+  /// A different question from `review`, which is the pull request's
+  /// AGGREGATE decision: it reads "changes_requested" when someone else
+  /// blocked it. Matching the viewer's login against this is the only
+  /// way to answer "did MY approval land".
+  latest_reviews: { author: string; state: string }[];
   additions: number;
   deletions: number;
   changed_files: number;

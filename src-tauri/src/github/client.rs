@@ -407,10 +407,30 @@ impl GitHubClient {
         Ok(())
     }
 
+    /// Like `graphql_mutation`, but hands back the `data` object.
+    ///
+    /// Most mutations only need "did it fail", so `graphql_mutation`
+    /// discards the payload. A review is different: the response carries
+    /// the state the review actually landed in, and that is the only way
+    /// to distinguish an approval from one GitHub filed as PENDING.
+    pub(super) async fn graphql_mutation_data(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.graphql_mutation_inner(body).await
+    }
+
     pub(super) async fn graphql_mutation(
         &self,
         body: &serde_json::Value,
     ) -> Result<(), ClientError> {
+        self.graphql_mutation_inner(body).await.map(|_| ())
+    }
+
+    async fn graphql_mutation_inner(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, ClientError> {
         let raw: serde_json::Value = self.octocrab.post("/graphql", Some(body)).await?;
 
         if let Some(errs) = raw.get("errors").and_then(|e| e.as_array()) {
@@ -430,12 +450,12 @@ impl GitHubClient {
 
         // A response with neither errors nor data means something is
         // wrong with our request shape; do not report success for it.
-        if raw.get("data").is_none_or(|d| d.is_null()) {
-            return Err(ClientError::Graphql(
+        match raw.get("data") {
+            Some(d) if !d.is_null() => Ok(d.clone()),
+            _ => Err(ClientError::Graphql(
                 "GitHub returned no result for the change".into(),
-            ));
+            )),
         }
-        Ok(())
     }
 
     /// Everything the detail view needs, in one request at cost 1.
@@ -785,6 +805,7 @@ async fn graphql_partial_ok(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::mutate::ReviewVerdict;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -814,6 +835,78 @@ mod tests {
         let prs = client_for(&server).await.fetch_prs().await.unwrap();
         assert_eq!(prs.len(), 3);
         assert_eq!(prs[0].number, 42);
+    }
+
+    /// The reported bug, at its root: "I clicked approve, saw no error,
+    /// and it had not worked."
+    ///
+    /// GitHub can accept `addPullRequestReview` and file the review as
+    /// PENDING -- HTTP 200, no `errors` array, nothing for the old code
+    /// to object to. It reported success, the button reset to "Approve",
+    /// and the approval was never submitted.
+    #[tokio::test]
+    async fn a_review_left_pending_is_reported_as_a_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "addPullRequestReview": {
+                    "pullRequestReview": { "state": "PENDING" }
+                }}
+            })))
+            .mount(&server)
+            .await;
+
+        let err = client_for(&server)
+            .await
+            .add_review("PR_1", ReviewVerdict::Approve, "")
+            .await
+            .expect_err("a pending review has not been submitted");
+        assert!(
+            err.to_string().contains("pending"),
+            "the message must say what actually happened: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_submitted_review_succeeds() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "addPullRequestReview": {
+                    "pullRequestReview": { "state": "APPROVED" }
+                }}
+            })))
+            .mount(&server)
+            .await;
+        assert!(client_for(&server)
+            .await
+            .add_review("PR_1", ReviewVerdict::Approve, "")
+            .await
+            .is_ok());
+    }
+
+    /// An unfamiliar state must NOT be treated as failure. Guessing that
+    /// an unrecognised value means the review did not land would break
+    /// approving outright the next time GitHub adds a state.
+    #[tokio::test]
+    async fn an_unrecognised_review_state_is_not_treated_as_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "addPullRequestReview": {
+                    "pullRequestReview": { "state": "SOMETHING_NEW" }
+                }}
+            })))
+            .mount(&server)
+            .await;
+        assert!(client_for(&server)
+            .await
+            .add_review("PR_1", ReviewVerdict::Approve, "")
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

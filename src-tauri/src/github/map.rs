@@ -2,7 +2,7 @@
 
 use super::model::{
     CheckRun, CiState, CycleTrend, HistoryPoint, Label, MergeState, MergeStateStatus, MergedDetail,
-    MergedPr, PrComment, PrDetail, PullRequest, RepoCount, ReviewState,
+    MergedPr, PrComment, PrDetail, PullRequest, RepoCount, ReviewState, ReviewerVerdict,
 };
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
@@ -111,6 +111,20 @@ pub fn map_detail(v: &Value, repo: &str) -> PrDetail {
         base_ref: pr["baseRefName"].as_str().unwrap_or_default().to_string(),
         merge_status: merge_status(pr),
         review: review_state(pr),
+        latest_reviews: pr["latestReviews"]["nodes"]
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            // A review whose author GitHub cannot name is useless for
+            // matching against the viewer's login, so it is dropped
+            // rather than mapped to a placeholder that could collide.
+            .filter_map(|r| {
+                Some(ReviewerVerdict {
+                    author: r["author"]["login"].as_str()?.to_string(),
+                    state: r["state"].as_str()?.to_string(),
+                })
+            })
+            .collect(),
         additions: pr["additions"].as_u64().unwrap_or(0),
         deletions: pr["deletions"].as_u64().unwrap_or(0),
         changed_files: pr["changedFiles"].as_u64().unwrap_or(0),
@@ -721,6 +735,34 @@ mod tests {
         assert_eq!(d.checks[1].name, "legacy", "StatusContext uses `context`");
         assert_eq!(d.checks[1].state, "failure");
         assert_eq!(d.comments[0].author, "octocat");
+    }
+
+    /// The viewer's OWN verdict, which `reviewDecision` cannot answer.
+    ///
+    /// This payload is the exact case that made the reported bug
+    /// invisible: the viewer approved, someone else requested changes,
+    /// so the aggregate decision is CHANGES_REQUESTED. Reading the
+    /// aggregate would tell the user their approval had not landed.
+    #[test]
+    fn maps_each_reviewers_latest_verdict_separately_from_the_decision() {
+        let v = json!({"repository": {"pullRequest": {
+            "number": 42,
+            "reviewDecision": "CHANGES_REQUESTED",
+            "latestReviews": {"nodes": [
+                {"state": "APPROVED", "author": {"login": "octocat"}},
+                {"state": "CHANGES_REQUESTED", "author": {"login": "hubot"}},
+                // No author: unmatched against any login, so dropped
+                // rather than given a placeholder that could collide
+                // with a real user.
+                {"state": "APPROVED", "author": null}
+            ]}
+        }}});
+        let d = map_detail(&v, "octocat/hello-world");
+        assert_eq!(d.review, ReviewState::ChangesRequested);
+        assert_eq!(d.latest_reviews.len(), 2, "the authorless review is dropped");
+        assert_eq!(d.latest_reviews[0].author, "octocat");
+        assert_eq!(d.latest_reviews[0].state, "APPROVED");
+        assert_eq!(d.latest_reviews[1].state, "CHANGES_REQUESTED");
     }
 
     /// A PR with no checks, no comments and a null author must not panic:
