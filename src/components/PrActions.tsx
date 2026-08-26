@@ -117,15 +117,31 @@ export function PrActions({ pr }: { pr: PrDetail }) {
   const invoke = (action: PrActionName) =>
     action === "close" ? setPending(action) : run(action);
 
+  // ONE primary action, chosen by whether the base branch queues.
+  //
+  // Offering both Merge and "Add to merge queue" side by side asked the
+  // user to know which one their repo needs -- and on a queue-enabled
+  // branch, Merge is simply the wrong button. `isMergeQueueEnabled` is
+  // per-pull-request, so this follows the base branch rather than a
+  // repo-wide guess.
+  //
+  // `dequeue` replaces it entirely once the PR is queued: the only
+  // useful action then is getting it back out.
+  const primaryMerge: PrActionName = pr.in_merge_queue
+    ? "dequeue"
+    : pr.merge_queue_enabled
+      ? "enqueue"
+      : "merge";
+
   const offered: PrActionName[] = pr.is_draft
     ? ["ready", "close"]
-    : ["merge", "enqueue", "draft", "close"];
+    : [primaryMerge, "draft", "close"];
 
   return (
     <div className="flex flex-wrap items-center gap-2">
       {offered.map((action) => {
         const why = unavailable(pr, action);
-        const primary = action === "merge";
+        const primary = action === primaryMerge && action !== "dequeue";
         // Closing a pull request is destructive and irreversible from
         // here (`inverseOf` deliberately gives close no undo), so it is
         // the one action that must not look like its neutral neighbours.

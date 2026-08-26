@@ -246,6 +246,13 @@ export interface PrDetail {
   /// blocked it. Matching the viewer's login against this is the only
   /// way to answer "did MY approval land".
   latest_reviews: { author: string; state: string }[];
+  /// Whether this pull request's base branch uses a merge queue.
+  ///
+  /// Chooses between Merge and Add to merge queue, so the user is not
+  /// asked to pick between two buttons only one of which can work.
+  merge_queue_enabled: boolean;
+  /// Whether it is currently queued (and not rejected by the queue).
+  in_merge_queue: boolean;
   additions: number;
   deletions: number;
   changed_files: number;

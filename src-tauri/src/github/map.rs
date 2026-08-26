@@ -111,6 +111,8 @@ pub fn map_detail(v: &Value, repo: &str) -> PrDetail {
         base_ref: pr["baseRefName"].as_str().unwrap_or_default().to_string(),
         merge_status: merge_status(pr),
         review: review_state(pr),
+        merge_queue_enabled: pr["isMergeQueueEnabled"].as_bool().unwrap_or(false),
+        in_merge_queue: in_merge_queue(pr),
         latest_reviews: pr["latestReviews"]["nodes"]
             .as_array()
             .unwrap_or(&empty)
@@ -133,6 +135,23 @@ pub fn map_detail(v: &Value, repo: &str) -> PrDetail {
         comments,
         checks,
     }
+}
+
+/// Is this pull request genuinely sitting in the merge queue?
+///
+/// `isInMergeQueue` stays TRUE for an entry the queue has REJECTED, so
+/// reading it alone renders a stuck pull request as calmly queued. The
+/// entry's own state is what separates them.
+///
+/// Shared by the list and detail mappers deliberately: they must agree,
+/// or the row and the button it opens would disagree about whether the
+/// pull request is queued.
+fn in_merge_queue(node: &Value) -> bool {
+    node["isInMergeQueue"].as_bool().unwrap_or(false)
+        && !matches!(
+            node["mergeQueueEntry"]["state"].as_str(),
+            Some("UNMERGEABLE") | Some("LOCKED")
+        )
 }
 
 /// Open review conversations on the current code.
@@ -239,11 +258,7 @@ fn map_node(node: &Value) -> Option<PullRequest> {
         // An absent entry falls back to the flag: `mergeQueueEntry` is
         // null on repositories without a merge queue, where
         // `isInMergeQueue` is false anyway.
-        in_merge_queue: node["isInMergeQueue"].as_bool().unwrap_or(false)
-            && !matches!(
-                node["mergeQueueEntry"]["state"].as_str(),
-                Some("UNMERGEABLE") | Some("LOCKED")
-            ),
+        in_merge_queue: in_merge_queue(node),
         labels: labels(node),
         comment_count: node["totalCommentsCount"].as_u64().unwrap_or(0),
         unresolved_threads: unresolved_threads(node),

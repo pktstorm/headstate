@@ -317,6 +317,18 @@ pub struct PrDetail {
     /// through the client and mapper for one field.
     #[serde(default)]
     pub latest_reviews: Vec<ReviewerVerdict>,
+    /// Whether this pull request's base branch uses a merge queue.
+    ///
+    /// Decides whether the primary action merges or enqueues. Defaults
+    /// to false when absent, which is the safe direction: it offers a
+    /// plain Merge, and GitHub refuses that if the branch really does
+    /// require the queue. Defaulting the other way would hide Merge on
+    /// every repo the field could not be read for.
+    #[serde(default)]
+    pub merge_queue_enabled: bool,
+    /// Whether it is currently queued (and not rejected by the queue).
+    #[serde(default)]
+    pub in_merge_queue: bool,
     pub additions: u64,
     pub deletions: u64,
     pub changed_files: u64,

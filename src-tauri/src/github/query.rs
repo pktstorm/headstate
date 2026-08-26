@@ -268,6 +268,20 @@ query($owner: String!, $repo: String!, $number: Int!) {
     pullRequest(number: $number) {
       id number title url state isDraft body
       mergeable mergeStateStatus reviewDecision
+      # Does THIS pull request's base branch use a merge queue?
+      #
+      # Per-pull-request rather than per-repository, which is the only
+      # correct granularity: the setting is branch-scoped, so a repo can
+      # queue `main` and not `release/*`, and asking at the repo level
+      # would mislabel the button on every PR targeting another branch.
+      #
+      # MEASURED against the live API: the detail query still costs 1
+      # point with this field, so it is affordable here in a way it
+      # would not be on `PRS_QUERY` -- see #312.
+      isMergeQueueEnabled
+      # Same pair as the list query, and mapped by the same function:
+      # `isInMergeQueue` alone reports a REJECTED entry as queued.
+      isInMergeQueue mergeQueueEntry { state }
       additions deletions changedFiles
       headRefName headRefOid baseRefName
         headRef { id }
@@ -278,6 +292,23 @@ query($owner: String!, $repo: String!, $number: Int!) {
         nodes { author { login } createdAt body }
       }
       reviewThreads(first: 20) { nodes { isResolved isOutdated } }
+      # Does the BASE branch of this pull request use a merge queue?
+      #
+      # `mergeQueue(branch:)` is branch-scoped because the setting is:
+      # a repository can queue `main` and not `release/*`. Asking about
+      # the PR's own base branch is therefore the only correct question
+      # -- the repository-wide form would answer about the default
+      # branch and mislabel the button on every PR targeting another.
+      #
+      # MEASURED: adds nothing to the query cost (the whole detail
+      # query still totals 1 point), so this is affordable in a way the
+      # list query is not -- see #312, which is why this lives on the
+      # DETAIL query and not on `PRS_QUERY`.
+      #
+      # `null` means no queue, and also means "we could not tell". Both
+      # collapse to "not queued", which is the safe default: it offers
+      # a plain Merge, and GitHub refuses it if the branch really does
+      # require the queue.
       # The VIEWER's own latest review, which is a different question
       # from `reviewDecision`. The decision is the pull request's
       # aggregate state: it reads CHANGES_REQUESTED when someone else

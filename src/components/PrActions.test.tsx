@@ -34,11 +34,36 @@ const pr = (over: Partial<PrDetail> = {}): PrDetail => ({
   comment_count: 0,
   comments: [],
   latest_reviews: [],
+  merge_queue_enabled: false,
+  in_merge_queue: false,
   checks: [],
   ...over,
 });
 
 describe("PrActions", () => {
+  /// Offering Merge and "Add to merge queue" side by side asked the user
+  /// to know which one their repo needs -- and on a queue-enabled branch
+  /// Merge is simply the wrong button.
+  it("offers only the queue action when the base branch queues", () => {
+    render(<PrActions pr={pr({ merge_queue_enabled: true })} />);
+    expect(screen.getByRole("button", { name: "Add to merge queue" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Merge" })).toBeNull();
+  });
+
+  it("offers only Merge when the base branch does not queue", () => {
+    render(<PrActions pr={pr({ merge_queue_enabled: false })} />);
+    expect(screen.getByRole("button", { name: "Merge" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Add to merge queue" })).toBeNull();
+  });
+
+  /// Once it is queued the only useful action is getting it back out.
+  it("offers dequeue instead once the pull request is queued", () => {
+    render(<PrActions pr={pr({ merge_queue_enabled: true, in_merge_queue: true })} />);
+    expect(screen.getByRole("button", { name: "Remove from merge queue" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Add to merge queue" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Merge" })).toBeNull();
+  });
+
   /// Close is irreversible from here -- `inverseOf` gives it no undo --
   /// and it sits beside "Back to list", where a bare "Close" reads as
   /// "close this view". Both halves of that fix are asserted: the words
