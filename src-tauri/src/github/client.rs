@@ -300,7 +300,9 @@ impl GitHubClient {
     }
 
     pub async fn fetch_reviewing(&self) -> Result<Vec<PullRequest>, ClientError> {
-        self.fetch_reviewing_with_shortfall().await.map(|(prs, _)| prs)
+        self.fetch_reviewing_with_shortfall()
+            .await
+            .map(|(prs, _)| prs)
     }
 
     /// The review list, plus how many pull requests are MISSING from it.
@@ -361,8 +363,6 @@ impl GitHubClient {
             (prs, short)
         })
     }
-
-
 
     /// How many pull requests await the user's review.
     ///
@@ -841,8 +841,8 @@ async fn graphql_partial_ok(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::mutate::ReviewVerdict;
+    use super::*;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

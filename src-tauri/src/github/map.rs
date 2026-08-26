@@ -774,7 +774,11 @@ mod tests {
         }}});
         let d = map_detail(&v, "octocat/hello-world");
         assert_eq!(d.review, ReviewState::ChangesRequested);
-        assert_eq!(d.latest_reviews.len(), 2, "the authorless review is dropped");
+        assert_eq!(
+            d.latest_reviews.len(),
+            2,
+            "the authorless review is dropped"
+        );
         assert_eq!(d.latest_reviews[0].author, "octocat");
         assert_eq!(d.latest_reviews[0].state, "APPROVED");
         assert_eq!(d.latest_reviews[1].state, "CHANGES_REQUESTED");
