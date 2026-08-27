@@ -388,7 +388,14 @@ export function WorktreesPage() {
                 ? "Paste it in your terminal to start the assessment."
                 : "Paste it in your terminal. Claude Code was not found on this machine.",
             }),
-          () => toast.error("Could not copy the command"),
+          // WITH the reason. `navigator.clipboard` rejects when the
+          // document is not focused, which is a real case in a desktop
+          // webview -- and "could not copy" alone leaves the user with
+          // nothing to do about it.
+          (e: unknown) =>
+            toast.error("Could not copy the command", {
+              description: e instanceof Error ? e.message : undefined,
+            }),
         ),
       (e: unknown) =>
         toast.error("Could not build the command", {

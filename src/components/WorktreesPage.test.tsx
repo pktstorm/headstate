@@ -449,6 +449,28 @@ describe("WorktreesPage", () => {
       expect(opts.description).toMatch(/paste it in your terminal/i);
     });
 
+    /// #347: reported as "no indication it copied anything". The
+    /// success toast is asserted above, so the visible gap is the
+    /// FAILURE path -- `navigator.clipboard` rejects when the document
+    /// is not focused, which is a real case in a desktop webview, and
+    /// nothing tested that the user hears about it.
+    it("says so when the clipboard refuses", async () => {
+      const writeText = vi.fn<(text: string) => Promise<void>>(() =>
+        Promise.reject(new Error("Document is not focused")),
+      );
+      Object.assign(navigator, { clipboard: { writeText } });
+      state.classified = [wt({ safety: { kind: "never_pushed" } })];
+      render(<WorktreesPage />);
+
+      fireEvent.click(screen.getByRole("button", { name: /claudify/i }));
+      await waitFor(() => expect(toastError).toHaveBeenCalled());
+      expect(toastError.mock.calls[0][0]).toMatch(/could not copy/i);
+      // And the reason, which is the actionable part -- "could not
+      // copy" alone leaves the user with nothing to do.
+      const [, opts] = toastError.mock.calls[0] as [string, { description?: string }];
+      expect(opts?.description).toMatch(/not focused/i);
+    });
+
     // Better to learn it here than as `command not found` after pasting.
     it("says so when Claude Code was not found, but still copies", async () => {
       const writeText = vi.fn<(text: string) => Promise<void>>(() => Promise.resolve());
