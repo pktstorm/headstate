@@ -2136,7 +2136,7 @@ mod live {
             for (i, line) in ["one", "two", "three"].iter().enumerate() {
                 std::fs::write(
                     repo.join("work.txt"),
-                    format!("{}\n", &["one", "one\ntwo", "one\ntwo\nthree"][i]),
+                    format!("{}\n", ["one", "one\ntwo", "one\ntwo\nthree"][i]),
                 )
                 .unwrap();
                 assert!(run(&repo, &["add", "-A"]));
