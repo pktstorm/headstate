@@ -369,7 +369,15 @@ export function WorktreesPage() {
     error: classifyError,
     refetch: retryClassify,
   } = useWorktreeSafety(selected?.path);
-  const { data: sizes, isLoading: sizing } = useWorktreeSizes(selected?.path);
+  const sizesQuery = useWorktreeSizes(selected?.path);
+  const sizes = sizesQuery.data;
+  // `isFetching`, NOT `isLoading`. A DISABLED query reports `isLoading:
+  // true` forever in TanStack v5 -- it has no data and never will --
+  // so on "All repositories", where no repo is selected and the sizing
+  // query never runs, every row waited on a request that was never
+  // made. `isFetching` is true only while something is actually in
+  // flight.
+  const sizing = sizesQuery.isFetching;
   const remove = useRemoveWorktree();
 
   /// Copy rather than spawn. The command lands in the user's own shell,
@@ -497,10 +505,28 @@ export function WorktreesPage() {
             {/* "at least" while any size is still unmeasured: a total
                 that silently counts unknowns as zero is a confident
                 wrong answer. */}
+            {/* "at least" while any size is still unmeasured: a total
+                that silently counts unknowns as zero is a confident
+                wrong answer. */}
             {sizesComplete ? "" : "at least "}
             {formatSize(totalBytes)}
           </span>
         </div>
+        {/* Sizes are measured PER REPOSITORY -- `size_repo` runs `du`
+            over one repo's worktrees, and the query is keyed on the
+            SELECTED repo, so on this view it never runs at all. The
+            page read "at least 0 B" with a dash in every row
+            indefinitely, which is indistinguishable from a measurement
+            that failed rather than one never started.
+
+            Said once, above the rows, rather than replacing the total:
+            a partially-measured set can legitimately total zero, and
+            that is a real answer. */}
+        {worktrees.length > 0 && worktrees.every((w) => w.size_bytes == null) ? (
+          <p className="border-b border-[#30363d] px-4 py-2 text-xs text-[#8b949e]">
+            Open a repository to measure sizes.
+          </p>
+        ) : null}
         {worktrees.map((wt) => (
           <button
             type="button"
@@ -607,6 +633,7 @@ export function WorktreesPage() {
             {formatSize(totalBytes)} total
           </span>
         ) : null}
+
         {/* The count is in the label, so the scope is legible before
             clicking rather than only in the dialog. 106 of 268 worktrees
             are safe on a real machine, mostly in a few repos -- clicking
