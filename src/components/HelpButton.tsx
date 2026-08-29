@@ -25,10 +25,15 @@ export function HelpButton({ topic }: { topic: HelpTopicId }) {
       <button
         type="button"
         onClick={() => setOpen(true)}
-        // The topic's own title, not a bare "Help". A screen reader
-        // announcing "button, help" eleven times on one page conveys
-        // nothing about which one to press.
-        aria-label={title}
+        // The topic's own title, prefixed. A bare "Help" repeated
+        // across a page says nothing about which one to press, but the
+        // bare title collides with the control it explains: "What makes
+        // a worktree safe to remove" matched a query for the Remove
+        // button, for a screen reader as much as for a test.
+        //
+        // Topic titles are therefore noun phrases without action verbs,
+        // and this prefix makes the element's ROLE unambiguous.
+        aria-label={`About ${title.charAt(0).toLowerCase()}${title.slice(1)}`}
         // `align-middle` and a fixed size keep the glyph from shifting
         // the baseline of the heading it sits beside.
         className="ml-1.5 inline-flex h-4 w-4 shrink-0 items-center justify-center align-middle text-[#8b949e] hover:text-[#e6edf3]"

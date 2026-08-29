@@ -26,9 +26,14 @@ describe("HelpButton", () => {
   /// across a page says nothing about which one to press.
   it("names itself by its topic, not as a bare help button", () => {
     render(<HelpButton topic="triage-chips" />);
-    const label = screen.getByRole("button").getAttribute("aria-label");
-    expect(label).toBe(HELP_TOPICS["triage-chips"].title);
+    const label = screen.getByRole("button").getAttribute("aria-label") ?? "";
+    // Names its topic, so eleven of these on a page are distinguishable.
+    expect(label.toLowerCase()).toContain("triage chips");
     expect(label).not.toMatch(/^help$/i);
+    // And says it is help, so it cannot be mistaken for the control it
+    // sits beside -- a title reading "...safe to remove" matched a
+    // query for the Remove button.
+    expect(label).toMatch(/^About /);
   });
 });
 
@@ -47,5 +52,13 @@ describe("help topics", () => {
   /// panel heading, and the Sheet already sits in answer position.
   it.each(Object.entries(HELP_TOPICS))("%s is titled as a noun phrase", (_id, topic) => {
     expect(topic.title).not.toMatch(/\?$/);
+  });
+
+  /// A title becomes the button's accessible name, so an action verb in
+  /// one makes the help button indistinguishable from the control it
+  /// explains. "What makes a worktree safe to remove" matched a query
+  /// for the Remove button -- for a screen reader as much as for a test.
+  it.each(Object.entries(HELP_TOPICS))("%s does not read as an action", (_id, topic) => {
+    expect(topic.title).not.toMatch(/\b(remov|delet|install|merg|updat|clear)/i);
   });
 });
