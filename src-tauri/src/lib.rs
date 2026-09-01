@@ -94,6 +94,8 @@ pub fn run() {
             commands::set_notify_prefs,
             commands::review_pr,
             commands::comment_on_pr,
+            commands::scan_artifacts,
+            commands::size_artifacts,
             commands::resolve_thread,
             commands::unresolve_thread,
             commands::reply_to_thread,

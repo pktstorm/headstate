@@ -651,6 +651,50 @@ pub async fn size_worktrees(repo_path: String) -> Result<Vec<(String, u64)>, Str
         .map_err(|e| e.to_string())?
 }
 
+/// Regenerable build output under the configured scan roots.
+///
+/// Discovery only -- every `size_bytes` comes back None. The two passes
+/// are separate because they differ by three orders of magnitude:
+/// measured on a real 221 GB code tree, finding 178 directories takes
+/// ~1.5s where sizing them takes ~56s. Blocking the view on the second
+/// would repeat the "All repositories never populates" complaint that
+/// shaped the worktree view.
+#[tauri::command]
+pub async fn scan_artifacts(app: AppHandle) -> Result<Vec<crate::artifacts::Artifact>, String> {
+    // The SAME roots the worktree view scans. A second directory setting
+    // would be one more thing to keep in sync, and a user who has told
+    // the app where their code lives has already answered this question.
+    let dirs = get_worktree_dirs(app);
+    tauri::async_runtime::spawn_blocking(move || crate::artifacts::scan(&dirs))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Sizes for artifact directories, as `(path, bytes, secs_since_write)`.
+///
+/// Takes explicit paths rather than rescanning, so the caller measures
+/// exactly what it is showing -- a rescan here could return a directory
+/// the list does not have a row for.
+///
+/// `secs_since_write` rides along because the walk already stats every
+/// entry: asking a second question of the same `metadata()` call is
+/// free, and it is the ONLY signal that a build is currently writing
+/// there. Build output is gitignored, so no git check can see it.
+#[tauri::command]
+pub async fn size_artifacts(paths: Vec<String>) -> Result<Vec<(String, u64, Option<u64>)>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .map(|p| {
+                let (bytes, age) = crate::artifacts::measure(std::path::Path::new(&p));
+                (p, bytes, age)
+            })
+            .collect()
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// Remove a worktree, refusing anything not provably safe.
 ///
 /// The safety gate is re-evaluated inside `remove_worktree` rather than

@@ -8,6 +8,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  Artifact,
   Assessment,
   CycleTrend,
   DanglingVolume,
@@ -384,3 +385,14 @@ export const getMergedDetail = () => invoke<MergedDetail>("get_merged_detail");
 /// Computed once at startup from the `gh` CLI token. `ok: false` means the
 /// user needs to run `gh auth login`; `message` is ready-to-display prose.
 export const getAuthState = () => invoke<AuthState>("get_auth_state");
+
+/// Regenerable build output under the configured scan roots.
+///
+/// Discovery only: every `size_bytes` comes back null. See
+/// `sizeArtifacts` for the second pass.
+export const scanArtifacts = () => invoke<Artifact[]>("scan_artifacts");
+
+/// Sizes for specific artifact directories, as
+/// `[path, bytes, secsSinceWrite]`.
+export const sizeArtifacts = (paths: string[]) =>
+  invoke<[string, number, number | null][]>("size_artifacts", { paths });

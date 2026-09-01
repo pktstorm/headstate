@@ -406,3 +406,34 @@ export interface Assessment {
   subjects: string[];
   subjects_elided: number;
 }
+
+/// What kind of build output a directory holds.
+///
+/// Mirrors `ArtifactKind` in Rust. The membership rule is that a
+/// documented command rebuilds it -- which is what makes removal cost a
+/// rebuild rather than work, and why this is a closed set rather than a
+/// user-supplied pattern.
+export type ArtifactKind = "cargo_target" | "node_modules" | "terraform" | "build_output";
+
+/// One directory of regenerable build output.
+export interface Artifact {
+  /// Absolute path. Removal takes this, never a name matched by pattern.
+  path: string;
+  kind: ArtifactKind;
+  /// The checkout it belongs to, for grouping.
+  repo_path: string;
+  /// Bytes on disk, or null until measured.
+  ///
+  /// Discovery and sizing differ by three orders of magnitude (measured:
+  /// ~1.5s to find 178 directories, ~56s to size them), so the list
+  /// renders before this is known. Null rather than 0: "not measured
+  /// yet" and "empty" are different facts, and showing 0 B for the
+  /// former is a lie the user would act on.
+  size_bytes: number | null;
+  /// Seconds since anything under it was written, or null if unknown.
+  ///
+  /// A running build does not make git dirty -- build output is
+  /// gitignored -- so this is the only signal that a directory is in
+  /// active use.
+  modified_secs_ago: number | null;
+}

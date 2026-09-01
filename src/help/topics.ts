@@ -107,6 +107,37 @@ that, a measurement on a real machine found ancestry alone recognised
 10 of 157 merged worktrees.`,
   },
 
+  "build-artifacts": {
+    title: "Build output, and what puts it back",
+    body: `Directories a **tool regenerates**: \`target\`, \`node_modules\`,
+\`.terraform\`, and gitignored \`dist\`/\`build\` folders.
+
+That is the whole membership rule, and it is what makes this view safe in
+a way the Worktrees view is not. Deleting build output costs a rebuild.
+Deleting a worktree with unpushed commits costs the work. Every row here
+names the command that restores it.
+
+### Why these are not on the Worktrees page
+
+Build output lives beside your **checkouts**, not inside your worktrees.
+On the machine this feature was built for, 108 GB of Rust build output
+sat next to main checkouts and only 0.28 GB inside worktrees — so
+removing every worktree would not have touched 99.7% of it.
+
+### Sizes arrive after the list
+
+Finding these directories takes about a second; measuring them takes
+around a minute. So the list appears first and fills in, and the total
+reads "at least" until every repository has answered. A total over a
+partial set is not the total.
+
+### "Written recently"
+
+A build writing into a directory does not show up in \`git status\` —
+build output is gitignored, so git cannot see it at all. The only
+available signal is when the directory was last written, and a row marked
+this way may have a build running in it right now.`,
+  },
   "bulk-removal": {
     title: "Bulk cleanup, and leaving the page",
     body: `Removals run **on the backend, in one batch** — not one request per

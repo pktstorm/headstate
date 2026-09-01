@@ -112,7 +112,7 @@ const wt = (over: Partial<Worktree>): Worktree => ({
   ...over,
 });
 
-const EMPTY = { "my-prs": {}, "to-review": {}, worktrees: {}, docker: {} } as const;
+const EMPTY = { "my-prs": {}, "to-review": {}, worktrees: {}, docker: {}, artifacts: {} } as const;
 
 describe("WorktreesPage", () => {
   beforeEach(() => {
@@ -355,7 +355,7 @@ describe("WorktreesPage", () => {
       sizesTotal: 2,
     });
     useFilters.setState({
-      filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {}, docker: {} },
+      filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {}, docker: {}, artifacts: {} },
       view: "worktrees",
     } as never);
     render(<WorktreesPage />);
@@ -373,7 +373,7 @@ describe("WorktreesPage", () => {
       sizesTotal: 1,
     });
     useFilters.setState({
-      filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {}, docker: {} },
+      filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {}, docker: {}, artifacts: {} },
       view: "worktrees",
     } as never);
     render(<WorktreesPage />);
