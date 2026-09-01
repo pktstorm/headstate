@@ -31,6 +31,9 @@ vi.mock("../api/hooks", () => ({
   useReviewPr: () => reviewPr,
   useRerunChecks: () => rerunChecks,
   useCommentOnPr: () => commentOnPr,
+  useResolveThread: () => vi.fn(() => Promise.resolve()),
+  useUnresolveThread: () => vi.fn(() => Promise.resolve()),
+  useReplyToThread: () => vi.fn(() => Promise.resolve()),
   // The detail view treats undefined as "we could not ask", which is
   // deliberately NOT the same as "this is mine" -- see ReviewBox.
   // Controllable so the pinned Approve button, which is hidden on your
@@ -62,6 +65,7 @@ const detail = (over: Partial<PrDetail> = {}): PrDetail => ({
   unresolved_threads: 0,
   comment_count: 0,
   comments: [],
+  review_threads: [],
   latest_reviews: [],
   merge_queue_enabled: false,
   in_merge_queue: false,
@@ -260,6 +264,38 @@ describe("PrDetailView", () => {
     expect(
       screen.getByRole("button", { name: /the only comment/ }).getAttribute("aria-expanded"),
     ).toBe("true");
+  });
+
+  /// The threads have to REACH the view, not merely exist in the model:
+  /// this is the wiring between PrDetail and the Conversations section.
+  it("shows review conversations from the detail payload", () => {
+    view({
+      review_threads: [
+        {
+          id: "RT_1",
+          is_resolved: false,
+          is_outdated: false,
+          path: "src/api/hooks.ts",
+          line: 412,
+          viewer_can_reply: true,
+          viewer_can_resolve: true,
+          viewer_can_unresolve: false,
+          comments: [
+            {
+              author: "carol",
+              created_at: "2026-08-20T10:00:00Z",
+              body: "This leaks the subscription",
+            },
+          ],
+          comment_count: 1,
+        },
+      ],
+    });
+    expect(screen.getByText("src/api/hooks.ts:412")).toBeTruthy();
+    // Unresolved, so it is open and its content is on screen without a
+    // click -- the reason the section exists.
+    expect(screen.getByText(/This leaks the subscription/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Resolve conversation" })).toBeTruthy();
   });
 
   /// The description is what the pull request IS -- collapsing it by

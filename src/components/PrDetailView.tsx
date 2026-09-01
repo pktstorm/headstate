@@ -15,6 +15,7 @@ import { agentPrompt, toAgentContext } from "../lib/agentPrompt";
 import { rerunnableRun } from "../lib/rerun";
 import { Markdown } from "./Markdown";
 import { CommentRow } from "./CommentRow";
+import { ReviewThreads } from "./ReviewThreads";
 import { Section } from "./Section";
 import { PrActions } from "./PrActions";
 import { ReviewBox } from "./ReviewBox";
@@ -374,6 +375,11 @@ export function PrDetailView({
           ))}
         </Section>
       ) : null}
+
+      {/* ABOVE the comments: a conversation waiting on an answer is
+          more urgent than the discussion thread, and the header's
+          unresolved count points at this section. */}
+      <ReviewThreads threads={pr.review_threads} repo={pr.repo} number={pr.number} />
 
       {pr.comments.length > 0 ? (
         // COLLAPSED past a handful. Fifty comments is the longest block
