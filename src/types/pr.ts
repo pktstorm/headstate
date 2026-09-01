@@ -437,3 +437,14 @@ export interface Artifact {
   /// active use.
   modified_secs_ago: number | null;
 }
+
+/// The outcome of removing one artifact directory.
+///
+/// Per-directory rather than one verdict for the batch: a directory that
+/// went active since the scan is refused while the rest succeed.
+export interface ArtifactRemoval {
+  path: string;
+  /// Null on success. Shown verbatim -- it names WHY, and "could not
+  /// remove" alone is not something a user can act on.
+  error: string | null;
+}

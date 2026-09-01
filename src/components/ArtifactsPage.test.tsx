@@ -1,5 +1,5 @@
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Artifact } from "@/types/pr";
 
 const state = vi.hoisted(() => ({
@@ -11,7 +11,12 @@ const state = vi.hoisted(() => ({
   total: 0,
 }));
 
+const removeFn = vi.hoisted(() => vi.fn(() => Promise.resolve([])));
+
+vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+
 vi.mock("../api/hooks", () => ({
+  useRemoveArtifacts: () => removeFn,
   useArtifacts: () => ({ data: state.artifacts, isLoading: state.loading }),
   useArtifactSizes: () => ({
     sizes: state.sizes,
@@ -145,5 +150,86 @@ describe("ArtifactsPage", () => {
       "/code/b-small/target",
       "/code/a-unmeasured/target",
     ]);
+  });
+});
+
+describe("ArtifactsPage removal", () => {
+  beforeEach(() => {
+    removeFn.mockClear();
+    state.ages = new Map();
+    state.pending = 0;
+  });
+  /// Nothing is offered until something is chosen: a destructive action
+  /// that is always on screen is one click from being an accident.
+  it("offers no removal until a row is selected", () => {
+    state.artifacts = [art()];
+    state.sizes = new Map([["/code/repo/target", 1_000]]);
+    state.ages = new Map();
+    state.pending = 0;
+    render(<ArtifactsPage />);
+    expect(screen.queryByRole("button", { name: /^Remove/ })).toBeNull();
+  });
+
+  it("names the count and the size before the dialog", () => {
+    state.artifacts = [art()];
+    state.sizes = new Map([["/code/repo/target", 2_000_000_000]]);
+    render(<ArtifactsPage />);
+    fireEvent.click(screen.getByRole("checkbox", { name: /Select \/code\/repo\/target/ }));
+    expect(screen.getByRole("button", { name: /^Remove 1 ·/ })).toBeTruthy();
+  });
+
+  /// The dialog states the loss in the terms that matter. For build
+  /// output the honest answer is that the cost is TIME, which is exactly
+  /// what separates this from removing a worktree.
+  it("says the cost is a rebuild, not lost work", () => {
+    state.artifacts = [art()];
+    state.sizes = new Map([["/code/repo/target", 1_000]]);
+    render(<ArtifactsPage />);
+    fireEvent.click(screen.getByRole("checkbox", { name: /Select/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^Remove 1/ }));
+    expect(screen.getByText(/not lost work/)).toBeTruthy();
+  });
+
+  /// A directory a build is writing to will be refused by the backend.
+  /// Saying so BEFORE the click is the difference between a guard the
+  /// user understands and one that looks like a malfunction.
+  it("warns when a selected directory was written to recently", () => {
+    state.artifacts = [art()];
+    state.sizes = new Map([["/code/repo/target", 1_000]]);
+    state.ages = new Map([["/code/repo/target", 30]]);
+    render(<ArtifactsPage />);
+    fireEvent.click(screen.getByRole("checkbox", { name: /Select/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^Remove 1/ }));
+    expect(screen.getByText(/may have a build running/)).toBeTruthy();
+  });
+
+  it("removes the selected paths on confirm", () => {
+    state.artifacts = [art()];
+    state.sizes = new Map([["/code/repo/target", 1_000]]);
+    state.ages = new Map();
+    render(<ArtifactsPage />);
+    fireEvent.click(screen.getByRole("checkbox", { name: /Select/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^Remove 1/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    expect(removeFn).toHaveBeenCalledWith(["/code/repo/target"]);
+  });
+
+  it("removes nothing on cancel", () => {
+    state.artifacts = [art()];
+    state.sizes = new Map([["/code/repo/target", 1_000]]);
+    render(<ArtifactsPage />);
+    fireEvent.click(screen.getByRole("checkbox", { name: /Select/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^Remove 1/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(removeFn).not.toHaveBeenCalled();
+  });
+
+  /// With 178 rows an unnamed checkbox is 178 identical controls to a
+  /// screen reader.
+  it("names each checkbox by its path", () => {
+    state.artifacts = [art({ path: "/code/a/target" }), art({ path: "/code/b/target" })];
+    render(<ArtifactsPage />);
+    expect(screen.getByRole("checkbox", { name: "Select /code/a/target" })).toBeTruthy();
+    expect(screen.getByRole("checkbox", { name: "Select /code/b/target" })).toBeTruthy();
   });
 });

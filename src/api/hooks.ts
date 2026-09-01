@@ -35,6 +35,7 @@ import {
   removeWorktreeForced,
   setAutoMerge,
   removeWorktrees,
+  removeArtifacts,
   scanArtifacts,
   sizeArtifacts,
   sizeWorktrees,
@@ -583,6 +584,21 @@ export function useArtifactSizes(artifacts: Artifact[], enabled: boolean) {
     /// makes a partially-filled page legible rather than broken.
     pending: results.filter((r) => r.isFetching).length,
     total: results.length,
+  };
+}
+
+/// Remove artifact directories.
+///
+/// Invalidates the scan AND the sizes: a removed directory must leave
+/// the list, and a stale size row would otherwise keep counting bytes
+/// that are no longer there.
+export function useRemoveArtifacts() {
+  const qc = useQueryClient();
+  return async (paths: string[]) => {
+    const out = await removeArtifacts(paths);
+    await qc.invalidateQueries({ queryKey: ["artifacts"] });
+    await qc.invalidateQueries({ queryKey: ["artifact-sizes"] });
+    return out;
   };
 }
 

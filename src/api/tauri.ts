@@ -9,6 +9,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   Artifact,
+  ArtifactRemoval,
   Assessment,
   CycleTrend,
   DanglingVolume,
@@ -396,3 +397,8 @@ export const scanArtifacts = () => invoke<Artifact[]>("scan_artifacts");
 /// `[path, bytes, secsSinceWrite]`.
 export const sizeArtifacts = (paths: string[]) =>
   invoke<[string, number, number | null][]>("size_artifacts", { paths });
+
+/// Remove artifact directories. Each is re-verified at delete time, so a
+/// stale row is refused rather than acted on.
+export const removeArtifacts = (paths: string[]) =>
+  invoke<ArtifactRemoval[]>("remove_artifacts", { paths });

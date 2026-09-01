@@ -136,7 +136,20 @@ partial set is not the total.
 A build writing into a directory does not show up in \`git status\` —
 build output is gitignored, so git cannot see it at all. The only
 available signal is when the directory was last written, and a row marked
-this way may have a build running in it right now.`,
+this way may have a build running in it right now.
+
+Removal **refuses** anything written to in the last few minutes, rather
+than trusting the list you clicked. Deleting a \`target\` out from under a
+running build is the one way this can cost real time instead of a rebuild.
+
+### What is re-checked when you remove
+
+Everything, and from the filesystem rather than from the row. The list
+may be minutes old, so before anything is deleted it must still be inside
+a scanned folder, still a real directory rather than a symlink, still
+recognised as build output, and still idle. A directory that fails any of
+those is refused and named in the result — a refusal is the guard
+working, not a malfunction.`,
   },
   "bulk-removal": {
     title: "Bulk cleanup, and leaving the page",

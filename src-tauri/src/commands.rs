@@ -695,6 +695,32 @@ pub async fn size_artifacts(paths: Vec<String>) -> Result<Vec<(String, u64, Opti
     .map_err(|e| e.to_string())
 }
 
+/// Remove artifact directories, re-verifying each at delete time.
+///
+/// The scan roots are passed to the backend rather than trusted from the
+/// caller: containment is the only thing between a bad path and
+/// `remove_dir_all` on an arbitrary directory, so the boundary it checks
+/// against must come from settings, not from the request.
+#[tauri::command]
+pub async fn remove_artifacts(
+    app: AppHandle,
+    paths: Vec<String>,
+) -> Result<Vec<crate::artifacts::ArtifactRemoval>, String> {
+    let roots = get_worktree_dirs(app);
+    let out = tauri::async_runtime::spawn_blocking(move || {
+        crate::artifacts::remove_artifacts(&paths, &roots)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    let failed = out.iter().filter(|o| o.error.is_some()).count();
+    log::info!(
+        "artifact removal: {} of {} removed",
+        out.len() - failed,
+        out.len()
+    );
+    Ok(out)
+}
+
 /// Remove a worktree, refusing anything not provably safe.
 ///
 /// The safety gate is re-evaluated inside `remove_worktree` rather than

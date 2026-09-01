@@ -75,6 +75,25 @@ fn walk(dir: &Path, root: &Path, depth: usize, out: &mut Vec<Artifact>) {
     }
 }
 
+/// Whether a path classifies as an artifact right now.
+///
+/// The delete-time counterpart to what the walk does, sharing `classify`
+/// so the two can never disagree. Removal re-derives this from the
+/// filesystem rather than trusting the row the user clicked: that row may
+/// be minutes old, and a `.gitignore` change or a replaced directory in
+/// between must be caught here, not assumed away.
+pub(crate) fn is_artifact(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(&(_, kind)) = CANDIDATES.iter().find(|(n, _)| *n == name) else {
+        return false;
+    };
+    // `root` only groups the result, and a rejection does not depend on
+    // it -- the containment check is the caller's job and is stricter.
+    classify(path, kind, path).is_some()
+}
+
 /// Whether this directory is really regenerable build output.
 ///
 /// Two ways a name can lie, and each kind is vulnerable to one of them:
