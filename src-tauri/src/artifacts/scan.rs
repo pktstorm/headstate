@@ -159,11 +159,28 @@ fn is_ignored(path: &Path) -> bool {
         .status();
     // `check-ignore -q` answers in three ways, and only ONE of them is
     // permission: 0 means ignored, 1 means tracked or untracked, and
-    // anything else (128 for a broken repository, or a spawn failure
-    // when git is missing) means it could not answer. Both non-zero
-    // cases collapse to false here, which is the direction that matters
-    // -- an inconclusive check must never read as "safe to delete".
-    matches!(status, Ok(s) if s.success())
+    // anything else (128 for a broken repository) means it could not
+    // answer. All the non-permission cases collapse to false, which is
+    // the direction that matters -- an inconclusive check must never
+    // read as "safe to delete".
+    match status {
+        Ok(s) => s.success(),
+        // git is not on PATH at all. The answer is still "not
+        // disposable", but this one is worth SAYING: it silently
+        // removes every `dist`/`build` row from the view, and a user
+        // seeing their build output missing has no way to know why.
+        //
+        // A macOS .app launched from Finder does not inherit a shell's
+        // PATH, so this is a real configuration to hit rather than a
+        // theoretical one.
+        Err(e) => {
+            log::warn!(
+                "cannot check gitignore status ({e}); \
+                 build output directories will not be listed"
+            );
+            false
+        }
+    }
 }
 
 /// The checkout a directory belongs to, by walking up to the nearest
@@ -185,18 +202,31 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// Whether git can be run at all.
+    ///
+    /// The Rust test image has no git binary, and these tests were
+    /// unwrapping the spawn -- so they passed locally and panicked in
+    /// CI. Returning a bool rather than panicking lets the git-dependent
+    /// tests skip explicitly instead of failing for a reason that has
+    /// nothing to do with what they check.
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .status()
+            .is_ok()
+    }
+
     fn git_init(dir: &Path) {
         for args in [
             vec!["init", "-q"],
             vec!["config", "user.email", "t@t"],
             vec!["config", "user.name", "t"],
         ] {
-            std::process::Command::new("git")
+            let _ = std::process::Command::new("git")
                 .arg("-C")
                 .arg(dir)
                 .args(args)
-                .status()
-                .unwrap();
+                .status();
         }
     }
 
@@ -241,6 +271,9 @@ mod tests {
     /// offering it for deletion would destroy work.
     #[test]
     fn a_tracked_build_directory_is_never_offered() {
+        if !git_available() {
+            return;
+        }
         let t = tempfile::TempDir::new().unwrap();
         git_init(t.path());
         fs::create_dir(t.path().join("build")).unwrap();
@@ -254,6 +287,9 @@ mod tests {
 
     #[test]
     fn a_gitignored_build_directory_is_an_artifact() {
+        if !git_available() {
+            return;
+        }
         let t = tempfile::TempDir::new().unwrap();
         git_init(t.path());
         fs::write(t.path().join(".gitignore"), "build/\n").unwrap();
@@ -302,6 +338,7 @@ mod tests {
     /// test linked to a directory the manifest check would have refused
     /// anyway, so it passed with the symlink handling removed entirely.
     #[test]
+    #[cfg(unix)]
     fn symlinked_directories_are_not_followed() {
         let t = tempfile::TempDir::new().unwrap();
         let real = tempfile::TempDir::new().unwrap();
@@ -327,6 +364,9 @@ mod tests {
     /// offer tracked source if it were inverted.
     #[test]
     fn an_unrunnable_ignore_check_never_reads_as_permission() {
+        if !git_available() {
+            return;
+        }
         let t = tempfile::TempDir::new().unwrap();
         // A git repo whose index is unreadable: `check-ignore` fails
         // rather than answering.
@@ -386,6 +426,9 @@ dist/
     /// feature, so the check is also what keeps discovery fast.
     #[test]
     fn a_build_dir_reached_below_its_artifact_parent_is_still_subsumed() {
+        if !git_available() {
+            return;
+        }
         let t = tempfile::TempDir::new().unwrap();
         git_init(t.path());
         fs::write(t.path().join(".gitignore"), "dist/\n").unwrap();
