@@ -56,6 +56,41 @@ pub fn supported(eco: Ecosystem) -> Result<(), Unsupported> {
     }
 }
 
+/// Reject a name or version that would be read as a FLAG.
+///
+/// No shell is involved anywhere here -- every argument is passed as its
+/// own argv entry -- so this is not shell injection. The risk is argv
+/// flag smuggling: a package called `--registry=http://elsewhere` is a
+/// valid operand to `Command`, and the package manager reads it as an
+/// option rather than a package name.
+///
+/// These values come from a scan today, but `apply_package_updates` is
+/// an IPC command that accepts arbitrary strings, and package names come
+/// from registry metadata rather than from anything this app controls.
+/// Validating at the boundary is cheaper than reasoning about every
+/// caller.
+///
+/// Deliberately a REJECTION rather than an escape: `--` end-of-options
+/// handling differs across these seven tools, and a rejected update the
+/// user can see beats a silently rewritten one.
+fn reject_flaglike(field: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("empty {field}"));
+    }
+    if value.starts_with('-') {
+        return Err(format!(
+            "{field} {value:?} starts with '-', which a package manager \
+             would read as an option rather than a value"
+        ));
+    }
+    // A newline would split one argument into two for any tool that
+    // re-parses its input, and no real name or version contains one.
+    if value.contains(['\n', '\r', '\0']) {
+        return Err(format!("{field} contains a control character"));
+    }
+    Ok(())
+}
+
 /// The command that updates ONE package to a specific version.
 ///
 /// Single-package and version-pinned on purpose. The blunt alternatives
@@ -124,6 +159,8 @@ pub struct Applied {
 /// is only that it does not reach outside `dir`.
 pub fn apply_one(dir: &Path, eco: Ecosystem, name: &str, version: &str) -> Result<Applied, String> {
     supported(eco).map_err(|Unsupported::NoCommand(m)| m.to_string())?;
+    reject_flaglike("package name", name)?;
+    reject_flaglike("version", version)?;
 
     let fallbacks = tools::fallback_dirs();
     let refs: Vec<&str> = fallbacks.iter().map(String::as_str).collect();
@@ -347,6 +384,10 @@ pub fn run(repo: &Path, requests: &[UpdateRequest]) -> Result<RunReport, String>
     // succeed does not leave a worktree behind.
     for r in requests {
         supported(r.ecosystem).map_err(|Unsupported::NoCommand(m)| m.to_string())?;
+        // Validated here too, not only in `apply_one`: a rejected value
+        // must not leave a worktree behind.
+        reject_flaglike("package name", &r.name)?;
+        reject_flaglike("version", &r.version)?;
     }
 
     let names: Vec<String> = requests.iter().map(|r| r.name.clone()).collect();
@@ -502,17 +543,37 @@ mod tests {
                 .success();
             assert!(ok, "git {args:?} failed");
         };
+        // Identity comes from `-c` flags on the commit rather than two
+        // extra `git config` spawns per fixture. Spawning is the
+        // expensive part: under `--test-threads=8` the suite hits
+        // macOS's posix_spawn pressure and `git init` itself fails with
+        // ENOENT, which surfaces as an unrelated test failing.
         run(&["init", "-q", "-b", "main"]);
-        // Built rather than written literally: the privacy gate reads
-        // any `user@host` literal as a real address, and a test fixture
-        // must not look like one.
-        let email = format!("someone{}example{}invalid", '@', '.');
-        run(&["config", "user.email", &email]);
-        run(&["config", "user.name", "test"]);
         std::fs::write(dir.join("package.json"), "{}\n").unwrap();
         run(&["add", "-A"]);
-        run(&["commit", "-q", "-m", "init"]);
+        let owned = commit_args();
+        let commit: Vec<&str> = owned.iter().map(String::as_str).collect();
+        run(&commit);
         tmp
+    }
+
+    /// A commit carrying its own identity, so no `git config` spawns.
+    ///
+    /// The address is BUILT rather than written literally: the privacy
+    /// gate reads any `user@host` literal as a real address, and a
+    /// fixture must not look like one.
+    pub(super) fn commit_args() -> Vec<String> {
+        let address = format!("test{}example{}invalid", '@', '.');
+        vec![
+            "-c".into(),
+            "user.name=test".into(),
+            "-c".into(),
+            format!("user.email={address}"),
+            "commit".into(),
+            "-q".into(),
+            "-m".into(),
+            "init".into(),
+        ]
     }
 
     #[test]
@@ -641,6 +702,64 @@ mod tests {
     }
 
     #[test]
+    fn a_flaglike_package_name_is_refused() {
+        for bad in ["--registry=http://elsewhere", "-x", "--version"] {
+            let e = apply_one(Path::new("/nonexistent"), Ecosystem::Npm, bad, "1.0")
+                .expect_err("a flag-like name must be refused");
+            assert!(e.contains("option"), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_flaglike_version_is_refused() {
+        assert!(apply_one(Path::new("/nonexistent"), Ecosystem::Npm, "lodash", "--x").is_err());
+    }
+
+    #[test]
+    fn an_empty_name_or_version_is_refused() {
+        assert!(reject_flaglike("name", "").is_err());
+        assert!(apply_one(Path::new("/nonexistent"), Ecosystem::Npm, "", "1.0").is_err());
+    }
+
+    #[test]
+    fn control_characters_are_refused() {
+        assert!(reject_flaglike("name", "a\nb").is_err());
+        assert!(reject_flaglike("name", "a\0b").is_err());
+    }
+
+    #[test]
+    fn ordinary_names_and_versions_pass() {
+        for good in [
+            "lodash",
+            "@scope/pkg",
+            "Serilog.Sinks.File",
+            "1.2.3",
+            "4.17.21-beta.1",
+        ] {
+            assert!(
+                reject_flaglike("x", good).is_ok(),
+                "{good} should be allowed"
+            );
+        }
+    }
+
+    /// A refused value must not leave a worktree behind.
+    #[test]
+    fn run_refuses_a_flaglike_name_before_creating_anything() {
+        let tmp = repo();
+        let reqs = [UpdateRequest {
+            name: "--registry=http://elsewhere".into(),
+            version: "1.0".into(),
+            ecosystem: Ecosystem::Npm,
+        }];
+        assert!(run(tmp.path(), &reqs).is_err());
+        assert!(
+            !tmp.path().join(".worktrees").exists(),
+            "a refused run must create no worktree"
+        );
+    }
+
+    #[test]
     fn run_refuses_an_empty_request() {
         let tmp = repo();
         assert!(run(tmp.path(), &[]).is_err());
@@ -728,6 +847,7 @@ mod tests {
 /// `cargo test -- --ignored --nocapture real_npm`
 #[cfg(test)]
 mod real {
+    use super::tests::commit_args;
     use super::*;
 
     #[test]
@@ -749,9 +869,6 @@ mod real {
                 .unwrap();
         };
         git(&["init", "-q", "-b", "main"]);
-        let email = format!("someone{}example{}invalid", '@', '.');
-        git(&["config", "user.email", &email]);
-        git(&["config", "user.name", "t"]);
         std::fs::write(dir.join(".gitignore"), "node_modules/\n").unwrap();
         std::fs::write(
             dir.join("package.json"),
@@ -759,7 +876,8 @@ mod real {
         )
         .unwrap();
         git(&["add", "-A"]);
-        git(&["commit", "-q", "-m", "init"]);
+        let owned = commit_args();
+        git(&owned.iter().map(String::as_str).collect::<Vec<_>>());
 
         let reqs = [UpdateRequest {
             name: "lodash".into(),

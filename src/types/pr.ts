@@ -544,7 +544,7 @@ export interface UpdateRequest {
 /// Per-package rather than one status for the run: updates apply in
 /// sequence, and a failure in the third must not erase the report of the
 /// two that worked.
-export interface UpdateOutcome {
+interface UpdateOutcome {
   name: string;
   /// The version ASKED FOR.
   requested: string;
