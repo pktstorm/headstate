@@ -770,10 +770,18 @@ pub async fn remove_venvs(
     app: AppHandle,
     paths: Vec<String>,
 ) -> Result<Vec<crate::caches::VenvRemoval>, String> {
+    // The policy is read from SETTINGS, never from the request. Whether
+    // a stale venv may be removed is the user's standing decision, and a
+    // caller that could pass its own would make the opt-in decorative.
+    let prefs = get_ui_prefs(app.clone());
+    let policy = crate::caches::RemovalPolicy {
+        allow_stale: prefs.remove_stale_venvs,
+        stale_days: crate::poll::stale_venv_days(&prefs),
+    };
     let roots = get_worktree_dirs(app);
     let out = tauri::async_runtime::spawn_blocking(move || {
         let dirs = crate::caches::project_dirs(&roots);
-        crate::caches::remove_venvs(&paths, &dirs)
+        crate::caches::remove_venvs(&paths, &dirs, policy)
     })
     .await
     .map_err(|e| e.to_string())?;
