@@ -202,12 +202,25 @@ virtualenv is live again and the removal is refused.`,
   "build-artifacts": {
     title: "Build output, and what puts it back",
     body: `Directories a **tool regenerates**: \`target\`, \`node_modules\`,
-\`.terraform\`, and gitignored \`dist\`/\`build\` folders.
+\`.terraform\`, .NET's \`bin\`/\`obj\`, and gitignored \`dist\`/\`build\`
+folders.
 
 That is the whole membership rule, and it is what makes this view safe in
 a way the Worktrees view is not. Deleting build output costs a rebuild.
 Deleting a worktree with unpushed commits costs the work. Every row here
 names the command that restores it.
+
+### Why a folder named \`bin\` might not be listed
+
+Because the name alone proves nothing. A \`bin\` is .NET's build output
+only when a project file — \`.csproj\`, \`.fsproj\`, \`.vbproj\` — sits
+beside it. Everywhere else \`bin\` usually holds programs a package
+*ships*, which nothing regenerates: deleting one breaks the package.
+
+The same rule governs every kind here. A \`target\` needs a
+\`Cargo.toml\`, a \`node_modules\` needs a \`package.json\`, and a
+\`dist\` must be gitignored. A directory that cannot prove what made it
+is left alone.
 
 ### Why these are not on the Worktrees page
 

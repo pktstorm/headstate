@@ -413,7 +413,12 @@ export interface Assessment {
 /// documented command rebuilds it -- which is what makes removal cost a
 /// rebuild rather than work, and why this is a closed set rather than a
 /// user-supplied pattern.
-export type ArtifactKind = "cargo_target" | "node_modules" | "terraform" | "build_output";
+export type ArtifactKind =
+  | "cargo_target"
+  | "node_modules"
+  | "terraform"
+  | "dotnet_build"
+  | "build_output";
 
 /// One directory of regenerable build output.
 export interface Artifact {
