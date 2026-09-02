@@ -6,6 +6,7 @@ pub mod commands;
 pub mod diag;
 pub mod docker;
 pub mod github;
+pub mod packages;
 pub mod poll;
 pub mod store;
 pub mod tray;
