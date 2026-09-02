@@ -8,8 +8,11 @@ const state = vi.hoisted(() => ({
   loading: false,
 }));
 const markdownFn = vi.hoisted(() => vi.fn(() => Promise.resolve("# md")));
+// Typed via the mock's signature rather than an unused parameter, so
+// `copyFn.mock.calls[0][0]` is a string without eslint objecting to an
+// argument nothing reads.
 const copyFn = vi.hoisted(() =>
-  vi.fn((_text: string) => Promise.resolve(null as string | null)),
+  vi.fn<(text: string) => Promise<string | null>>(() => Promise.resolve(null)),
 );
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
