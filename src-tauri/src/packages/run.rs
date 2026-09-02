@@ -51,6 +51,10 @@ pub fn check(repo: &Path, eco: Ecosystem) -> EcosystemReport {
 
     let out = match std::process::Command::new(&bin)
         .args(args)
+        // The tool's own directory goes on the child's PATH: `npm` and
+        // `yarn` are `#!/usr/bin/env node` scripts, so finding them is
+        // not enough -- the child has to find `node` too.
+        .env("PATH", tools::child_path(&bin))
         .current_dir(repo)
         .output()
     {
