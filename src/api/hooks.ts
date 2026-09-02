@@ -36,6 +36,7 @@ import {
   setAutoMerge,
   removeWorktrees,
   removeArtifacts,
+  markAssessed,
   removeVenvs,
   scanVenvs,
   sizeVenvs,
@@ -906,6 +907,20 @@ export function useAssessed() {
     queryFn: assessedWorktrees,
     staleTime: 5_000,
   });
+}
+
+/// Record that a human read an assessment.
+///
+/// Invalidates the assessed list so the row's action updates -- which is
+/// the point: the change is now the deliberate result of the user saying
+/// they read the verdict, rather than a delayed side effect of copying a
+/// command.
+export function useMarkAssessed() {
+  const qc = useQueryClient();
+  return async (worktreePath: string) => {
+    await markAssessed(worktreePath);
+    await qc.invalidateQueries({ queryKey: ["assessed-worktrees"] });
+  };
 }
 
 /// Remove a worktree past the safety gate.

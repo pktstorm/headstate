@@ -98,6 +98,7 @@ pub fn run() {
             commands::scan_artifacts,
             commands::remove_artifacts,
             commands::size_artifacts,
+            commands::mark_assessed,
             commands::scan_venvs,
             commands::size_venvs,
             commands::remove_venvs,

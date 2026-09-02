@@ -786,6 +786,32 @@ pub async fn remove_venvs(
     Ok(out)
 }
 
+/// Record that a human read an assessment for this worktree.
+///
+/// Split out of `claudify_command`, which used to do it as a side effect
+/// of copying the prompt. That conflated "I asked for an assessment"
+/// with "I read one" -- and the flag it sets is what unlocks removing a
+/// worktree past the safety gate, which `remove_worktree_forced`
+/// describes as needing "the record that a human looked at what would be
+/// lost".
+///
+/// Keyed by the head OID it was assessed AT, so the mark expires the
+/// moment the branch moves: a verdict about different commits is not a
+/// verdict about these ones.
+#[tauri::command]
+pub fn mark_assessed(app: AppHandle, worktree_path: String) -> Result<(), String> {
+    let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
+    let mut seen: std::collections::BTreeMap<String, String> =
+        settings::get(&conn, settings::keys::ASSESSED_WORKTREES)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+    let head = crate::worktrees::head_oid(&worktree_path)
+        .map_err(|e| format!("could not read the worktree's head: {e}"))?;
+    seen.insert(worktree_path, head);
+    settings::set(&conn, settings::keys::ASSESSED_WORKTREES, &seen).map_err(|e| e.to_string())
+}
+
 /// Remove a worktree, refusing anything not provably safe.
 ///
 /// The safety gate is re-evaluated inside `remove_worktree` rather than
@@ -1103,7 +1129,6 @@ pub async fn assess_worktree(
 /// GUI app's PATH, but the pasted command runs in a login shell where it
 /// resolves fine.
 pub fn claudify_command(
-    app: AppHandle,
     repo_path: String,
     worktree_path: String,
     branch: String,
@@ -1117,20 +1142,20 @@ pub fn claudify_command(
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "claude".to_string());
 
-    // Record what was assessed, keyed by the head it was assessed AT.
-    // Without this the user comes back from a "safe to discard" verdict
-    // and has to find the row again among 124 candidates.
-    if let Ok(conn) = open_db(&db_path(&app)) {
-        let mut seen: std::collections::BTreeMap<String, String> =
-            settings::get(&conn, settings::keys::ASSESSED_WORKTREES)
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-        if let Ok(head) = crate::worktrees::head_oid(&worktree_path) {
-            seen.insert(worktree_path.clone(), head);
-            let _ = settings::set(&conn, settings::keys::ASSESSED_WORKTREES, &seen);
-        }
-    }
+    // NOTE: copying the command deliberately does NOT record an
+    // assessment.
+    //
+    // It used to. The mark gates "Remove anyway…", and `commands.rs`
+    // describes that flag as "the record that a human looked at what
+    // would be lost" -- but copying a prompt is the START of an
+    // assessment, not the end of one. Marking here armed a force-remove
+    // button on a worktree nobody had actually read a verdict for, and
+    // it did so seconds later when the query refetched, swapping a
+    // narrow "Claudify" for a wide "Remove anyway…" and re-flowing every
+    // column in the table.
+    //
+    // `mark_assessed` is what records it, called once the user says they
+    // have read the result.
 
     ClaudifyCommand {
         command: facts.command(&bin),

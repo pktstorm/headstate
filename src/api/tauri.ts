@@ -416,3 +416,11 @@ export const sizeVenvs = (paths: string[]) =>
 /// Remove virtualenvs. Each is re-verified at delete time.
 export const removeVenvs = (paths: string[]) =>
   invoke<VenvRemoval[]>("remove_venvs", { paths });
+
+/// Record that a human read an assessment for this worktree.
+///
+/// Deliberately NOT done by `claudifyCommand`: copying a prompt is the
+/// start of an assessment, and the flag this sets unlocks removing a
+/// worktree past its safety gate.
+export const markAssessed = (worktreePath: string) =>
+  invoke<void>("mark_assessed", { worktreePath });
