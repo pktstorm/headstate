@@ -276,8 +276,9 @@ mod tests {
     /// this is disposable" and skips. The test that failed was never
     /// the test that was wrong.
     ///
-    /// Identity is passed per-command rather than via two extra `git
-    /// config` spawns, because spawning is the scarce resource here.
+    /// The two `git config` spawns this used to do are gone: no test
+    /// here commits, so an identity was never needed, and spawning is
+    /// the scarce resource.
     fn git_init(dir: &Path) {
         for attempt in 0..5 {
             let out = std::process::Command::new("git")
