@@ -24,6 +24,9 @@ vi.mock("../api/hooks", () => ({
   useVenvs: () => ({ data: state.venvs ?? [] }),
   useVenvSizes: () => ({ sizes: new Map(), idle: new Map(), measuring: false }),
   useRemoveVenvs: () => vi.fn(),
+  // The page renders CleanupLog on "Everything"; it has its own test
+  // file, so this is stubbed empty rather than exercised here.
+  useCleanupLog: () => ({ entries: [], isLoading: false, run: () => Promise.resolve([]) }),
   useArtifacts: () => ({ data: state.artifacts, isLoading: state.loading }),
   useArtifactSizes: () => ({
     sizes: state.sizes,

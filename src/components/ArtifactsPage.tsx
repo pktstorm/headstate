@@ -9,6 +9,7 @@ import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 import { formatSize } from "@/lib/worktrees";
 import { HelpButton } from "./HelpButton";
 import { VenvSection } from "./VenvSection";
+import { CleanupLog } from "./CleanupLog";
 
 /// A placeholder holding the same footprint as the number it stands in
 /// for, so rows do not jump as each measurement lands. Matches the one
@@ -303,6 +304,11 @@ export function ArtifactsPage() {
           build-artifact group is selected -- the sidebar's whole point is
           that choosing a group narrows the page to it. */}
       {showVenvs ? <VenvSection /> : null}
+
+      {/* The ledger, on "Everything" only: it spans both kinds, so it
+          belongs where the whole picture is rather than repeated under
+          each group. */}
+      {group === undefined ? <CleanupLog /> : null}
     </div>
   );
 }
