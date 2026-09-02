@@ -9,6 +9,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   Artifact,
+  ClaudeFile,
   EcosystemReport,
   UpdateFilter,
   CleanupPrefs,
@@ -461,3 +462,10 @@ export const packagesMarkdown = (
   reports: EcosystemReport[],
   filter: UpdateFilter,
 ) => invoke<string>("packages_markdown", { repoPath, reports, filter });
+
+/// Every CLAUDE.md in a repository, with its import tree resolved.
+export const scanClaudeMd = (repoPath: string) =>
+  invoke<ClaudeFile[]>("scan_claude_md", { repoPath });
+
+/// The text of one file, for rendering.
+export const readClaudeMd = (path: string) => invoke<string>("read_claude_md", { path });

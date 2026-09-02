@@ -537,3 +537,32 @@ export interface EcosystemReport {
 }
 
 export type UpdateFilter = "patch" | "minor" | "all";
+
+/// One imported file in a CLAUDE.md tree.
+export interface ImportNode {
+  /// What the file wrote, verbatim.
+  raw: string;
+  /// Where it resolved to, when it did.
+  path: string | null;
+  bytes: number;
+  tokens: number;
+  /// Why this node is unusable, when it is. A broken or circular import
+  /// is SHOWN rather than dropped -- omitting it makes the tree look
+  /// complete when it is not.
+  problem: string | null;
+  children: ImportNode[];
+}
+
+/// One CLAUDE.md and the tree it pulls in.
+export interface ClaudeFile {
+  path: string;
+  bytes: number;
+  /// ESTIMATED tokens for this file alone. Characters divided by four,
+  /// not a real tokeniser -- every label says so.
+  tokens: number;
+  /// Estimated tokens for this file plus everything it imports. The
+  /// number that matters: a 2 KB file pulling in 40 KB of imports is the
+  /// case this view exists to surface.
+  total_tokens: number;
+  imports: ImportNode[];
+}

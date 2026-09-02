@@ -911,6 +911,30 @@ pub fn packages_markdown(
     crate::packages::markdown::render(&repo_path, &reports, filter)
 }
 
+/// Every CLAUDE.md in a repository, with its import tree resolved.
+#[tauri::command]
+pub async fn scan_claude_md(repo_path: String) -> Result<Vec<crate::claudemd::ClaudeFile>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::claudemd::scan_repo(std::path::Path::new(&repo_path))
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// The text of one file, for rendering.
+///
+/// Read fresh rather than carried in the scan: the scan holds every file
+/// in a repository, and shipping all of their contents to the frontend
+/// to display one is a lot of bytes crossing the bridge for nothing.
+#[tauri::command]
+pub fn read_claude_md(path: String) -> Result<String, String> {
+    // No containment check because there is no write here and no
+    // deletion -- this reads a path the user picked from a list the app
+    // produced. The risk a containment check guards against elsewhere
+    // (`remove_dir_all` on an arbitrary path) does not exist for a read.
+    std::fs::read_to_string(&path).map_err(|e| format!("could not read {path}: {e}"))
+}
+
 /// Remove a worktree, refusing anything not provably safe.
 ///
 /// The safety gate is re-evaluated inside `remove_worktree` rather than

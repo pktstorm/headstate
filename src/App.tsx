@@ -28,6 +28,7 @@ import { WorktreeSidebar } from "./components/WorktreeSidebar";
 import { ArtifactsPage } from "./components/ArtifactsPage";
 import { ArtifactSidebar } from "./components/ArtifactSidebar";
 import { PackagesPage } from "./components/PackagesPage";
+import { ClaudeMdPage } from "./components/ClaudeMdPage";
 import { RepoPickerSidebar } from "./components/RepoPickerSidebar";
 import { DockerPage } from "./components/DockerPage";
 import { DockerSidebar } from "./components/DockerSidebar";
@@ -207,7 +208,7 @@ export default function App() {
   return (
     <div className="flex h-screen flex-col bg-[#0d1117] text-[#e6edf3]">
       <div className="flex min-h-0 flex-1">
-      {view === "packages" ? (
+      {view === "packages" || view === "claude-md" ? (
         <RepoPickerSidebar reviewingCount={reviewingCount} />
       ) : view === "artifacts" ? (
         <ArtifactSidebar reviewingCount={reviewingCount} />
@@ -227,6 +228,8 @@ export default function App() {
           <h1 className="text-sm font-semibold">
             {view === "to-review"
               ? "Pull requests to review"
+              : view === "claude-md"
+                ? "CLAUDE.md"
               : view === "packages"
                 ? "Package updates"
               : view === "artifacts"
@@ -261,6 +264,8 @@ export default function App() {
               onBack={() => selectPr(null)}
             />
           </div>
+        ) : view === "claude-md" ? (
+          <ClaudeMdPage />
         ) : view === "packages" ? (
           <PackagesPage />
         ) : view === "artifacts" ? (

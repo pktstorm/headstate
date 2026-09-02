@@ -6,6 +6,7 @@ import { usePackages } from "@/api/hooks";
 import { packagesMarkdown } from "@/api/tauri";
 import { copyText } from "@/lib/clipboard";
 import { useActiveFilters } from "@/store/filters";
+import { HelpButton } from "./HelpButton";
 
 /// Shown as the section heading for each ecosystem's rows.
 const ECOSYSTEM_LABEL: Record<Ecosystem, string> = {
@@ -118,6 +119,8 @@ export function PackagesPage() {
             </button>
           ))}
         </div>
+
+        <HelpButton topic="package-updates" />
 
         <button
           type="button"

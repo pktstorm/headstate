@@ -23,6 +23,7 @@ export const ALL_VIEWS = [
   "docker",
   "artifacts",
   "packages",
+  "claude-md",
 ] as const;
 
 export type View = (typeof ALL_VIEWS)[number];
@@ -94,6 +95,7 @@ const EMPTY_FILTERS: Record<View, Filters> = {
   docker: {},
   artifacts: {},
   packages: {},
+  "claude-md": {},
 };
 
 /// Filters and view survive a relaunch.

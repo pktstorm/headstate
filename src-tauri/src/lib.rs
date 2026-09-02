@@ -1,6 +1,7 @@
 pub mod artifacts;
 pub mod auth;
 pub mod caches;
+pub mod claudemd;
 pub mod cleanup;
 pub mod commands;
 pub mod diag;
@@ -105,6 +106,8 @@ pub fn run() {
             commands::cleanup_log,
             commands::get_cleanup_prefs,
             commands::set_cleanup_prefs,
+            commands::scan_claude_md,
+            commands::read_claude_md,
             commands::check_packages,
             commands::packages_markdown,
             commands::scan_venvs,
