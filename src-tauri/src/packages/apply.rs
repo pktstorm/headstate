@@ -622,12 +622,22 @@ mod tests {
     fn branches_from_current_head() {
         let tmp = repo();
         std::fs::write(tmp.path().join("marker.txt"), "local\n").unwrap();
-        for args in [vec!["add", "-A"], vec!["commit", "-q", "-m", "local only"]] {
-            std::process::Command::new("git")
-                .args(&args)
+        // The commit carries its own identity, like the fixture's does:
+        // CI runners have no global git identity, so a bare `git commit`
+        // fails there while passing on a developer machine.
+        let commit = commit_args();
+        let commit: Vec<&str> = commit.iter().map(String::as_str).collect();
+        for args in [&["add", "-A"][..], &commit[..]] {
+            let out = std::process::Command::new("git")
+                .args(args)
                 .current_dir(tmp.path())
                 .output()
                 .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
         let wt = tmp.path().join("wt");
         create_worktree(tmp.path(), "headstate/test", &wt).unwrap();
