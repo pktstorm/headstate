@@ -300,17 +300,12 @@ pub fn remove_venv(path: &str, project_dirs: &[String]) -> Result<(), String> {
 
     // 2. Inside Poetry's own cache directory. This is the containment
     //    boundary: without it a bad path is `remove_dir_all` on anything
-    //    at all. Canonicalised on both sides so `../` cannot walk out.
+    //    at all.
     let cache = poetry::cache_dir().ok_or("could not locate the Poetry cache")?;
     let canon = p
         .canonicalize()
         .map_err(|e| format!("could not resolve the path: {e}"))?;
-    let cache_canon = cache
-        .canonicalize()
-        .map_err(|e| format!("could not resolve the cache directory: {e}"))?;
-    if !canon.starts_with(&cache_canon) {
-        return Err("that directory is not inside the Poetry cache".into());
-    }
+    is_inside_cache(&canon, &cache)?;
 
     // 3. Still parses as a venv name. A directory someone dropped in the
     //    cache by hand is not ours to delete.
@@ -332,6 +327,25 @@ pub fn remove_venv(path: &str, project_dirs: &[String]) -> Result<(), String> {
     }
 
     std::fs::remove_dir_all(&canon).map_err(|e| format!("could not remove it: {e}"))
+}
+
+/// Whether a canonical path sits inside the cache directory.
+///
+/// Split out so the containment rule can be tested WITHOUT a Poetry
+/// cache on the machine. It is the guard standing between a bad path and
+/// `remove_dir_all` on an arbitrary directory, so it is the one rule
+/// that must never go untested because CI happens to lack Python
+/// tooling -- which is exactly what happened the first time this shipped.
+///
+/// Both sides are canonicalised so `../` cannot walk out of the cache.
+fn is_inside_cache(canon: &Path, cache: &Path) -> Result<(), String> {
+    let cache_canon = cache
+        .canonicalize()
+        .map_err(|e| format!("could not resolve the cache directory: {e}"))?;
+    if !canon.starts_with(&cache_canon) {
+        return Err("that directory is not inside the Poetry cache".into());
+    }
+    Ok(())
 }
 
 /// Remove several, reporting each independently.
@@ -405,15 +419,43 @@ mod removal_tests {
 
     /// The containment boundary. Without it a bad path is
     /// `remove_dir_all` on anything at all.
+    /// The containment boundary, tested against a SYNTHETIC cache
+    /// directory rather than the real one.
+    ///
+    /// The first version drove this through `remove_venv`, which needs a
+    /// real Poetry cache to exist -- so on CI, which has no Python
+    /// tooling, it failed on "could not locate the Poetry cache" and
+    /// never reached the rule it was meant to check. The guard standing
+    /// between a bad path and `remove_dir_all` on an arbitrary directory
+    /// must not go untested because the runner lacks Poetry.
     #[test]
     fn refuses_a_path_outside_the_poetry_cache() {
-        let t = tempfile::TempDir::new().unwrap();
-        let victim = t.path().join("not-a-venv-ZZZZZZZZ-py3.99");
-        std::fs::create_dir(&victim).unwrap();
+        let cache = tempfile::TempDir::new().unwrap();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        let outside = elsewhere.path().canonicalize().unwrap();
 
-        let err = remove_venv(&victim.to_string_lossy(), &[]).unwrap_err();
+        let err = is_inside_cache(&outside, cache.path()).unwrap_err();
         assert!(err.contains("not inside the Poetry cache"), "{err}");
-        assert!(victim.exists());
+    }
+
+    #[test]
+    fn accepts_a_path_inside_the_cache() {
+        let cache = tempfile::TempDir::new().unwrap();
+        let venv = cache.path().join("a-AAAAAAAA-py3.13");
+        std::fs::create_dir(&venv).unwrap();
+        let canon = venv.canonicalize().unwrap();
+        assert!(is_inside_cache(&canon, cache.path()).is_ok());
+    }
+
+    /// `../` must not walk out of the cache. Both sides are
+    /// canonicalised for exactly this.
+    #[test]
+    fn a_traversal_out_of_the_cache_is_refused() {
+        let cache = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(outside.path().join("victim")).unwrap();
+        let sneaky = outside.path().join("victim").canonicalize().unwrap();
+        assert!(is_inside_cache(&sneaky, cache.path()).is_err());
     }
 
     /// The cache directory is not exclusively ours. A directory someone
