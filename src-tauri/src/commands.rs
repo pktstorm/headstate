@@ -877,6 +877,40 @@ pub fn set_cleanup_prefs(
     settings::set(&conn, settings::keys::CLEANUP_PREFS, &prefs).map_err(|e| e.to_string())
 }
 
+/// Which dependencies are out of date in one repository.
+///
+/// On demand, never on a timer: these commands hit package registries and
+/// take seconds on a large tree. That is a per-repo click, not something
+/// to do in the background across every repository.
+#[tauri::command]
+pub async fn check_packages(
+    repo_path: String,
+) -> Result<Vec<crate::packages::EcosystemReport>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let reports = crate::packages::run::check_repo(std::path::Path::new(&repo_path));
+        // Counts only -- never package names, which would put a private
+        // dependency list in a log meant to be shared.
+        log::info!(
+            "package check: {} ecosystems, {} outdated",
+            reports.len(),
+            reports.iter().map(|r| r.outdated.len()).sum::<usize>()
+        );
+        reports
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// The updates as markdown, for handing to an agent.
+#[tauri::command]
+pub fn packages_markdown(
+    repo_path: String,
+    reports: Vec<crate::packages::EcosystemReport>,
+    filter: crate::packages::markdown::Filter,
+) -> String {
+    crate::packages::markdown::render(&repo_path, &reports, filter)
+}
+
 /// Remove a worktree, refusing anything not provably safe.
 ///
 /// The safety gate is re-evaluated inside `remove_worktree` rather than

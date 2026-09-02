@@ -9,6 +9,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   Artifact,
+  EcosystemReport,
+  UpdateFilter,
   CleanupPrefs,
   LedgerEntry,
   Venv,
@@ -448,3 +450,14 @@ export const cleanupLog = () => invoke<LedgerEntry[]>("cleanup_log");
 export const getCleanupPrefs = () => invoke<CleanupPrefs>("get_cleanup_prefs");
 export const setCleanupPrefs = (prefs: CleanupPrefs) =>
   invoke<void>("set_cleanup_prefs", { prefs });
+
+/// Which dependencies are out of date in one repository.
+export const checkPackages = (repoPath: string) =>
+  invoke<EcosystemReport[]>("check_packages", { repoPath });
+
+/// The updates as markdown, for handing to an agent.
+export const packagesMarkdown = (
+  repoPath: string,
+  reports: EcosystemReport[],
+  filter: UpdateFilter,
+) => invoke<string>("packages_markdown", { repoPath, reports, filter });

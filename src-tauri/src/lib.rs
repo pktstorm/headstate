@@ -105,6 +105,8 @@ pub fn run() {
             commands::cleanup_log,
             commands::get_cleanup_prefs,
             commands::set_cleanup_prefs,
+            commands::check_packages,
+            commands::packages_markdown,
             commands::scan_venvs,
             commands::size_venvs,
             commands::remove_venvs,

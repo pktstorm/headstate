@@ -45,6 +45,7 @@ import {
   removeWorktrees,
   removeArtifacts,
   markAssessed,
+  checkPackages,
   cleanupLog,
   getCleanupPrefs,
   previewCleanup,
@@ -706,6 +707,21 @@ export function useCleanupLog(enabled: boolean) {
       return out;
     },
   };
+}
+
+/// Outdated packages for one repository.
+///
+/// `enabled` gates it on a repo actually being selected, and it never
+/// runs on a timer: these commands hit registries and take seconds.
+export function usePackages(repoPath: string | undefined) {
+  return useQuery({
+    queryKey: ["packages", repoPath],
+    queryFn: () => checkPackages(repoPath as string),
+    enabled: Boolean(repoPath),
+    // Long, because the answer changes when a registry publishes, not
+    // when the user clicks around. Refetching costs seconds and network.
+    staleTime: 10 * 60 * 1000,
+  });
 }
 
 /// Merge the base branch into a pull request's head.

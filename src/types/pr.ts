@@ -504,3 +504,36 @@ export interface CleanupPrefs {
   venvs: boolean;
   max_per_run: number;
 }
+
+export type Ecosystem = "npm" | "yarn" | "poetry" | "uv" | "dotnet";
+
+/// How large a version jump is.
+///
+/// `unknown` is a real answer, not a fallback. Version schemes here are
+/// not all semver -- .NET ships four parts, PEP 440 has epochs -- and a
+/// version silently called major hides from a "minors only" filter while
+/// one silently called minor is offered as safe.
+export type Bump = "patch" | "minor" | "major" | "unknown";
+
+export interface Outdated {
+  name: string;
+  current: string;
+  latest: string;
+  bump: Bump;
+  ecosystem: Ecosystem;
+  /// The manifest to edit, so an agent does not have to find it.
+  manifest: string;
+}
+
+/// What one ecosystem reported for one repository.
+///
+/// `error` exists because "no updates" and "the check did not run" are
+/// opposite answers, and rendering both as an empty list reports failure
+/// as good news.
+export interface EcosystemReport {
+  ecosystem: Ecosystem;
+  outdated: Outdated[];
+  error: string | null;
+}
+
+export type UpdateFilter = "patch" | "minor" | "all";
