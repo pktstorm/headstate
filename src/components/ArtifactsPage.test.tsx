@@ -17,6 +17,12 @@ vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
 vi.mock("../api/hooks", () => ({
   useRemoveArtifacts: () => removeFn,
+  // The page renders VenvSection, which has its own hooks. Stubbed to
+  // empty here rather than exercised: that component has its own test
+  // file, and duplicating its fixtures would make both harder to change.
+  useVenvs: () => ({ data: [] }),
+  useVenvSizes: () => ({ sizes: new Map(), idle: new Map(), measuring: false }),
+  useRemoveVenvs: () => vi.fn(),
   useArtifacts: () => ({ data: state.artifacts, isLoading: state.loading }),
   useArtifactSizes: () => ({
     sizes: state.sizes,

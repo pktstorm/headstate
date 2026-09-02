@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 import { formatSize } from "@/lib/worktrees";
 import { HelpButton } from "./HelpButton";
+import { VenvSection } from "./VenvSection";
 
 /// A placeholder holding the same footprint as the number it stands in
 /// for, so rows do not jump as each measurement lands. Matches the one
@@ -233,6 +234,11 @@ export function ArtifactsPage() {
           />
         ))}
       </ul>
+
+      {/* Tool caches on the SAME page: both answer "where did the disk
+          go", and splitting them across two views would make a user
+          check two places for one answer. */}
+      <VenvSection />
     </div>
   );
 }

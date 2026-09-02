@@ -107,6 +107,44 @@ that, a measurement on a real machine found ancestry alone recognised
 10 of 157 merged worktrees.`,
   },
 
+  "poetry-venvs": {
+    title: "Poetry virtualenvs, and why there are so many",
+    body: `Poetry names each virtualenv after **the absolute path of the project
+that created it** — so every worktree gets its own, and deleting the
+worktree leaves the virtualenv behind forever.
+
+That is why this list is long. On the machine this feature was built for,
+one project that no longer exists on disk at all accounted for 70 of the
+90 virtualenvs and 55 GB.
+
+### The three states
+
+**Orphaned** — no directory on this machine hashes to this virtualenv's
+name. The path that created it is gone, so nothing can ever use it again.
+This is a *fact*, not an estimate, and it is the only state offered for
+removal.
+
+**Stale** — the project directory still exists, but nothing inside the
+virtualenv has been written to in over 90 days. Shown so you can see it;
+never removed automatically, because a project you have not touched since
+spring is not the same as one you have abandoned.
+
+**Live** — everything else, including anything that could not be
+measured.
+
+### Why "stale" is not offered for removal
+
+Orphaned is provable. Stale is a guess about your intentions, and this
+view will not act on a guess. If a stale virtualenv really is finished
+with, deleting its project directory makes it an orphan, and then it can
+go.
+
+### What is re-checked when you remove
+
+The verdict is re-derived from the filesystem, not taken from the row you
+clicked. If a project directory reappeared since the list was built, that
+virtualenv is live again and the removal is refused.`,
+  },
   "build-artifacts": {
     title: "Build output, and what puts it back",
     body: `Directories a **tool regenerates**: \`target\`, \`node_modules\`,

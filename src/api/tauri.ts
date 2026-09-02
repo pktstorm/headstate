@@ -9,6 +9,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   Artifact,
+  Venv,
+  VenvRemoval,
   ArtifactRemoval,
   Assessment,
   CycleTrend,
@@ -402,3 +404,15 @@ export const sizeArtifacts = (paths: string[]) =>
 /// stale row is refused rather than acted on.
 export const removeArtifacts = (paths: string[]) =>
   invoke<ArtifactRemoval[]>("remove_artifacts", { paths });
+
+/// Poetry virtualenvs, classified. Discovery only: sizes and idle times
+/// come from `sizeVenvs`.
+export const scanVenvs = () => invoke<Venv[]>("scan_venvs");
+
+/// Sizes and idle times, as `[path, bytes, idleSecs]`.
+export const sizeVenvs = (paths: string[]) =>
+  invoke<[string, number, number | null][]>("size_venvs", { paths });
+
+/// Remove virtualenvs. Each is re-verified at delete time.
+export const removeVenvs = (paths: string[]) =>
+  invoke<VenvRemoval[]>("remove_venvs", { paths });

@@ -721,6 +721,71 @@ pub async fn remove_artifacts(
     Ok(out)
 }
 
+/// Poetry virtualenvs, classified against every directory we can see.
+///
+/// Discovery only: sizes and idle times come from `size_venvs`, because
+/// deciding staleness needs a full walk of each venv and the list should
+/// paint before that finishes.
+#[tauri::command]
+pub async fn scan_venvs(app: AppHandle) -> Result<Vec<crate::caches::Venv>, String> {
+    let roots = get_worktree_dirs(app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let dirs = crate::caches::project_dirs(&roots);
+        log::info!("venv scan: {} candidate project directories", dirs.len());
+        crate::caches::scan_poetry(&dirs)
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Sizes and idle times, as `(path, bytes, idle_secs)`.
+///
+/// The idle time is the whole reason this is a second pass: it comes
+/// from the DEEPEST file mtime, which needs the same walk as the size.
+/// Poetry touches a venv's root without writing inside, so the
+/// directory's own mtime reports a year-old venv as days old.
+#[tauri::command]
+pub async fn size_venvs(paths: Vec<String>) -> Result<Vec<(String, u64, Option<u64>)>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .map(|p| {
+                let (bytes, idle) = crate::caches::measure(std::path::Path::new(&p));
+                (p, bytes, idle)
+            })
+            .collect()
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Remove Poetry virtualenvs, re-verifying each at delete time.
+///
+/// The project directories are re-walked HERE rather than taken from the
+/// request: whether a venv is orphaned depends entirely on that set, and
+/// a caller supplying a short one could turn any live venv into a
+/// deletion candidate.
+#[tauri::command]
+pub async fn remove_venvs(
+    app: AppHandle,
+    paths: Vec<String>,
+) -> Result<Vec<crate::caches::VenvRemoval>, String> {
+    let roots = get_worktree_dirs(app);
+    let out = tauri::async_runtime::spawn_blocking(move || {
+        let dirs = crate::caches::project_dirs(&roots);
+        crate::caches::remove_venvs(&paths, &dirs)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    let failed = out.iter().filter(|o| o.error.is_some()).count();
+    log::info!(
+        "venv removal: {} of {} removed",
+        out.len() - failed,
+        out.len()
+    );
+    Ok(out)
+}
+
 /// Remove a worktree, refusing anything not provably safe.
 ///
 /// The safety gate is re-evaluated inside `remove_worktree` rather than

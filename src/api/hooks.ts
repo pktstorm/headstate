@@ -3,7 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { safeUnlisten } from "./unlisten";
 import { timed } from "./diag";
 import { useEffect, useState, useSyncExternalStore } from "react";
-import type { Artifact, DockerImage, PrDetail, PullRequest, Worktree } from "../types/pr";
+import type { Artifact, DockerImage, PrDetail, PullRequest, Venv, Worktree } from "../types/pr";
 import type { PrActionName } from "./tauri";
 import {
   getCached,
@@ -36,6 +36,9 @@ import {
   setAutoMerge,
   removeWorktrees,
   removeArtifacts,
+  removeVenvs,
+  scanVenvs,
+  sizeVenvs,
   scanArtifacts,
   sizeArtifacts,
   sizeWorktrees,
@@ -598,6 +601,54 @@ export function useRemoveArtifacts() {
     const out = await removeArtifacts(paths);
     await qc.invalidateQueries({ queryKey: ["artifacts"] });
     await qc.invalidateQueries({ queryKey: ["artifact-sizes"] });
+    return out;
+  };
+}
+
+/// Poetry virtualenvs, classified.
+///
+/// Discovery only. Sizes and idle times come from `useVenvSizes`,
+/// because deciding staleness needs a full walk of each venv.
+export function useVenvs(enabled: boolean) {
+  return useQuery({
+    queryKey: ["venvs"],
+    queryFn: scanVenvs,
+    enabled,
+    staleTime: 60 * 1000,
+  });
+}
+
+/// Sizes and idle times for virtualenvs.
+///
+/// One batch rather than per-project groups: unlike artifacts, venvs are
+/// individually small (under a gigabyte each on a real cache), so no
+/// single one holds up the rest and the added query keys would only
+/// fragment the cache.
+export function useVenvSizes(venvs: Venv[], enabled: boolean) {
+  const paths = venvs.map((v) => v.path);
+  const q = useQuery({
+    queryKey: ["venv-sizes", paths.length],
+    queryFn: () => sizeVenvs(paths),
+    enabled: enabled && paths.length > 0,
+    staleTime: 5 * 60 * 1000,
+  });
+
+  const sizes = new Map<string, number>();
+  const idle = new Map<string, number>();
+  for (const [path, bytes, secs] of q.data ?? []) {
+    sizes.set(path, bytes);
+    if (secs !== null) idle.set(path, secs);
+  }
+  return { sizes, idle, measuring: q.isFetching };
+}
+
+/// Remove virtualenvs, then refresh what is left.
+export function useRemoveVenvs() {
+  const qc = useQueryClient();
+  return async (paths: string[]) => {
+    const out = await removeVenvs(paths);
+    await qc.invalidateQueries({ queryKey: ["venvs"] });
+    await qc.invalidateQueries({ queryKey: ["venv-sizes"] });
     return out;
   };
 }

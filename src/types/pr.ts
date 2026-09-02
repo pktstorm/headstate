@@ -448,3 +448,27 @@ export interface ArtifactRemoval {
   /// remove" alone is not something a user can act on.
   error: string | null;
 }
+
+/// Why a Poetry virtualenv is reclaimable.
+export type VenvState = "orphaned" | "stale" | "live";
+
+/// One Poetry virtualenv.
+export interface Venv {
+  path: string;
+  /// The project name Poetry encoded, e.g. `mls-delivery-service`.
+  project: string;
+  state: VenvState;
+  /// The directory that produced it. Null for an orphan -- that IS the
+  /// finding, not missing data.
+  source: string | null;
+  size_bytes: number | null;
+  /// Seconds since the newest file INSIDE was written. Poetry touches a
+  /// venv's root without writing inside, so its own mtime reports a
+  /// year-old venv as days old.
+  idle_secs: number | null;
+}
+
+export interface VenvRemoval {
+  path: string;
+  error: string | null;
+}
