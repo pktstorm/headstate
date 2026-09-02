@@ -885,15 +885,19 @@ pub fn set_cleanup_prefs(
 #[tauri::command]
 pub async fn check_packages(
     repo_path: String,
-) -> Result<Vec<crate::packages::EcosystemReport>, String> {
+) -> Result<Vec<crate::packages::ProjectReport>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let reports = crate::packages::run::check_repo(std::path::Path::new(&repo_path));
         // Counts only -- never package names, which would put a private
         // dependency list in a log meant to be shared.
         log::info!(
-            "package check: {} ecosystems, {} outdated",
+            "package check: {} projects, {} outdated",
             reports.len(),
-            reports.iter().map(|r| r.outdated.len()).sum::<usize>()
+            reports
+                .iter()
+                .flat_map(|p| &p.reports)
+                .map(|r| r.outdated.len())
+                .sum::<usize>()
         );
         reports
     })
@@ -905,7 +909,7 @@ pub async fn check_packages(
 #[tauri::command]
 pub fn packages_markdown(
     repo_path: String,
-    reports: Vec<crate::packages::EcosystemReport>,
+    reports: Vec<crate::packages::ProjectReport>,
     filter: crate::packages::markdown::Filter,
 ) -> String {
     crate::packages::markdown::render(&repo_path, &reports, filter)
