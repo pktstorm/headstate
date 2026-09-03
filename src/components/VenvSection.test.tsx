@@ -14,11 +14,12 @@ const state = vi.hoisted(() => ({
   sizes: new Map<string, number>(),
   idle: new Map<string, number>(),
   measuring: false,
+  loading: false,
 }));
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 vi.mock("../api/hooks", () => ({
-  useVenvs: () => ({ data: state.venvs }),
+  useVenvs: () => ({ data: state.venvs, isLoading: state.loading }),
   useVenvSizes: () => ({
     sizes: state.sizes,
     idle: state.idle,
@@ -42,6 +43,7 @@ const venv = (over: Partial<Venv> = {}): Venv => ({
 beforeEach(() => {
   removeFn.mockClear();
   state.venvs = [];
+  state.loading = false;
   state.sizes = new Map();
   state.idle = new Map();
   state.measuring = false;
@@ -359,5 +361,35 @@ describe("age on a virtualenv row", () => {
     state.idle = new Map();
     render(<VenvSection />);
     expect(screen.queryByText("just now")).toBeNull();
+  });
+});
+
+/// #431: the section rendered NOTHING for the 9-40 seconds the scan
+/// takes on a real machine, which is indistinguishable from having no
+/// virtualenvs -- and is exactly how it was reported.
+describe("while the scan is running", () => {
+  it("says it is looking, rather than rendering nothing", () => {
+    state.venvs = [];
+    state.loading = true;
+    const { container } = render(<VenvSection />);
+    expect(screen.getByText(/looking for poetry virtualenvs/i)).toBeTruthy();
+    expect(container.textContent).not.toBe("");
+  });
+
+  /// Once the scan has ANSWERED, an empty list really does mean none --
+  /// and then saying nothing is right.
+  it("renders nothing once an empty result is known", () => {
+    state.venvs = [];
+    state.loading = false;
+    const { container } = render(<VenvSection />);
+    expect(container.textContent).toBe("");
+  });
+
+  it("shows the rows once they arrive", () => {
+    state.venvs = [venv()];
+    state.loading = false;
+    render(<VenvSection />);
+    expect(screen.getByText("mls-delivery-service")).toBeTruthy();
+    expect(screen.queryByText(/looking for poetry/i)).toBeNull();
   });
 });
