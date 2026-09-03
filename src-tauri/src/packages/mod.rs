@@ -12,6 +12,7 @@ pub mod markdown;
 pub mod model;
 pub mod registry;
 pub mod run;
+pub mod swift;
 pub mod terraform;
 pub mod tools;
 pub mod version;

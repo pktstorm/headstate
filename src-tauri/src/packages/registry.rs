@@ -81,8 +81,9 @@ pub async fn enrich(reports: &mut [super::model::ProjectReport]) {
     for p in reports.iter() {
         for r in &p.reports {
             for o in &r.outdated {
-                if needs_lookup(o.ecosystem) && !wanted.iter().any(|(_, n)| n == &o.name) {
-                    wanted.push((o.ecosystem, o.name.clone()));
+                let key = lookup_key(o);
+                if needs_lookup(o.ecosystem) && !wanted.iter().any(|(_, n)| n == &key) {
+                    wanted.push((o.ecosystem, key));
                 }
             }
         }
@@ -101,13 +102,44 @@ pub async fn enrich(reports: &mut [super::model::ProjectReport]) {
     for p in reports.iter_mut() {
         for r in &mut p.reports {
             for o in &mut r.outdated {
-                if let Some(latest) = found.get(&o.name) {
+                if let Some(latest) = found.get(&lookup_key(o)) {
                     o.bump = super::version::bump(&o.current, latest);
                     o.latest = latest.clone();
                 }
             }
         }
     }
+}
+
+/// The newest release TAG for a Swift package on GitHub.
+///
+/// Swift package versions are git tags, so this is a tag listing. Only
+/// GitHub: anything else reports nothing rather than being guessed at,
+/// and `latest` stays equal to `current` with `Bump::Unknown`, which
+/// renders as "cannot check".
+///
+/// The public REST endpoint rather than the authenticated client. These
+/// are public repositories by definition -- a Swift package resolved
+/// from a URL is fetchable -- and routing this through octocrab would
+/// spend the user's rate limit on someone else's dependency list.
+async fn swift_latest(client: &reqwest::Client, location: &str) -> Option<String> {
+    let (owner, repo) = super::swift::github_repo(location)?;
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/tags?per_page=100");
+    let body: serde_json::Value = client
+        .get(&url)
+        // GitHub rejects an absent User-Agent outright.
+        .header("User-Agent", "headstate")
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    let tags = body.as_array()?;
+    newest(
+        tags.iter()
+            .filter_map(|t| t.get("name")?.as_str().map(str::to_string)),
+    )
 }
 
 /// Install rustls' crypto provider, once.
@@ -132,9 +164,28 @@ fn install_crypto_provider() {
     });
 }
 
+/// What to ask the registry about, which is not always the display name.
+///
+/// Terraform's `name` IS the full provider address, so it is the key.
+/// Swift's name was shortened for the list -- `sqlcipher/SQLCipher.swift`
+/// rather than the `.git` URL -- so the source URL is carried at the
+/// front of `manifest` and recovered here.
+fn lookup_key(o: &super::model::Outdated) -> String {
+    match o.ecosystem {
+        super::model::Ecosystem::Swift => o
+            .manifest
+            .split_once(" <- ")
+            .map_or_else(|| o.name.clone(), |(url, _)| url.to_string()),
+        _ => o.name.clone(),
+    }
+}
+
 /// Whether this ecosystem's latest version comes from a registry.
 fn needs_lookup(eco: super::model::Ecosystem) -> bool {
-    matches!(eco, super::model::Ecosystem::Terraform)
+    matches!(
+        eco,
+        super::model::Ecosystem::Terraform | super::model::Ecosystem::Swift
+    )
 }
 
 /// The newest published version for one dependency.
@@ -145,6 +196,7 @@ async fn latest_for(
 ) -> Option<String> {
     match eco {
         super::model::Ecosystem::Terraform => terraform_latest(client, name).await,
+        super::model::Ecosystem::Swift => swift_latest(client, name).await,
         _ => None,
     }
 }
@@ -267,5 +319,31 @@ mod live {
         let moved = rows.iter().filter(|o| o.latest != o.current).count();
         eprintln!("rows with a NEWER version available: {moved}");
         assert!(!rows.is_empty(), "the repo must yield providers");
+    }
+}
+
+#[cfg(test)]
+mod live_swift {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "needs network access and a real Swift project"]
+    async fn enriches_a_real_swift_project() {
+        let Ok(repo) = std::env::var("HEADSTATE_SWIFT_REPO") else {
+            eprintln!("set HEADSTATE_SWIFT_REPO");
+            return;
+        };
+        let mut reports = super::super::run::check_repo(std::path::Path::new(&repo));
+        enrich(&mut reports).await;
+        let rows: Vec<_> = reports
+            .iter()
+            .flat_map(|p| &p.reports)
+            .filter(|r| r.ecosystem == super::super::model::Ecosystem::Swift)
+            .flat_map(|r| &r.outdated)
+            .collect();
+        eprintln!("swift rows: {}", rows.len());
+        for o in rows.iter().take(5) {
+            eprintln!("  {} {} -> {} ({:?})", o.name, o.current, o.latest, o.bump);
+        }
     }
 }
