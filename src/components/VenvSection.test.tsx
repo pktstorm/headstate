@@ -59,7 +59,11 @@ describe("VenvSection", () => {
   /// Orphaned is a FACT -- the path that made it is gone. Stale is a
   /// judgement about a project that still exists, and this view will not
   /// act on a judgement.
-  it("offers only orphans for removal", () => {
+  /// Was "offers only orphans". A 416-day-old virtualenv is now
+  /// removable without a setting: ticking the row IS the intent, and no
+  /// other artifact asks twice. `live` stays refused -- its project
+  /// exists and is in use, which is a fact rather than a threshold.
+  it("offers orphans and stale virtualenvs, but never live ones", () => {
     state.venvs = [
       venv(),
       venv({
@@ -74,8 +78,10 @@ describe("VenvSection", () => {
 
     const boxes = screen.getAllByRole("checkbox");
     expect(boxes).toHaveLength(2);
+    // The orphan.
     expect(boxes[0].hasAttribute("disabled")).toBe(false);
-    expect(boxes[1].hasAttribute("disabled")).toBe(true);
+    // 416 days idle -> stale -> now selectable, no setting involved.
+    expect(boxes[1].hasAttribute("disabled")).toBe(false);
   });
 
   /// The reported case: a project still on disk, untouched for over a
@@ -252,15 +258,16 @@ describe("selecting a stale virtualenv", () => {
     expect(box.hasAttribute("disabled")).toBe(false);
   });
 
-  /// Off by default: a stale venv's project still exists, so removing it
-  /// is a judgement the user has to make explicitly.
-  it("is not selectable while the setting is off", () => {
+  /// The gate is GONE. This asserts it stays gone: a stale virtualenv is
+  /// selectable regardless of any setting, because manual removal is not
+  /// where a staleness threshold needs the user's permission.
+  it("is selectable regardless of any setting", () => {
     state.venvs = [staleVenv()];
     state.idle = new Map([["/cache/old-project-BBBBBBBB-py3.13", 60 * 60 * 24 * 400]]);
     state.allowStale = false;
     render(<VenvSection />);
-    const box = screen.getByLabelText(/old-project virtualenv is stale/);
-    expect(box.hasAttribute("disabled")).toBe(true);
+    const box = screen.getByLabelText("Select old-project virtualenv");
+    expect(box.hasAttribute("disabled")).toBe(false);
   });
 
   /// A live venv is never removable, at either layer.

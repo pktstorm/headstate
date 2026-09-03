@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { toast } from "sonner";
 import type { Venv, VenvState } from "@/types/pr";
-import { useRemoveVenvs, useUiPrefs, useVenvs, useVenvSizes } from "@/api/hooks";
+import { useRemoveVenvs, useVenvs, useVenvSizes } from "@/api/hooks";
 import { formatSize } from "@/lib/worktrees";
 import { relativeSeconds } from "@/lib/time";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
@@ -29,10 +29,20 @@ const STALE_SECS = 90 * 24 * 60 * 60;
 /// on changed nothing a user could see -- the checkbox stayed disabled
 /// and the row could never be selected. `live` is never removable at
 /// either layer.
-function isRemovable(v: Venv, state: VenvState, allowStale: boolean): boolean {
+function isRemovable(v: Venv, state: VenvState): boolean {
   if (v.path.length === 0) return false;
-  if (state === "orphaned") return true;
-  return state === "stale" && allowStale;
+  // Orphaned OR stale. No setting.
+  //
+  // Stale used to require `remove_stale_venvs`, on the reasoning that a
+  // 90-day threshold is a guess about intent. True for AUTOMATIC
+  // cleanup; wrong here. Ticking a specific row and confirming in a
+  // dialog IS the intent, and no other artifact asks twice -- a Rust
+  // `target` costs minutes to rebuild and has no gate, while a
+  // virtualenv is `poetry install`.
+  //
+  // `live` stays unremovable: its project exists and is in use, which
+  // is a fact rather than a threshold.
+  return state === "orphaned" || state === "stale";
 }
 
 /// The state a row displays, once its idle time is known.
@@ -61,10 +71,6 @@ export function VenvSection() {
   const { data: venvs = [] } = useVenvs(true);
   const { sizes, idle, measuring } = useVenvSizes(venvs, venvs.length > 0);
   const [checked, setChecked] = useState<Set<string>>(new Set());
-  // The same setting the backend reads. Without it the two layers
-  // disagree and the UI silently refuses what the backend would allow.
-  const { prefs } = useUiPrefs();
-  const allowStale = prefs?.remove_stale_venvs ?? false;
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   const remove = useRemoveVenvs();
@@ -196,7 +202,7 @@ export function VenvSection() {
 
       <ul className="flex flex-col gap-1">
         {rows.map(({ v, state }) => {
-          const removable = isRemovable(v, state, allowStale);
+          const removable = isRemovable(v, state);
           return (
             <li
               key={v.path}
@@ -219,9 +225,7 @@ export function VenvSection() {
                 aria-label={
                   removable
                     ? `Select ${v.project} virtualenv`
-                    : state === "stale"
-                      ? `${v.project} virtualenv is stale: enable "Also allow removing stale virtualenvs" in Settings`
-                      : `${v.project} virtualenv cannot be removed: its project still exists`
+                    : `${v.project} virtualenv cannot be removed: its project still exists and is in use`
                 }
                 className="shrink-0 disabled:opacity-30"
               />

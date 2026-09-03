@@ -239,15 +239,22 @@ pub struct UiPrefs {
     /// almost none of them need.
     #[serde(default)]
     pub diagnostic_logging: bool,
-    /// Whether STALE virtualenvs may be selected for removal.
+    /// Whether AUTOMATIC cleanup may remove a stale virtualenv.
     ///
-    /// Orphans need no opt-in: nothing on the machine hashes to them, so
-    /// the path that made them is gone and the verdict is a fact. Stale
-    /// is a judgement about a project that still EXISTS -- the threshold
-    /// is a guess about intent, and the app should not act on a guess
-    /// unless the user has supplied the intent themselves.
+    /// No longer gates manual removal. It did, and that was wrong: when
+    /// the user ticks a specific row and confirms a dialog, the tick IS
+    /// the intent, and no other artifact asks permission twice.
     ///
-    /// Defaults OFF, so an upgrade never widens what a click can delete.
+    /// The reasoning still holds where the app acts on its OWN: orphans
+    /// are a fact (nothing hashes to them, so the path that made them is
+    /// gone), while stale is a threshold, and a threshold is a guess
+    /// about intent that unattended deletion should not act on.
+    ///
+    /// `cleanup::propose` is currently hardcoded to orphans only and
+    /// does not read this yet -- see #453. Kept rather than removed
+    /// because that is where it belongs.
+    ///
+    /// Defaults OFF, so an upgrade never widens what runs unattended.
     #[serde(default)]
     pub remove_stale_venvs: bool,
     /// How many days idle before a virtualenv counts as stale.
