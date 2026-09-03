@@ -1,5 +1,5 @@
 use super::model::{Ecosystem, EcosystemReport, Outdated, ProjectReport};
-use super::{detect, tools, version};
+use super::{detect, terraform, tools, version};
 use std::path::Path;
 
 /// Whether this project's Yarn is version 1.
@@ -54,6 +54,20 @@ pub fn check(repo: &Path, eco: Ecosystem) -> EcosystemReport {
     // Saying so is the point. An empty list would read as "up to date",
     // which is the same inversion a missing tool would produce, and this
     // module exists to refuse it.
+    // Terraform answers from a FILE plus the registry, never a command.
+    //
+    // `terraform providers` reports the constraints (`>= 5.0.0`) and
+    // does not diff, so there is nothing to spawn and parse. The lock
+    // file carries the resolved versions, and `enrich` fills in the
+    // latest asynchronously afterwards.
+    if eco == Ecosystem::Terraform {
+        return EcosystemReport {
+            ecosystem: eco,
+            outdated: terraform::pinned(repo),
+            error: None,
+        };
+    }
+
     if eco == Ecosystem::Swift {
         return EcosystemReport {
             ecosystem: eco,
@@ -111,6 +125,9 @@ pub fn check(repo: &Path, eco: Ecosystem) -> EcosystemReport {
         Ecosystem::Uv => &["pip", "list", "--outdated", "--format", "json"],
         Ecosystem::Dotnet => &["list", "package", "--outdated"],
         Ecosystem::Cocoapods => &["outdated"],
+        // Neither reaches here: both return early above, because
+        // neither has a command that answers the question.
+        Ecosystem::Terraform => &["version"],
         // Swift never reaches here -- `check` returns early for it,
         // because there is no command that answers the question.
         Ecosystem::Swift => &["--version"],
@@ -255,8 +272,8 @@ pub fn parse(stdout: &str, eco: Ecosystem, repo: &Path) -> Vec<Outdated> {
         Ecosystem::Poetry => parse_poetry(stdout),
         Ecosystem::Dotnet => parse_dotnet(stdout, repo),
         Ecosystem::Cocoapods => parse_cocoapods(stdout),
-        // Handled before any command runs.
-        Ecosystem::Swift => Vec::new(),
+        // Both handled before any command runs: neither has one.
+        Ecosystem::Swift | Ecosystem::Terraform => Vec::new(),
     }
 }
 
