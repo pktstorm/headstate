@@ -385,9 +385,10 @@ export function SettingsDialog({
               <label className="ml-6 flex items-center gap-2 text-sm">
                 <input
                   type="checkbox"
-                  checked={ui?.remove_stale_venvs ?? false}
+                  checked={cleanup.venvs_stale}
+                  disabled={!cleanup.venvs}
                   onChange={() =>
-                    ui && void setUi({ ...ui, remove_stale_venvs: !ui.remove_stale_venvs })
+                    void setCleanup({ ...cleanup, venvs_stale: !cleanup.venvs_stale })
                   }
                 />
                 Stale virtualenvs, whose projects still exist

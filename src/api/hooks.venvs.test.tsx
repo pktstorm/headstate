@@ -3,8 +3,10 @@ import { renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 
+// Typed by its SIGNATURE, so `mock.calls[i][0]` is a string without an
+// unused parameter that lint rejects.
 const invoke = vi.hoisted(() =>
-  vi.fn((_cmd: string) => Promise.resolve([])),
+  vi.fn<(cmd: string) => Promise<unknown[]>>(() => Promise.resolve([])),
 );
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(() => Promise.resolve(() => {})) }));

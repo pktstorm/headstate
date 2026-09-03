@@ -239,24 +239,6 @@ pub struct UiPrefs {
     /// almost none of them need.
     #[serde(default)]
     pub diagnostic_logging: bool,
-    /// Whether AUTOMATIC cleanup may remove a stale virtualenv.
-    ///
-    /// No longer gates manual removal. It did, and that was wrong: when
-    /// the user ticks a specific row and confirms a dialog, the tick IS
-    /// the intent, and no other artifact asks permission twice.
-    ///
-    /// The reasoning still holds where the app acts on its OWN: orphans
-    /// are a fact (nothing hashes to them, so the path that made them is
-    /// gone), while stale is a threshold, and a threshold is a guess
-    /// about intent that unattended deletion should not act on.
-    ///
-    /// `cleanup::propose` is currently hardcoded to orphans only and
-    /// does not read this yet -- see #453. Kept rather than removed
-    /// because that is where it belongs.
-    ///
-    /// Defaults OFF, so an upgrade never widens what runs unattended.
-    #[serde(default)]
-    pub remove_stale_venvs: bool,
     /// How many days idle before a virtualenv counts as stale.
     ///
     /// Adjustable because 90 is a default, not a fact: someone with
@@ -300,7 +282,6 @@ impl Default for UiPrefs {
             // the setting is for.
             announce_updates: true,
             // OFF: an upgrade must never widen what a click can delete.
-            remove_stale_venvs: false,
             // 0 means "use the default", resolved by `stale_venv_days`.
             stale_venv_days: 0,
             // OFF. Verbose per-request logging is a cost every user

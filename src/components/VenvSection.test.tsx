@@ -14,12 +14,10 @@ const state = vi.hoisted(() => ({
   sizes: new Map<string, number>(),
   idle: new Map<string, number>(),
   measuring: false,
-  allowStale: false,
 }));
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 vi.mock("../api/hooks", () => ({
-  useUiPrefs: () => ({ prefs: { remove_stale_venvs: state.allowStale }, set: vi.fn() }),
   useVenvs: () => ({ data: state.venvs }),
   useVenvSizes: () => ({
     sizes: state.sizes,
@@ -44,7 +42,6 @@ const venv = (over: Partial<Venv> = {}): Venv => ({
 beforeEach(() => {
   removeFn.mockClear();
   state.venvs = [];
-  state.allowStale = false;
   state.sizes = new Map();
   state.idle = new Map();
   state.measuring = false;
@@ -251,7 +248,6 @@ describe("selecting a stale virtualenv", () => {
   it("is selectable once the setting allows it", () => {
     state.venvs = [staleVenv()];
     state.idle = new Map([["/cache/old-project-BBBBBBBB-py3.13", 60 * 60 * 24 * 400]]);
-    state.allowStale = true;
     render(<VenvSection />);
     expect(screen.getByText("stale")).toBeTruthy();
     const box = screen.getByLabelText("Select old-project virtualenv");
@@ -264,7 +260,6 @@ describe("selecting a stale virtualenv", () => {
   it("is selectable regardless of any setting", () => {
     state.venvs = [staleVenv()];
     state.idle = new Map([["/cache/old-project-BBBBBBBB-py3.13", 60 * 60 * 24 * 400]]);
-    state.allowStale = false;
     render(<VenvSection />);
     const box = screen.getByLabelText("Select old-project virtualenv");
     expect(box.hasAttribute("disabled")).toBe(false);
@@ -274,7 +269,6 @@ describe("selecting a stale virtualenv", () => {
   it("never offers a live virtualenv, even with the setting on", () => {
     state.venvs = [venv({ path: "/cache/live-CCCCCCCC-py3.13", project: "live", state: "live" })];
     state.idle = new Map([["/cache/live-CCCCCCCC-py3.13", 60]]);
-    state.allowStale = true;
     render(<VenvSection />);
     const box = screen.getByLabelText(/live virtualenv cannot be removed/);
     expect(box.hasAttribute("disabled")).toBe(true);
@@ -284,7 +278,6 @@ describe("selecting a stale virtualenv", () => {
   /// rather than a judgement.
   it("always offers an orphan", () => {
     state.venvs = [venv()];
-    state.allowStale = false;
     render(<VenvSection />);
     const box = screen.getByLabelText("Select mls-delivery-service virtualenv");
     expect(box.hasAttribute("disabled")).toBe(false);
