@@ -1349,7 +1349,19 @@ pub fn default_worktree_dirs() -> Vec<String> {
 /// records. Eight workers mirrors `CLASSIFY_WORKERS` in the worktree
 /// scanner, whose author measured 12 and 16 as REGRESSIONS -- the number
 /// is empirical, not a core count.
-pub fn docker_builds() -> Result<Vec<crate::docker::Build>, String> {
+///
+/// BLOCKING work, so it goes to a blocking thread. Every command in this
+/// module used to be a plain `fn`, which runs on the async runtime's
+/// worker and stalls it -- clicking Docker in the menu froze the WHOLE
+/// UI for seconds, not just this view (#496). `list_branches` already
+/// had the right shape; these did not.
+pub async fn docker_builds() -> Result<Vec<crate::docker::Build>, String> {
+    tauri::async_runtime::spawn_blocking(docker_builds_blocking)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn docker_builds_blocking() -> Result<Vec<crate::docker::Build>, String> {
     const ENRICH_WORKERS: usize = 8;
 
     let mut builds = crate::docker::docker(&["buildx", "history", "ls", "--format", "{{json .}}"])
@@ -1375,8 +1387,14 @@ pub fn docker_builds() -> Result<Vec<crate::docker::Build>, String> {
 /// A stopped daemon is a state, not an error: reporting it as a failure
 /// -- or as an empty image list -- would say the machine is clean when
 /// the truth is that we could not ask.
-pub fn docker_state() -> crate::docker::DockerState {
-    crate::docker::state()
+pub async fn docker_state() -> crate::docker::DockerState {
+    // See `docker_builds`: a plain `fn` here blocks the async runtime.
+    tauri::async_runtime::spawn_blocking(crate::docker::state)
+        .await
+        // A join failure means we could not ASK, which is precisely
+        // what `Unknown` means -- never `NotRunning`, which would tell
+        // the user to start a daemon that may well be running.
+        .unwrap_or_else(|e| crate::docker::DockerState::Unknown(e.to_string()))
 }
 
 #[tauri::command]
@@ -1384,8 +1402,18 @@ pub fn docker_state() -> crate::docker::DockerState {
 ///
 /// Resolved against the same directories the worktrees view scans, so a
 /// machine configured once works for both.
-pub fn docker_images(app: AppHandle) -> Result<Vec<crate::docker::Image>, String> {
+pub async fn docker_images(app: AppHandle) -> Result<Vec<crate::docker::Image>, String> {
     let dirs = get_worktree_dirs(app);
+    // The heaviest of these: `scan_dirs_fast` is the same full worktree
+    // expansion the Worktrees view pays ~2.6s for, and `classify` then
+    // runs git per repository on top of it. Blocking the runtime on
+    // that is what froze the app on every switch to this view.
+    tauri::async_runtime::spawn_blocking(move || docker_images_blocking(dirs))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn docker_images_blocking(dirs: Vec<String>) -> Result<Vec<crate::docker::Image>, String> {
     // EXPANDED into repositories, not passed as scan roots.
     //
     // `classify` resolves a SHA-shaped image tag by running git in each
@@ -1407,8 +1435,13 @@ pub fn docker_images(app: AppHandle) -> Result<Vec<crate::docker::Image>, String
 
 #[tauri::command]
 /// Where the disk actually went. Images are only part of it.
-pub fn docker_disk_usage() -> Result<crate::docker::DiskUsage, String> {
-    crate::docker::docker(&["system", "df"]).map(|out| crate::docker::disk_usage(&out))
+pub async fn docker_disk_usage() -> Result<crate::docker::DiskUsage, String> {
+    // See `docker_builds`.
+    tauri::async_runtime::spawn_blocking(|| {
+        crate::docker::docker(&["system", "df"]).map(|out| crate::docker::disk_usage(&out))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -2011,15 +2044,50 @@ mod tests {
     #[test]
     fn docker_builds_enriches_rather_than_returning_bare_history() {
         let src = include_str!("commands.rs");
+        // The blocking half, not the async wrapper: the enrichment
+        // lives there now (#496 moved it off the runtime).
         let start = src
-            .find("pub fn docker_builds()")
-            .expect("docker_builds not found");
+            .find("fn docker_builds_blocking()")
+            .expect("docker_builds_blocking not found");
         let body = &src[start..start + 1200];
         assert!(
             body.contains("enrich"),
             "docker_builds must enrich, or context and revision stay null \
              and the build fold never renders"
         );
+    }
+
+    /// No Docker command may be a plain `fn`.
+    ///
+    /// A synchronous `#[tauri::command]` runs on the async runtime's
+    /// worker and BLOCKS it, so the whole UI freezes -- not just the
+    /// view that asked. Clicking Docker in the menu hung the app for
+    /// 5+ seconds because all four of these were sync, and the
+    /// heaviest re-runs the full worktree expansion (#496).
+    ///
+    /// Asserted on the source for the same reason as the enrichment
+    /// check above: the behaviour needs a Docker daemon, and this bug
+    /// survived precisely because nothing looked.
+    #[test]
+    fn docker_commands_never_block_the_async_runtime() {
+        let src = include_str!("commands.rs");
+        for name in [
+            "docker_builds",
+            "docker_state",
+            "docker_images",
+            "docker_disk_usage",
+        ] {
+            assert!(
+                src.contains(&format!("pub async fn {name}")),
+                "{name} must be `pub async fn` and hand its work to \
+                 spawn_blocking; a plain `fn` stalls the runtime and \
+                 freezes the entire UI"
+            );
+            assert!(
+                !src.contains(&format!("pub fn {name}(")),
+                "{name} still has a blocking signature"
+            );
+        }
     }
 
     /// Every verdict the frontend can name must map, and nothing else

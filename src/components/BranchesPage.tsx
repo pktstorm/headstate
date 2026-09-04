@@ -96,14 +96,36 @@ export function BranchesPage() {
 
     setBusy(true);
     setAsking(false);
-    Promise.all([
-      t.local.length > 0 ? deleteBranches(repo, t.local) : Promise.resolve([]),
-      t.remote.length > 0 ? deleteRemoteBranches(repo, t.remote) : Promise.resolve([]),
-    ]).then(
-      ([local, remote]) => {
+    // REMOTE FIRST, and SEQUENTIALLY.
+    //
+    // These ran concurrently, and for a tracked branch both halves name
+    // the same branch -- so the local delete removed the ref while the
+    // remote half was still re-checking it, and the remote half then
+    // reported "no longer exists" for a deletion that would have
+    // worked (#492).
+    //
+    // Remote leads because it is the half that cannot be undone: if it
+    // fails, the local ref is still there to try again from. The
+    // reverse order loses the only remaining reference to the commits.
+    // SAID, not silent. Every branch is re-checked against a fresh
+    // scan before deletion, which is seconds of git on a large
+    // repository -- and the page used to sit unchanged throughout, so
+    // the first sign anything had happened was a burst of toasts a
+    // minute later.
+    const total = t.local.length + t.remote.length;
+    toast.info(`Deleting ${total} branch${total === 1 ? "" : "es"}…`, {
+      description: "Each is re-checked before it is removed.",
+    });
+    (async () => {
+      const remote =
+        t.remote.length > 0 ? await deleteRemoteBranches(repo, t.remote) : [];
+      const local = t.local.length > 0 ? await deleteBranches(repo, t.local) : [];
+      return [...remote, ...local];
+    })().then(
+      (outcomes) => {
         setBusy(false);
         setPicked(new Set());
-        report([...local, ...remote]);
+        report(outcomes);
         void qc.invalidateQueries({ queryKey: ["branches", repo] });
       },
       (e: unknown) => {
@@ -143,6 +165,14 @@ export function BranchesPage() {
       </p>
 
       <div className="flex flex-wrap items-center gap-2">
+        {/* Visible while it runs, not just a disabled button. The
+            re-check is seconds of git per batch, and a toolbar that
+            merely greys out is indistinguishable from a hang. */}
+        {busy ? (
+          <span className="rounded border border-[#30363d] bg-[#161b22] px-2 py-1 text-xs text-[#8b949e]">
+            Deleting…
+          </span>
+        ) : null}
         {/* Selects exactly what ticking every deletable row by hand
             would select -- the same `merged` gate, not a second
             definition that could drift from it. */}

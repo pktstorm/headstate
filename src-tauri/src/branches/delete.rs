@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use super::model::Deletable;
+use super::model::{Branch, Deletable};
 use super::scan;
 use crate::worktrees::scan::git;
 
@@ -25,10 +25,29 @@ pub struct DeleteOutcome {
 }
 
 /// Re-check that this branch is still deletable, right now.
-fn still_deletable(dir: &Path, name: &str) -> Result<(), String> {
-    let branches = scan::scan(dir)?;
+/// Re-check one branch against a scan taken for THIS batch.
+///
+/// The scan is passed in rather than taken here. It used to call
+/// `scan::scan` per branch -- ~9.4s on a 507-branch repository -- so a
+/// ten-branch deletion spent a minute and a half in git before saying
+/// anything (#492).
+///
+/// Still a delete-time check: the scan is taken when the batch starts,
+/// not when the list was rendered, so a branch that changed since the
+/// user looked is still caught.
+fn still_deletable(branches: &[Branch], name: &str) -> Result<(), String> {
     let Some(b) = branches.iter().find(|b| b.name == name) else {
-        return Err(format!("{name} no longer exists"));
+        // ABSENT, not undeletable.
+        //
+        // A local delete in the same batch removes the branch from this
+        // scan, and the remote half then could not find it and reported
+        // "no longer exists" -- about a LOCAL ref, for a remote
+        // deletion the user had asked for and which would have
+        // succeeded. That was the whole #492 symptom.
+        //
+        // Nothing here established that the ref is undeletable, so the
+        // caller proceeds and git gives the real answer.
+        return Ok(());
     };
     match &b.deletable {
         Deletable::Merged { .. } => Ok(()),
@@ -60,10 +79,25 @@ fn still_deletable(dir: &Path, name: &str) -> Result<(), String> {
 /// UI last displayed.
 pub fn delete_local(repo_path: &str, names: &[String]) -> Vec<DeleteOutcome> {
     let dir = Path::new(repo_path);
+    // ONE scan for the whole batch, not one per branch.
+    let branches = match scan::scan(dir) {
+        Ok(b) => b,
+        // A scan that failed is not permission to delete: every branch
+        // is refused with the reason, rather than proceeding blind.
+        Err(e) => {
+            return names
+                .iter()
+                .map(|name| DeleteOutcome {
+                    name: name.clone(),
+                    error: Some(format!("could not re-check branches before deleting: {e}")),
+                })
+                .collect()
+        }
+    };
     names
         .iter()
         .map(|name| {
-            let error = still_deletable(dir, name)
+            let error = still_deletable(&branches, name)
                 .err()
                 .or_else(|| git(dir, &["branch", "-D", name]).err());
             DeleteOutcome {
@@ -83,6 +117,18 @@ pub fn delete_local(repo_path: &str, names: &[String]) -> Vec<DeleteOutcome> {
 /// the branch any more disposable.
 pub fn delete_remote(repo_path: &str, names: &[String]) -> Vec<DeleteOutcome> {
     let dir = Path::new(repo_path);
+    let branches = match scan::scan(dir) {
+        Ok(b) => b,
+        Err(e) => {
+            return names
+                .iter()
+                .map(|name| DeleteOutcome {
+                    name: name.clone(),
+                    error: Some(format!("could not re-check branches before deleting: {e}")),
+                })
+                .collect()
+        }
+    };
     names
         .iter()
         .map(|name| {
@@ -92,7 +138,7 @@ pub fn delete_remote(repo_path: &str, names: &[String]) -> Vec<DeleteOutcome> {
                 None => Some(format!(
                     "{name} does not name a remote branch (expected <remote>/<branch>)"
                 )),
-                Some((remote, branch)) => still_deletable(dir, name)
+                Some((remote, branch)) => still_deletable(&branches, name)
                     .err()
                     .or_else(|| git(dir, &["push", remote, "--delete", branch]).err()),
             };
@@ -363,6 +409,70 @@ mod tests {
             .output()
             .unwrap();
         assert!(!String::from_utf8_lossy(&refs.stdout).trim().is_empty());
+    }
+
+    /// #492: a branch the scan cannot see is not thereby undeletable.
+    ///
+    /// Deleting a tracked branch in both places used to run the two
+    /// halves concurrently. The local half removed the ref, the remote
+    /// half's gate then failed to find the branch, and the user got
+    /// "no longer exists" for a REMOTE deletion that would otherwise
+    /// have succeeded -- which is exactly why doing them one at a time
+    /// worked.
+    ///
+    /// The gate must not be the thing that refuses. Whatever git says
+    /// about a ref that is genuinely gone is git's to say.
+    #[test]
+    fn a_branch_missing_from_the_scan_is_not_refused_by_the_gate() {
+        let (_t, repo) = fixture();
+        run(&repo, &["checkout", "-q", "-b", "shipped"]);
+        commit(&repo, "shipped-work");
+        run(&repo, &["push", "-q", "-u", "origin", "shipped"]);
+        squash_merge(&repo, "shipped");
+
+        // Both refs gone: the state the racing halves could reach, and
+        // the one where the scan has nothing to say about either name.
+        run(&repo, &["branch", "-q", "-D", "shipped"]);
+        run(&repo, &["push", "-q", "origin", "--delete", "shipped"]);
+        run(&repo, &["fetch", "-q", "--prune", "origin"]);
+
+        let out = delete_remote(repo.to_str().unwrap(), &["origin/shipped".to_string()]);
+        let err = out[0].error.as_deref().unwrap_or("");
+        assert!(
+            !err.contains("no longer exists"),
+            "the gate must not refuse an absent branch; got: {err}"
+        );
+    }
+
+    /// The gate still refuses what it CAN see is unmergeable. Tolerating
+    /// an absent branch must not become tolerating everything.
+    #[test]
+    fn a_branch_present_and_unmerged_is_still_refused() {
+        let (_t, repo) = fixture();
+        run(&repo, &["checkout", "-q", "-b", "wip"]);
+        commit(&repo, "unshared");
+        run(&repo, &["checkout", "-q", "main"]);
+
+        let out = delete_local(repo.to_str().unwrap(), &["wip".to_string()]);
+        assert!(out[0].error.is_some());
+        assert!(branch_exists(&repo, "wip"));
+    }
+
+    /// A scan that FAILED is not permission to delete. Every branch is
+    /// refused with the reason rather than proceeding blind.
+    #[test]
+    fn a_failed_scan_refuses_the_whole_batch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let notrepo = tmp.path().join("nope");
+        std::fs::create_dir_all(&notrepo).unwrap();
+
+        let out = delete_local(notrepo.to_str().unwrap(), &["anything".to_string()]);
+        assert_eq!(out.len(), 1);
+        let err = out[0].error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("could not re-check"),
+            "a failed scan must refuse, got: {err}"
+        );
     }
 
     /// A tracked branch deleted in BOTH places.
