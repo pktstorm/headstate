@@ -1055,7 +1055,22 @@ pub async fn open_update_pr(
     repo_path: String,
     report: crate::packages::apply::RunReport,
 ) -> Result<String, String> {
+    open_update_pr_inner(client.inner(), &repo_path, report).await
+}
+
+/// The body of `open_update_pr`, callable without a `State`.
+///
+/// Split out so the background run (`apply_updates_in_background`) can
+/// open the pull request with the SAME refusals -- nothing applied, and
+/// an ecosystem whose resolved constraint cannot be read back. A second
+/// implementation would be a second set of rules to keep in step.
+pub(crate) async fn open_update_pr_inner(
+    client: &GhClient,
+    repo_path: &str,
+    report: crate::packages::apply::RunReport,
+) -> Result<String, String> {
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    let repo_path = repo_path.to_string();
 
     // Nothing applied, nothing to open. A pull request with an empty
     // diff is noise, and GitHub refuses it anyway ("No commits
@@ -2173,4 +2188,146 @@ pub async fn delete_remote_branches(
     tauri::async_runtime::spawn_blocking(move || crate::branches::delete_remote(&repo_path, &names))
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Apply updates, open a pull request, and report when it is up.
+///
+/// Returns IMMEDIATELY. The wizard used to await the whole run with the
+/// modal open on one unchanging "Applying…" label -- and the run is a
+/// package-manager command per package, so on a repository with 122
+/// selected it sat there for minutes with the app unusable (#495).
+///
+/// Progress and completion arrive as events, the same shape the
+/// worktree removal uses. The work runs to completion regardless of
+/// what is on screen, so navigating away does not cancel it.
+#[tauri::command]
+pub async fn apply_updates_in_background(
+    app: AppHandle,
+    client: State<'_, GhClient>,
+    repo_path: String,
+    requests: Vec<crate::packages::apply::UpdateRequest>,
+) -> Result<(), String> {
+    // Cloned OUT of `State` before spawning: the guard borrows the
+    // app handle and cannot outlive this function, but the task must.
+    let gh = GhClient(client.0.clone());
+    tauri::async_runtime::spawn(async move {
+        let repo = repo_path.clone();
+        let reqs = requests.clone();
+        let applied = tauri::async_runtime::spawn_blocking(move || {
+            crate::packages::apply::run(std::path::Path::new(&repo), &reqs)
+        })
+        .await;
+
+        let report = match applied {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                finish(&app, UpdateRunDone::failed(&repo_path, e));
+                return;
+            }
+            Err(e) => {
+                finish(&app, UpdateRunDone::failed(&repo_path, e.to_string()));
+                return;
+            }
+        };
+
+        // Every package failed: there is nothing to open a pull request
+        // about, and saying one is coming would be a lie.
+        if report.results.iter().all(|r| r.error.is_some()) {
+            finish(
+                &app,
+                UpdateRunDone::worktree_only(&repo_path, &report, "no update applied"),
+            );
+            return;
+        }
+
+        match crate::commands::open_update_pr_inner(&gh, &repo_path, report.clone()).await {
+            Ok(url) => finish(&app, UpdateRunDone::opened(&repo_path, &report, url)),
+            // The worktree still exists and the updates are still in it;
+            // only the pull request did not happen. Say exactly that.
+            Err(e) => finish(&app, UpdateRunDone::worktree_only(&repo_path, &report, &e)),
+        }
+    });
+    Ok(())
+}
+
+/// What a background update run produced.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateRunDone {
+    pub repo_path: String,
+    /// The pull request, when one was opened.
+    pub url: Option<String>,
+    pub branch: Option<String>,
+    pub applied: usize,
+    pub failed: usize,
+    /// Why no pull request, when there is none. Never a claim that one
+    /// exists.
+    pub error: Option<String>,
+}
+
+impl UpdateRunDone {
+    fn opened(repo: &str, r: &crate::packages::apply::RunReport, url: String) -> Self {
+        Self {
+            repo_path: repo.to_string(),
+            url: Some(url),
+            branch: Some(r.branch.clone()),
+            applied: r.results.iter().filter(|x| x.error.is_none()).count(),
+            failed: r.results.iter().filter(|x| x.error.is_some()).count(),
+            error: None,
+        }
+    }
+    fn worktree_only(repo: &str, r: &crate::packages::apply::RunReport, why: &str) -> Self {
+        Self {
+            repo_path: repo.to_string(),
+            url: None,
+            branch: Some(r.branch.clone()),
+            applied: r.results.iter().filter(|x| x.error.is_none()).count(),
+            failed: r.results.iter().filter(|x| x.error.is_some()).count(),
+            error: Some(why.to_string()),
+        }
+    }
+    fn failed(repo: &str, why: String) -> Self {
+        Self {
+            repo_path: repo.to_string(),
+            url: None,
+            branch: None,
+            applied: 0,
+            failed: 0,
+            error: Some(why),
+        }
+    }
+}
+
+/// Emit the outcome and, when a pull request went up, notify.
+fn finish(app: &AppHandle, done: UpdateRunDone) {
+    use tauri_plugin_notification::NotificationExt;
+
+    if let Err(e) = app.emit("update-run-done", &done) {
+        log::warn!("could not emit update-run-done: {e}");
+    }
+
+    // ONLY for a pull request that actually exists. A run that stopped
+    // at the worktree still did useful work, but interrupting the user
+    // to say "ready" about something that is not there is worse than
+    // staying quiet -- the toast carries that case.
+    let Some(url) = done.url.as_deref() else {
+        return;
+    };
+    if !crate::poll::notification_allowed(app) {
+        return;
+    }
+    let body = match done.failed {
+        0 => format!("{} package(s) updated", done.applied),
+        n => format!("{} updated, {n} could not be", done.applied),
+    };
+    if let Err(e) = app
+        .notification()
+        .builder()
+        .title("Package update pull request is ready")
+        .body(body)
+        .show()
+    {
+        log::warn!("failed to show notification: {e}");
+    }
+    log::info!("update run opened {url}");
 }

@@ -13,7 +13,6 @@ import type {
   DeleteOutcome,
   ClaudeFile,
   ProjectReport,
-  RunReport,
   UpdateRequest,
   UpdateFilter,
   CleanupPrefs,
@@ -472,14 +471,7 @@ export const packagesMarkdown = (
 /// Returns where the work landed and what each update actually did.
 /// Push the run's branch and open a pull request.
 ///
-/// The only call in this app that writes to a shared remote. Takes the
-/// report from `applyPackageUpdates` rather than doing the work again,
-/// so the user has seen what landed before anything is pushed.
-export const openUpdatePr = (repoPath: string, report: RunReport) =>
-  invoke<string>("open_update_pr", { repoPath, report });
 
-export const applyPackageUpdates = (repoPath: string, requests: UpdateRequest[]) =>
-  invoke<RunReport>("apply_package_updates", { repoPath, requests });
 
 /// Reveal the diagnostic log in the file manager. Returns its path.
 export const revealLog = () => invoke<string>("reveal_log");
@@ -509,3 +501,25 @@ export const deleteBranches = (repoPath: string, names: string[]) =>
 /// push to shared state that no reflog can undo.
 export const deleteRemoteBranches = (repoPath: string, names: string[]) =>
   invoke<DeleteOutcome[]>("delete_remote_branches", { repoPath, names });
+
+/// Apply updates and open a pull request, in the background.
+///
+/// Returns as soon as the run STARTS. The outcome arrives on the
+/// `update-run-done` event -- the wizard used to await the whole run
+/// with its modal open, which on a large selection meant minutes of an
+/// unchanging "Applying…" and an unusable app (#495).
+export const applyUpdatesInBackground = (repoPath: string, requests: UpdateRequest[]) =>
+  invoke<void>("apply_updates_in_background", { repoPath, requests });
+
+/// What a background update run produced.
+export interface UpdateRunDone {
+  repoPath: string;
+  /// The pull request, when one was opened. Null means none exists —
+  /// never a claim that one does.
+  url: string | null;
+  branch: string | null;
+  applied: number;
+  failed: number;
+  /// Why there is no pull request, when there is none.
+  error: string | null;
+}

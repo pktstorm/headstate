@@ -1,4 +1,6 @@
 import { type QueryClient, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
+import { useFilters } from "../store/filters";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { safeUnlisten } from "./unlisten";
 import { timeCall, timed } from "./diag";
@@ -28,6 +30,7 @@ import {
   getWorktreeDirs,
   classifyWorktrees,
   listBranches,
+  type UpdateRunDone,
   listWorktrees,
   removeWorktree,
   pullCheckout,
@@ -1681,4 +1684,87 @@ export function useBranches(repoPath: string | undefined) {
     enabled: !!repoPath,
     staleTime: 10_000,
   });
+}
+
+/// Surface the outcome of a background update run.
+///
+/// The run continues regardless of what is on screen (#495), so the
+/// result has to find the user rather than the other way round. A
+/// pull request that actually exists gets a toast whose action opens
+/// it in My pull requests; a run that stopped at the worktree says so
+/// without claiming one is coming.
+export function useUpdateRunOutcome(): void {
+  const setView = useFilters((s) => s.setView);
+  const selectPr = useFilters((s) => s.selectPr);
+  const qc = useQueryClient();
+
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    // GUARDED. `listen` reaches into the Tauri runtime and throws
+    // outside it, and this hook runs at the app level rather than
+    // behind a view -- so without this every App test would have to
+    // mock it, which is a mock that exists only to stop a crash.
+    let started: Promise<UnlistenFn>;
+    try {
+      started = listen<UpdateRunDone>("update-run-done", (e) => {
+      const d = e.payload;
+      // Refresh whatever the run changed, whichever way it ended.
+      void qc.invalidateQueries({ queryKey: ["packages"] });
+      void qc.invalidateQueries({ queryKey: ["worktrees"] });
+
+      if (d.url !== null) {
+        const pr = prFromUrl(d.url);
+        toast.success("Package update pull request is ready", {
+          description:
+            d.failed === 0
+              ? `${d.applied} package${d.applied === 1 ? "" : "s"} updated.`
+              : `${d.applied} updated, ${d.failed} could not be.`,
+          // Only offered when the URL parses. A button that silently
+          // does nothing is worse than no button.
+          action: pr
+            ? {
+                label: "Open",
+                onClick: () => {
+                  setView("my-prs");
+                  selectPr(pr);
+                },
+              }
+            : undefined,
+        });
+        return;
+      }
+
+      // No pull request. Never phrased as though one is on its way.
+      toast.warning("Updates applied, but no pull request was opened", {
+        description: d.error ?? undefined,
+      });
+      });
+    } catch {
+      return;
+    }
+    started.then(
+      (fn) => {
+        if (cancelled) safeUnlisten(fn);
+        else unlisten = fn;
+      },
+      () => {},
+    );
+    return () => {
+      cancelled = true;
+      if (unlisten) safeUnlisten(unlisten);
+    };
+  }, [setView, selectPr, qc]);
+}
+
+/// `owner/repo` and number from a pull request URL.
+///
+/// Returns null rather than guessing: the toast's action is only
+/// offered when this parses, so a URL shape we do not recognise costs
+/// a button rather than producing one that goes nowhere.
+export function prFromUrl(url: string): { repo: string; number: number } | null {
+  const m = /github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/.exec(url);
+  if (!m) return null;
+  const number = Number(m[2]);
+  return Number.isFinite(number) ? { repo: m[1], number } : null;
 }

@@ -1,9 +1,7 @@
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
-import { Loader2 } from "lucide-react";
-import type { Ecosystem, Outdated, RunReport } from "@/types/pr";
-import { ExternalLink } from "./ExternalLink";
-import { applyPackageUpdates, openUpdatePr } from "@/api/tauri";
+import type { Ecosystem, Outdated } from "@/types/pr";
+import { applyUpdatesInBackground } from "@/api/tauri";
 import {
   Dialog,
   DialogContent,
@@ -48,8 +46,7 @@ export function UpdateWizard({
   onOpenChange: (open: boolean) => void;
 }) {
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [running, setRunning] = useState(false);
-  const [report, setReport] = useState<RunReport | null>(null);
+
 
   /// Identifies a ROW, not a package.
   ///
@@ -87,32 +84,25 @@ export function UpdateWizard({
     // Unreachable through the UI -- the button is disabled with an
     // empty selection -- and kept as a guard for any other caller.
     if (requests.length === 0) return;
-    setRunning(true);
-    applyPackageUpdates(repo, requests).then(
-      (r) => {
-        setRunning(false);
-        setReport(r);
-        const failed = r.results.filter((x) => x.error !== null).length;
-        if (failed === 0) {
-          toast.success(`Updated ${r.results.length} package${r.results.length === 1 ? "" : "s"}`, {
-            description: `On branch ${r.branch}. Nothing was pushed.`,
-          });
-        } else {
-          // Not an error toast: the run itself succeeded and the
-          // worktree exists. Some packages failing is a result, not a
-          // failure of the operation.
-          toast.warning(`${failed} of ${r.results.length} could not be updated`, {
-            description: "See the details below.",
-          });
-        }
-      },
-      (e: unknown) => {
-        setRunning(false);
-        toast.error("Could not apply updates", {
-          description: typeof e === "string" ? e : undefined,
-        });
-      },
-    );
+
+    // CLOSED on click, not when the run finishes.
+    //
+    // The run is a package-manager command per package, so a large
+    // selection took minutes -- and the modal sat over the app on one
+    // unchanging "Applying…" for all of it (#495). The work does not
+    // need the dialog: it continues regardless of what is on screen,
+    // and the outcome arrives on `update-run-done`.
+    onOpenChange(false);
+    setSelected(new Set());
+    toast.info(`Updating ${requests.length} package${requests.length === 1 ? "" : "s"}…`, {
+      description: "A worktree is being prepared and a pull request assembled.",
+    });
+
+    applyUpdatesInBackground(repo, requests).catch((e: unknown) => {
+      toast.error("Could not start the update run", {
+        description: typeof e === "string" ? e : undefined,
+      });
+    });
   };
 
   return (
@@ -126,9 +116,7 @@ export function UpdateWizard({
           review. Nothing is pushed and no pull request is opened.
         </p>
 
-        {report ? (
-          <Report report={report} repo={repo} />
-        ) : (
+        {(
           <>
             {applicable.length > 1 ? (
               <div className="flex items-center gap-3 border-b border-[#30363d] pb-2 text-xs">
@@ -218,12 +206,11 @@ export function UpdateWizard({
               </button>
               <button
                 type="button"
-                disabled={selected.size === 0 || running}
+                disabled={selected.size === 0}
                 onClick={run}
                 className="flex items-center gap-1 rounded border border-[#238636]/40 px-3 py-1 text-xs text-[#3fb950] hover:bg-[#238636]/10 disabled:opacity-50"
               >
-                {running && <Loader2 className="h-3 w-3 animate-spin" />}
-                {running ? "Applying…" : `Apply ${selected.size} update${selected.size === 1 ? "" : "s"}`}
+                {`Apply ${selected.size} update${selected.size === 1 ? "" : "s"}`}
               </button>
             </div>
           </>
@@ -237,98 +224,3 @@ export function UpdateWizard({
 ///
 /// Reports the resolved constraint next to the requested version because
 /// they genuinely differ: npm rewrites a pinned `4.17.21` request into
-/// `^4.17.21`, a range rather than a pin. Echoing back the requested
-/// version would look like a report while telling the user nothing.
-function Report({ report, repo }: { report: RunReport; repo: string }) {
-  const [opening, setOpening] = useState(false);
-  const [url, setUrl] = useState<string | null>(null);
-
-  const applied = report.results.filter((r) => r.error === null).length;
-  // Only where the resolved constraint can be read back. The other
-  // ecosystems report it as null, so the description would have to say
-  // "not verified" about every row.
-  const describable = report.ecosystems.every((e) => e === "npm" || e === "yarn");
-
-  const open = () => {
-    setOpening(true);
-    openUpdatePr(repo, report).then(
-      (u) => {
-        setOpening(false);
-        setUrl(u);
-        toast.success("Pull request opened", { description: u });
-      },
-      (e: unknown) => {
-        setOpening(false);
-        toast.error("Could not open the pull request", {
-          description: typeof e === "string" ? e : undefined,
-        });
-      },
-    );
-  };
-
-  return (
-    <div className="space-y-3 text-sm">
-      <p className="text-[#8b949e]">
-        Worktree: <code className="text-[#e6edf3]">{report.worktree}</code>
-        <br />
-        Branch: <code className="text-[#e6edf3]">{report.branch}</code>
-      </p>
-
-      {/* The one action here that leaves this machine. Everything above
-          is a local worktree the user can delete; this pushes a branch
-          and opens a pull request. */}
-      {url !== null ? (
-        <p className="text-xs">
-          <ExternalLink href={url} className="text-[#4493f8] hover:underline">
-            {url}
-          </ExternalLink>
-        </p>
-      ) : applied > 0 && describable ? (
-        <button
-          type="button"
-          disabled={opening}
-          onClick={open}
-          className="rounded border border-[#238636]/40 px-3 py-1 text-xs text-[#3fb950] hover:bg-[#238636]/10 disabled:opacity-50"
-        >
-          {opening ? "Opening…" : "Push and open a pull request"}
-        </button>
-      ) : applied > 0 ? (
-        // Said, not hidden. A missing button reads as a bug, where the
-        // reason is a real limitation worth knowing.
-        <p className="text-xs text-[#8b949e]">
-          A pull request can only be opened for npm and yarn so far — the other
-          ecosystems do not report which version actually landed.
-        </p>
-      ) : null}
-      {report.results.map((r) => (
-        <div key={r.name} className="rounded border border-[#30363d] p-2">
-          <p className="text-[#e6edf3]">{r.name}</p>
-          {r.error !== null ? (
-            <p className="mt-1 whitespace-pre-wrap text-xs text-[#f85149]">{r.error}</p>
-          ) : (
-            <div className="mt-1 space-y-0.5 text-xs text-[#8b949e]">
-              <p>
-                Requested <code className="text-[#e6edf3]">{r.requested}</code>
-                {r.resolved_constraint !== null && (
-                  <>
-                    , manifest now{" "}
-                    <code className="text-[#e6edf3]">{r.resolved_constraint}</code>
-                  </>
-                )}
-              </p>
-              {/* Reported rather than hidden: a command that succeeded
-                  and changed nothing usually means a manifest
-                  constraint pinned the package below what was asked
-                  for, which the user needs to know. */}
-              <p>
-                {r.changed_files.length > 0
-                  ? `Changed: ${r.changed_files.join(", ")}`
-                  : "No files changed."}
-              </p>
-            </div>
-          )}
-        </div>
-      ))}
-    </div>
-  );
-}

@@ -8,10 +8,11 @@ const toasts = vi.hoisted(() => ({
   success: vi.fn(),
   error: vi.fn(),
   warning: vi.fn(),
+  info: vi.fn(),
 }));
 
 vi.mock("sonner", () => ({ toast: toasts }));
-vi.mock("../api/tauri", () => ({ applyPackageUpdates: applyFn, openUpdatePr: prFn }));
+vi.mock("../api/tauri", () => ({ applyUpdatesInBackground: applyFn }));
 
 import { UpdateWizard } from "./UpdateWizard";
 
@@ -73,99 +74,11 @@ describe("UpdateWizard", () => {
     expect(applyFn).not.toHaveBeenCalled();
   });
 
-  it("requests the latest version for each selected package", async () => {
-    show([pkg("lodash")]);
-    fireEvent.click(screen.getByRole("checkbox"));
-    fireEvent.click(screen.getByRole("button", { name: /Apply/ }));
-    await waitFor(() => expect(applyFn).toHaveBeenCalledTimes(1));
-    expect(applyFn).toHaveBeenCalledWith("/code/app", [
-      { name: "lodash", version: "2.0.0", ecosystem: "npm" },
-    ]);
-  });
 
-  /// The finding phase 1 exists to surface: what the resolver actually
-  /// wrote differs from what was asked for.
-  it("reports the resolved constraint, not the requested version", async () => {
-    show([pkg("lodash")]);
-    fireEvent.click(screen.getByRole("checkbox"));
-    fireEvent.click(screen.getByRole("button", { name: /Apply/ }));
-    await screen.findByText("^4.17.21");
-    expect(screen.getByText("4.17.21")).toBeTruthy();
-  });
 
-  it("shows where the work landed", async () => {
-    show([pkg("lodash")]);
-    fireEvent.click(screen.getByRole("checkbox"));
-    fireEvent.click(screen.getByRole("button", { name: /Apply/ }));
-    await screen.findByText("/code/app/.worktrees/update-lodash");
-  });
 
-  /// A command that succeeded and changed nothing is a real outcome --
-  /// usually a manifest constraint pinning the package below what was
-  /// asked for -- and must not render as blank.
-  it("states when nothing changed rather than showing an empty list", async () => {
-    applyFn.mockResolvedValue({
-      worktree: "/w",
-      branch: "b",
-      ecosystems: ["npm"],
-      results: [
-        {
-          name: "lodash",
-          requested: "2.0.0",
-          changed_files: [],
-          output: "",
-          resolved_constraint: "^1.0.0",
-          error: null,
-        },
-      ],
-    });
-    show([pkg("lodash")]);
-    fireEvent.click(screen.getByRole("checkbox"));
-    fireEvent.click(screen.getByRole("button", { name: /Apply/ }));
-    await screen.findByText(/No files changed/i);
-  });
 
-  /// One package failing must not hide the others.
-  it("reports a per-package failure without discarding the run", async () => {
-    applyFn.mockResolvedValue({
-      worktree: "/w",
-      branch: "b",
-      ecosystems: ["npm"],
-      results: [
-        {
-          name: "lodash",
-          requested: "2.0.0",
-          changed_files: ["package.json"],
-          output: "",
-          resolved_constraint: "^2.0.0",
-          error: null,
-        },
-        {
-          name: "express",
-          requested: "5.0.0",
-          changed_files: [],
-          output: "",
-          resolved_constraint: null,
-          error: "peer dependency conflict",
-        },
-      ],
-    });
-    show([pkg("lodash"), pkg("express")]);
-    for (const c of screen.getAllByRole("checkbox")) fireEvent.click(c);
-    fireEvent.click(screen.getByRole("button", { name: /Apply/ }));
-    await screen.findByText("peer dependency conflict");
-    // The one that worked is still reported.
-    expect(screen.getByText("^2.0.0")).toBeTruthy();
-    expect(toasts.warning).toHaveBeenCalled();
-  });
 
-  it("surfaces a failed run as an error", async () => {
-    applyFn.mockRejectedValue("branch already exists");
-    show([pkg("lodash")]);
-    fireEvent.click(screen.getByRole("checkbox"));
-    fireEvent.click(screen.getByRole("button", { name: /Apply/ }));
-    await waitFor(() => expect(toasts.error).toHaveBeenCalled());
-  });
 
   /// #478: one repository declares the same dependency in several
   /// manifests, so `ecosystem:name` was not a unique row identity --
@@ -231,71 +144,53 @@ describe("UpdateWizard", () => {
     expect(screen.getByText(/could not be determined/i)).toBeTruthy();
   });
 
-  describe("opening a pull request from the report", () => {
-    const runToReport = async () => {
-      show([pkg("lodash")]);
-      fireEvent.click(screen.getByRole("checkbox"));
-      fireEvent.click(screen.getByRole("button", { name: /apply/i }));
-      await screen.findByText("headstate/update-lodash");
-    };
 
-    it("pushes and opens a pull request, then shows the link", async () => {
-      await runToReport();
+  /// #495: the run does not need the dialog.
+  ///
+  /// Apply used to await the whole run with the modal open on one
+  /// unchanging "Applying…" -- minutes on a large selection, with the
+  /// app unusable throughout. The outcome now arrives on an event.
+  it("starts the run and closes immediately", async () => {
+    const onOpenChange = vi.fn();
+    render(
+      <UpdateWizard repo="/code/app" packages={[pkg("lodash")]} open onOpenChange={onOpenChange} />,
+    );
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: /^apply/i }));
 
-      fireEvent.click(screen.getByRole("button", { name: /push and open a pull request/i }));
+    await waitFor(() => expect(applyFn).toHaveBeenCalledTimes(1));
+    expect(applyFn).toHaveBeenCalledWith("/code/app", [
+      { name: "lodash", version: "2.0.0", ecosystem: "npm" },
+    ]);
+    // Closed on click, not on completion.
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
 
-      await waitFor(() => expect(prFn).toHaveBeenCalledTimes(1));
-      expect(prFn).toHaveBeenCalledWith(
-        "/code/app",
-        expect.objectContaining({ branch: "headstate/update-lodash" }),
-      );
-      // The URL is what the user needs next, so it stays on the page and is
-      // not merely announced in a toast that disappears.
-      expect(
-        await screen.findByText("https://github.com/octocat/hello-world/pull/7"),
-      ).toBeTruthy();
-    });
+  it("says the run has started rather than closing silently", async () => {
+    show([pkg("lodash")]);
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: /^apply/i }));
 
-    it("reports a failure instead of pretending the pull request opened", async () => {
-      prFn.mockRejectedValue("no upstream remote");
-      await runToReport();
+    await waitFor(() =>
+      expect(toasts.info).toHaveBeenCalledWith(
+        expect.stringMatching(/updating 1 package/i),
+        expect.anything(),
+      ),
+    );
+  });
 
-      fireEvent.click(screen.getByRole("button", { name: /push and open a pull request/i }));
+  /// A run that could not even START is a different thing from one that
+  /// ran and reported failures, and must not be silent.
+  it("reports a run that could not be started", async () => {
+    applyFn.mockRejectedValue("no such repository");
+    show([pkg("lodash")]);
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: /^apply/i }));
 
-      await waitFor(() =>
-        expect(toasts.error).toHaveBeenCalledWith(
-          "Could not open the pull request",
-          { description: "no upstream remote" },
-        ),
-      );
-      expect(screen.queryByText(/pull\/7/)).toBeNull();
-    });
-
-    it("explains, rather than hides, why an unverifiable ecosystem gets no button", async () => {
-      applyFn.mockResolvedValue({
-        worktree: "/code/app/.worktrees/update-boto3",
-        branch: "headstate/update-boto3",
-        ecosystems: ["poetry"],
-        results: [
-          {
-            name: "boto3",
-            requested: "2.0.0",
-            changed_files: ["requirements.txt"],
-            output: "",
-            resolved_constraint: null,
-            error: null,
-          },
-        ],
-      });
-      show([pkg("boto3", "poetry")]);
-      fireEvent.click(screen.getByRole("checkbox"));
-      fireEvent.click(screen.getByRole("button", { name: /apply/i }));
-      await screen.findByText("headstate/update-boto3");
-
-      expect(
-        screen.queryByRole("button", { name: /push and open a pull request/i }),
-      ).toBeNull();
-      expect(screen.getByText(/only be opened for npm and yarn/i)).toBeTruthy();
-    });
+    await waitFor(() =>
+      expect(toasts.error).toHaveBeenCalledWith("Could not start the update run", {
+        description: "no such repository",
+      }),
+    );
   });
 });
