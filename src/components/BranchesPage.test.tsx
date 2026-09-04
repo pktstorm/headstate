@@ -10,7 +10,12 @@ const delLocal = vi.hoisted(() =>
 const delRemote = vi.hoisted(() =>
   vi.fn<(...a: unknown[]) => Promise<{ name: string; error: string | null }[]>>(),
 );
-const toasts = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn(), warning: vi.fn() }));
+const toasts = vi.hoisted(() => ({
+  success: vi.fn(),
+  error: vi.fn(),
+  warning: vi.fn(),
+  info: vi.fn(),
+}));
 
 vi.mock("sonner", () => ({ toast: toasts }));
 // The hook, not the whole tauri module: `api/hooks` pulls in the rest of
@@ -190,6 +195,69 @@ describe("BranchesPage", () => {
     expect(delLocal).toHaveBeenCalledWith("/code/app", ["shipped"]);
     // The UPSTREAM name, not the local one.
     expect(delRemote).toHaveBeenCalledWith("/code/app", ["origin/shipped"]);
+  });
+
+  /// #492: the two halves must not run concurrently.
+  ///
+  /// They did, and for a tracked branch both name the same branch -- so
+  /// the local delete removed the ref while the remote half was still
+  /// re-checking it, and the remote half reported "no longer exists"
+  /// for a deletion that would have worked.
+  ///
+  /// Remote leads: it is the half nothing can undo, so if it fails the
+  /// local ref is still there to retry from.
+  it("deletes the remote before the local ref, not at the same time", async () => {
+    listFn.mockResolvedValue([
+      branch({ name: "shipped", location: "tracked", upstream: "origin/shipped" }),
+    ]);
+    const order: string[] = [];
+    let releaseRemote!: (v: unknown[]) => void;
+    delRemote.mockReturnValue(
+      new Promise((resolve) => {
+        order.push("remote:start");
+        releaseRemote = resolve as (v: unknown[]) => void;
+      }),
+    );
+    delLocal.mockImplementation(() => {
+      order.push("local:start");
+      return Promise.resolve([{ name: "shipped", error: null }]);
+    });
+
+    show();
+    await screen.findByText("shipped");
+    fireEvent.click(screen.getByLabelText("shipped"));
+    fireEvent.click(screen.getByRole("button", { name: /^delete 1…/i }));
+    await screen.findByText(/where should these be deleted/i);
+    fireEvent.click(screen.getByText(/both here and on the remote/i));
+    fireEvent.click(
+      screen.getByRole("button", { name: /delete 1 branch locally and on the remote/i }),
+    );
+
+    // The remote call is in flight and the local one has NOT started.
+    await waitFor(() => expect(delRemote).toHaveBeenCalledTimes(1));
+    expect(delLocal).not.toHaveBeenCalled();
+
+    releaseRemote([{ name: "origin/shipped", error: null }]);
+    await waitFor(() => expect(delLocal).toHaveBeenCalledTimes(1));
+    expect(order).toEqual(["remote:start", "local:start"]);
+  });
+
+  /// A minute of silence after a destructive action is indistinguishable
+  /// from a hang. The re-check is seconds of git per batch.
+  it("says a deletion has started rather than going silent", async () => {
+    show();
+    await screen.findByText("done");
+    fireEvent.click(screen.getByLabelText("done"));
+    fireEvent.click(screen.getByRole("button", { name: /^delete 1…/i }));
+    await screen.findByText(/where should these be deleted/i);
+    fireEvent.click(screen.getByRole("button", { name: /delete 1 branch locally/i }));
+
+    await waitFor(() =>
+      expect(toasts.info).toHaveBeenCalledWith(
+        expect.stringMatching(/deleting 1 branch/i),
+        expect.anything(),
+      ),
+    );
   });
 
   /// Local deletion is recoverable from the reflog; a remote one is

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { EcosystemReport, Outdated, ProjectReport } from "@/types/pr";
 
@@ -211,5 +211,50 @@ describe("PackagesPage grouping, sorting, and Claudify", () => {
     expect(prompt).toMatch(/run that project's own tests/i);
     expect(prompt).toMatch(/ACTUALLY chose/);
     expect(prompt).toMatch(/Do not update anything that is not listed/i);
+  });
+});
+
+/// #494: the wizard was handed every outdated package regardless of the
+/// bump filter. A repository showing 122 "Patch and minor" opened a
+/// modal listing all 153, and select-all selected all 153 -- so there
+/// was no way to act on just what had been filtered to.
+describe("the update wizard's contents", () => {
+  const mixed = () => [
+    report({
+      outdated: [pkg("patchy", "patch"), pkg("minory", "minor"), pkg("majory", "major")],
+    }),
+  ];
+
+  it("offers only what the filter is showing", async () => {
+    state.reports = mixed();
+    render(<PackagesPage />);
+
+    // Default filter excludes major.
+    fireEvent.click(screen.getByRole("button", { name: /update in worktree/i }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("patchy")).toBeTruthy();
+    expect(within(dialog).getByText("minory")).toBeTruthy();
+    expect(within(dialog).queryByText("majory")).toBeNull();
+  });
+
+  it("offers everything once the filter admits everything", async () => {
+    state.reports = mixed();
+    render(<PackagesPage />);
+    fireEvent.click(screen.getByRole("button", { name: /everything/i }));
+    fireEvent.click(screen.getByRole("button", { name: /update in worktree/i }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("majory")).toBeTruthy();
+  });
+
+  /// The count on the button and the rows in the modal describe one
+  /// set. They were derived separately from the same filter, which is
+  /// how they could disagree without anything looking wrong.
+  it("counts on the button what the modal will list", async () => {
+    state.reports = mixed();
+    render(<PackagesPage />);
+    expect(screen.getByText(/^2 updates$/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /update in worktree/i }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getAllByRole("checkbox")).toHaveLength(2);
   });
 });
