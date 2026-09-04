@@ -508,8 +508,11 @@ export const deleteRemoteBranches = (repoPath: string, names: string[]) =>
 /// `update-run-done` event -- the wizard used to await the whole run
 /// with its modal open, which on a large selection meant minutes of an
 /// unchanging "Applying…" and an unusable app (#495).
-export const applyUpdatesInBackground = (repoPath: string, requests: UpdateRequest[]) =>
-  invoke<void>("apply_updates_in_background", { repoPath, requests });
+export const applyUpdatesInBackground = (
+  repoPath: string,
+  requests: UpdateRequest[],
+  branch?: string,
+) => invoke<void>("apply_updates_in_background", { repoPath, requests, branch });
 
 /// What a background update run produced.
 export interface UpdateRunDone {

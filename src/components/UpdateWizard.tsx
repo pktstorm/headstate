@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { toast } from "sonner";
 import type { Ecosystem, Outdated } from "@/types/pr";
 import { applyUpdatesInBackground } from "@/api/tauri";
+import { branchNameError, derivedBranchName } from "@/lib/branchName";
 import {
   Dialog,
   DialogContent,
@@ -46,6 +47,10 @@ export function UpdateWizard({
   onOpenChange: (open: boolean) => void;
 }) {
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  /// null means "use the derived name". Only a deliberate edit sets it,
+  /// so the field keeps tracking the selection until the user takes it
+  /// over -- and a name typed then abandoned does not silently persist.
+  const [branchEdit, setBranchEdit] = useState<string | null>(null);
 
 
   /// Identifies a ROW, not a package.
@@ -77,6 +82,15 @@ export function UpdateWizard({
     return { applicable, blocked };
   }, [packages]);
 
+  const derivedName = useMemo(
+    () =>
+      derivedBranchName(
+        applicable.filter((p) => selected.has(key(p))).map((p) => p.name),
+      ),
+    [applicable, selected],
+  );
+  const branchError = branchNameError(branchEdit ?? derivedName);
+
   const run = () => {
     const requests = applicable
       .filter((p) => selected.has(key(p)))
@@ -94,11 +108,12 @@ export function UpdateWizard({
     // and the outcome arrives on `update-run-done`.
     onOpenChange(false);
     setSelected(new Set());
+    setBranchEdit(null);
     toast.info(`Updating ${requests.length} package${requests.length === 1 ? "" : "s"}…`, {
       description: "A worktree is being prepared and a pull request assembled.",
     });
 
-    applyUpdatesInBackground(repo, requests).catch((e: unknown) => {
+    applyUpdatesInBackground(repo, requests, branchEdit ?? undefined).catch((e: unknown) => {
       toast.error("Could not start the update run", {
         description: typeof e === "string" ? e : undefined,
       });
@@ -196,6 +211,26 @@ export function UpdateWizard({
               </div>
             )}
 
+            {/* #409: the name auto-populates and stays overridable.
+                It tracks the selection until the user edits it, so a
+                field they never touched cannot go stale against what
+                they picked. */}
+            <label className="mt-4 block text-xs">
+              <span className="block text-[#8b949e]">Branch</span>
+              <input
+                type="text"
+                value={branchEdit ?? derivedName}
+                onChange={(e) => setBranchEdit(e.target.value)}
+                spellCheck={false}
+                className="mt-1 w-full rounded border border-[#30363d] bg-[#0d1117] px-2 py-1 font-mono text-xs text-[#e6edf3]"
+              />
+              {/* Said as it is typed. The backend validates again --
+                  this is convenience, that is the gate. */}
+              {branchError ? (
+                <span className="mt-1 block text-[#f85149]">{branchError}</span>
+              ) : null}
+            </label>
+
             <div className="mt-4 flex items-center justify-end gap-2">
               <button
                 type="button"
@@ -206,7 +241,7 @@ export function UpdateWizard({
               </button>
               <button
                 type="button"
-                disabled={selected.size === 0}
+                disabled={selected.size === 0 || branchError !== null}
                 onClick={run}
                 className="flex items-center gap-1 rounded border border-[#238636]/40 px-3 py-1 text-xs text-[#3fb950] hover:bg-[#238636]/10 disabled:opacity-50"
               >

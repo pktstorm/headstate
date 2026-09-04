@@ -2274,7 +2274,15 @@ pub async fn apply_updates_in_background(
     client: State<'_, GhClient>,
     repo_path: String,
     requests: Vec<crate::packages::apply::UpdateRequest>,
+    branch: Option<String>,
 ) -> Result<(), String> {
+    // Checked HERE as well as inside the run: this command returns
+    // immediately, so a bad name would otherwise be reported only by a
+    // notification minutes later, long after the moment the user could
+    // connect it to what they typed.
+    if let Some(b) = branch.as_deref() {
+        crate::packages::apply::valid_branch_name(b)?;
+    }
     // Cloned OUT of `State` before spawning: the guard borrows the
     // app handle and cannot outlive this function, but the task must.
     let gh = GhClient(client.0.clone());
@@ -2282,7 +2290,11 @@ pub async fn apply_updates_in_background(
         let repo = repo_path.clone();
         let reqs = requests.clone();
         let applied = tauri::async_runtime::spawn_blocking(move || {
-            crate::packages::apply::run(std::path::Path::new(&repo), &reqs)
+            crate::packages::apply::run_on_branch(
+                std::path::Path::new(&repo),
+                &reqs,
+                branch.as_deref(),
+            )
         })
         .await;
 
