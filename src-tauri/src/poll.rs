@@ -112,31 +112,8 @@ fn notify_breakage(app: &AppHandle, b: &Breakage) {
     // the failure was swallowed by design ("a notification is an
     // affordance"). So a headline feature could be permanently dead with
     // no user-visible signal at all.
-    match app.notification().permission_state() {
-        Ok(tauri_plugin_notification::PermissionState::Granted) => {}
-        Ok(tauri_plugin_notification::PermissionState::Prompt)
-        | Ok(tauri_plugin_notification::PermissionState::PromptWithRationale) => {
-            if let Err(e) = app.notification().request_permission() {
-                log::warn!("could not request notification permission: {e}");
-                return;
-            }
-        }
-        Ok(tauri_plugin_notification::PermissionState::Denied) => {
-            // Logged at INFO, not warn: the user said no, which is a
-            // choice rather than a fault. Logging it once per breakage
-            // would be noise, but silence made "why do I get no
-            // notifications?" unanswerable from the log.
-            log::info!(
-                "notifications are denied; not notifying about {}#{}",
-                b.repo,
-                b.number
-            );
-            return;
-        }
-        Err(e) => {
-            log::warn!("could not read notification permission: {e}");
-            return;
-        }
+    if !notification_allowed(app) {
+        return;
     }
 
     let body = format!("{}#{} {}", b.repo, b.number, b.kind.reason());
@@ -148,6 +125,42 @@ fn notify_breakage(app: &AppHandle, b: &Breakage) {
         .show()
     {
         log::warn!("failed to show notification: {e}");
+    }
+}
+
+/// Whether a desktop notification can be shown, asking once if needed.
+///
+/// Shared with the package-update run, which notifies when a pull
+/// request is ready. Extracted rather than duplicated: the ASK-ONCE
+/// behaviour below is the load-bearing part, and a second copy would
+/// drift from it.
+pub(crate) fn notification_allowed(app: &AppHandle) -> bool {
+    use tauri_plugin_notification::NotificationExt;
+
+    match app.notification().permission_state() {
+        Ok(tauri_plugin_notification::PermissionState::Granted) => true,
+        Ok(tauri_plugin_notification::PermissionState::Prompt)
+        | Ok(tauri_plugin_notification::PermissionState::PromptWithRationale) => {
+            match app.notification().request_permission() {
+                Ok(tauri_plugin_notification::PermissionState::Granted) => true,
+                Ok(_) => false,
+                Err(e) => {
+                    log::warn!("could not request notification permission: {e}");
+                    false
+                }
+            }
+        }
+        Ok(tauri_plugin_notification::PermissionState::Denied) => {
+            // Logged at INFO, not warn: the user said no, which is a
+            // choice rather than a fault. Silence made "why do I get no
+            // notifications?" unanswerable from the log.
+            log::info!("notifications are denied; not notifying");
+            false
+        }
+        Err(e) => {
+            log::warn!("could not read notification permission: {e}");
+            false
+        }
     }
 }
 
