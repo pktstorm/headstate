@@ -11,6 +11,12 @@ import {
   useWorktreeDirs,
 } from "../api/hooks";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
+import {
+  CLEANUP_GROUPS,
+  parentState,
+  toggleChild,
+  toggleParent,
+} from "@/lib/cleanupGroups";
 
 /// Matches the backend's own range: `clamp_interval` allows 60s..3600s
 /// (`poll.rs`), and the UI previously stopped at 900 -- so a user who
@@ -464,41 +470,62 @@ export function SettingsDialog({
           </label>
           {cleanup?.enabled ? (
             <>
-              <label className="ml-6 flex items-center gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  checked={cleanup.artifacts}
-                  onChange={() =>
-                    void setCleanup({ ...cleanup, artifacts: !cleanup.artifacts })
-                  }
-                />
-                Build output
-              </label>
-              <label className="ml-6 flex items-center gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  checked={cleanup.venvs}
-                  onChange={() => void setCleanup({ ...cleanup, venvs: !cleanup.venvs })}
-                />
-                Orphaned virtualenvs
-              </label>
-              {/* Beside the orphan toggle, not in its own section.
-                  It used to gate MANUAL removal too, which was wrong --
-                  ticking a row and confirming a dialog is already the
-                  user's intent. Unattended deletion is different: a
-                  staleness threshold is a guess, and a guess is not
-                  something the app should act on by itself. */}
-              <label className="ml-6 flex items-center gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  checked={cleanup.venvs_stale}
-                  disabled={!cleanup.venvs}
-                  onChange={() =>
-                    void setCleanup({ ...cleanup, venvs_stale: !cleanup.venvs_stale })
-                  }
-                />
-                Stale virtualenvs, whose projects still exist
-              </label>
+              {/* GROUPED: a parent per category, with the specific
+                  claims beneath it. These were seven flat checkboxes,
+                  which made "branches" and "artifacts" look like the
+                  same kind of thing and left no room for the ones that
+                  needed adding (#493).
+
+                  A child is a separate claim about what may be deleted
+                  with nobody watching -- not a detail of its parent --
+                  which is why each has its own stored field. */}
+              {CLEANUP_GROUPS.map((g) => {
+                const state = parentState(cleanup, g);
+                return (
+                  <div key={g.key as string} className="ml-6">
+                    <label className="flex items-center gap-2 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={state === "on"}
+                        // A parent with only some children on is
+                        // neither: rendering it as plain "on" would
+                        // misstate what runs unattended.
+                        ref={(el) => {
+                          if (el) el.indeterminate = state === "mixed";
+                        }}
+                        onChange={() =>
+                          void setCleanup({ ...cleanup, ...toggleParent(cleanup, g) })
+                        }
+                      />
+                      {g.label}
+                      {g.pending ? (
+                        <span className="rounded bg-[#21262d] px-1.5 py-0.5 text-[10px] text-[#8b949e]">
+                          not yet acted on
+                        </span>
+                      ) : null}
+                    </label>
+                    {g.children.map((c) => (
+                      <label
+                        key={c.key as string}
+                        className="ml-6 mt-1 flex items-start gap-2 text-sm"
+                      >
+                        <input
+                          type="checkbox"
+                          className="mt-1"
+                          checked={Boolean(cleanup[c.key])}
+                          onChange={() =>
+                            void setCleanup({ ...cleanup, ...toggleChild(cleanup, g, c.key) })
+                          }
+                        />
+                        <span>
+                          <span className="block">{c.label}</span>
+                          <span className="block text-xs text-[#8b949e]">{c.hint}</span>
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                );
+              })}
             </>
           ) : null}
         </div>

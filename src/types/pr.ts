@@ -512,6 +512,22 @@ export interface CleanupPrefs {
   /// orphans. An orphan is a fact; stale is a threshold about a project
   /// that still exists, and that is what needs the opt-in here.
   venvs_stale: boolean;
+  /// Merged branches. Parent of the two below.
+  branches: boolean;
+  /// Merged by ancestry — a graph fact, the strongest claim available.
+  branches_ancestor: boolean;
+  /// Merged by squash, found by comparing patch-ids. A CONTENT
+  /// comparison rather than a graph one, so it gets its own opt-in for
+  /// the same reason `venvs_stale` does — and it is the common case
+  /// (489 of 536 on a real repository), so enabling it is not a small
+  /// decision.
+  branches_squash: boolean;
+  worktrees: boolean;
+  /// Merged, clean, and pushed — nothing is lost by removing one.
+  worktrees_safe: boolean;
+  docker: boolean;
+  /// Untagged and referenced by nothing.
+  docker_dangling: boolean;
   max_per_run: number;
 }
 

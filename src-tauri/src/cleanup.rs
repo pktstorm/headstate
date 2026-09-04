@@ -77,6 +77,43 @@ pub struct CleanupPrefs {
     /// Defaults OFF: an upgrade must never widen what runs by itself.
     #[serde(default)]
     pub venvs_stale: bool,
+    /// Whether merged BRANCHES are considered.
+    ///
+    /// Parent of the two below. Off by default for the same reason as
+    /// everything else here: an upgrade must never widen what runs
+    /// unattended.
+    #[serde(default)]
+    pub branches: bool,
+    /// Branches merged by ANCESTRY -- the tip is reachable from the
+    /// default branch. A graph fact, and the strongest claim available.
+    #[serde(default)]
+    pub branches_ancestor: bool,
+    /// Branches merged by SQUASH, found by comparing patch-ids.
+    ///
+    /// Separate from `branches_ancestor` for the reason `venvs_stale`
+    /// is separate from `venvs`: this is a CONTENT comparison, not a
+    /// graph one. Two different changes producing an identical diff are
+    /// indistinguishable to it. That is vanishingly rare and it is
+    /// still a weaker claim, so an unattended pass gets its own opt-in.
+    ///
+    /// It is also the common case -- measured at 489 of 536 merged
+    /// branches on a real repository -- so turning it off is not a
+    /// small restriction, and turning it on should be deliberate.
+    #[serde(default)]
+    pub branches_squash: bool,
+    /// Whether WORKTREES are considered.
+    #[serde(default)]
+    pub worktrees: bool,
+    /// Worktrees whose branch is merged, clean, and pushed -- the
+    /// `Safety::Safe` case. Nothing is lost by removing one.
+    #[serde(default)]
+    pub worktrees_safe: bool,
+    /// Whether DOCKER IMAGES are considered.
+    #[serde(default)]
+    pub docker: bool,
+    /// Dangling images -- untagged and referenced by nothing.
+    #[serde(default)]
+    pub docker_dangling: bool,
     /// Most entries a single run may propose.
     ///
     /// A blast radius, and it matters in Preview too: a run that proposed
@@ -98,6 +135,13 @@ impl Default for CleanupPrefs {
             artifacts: false,
             venvs: false,
             venvs_stale: false,
+            branches: false,
+            branches_ancestor: false,
+            branches_squash: false,
+            worktrees: false,
+            worktrees_safe: false,
+            docker: false,
+            docker_dangling: false,
             max_per_run: 0,
         }
     }
@@ -504,5 +548,80 @@ mod tests {
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].target, "/code/x/target");
         assert_eq!(back[0].bytes, Some(1234));
+    }
+}
+
+#[cfg(test)]
+mod granularity {
+    use super::*;
+
+    /// #493 added six fields to a PERSISTED struct.
+    ///
+    /// A user upgrading has prefs on disk written before they existed.
+    /// Every field carries `#[serde(default)]`, so the old shape must
+    /// still load and must not silently turn anything on.
+    #[test]
+    fn prefs_saved_before_these_fields_existed_still_load() {
+        let old = r#"{
+            "enabled": true,
+            "mode": "remove",
+            "artifacts": true,
+            "venvs": true,
+            "venvs_stale": true,
+            "max_per_run": 25
+        }"#;
+        let p: CleanupPrefs = serde_json::from_str(old).expect("the old shape must still load");
+
+        // What they set is preserved.
+        assert!(p.enabled);
+        assert!(p.artifacts);
+        assert!(p.venvs);
+        assert!(p.venvs_stale);
+        assert_eq!(p.max_per_run, 25);
+
+        // What they never saw is OFF. An upgrade must not widen what an
+        // unattended pass may delete -- and this user has `mode:
+        // remove`, so a default of `true` would start deleting branches
+        // they never opted into.
+        assert!(!p.branches, "an upgrade must not enable branch cleanup");
+        assert!(!p.branches_ancestor);
+        assert!(!p.branches_squash);
+        assert!(!p.worktrees, "an upgrade must not enable worktree cleanup");
+        assert!(!p.worktrees_safe);
+        assert!(!p.docker, "an upgrade must not enable image cleanup");
+        assert!(!p.docker_dangling);
+    }
+
+    /// A fresh install starts with nothing enabled.
+    #[test]
+    fn every_new_category_defaults_off() {
+        let d = CleanupPrefs::default();
+        assert!(!d.branches && !d.branches_ancestor && !d.branches_squash);
+        assert!(!d.worktrees && !d.worktrees_safe);
+        assert!(!d.docker && !d.docker_dangling);
+    }
+
+    /// The round trip must not lose a field, or saving prefs would
+    /// quietly reset whatever the writer did not know about.
+    #[test]
+    fn every_field_survives_a_round_trip() {
+        let p = CleanupPrefs {
+            enabled: true,
+            mode: CleanupMode::Preview,
+            artifacts: true,
+            venvs: true,
+            venvs_stale: true,
+            branches: true,
+            branches_ancestor: true,
+            branches_squash: true,
+            worktrees: true,
+            worktrees_safe: true,
+            docker: true,
+            docker_dangling: true,
+            max_per_run: 12,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: CleanupPrefs = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
     }
 }

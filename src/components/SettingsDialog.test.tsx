@@ -14,6 +14,14 @@ const cleanupPrefs = vi.hoisted(() => ({
     mode: "preview" as const,
     artifacts: false,
     venvs: false,
+    venvs_stale: false,
+    branches: false,
+    branches_ancestor: false,
+    branches_squash: false,
+    worktrees: false,
+    worktrees_safe: false,
+    docker: false,
+    docker_dangling: false,
     max_per_run: 0,
   },
 }));
@@ -119,13 +127,13 @@ describe("automatic cleanup settings", () => {
   it("hides the per-kind options until the feature is on", () => {
     cleanupPrefs.current = { ...cleanupPrefs.current, enabled: false };
     const r = render(<SettingsDialog open onOpenChange={() => {}} />);
-    expect(screen.queryByLabelText(/Build output/)).toBeNull();
+    expect(screen.queryByLabelText(/Build artifacts/)).toBeNull();
     r.unmount();
 
     cleanupPrefs.current = { ...cleanupPrefs.current, enabled: true };
     render(<SettingsDialog open onOpenChange={() => {}} />);
-    expect(screen.getByLabelText(/Build output/)).toBeTruthy();
-    expect(screen.getByLabelText(/Orphaned virtualenvs/)).toBeTruthy();
+    expect(screen.getByLabelText(/Build artifacts/)).toBeTruthy();
+    expect(screen.getByLabelText(/^Virtualenvs/)).toBeTruthy();
   });
 
   /// #394: the opt-in must say what turning it on ASSERTS, since the
@@ -135,10 +143,68 @@ describe("automatic cleanup settings", () => {
   /// one -- not to manual removal, which it used to gate. Ticking a row
   /// and confirming a dialog is already the user's intent; unattended
   /// deletion acting on a 90-day threshold is not.
+  /// #493: the categories the automatic pass can act on, each with the
+  /// specific claims beneath it.
+  it("offers every cleanup category", () => {
+    cleanupPrefs.current = { ...cleanupPrefs.current, enabled: true };
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+    for (const label of [
+      /Build artifacts/,
+      /^Virtualenvs/,
+      /Merged branches/,
+      /Merged worktrees/,
+      /Docker images/,
+    ]) {
+      expect(screen.getByLabelText(label)).toBeTruthy();
+    }
+  });
+
+  /// Ticking a parent ticks everything under it, in one save rather
+  /// than one per checkbox.
+  it("ticking a category ticks its specific options", () => {
+    cleanupPrefs.current = { ...cleanupPrefs.current, enabled: true };
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+    fireEvent.click(screen.getByLabelText(/Merged branches/));
+    expect(setCleanup).toHaveBeenCalledWith(
+      expect.objectContaining({
+        branches: true,
+        branches_ancestor: true,
+        branches_squash: true,
+      }),
+    );
+  });
+
+  /// A user could otherwise tick a specific option under an off
+  /// category and see nothing happen, because the pass reads the parent.
+  it("ticking a specific option turns its category on", () => {
+    cleanupPrefs.current = { ...cleanupPrefs.current, enabled: true };
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+    fireEvent.click(screen.getByLabelText(/Merged by squash/));
+    expect(setCleanup).toHaveBeenCalledWith(
+      expect.objectContaining({ branches_squash: true, branches: true }),
+    );
+  });
+
+  /// A parent with only some children on must not render as plain
+  /// "on": that would misstate what the unattended pass will do.
+  it("shows a partly-ticked category as indeterminate", () => {
+    cleanupPrefs.current = {
+      ...cleanupPrefs.current,
+      enabled: true,
+      branches: true,
+      branches_ancestor: true,
+      branches_squash: false,
+    };
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+    const parent = screen.getByLabelText(/Merged branches/) as HTMLInputElement;
+    expect(parent.indeterminate).toBe(true);
+    expect(parent.checked).toBe(false);
+  });
+
   it("offers stale virtualenvs beside orphaned ones, under automatic cleanup", () => {
     render(<SettingsDialog open onOpenChange={() => {}} />);
-    const orphaned = screen.getByLabelText(/Orphaned virtualenvs/);
-    const stale = screen.getByLabelText(/Stale virtualenvs/);
+    const orphaned = screen.getByLabelText(/^Virtualenvs/);
+    const stale = screen.getByLabelText(/Also stale ones/);
     expect(orphaned).toBeTruthy();
     expect(stale).toBeTruthy();
     // Same section: the stale toggle sits with the automatic-cleanup
