@@ -11,6 +11,7 @@ import {
   useIncomplete,
   useReviewShortfall,
   usePollError,
+  useUpdateRunOutcome,
 } from "./api/hooks";
 import { useReviewingDiag } from "./api/diag";
 import { useScrollReset } from "./lib/scrollReset";
@@ -75,6 +76,10 @@ export default function App() {
   const truncatedTotal = useTruncation();
   const refusedFields = useIncomplete();
   const reviewShortfall = useReviewShortfall();
+  // At the APP level, not in the wizard: the run outlives the modal
+  // that started it, and the user is expected to be elsewhere by the
+  // time it finishes (#495).
+  useUpdateRunOutcome();
   const pollError = usePollError();
   // The LIST only where it is rendered. The badge below uses a count
   // query instead, so Docker and Worktrees no longer fetch 100 pull

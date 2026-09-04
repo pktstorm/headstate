@@ -34,6 +34,7 @@ vi.mock("./api/hooks", () => ({
   useViewCadence: () => undefined,
   usePollState: () => "idle",
   useRemovalProgress: () => null,
+  useUpdateRunOutcome: () => undefined,
   usePollInterval: () => ({ seconds: 120, set: () => Promise.resolve(120) }),
   useWorktreeDirs: () => ({ dirs: [], set: () => Promise.resolve([]) }),
   // Defaults, matching the Rust side: absent prefs mean everything on.
