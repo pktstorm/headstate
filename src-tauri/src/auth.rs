@@ -606,12 +606,9 @@ mod tests {
     fn bogus_override_falls_back_to_path() {
         let tmp = std::env::temp_dir().join(format!("hs-gh-fb-{}", std::process::id()));
         let bin = fake_gh(&tmp);
-        temp_env::with_vars(
-            [
-                ("PATH", Some(tmp.to_str().unwrap())),
-                ("HEADSTATE_GH", Some("/nonexistent/gh")),
-            ],
-            || assert_eq!(find_gh(), Some(bin.clone())),
+        assert_eq!(
+            find_gh_with(&[], tmp.to_str(), Some("/nonexistent/gh")),
+            Some(bin.clone())
         );
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -627,13 +624,10 @@ mod tests {
         let empty = std::env::temp_dir().join(format!("hs-gh-nopath-{}", std::process::id()));
         std::fs::create_dir_all(&empty).unwrap();
         let fallbacks = [brew.to_str().unwrap()];
-        temp_env::with_vars(
-            [
-                // A PATH with no gh on it at all, as a GUI app sees.
-                ("PATH", Some(empty.to_str().unwrap())),
-                ("HEADSTATE_GH", None),
-            ],
-            || assert_eq!(find_gh_in(&fallbacks), Some(want.clone())),
+        // A PATH with no gh on it at all, as a GUI app sees.
+        assert_eq!(
+            find_gh_with(&fallbacks, empty.to_str(), None),
+            Some(want.clone())
         );
         std::fs::remove_dir_all(&brew).ok();
         std::fs::remove_dir_all(&empty).ok();
@@ -643,21 +637,13 @@ mod tests {
     fn returns_none_when_gh_is_nowhere() {
         let empty = std::env::temp_dir().join(format!("hs-gh-empty-{}", std::process::id()));
         std::fs::create_dir_all(&empty).unwrap();
-        temp_env::with_vars(
-            [
-                ("PATH", Some(empty.to_str().unwrap())),
-                ("HEADSTATE_GH", None),
-            ],
-            || {
-                // Only meaningful if the machine has no gh in a fallback dir.
-                if GH_FALLBACK_DIRS
-                    .iter()
-                    .all(|d| !std::path::Path::new(d).join("gh").is_file())
-                {
-                    assert_eq!(find_gh(), None);
-                }
-            },
-        );
+        // Only meaningful if the machine has no gh in a fallback dir.
+        if GH_FALLBACK_DIRS
+            .iter()
+            .all(|d| !std::path::Path::new(d).join("gh").is_file())
+        {
+            assert_eq!(find_gh_with(GH_FALLBACK_DIRS, empty.to_str(), None), None);
+        }
         std::fs::remove_dir_all(&empty).ok();
     }
 
@@ -679,20 +665,12 @@ mod tests {
         let bare = tmp.join("gh");
         std::fs::write(&bare, "x").unwrap();
 
-        temp_env::with_vars(
-            [
-                ("PATH", Some(tmp.to_str().unwrap())),
-                ("HEADSTATE_GH", None),
-            ],
-            || {
-                let found = find_gh_in(&[]);
-                if cfg!(windows) {
-                    assert_eq!(found, None, "a bare `gh` is not an executable on Windows");
-                } else {
-                    assert_eq!(found, Some(bare.clone()));
-                }
-            },
-        );
+        let found = find_gh_with(&[], tmp.to_str(), None);
+        if cfg!(windows) {
+            assert_eq!(found, None, "a bare `gh` is not an executable on Windows");
+        } else {
+            assert_eq!(found, Some(bare.clone()));
+        }
         std::fs::remove_dir_all(&tmp).ok();
     }
 
