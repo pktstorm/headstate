@@ -159,9 +159,14 @@ describe("UpdateWizard", () => {
     fireEvent.click(screen.getByRole("button", { name: /^apply/i }));
 
     await waitFor(() => expect(applyFn).toHaveBeenCalledTimes(1));
-    expect(applyFn).toHaveBeenCalledWith("/code/app", [
-      { name: "lodash", version: "2.0.0", ecosystem: "npm" },
-    ]);
+    // `undefined` for the branch: the field was left at its derived
+    // value, so the backend derives it too rather than being handed a
+    // string the user never chose.
+    expect(applyFn).toHaveBeenCalledWith(
+      "/code/app",
+      [{ name: "lodash", version: "2.0.0", ecosystem: "npm" }],
+      undefined,
+    );
     // Closed on click, not on completion.
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
@@ -192,5 +197,46 @@ describe("UpdateWizard", () => {
         description: "no such repository",
       }),
     );
+  });
+
+  /// #409: "Branch name auto-populates and stays overridable" -- the
+  /// last line of that issue's scope, and the reason it stayed open
+  /// after both phases shipped.
+  it("auto-populates the branch name from the selection", async () => {
+    show([pkg("lodash")]);
+    fireEvent.click(screen.getByRole("checkbox"));
+    const field = screen.getByLabelText(/branch/i) as HTMLInputElement;
+    await waitFor(() => expect(field.value).toBe("headstate/update-lodash"));
+  });
+
+  it("sends an edited branch name instead of the derived one", async () => {
+    show([pkg("lodash")]);
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.change(screen.getByLabelText(/branch/i), {
+      target: { value: "deps/weekly" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^apply/i }));
+
+    await waitFor(() => expect(applyFn).toHaveBeenCalledTimes(1));
+    expect(applyFn).toHaveBeenCalledWith(
+      "/code/app",
+      expect.anything(),
+      "deps/weekly",
+    );
+  });
+
+  /// Said as it is typed, and the run is blocked. The backend validates
+  /// again -- this is convenience, that is the gate.
+  it("refuses to apply with an invalid branch name", async () => {
+    show([pkg("lodash")]);
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.change(screen.getByLabelText(/branch/i), {
+      target: { value: "-dashname" },
+    });
+    expect(screen.getByText(/cannot start with/i)).toBeTruthy();
+    const apply = screen.getByRole("button", { name: /^apply/i });
+    expect(apply.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(apply);
+    expect(applyFn).not.toHaveBeenCalled();
   });
 });

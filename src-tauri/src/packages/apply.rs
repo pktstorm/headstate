@@ -459,6 +459,51 @@ pub fn branch_name(packages: &[String]) -> String {
     }
 }
 
+/// Whether a user-supplied branch name is one git will accept.
+///
+/// The generated name is sanitised by construction; an OVERRIDE is not,
+/// and it reaches `git worktree add -b` and later a push. Validated
+/// against git's own ref rules rather than trusted, and refused up
+/// front so a bad name does not leave a worktree behind.
+///
+/// Deliberately stricter than `git check-ref-format` in one respect: a
+/// leading `-` is refused outright, because git would read it as an
+/// option regardless of whether the ref grammar allows it.
+pub fn valid_branch_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("branch name is empty".into());
+    }
+    if name.starts_with('-') {
+        return Err(format!(
+            "branch name {name:?} starts with '-', which git would read \
+             as an option rather than a name"
+        ));
+    }
+    // git's own rules, the ones a wrong name fails on:
+    // https://git-scm.com/docs/git-check-ref-format
+    if name.starts_with('/') || name.ends_with('/') || name.contains("//") {
+        return Err("branch name may not start or end with '/', or contain '//'".into());
+    }
+    if name.ends_with('.') || name.contains("..") {
+        return Err("branch name may not end with '.' or contain '..'".into());
+    }
+    if name.ends_with(".lock") {
+        return Err("branch name may not end with '.lock'".into());
+    }
+    if name.contains("@{") {
+        return Err("branch name may not contain '@{'".into());
+    }
+    for c in name.chars() {
+        if c.is_control() || c == ' ' {
+            return Err("branch name may not contain spaces or control characters".into());
+        }
+        if matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\') {
+            return Err(format!("branch name may not contain {c:?}"));
+        }
+    }
+    Ok(())
+}
+
 /// One package to update.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct UpdateRequest {
@@ -538,6 +583,18 @@ impl UpdateOutcome {
 /// was refused by the resolver" is the useful answer and aborting would
 /// hide it.
 pub fn run(repo: &Path, requests: &[UpdateRequest]) -> Result<RunReport, String> {
+    run_on_branch(repo, requests, None)
+}
+
+/// `run`, with the branch name optionally chosen by the caller.
+///
+/// #409 asked for the generated name to be overridable. `None` keeps
+/// the derived one, which is what every existing caller wants.
+pub fn run_on_branch(
+    repo: &Path,
+    requests: &[UpdateRequest],
+    branch_override: Option<&str>,
+) -> Result<RunReport, String> {
     if requests.is_empty() {
         return Err("nothing to update".into());
     }
@@ -552,7 +609,16 @@ pub fn run(repo: &Path, requests: &[UpdateRequest]) -> Result<RunReport, String>
     }
 
     let names: Vec<String> = requests.iter().map(|r| r.name.clone()).collect();
-    let branch = branch_name(&names);
+    let branch = match branch_override {
+        // Validated BEFORE the worktree is created, for the same reason
+        // the package names above are: a refusal must not leave one
+        // behind.
+        Some(b) => {
+            valid_branch_name(b)?;
+            b.to_string()
+        }
+        None => branch_name(&names),
+    };
     // Beside the repository, not inside it: a worktree inside the
     // checkout shows up in the parent's own status and in every tool
     // that walks it.
@@ -1079,6 +1145,43 @@ mod tests {
         assert!(run(tmp.path(), &[]).is_err());
     }
 
+    /// A refusal must not leave a worktree behind.
+    ///
+    /// The same rule the package-name validation follows: everything is
+    /// checked before anything is created. Mutation testing caught this
+    /// -- removing the validation from `run_on_branch` passed every
+    /// other test, because they all exercise the validator directly.
+    #[test]
+    fn a_bad_override_is_refused_before_a_worktree_exists() {
+        let tmp = repo();
+        let reqs = [UpdateRequest {
+            name: "lodash".into(),
+            version: "2.0.0".into(),
+            ecosystem: Ecosystem::Npm,
+        }];
+        // Asserted on OUR message, not merely that it failed.
+        //
+        // git rejects these names too -- `-dashname` gives "unknown
+        // switch `s'" -- so a test that only checked for an error
+        // passed with this validation removed. Mutation testing caught
+        // exactly that. The point of validating here is a clear
+        // refusal instead of git's confusing one, so the message is
+        // what has to be asserted.
+        let err = run_on_branch(tmp.path(), &reqs, Some("-dashname")).unwrap_err();
+        // Wording only OUR refusal uses. `contains("option")` was not
+        // enough: git's own failure prints a usage block containing
+        // "options", so the assertion passed with the validation
+        // removed. Two mutants in a row survived before this.
+        assert!(
+            err.contains("which git would read"),
+            "expected our own refusal, got git's: {err}"
+        );
+        assert!(
+            !tmp.path().join(".worktrees").exists(),
+            "a refused branch name must create no worktree"
+        );
+    }
+
     /// A request that cannot succeed must not leave a worktree behind.
     #[test]
     fn run_refuses_swift_before_creating_anything() {
@@ -1223,6 +1326,81 @@ mod real {
             r.resolved_constraint.as_deref(),
             Some("4.17.21"),
             "a pinned manifest must stay pinned, not become a caret range"
+        );
+    }
+}
+
+#[cfg(test)]
+mod branch_override {
+    use super::*;
+
+    /// The generated name is sanitised by construction; an override is
+    /// not, and it reaches `git worktree add -b` and later a push.
+    #[test]
+    fn an_ordinary_name_is_accepted() {
+        for good in [
+            "update-deps",
+            "headstate/update-lodash",
+            "feature/deps.2026",
+            "renovate/npm-all",
+        ] {
+            assert!(valid_branch_name(good).is_ok(), "{good} should be valid");
+        }
+    }
+
+    /// A leading `-` is refused whatever git's ref grammar says: git
+    /// would read it as an option rather than a name.
+    #[test]
+    fn an_option_like_name_is_refused() {
+        let e = valid_branch_name("--force").unwrap_err();
+        assert!(e.contains("option"), "{e}");
+        assert!(valid_branch_name("-b").is_err());
+    }
+
+    /// git's own rules. A name that fails these fails at
+    /// `git check-ref-format`, so refusing here turns a confusing git
+    /// error into a clear one -- BEFORE a worktree exists.
+    #[test]
+    fn names_git_itself_would_reject_are_refused() {
+        for bad in [
+            "",          // empty
+            "/leading",  // leading slash
+            "trailing/", // trailing slash
+            "double//slash",
+            "ends.",      // trailing dot
+            "has..dots",  // double dot
+            "thing.lock", // reserved suffix
+            "at@{brace}",
+            "with space",
+            "tilde~1",
+            "caret^1",
+            "colon:here",
+            "question?",
+            "star*",
+            "bracket[",
+            "back\\slash",
+        ] {
+            assert!(valid_branch_name(bad).is_err(), "{bad:?} should be refused");
+        }
+    }
+
+    /// A control character would split one argument into two for
+    /// anything that re-parses, and no real branch name has one.
+    #[test]
+    fn control_characters_are_refused() {
+        assert!(valid_branch_name("new\nline").is_err());
+        assert!(valid_branch_name("null\0byte").is_err());
+        assert!(valid_branch_name("tab\there").is_err());
+    }
+
+    /// No override means the derived name, which is what every caller
+    /// before #409 wanted.
+    #[test]
+    fn no_override_keeps_the_derived_name() {
+        assert_eq!(branch_name(&["lodash".into()]), "headstate/update-lodash");
+        assert_eq!(
+            branch_name(&["a".into(), "b".into(), "c".into()]),
+            "headstate/updates-3"
         );
     }
 }
