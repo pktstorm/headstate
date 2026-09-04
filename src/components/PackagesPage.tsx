@@ -110,11 +110,23 @@ export function PackagesPage() {
         : BUMP_RANK[a.bump] - BUMP_RANK[b.bump] || a.name.localeCompare(b.name),
     );
 
+  // UNFILTERED. Only `hidden` below uses this, and it exists precisely
+  // to count what the filter excludes -- filtering it first would make
+  // that number always zero.
   const allOutdated = projects.flatMap((p) => p.reports.flatMap((r) => r.outdated));
-  const total = projects.reduce(
-    (n, p) => n + p.reports.reduce((m, r) => m + shown(r).length, 0),
-    0,
-  );
+  // FILTERED, the same rows the list renders.
+  //
+  // The wizard used to be handed `allOutdated`, so a repository showing
+  // 122 "Patch and minor" opened a modal listing all 153 -- and its
+  // select-all selected all 153, leaving no way to act on just what had
+  // been filtered to (#494). The filter is the user saying which
+  // updates they are willing to take; carrying it through is the point
+  // of setting it.
+  const offered = projects.flatMap((p) => p.reports.flatMap((r) => shown(r)));
+  // ONE derivation. These were computed separately from the same
+  // filter, which is how the button could say 122 while the modal
+  // listed 153 without anything looking wrong.
+  const total = offered.length;
 
   // Counted so the UI can SAY what the filter hides. A list that
   // silently omits what nothing could classify looks complete when it is
@@ -342,7 +354,7 @@ export function PackagesPage() {
 
       <UpdateWizard
         repo={repo}
-        packages={allOutdated}
+        packages={offered}
         open={wizardOpen}
         onOpenChange={setWizardOpen}
       />
