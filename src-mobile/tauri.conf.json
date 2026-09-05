@@ -1,0 +1,31 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Headstate Companion",
+  "version": "0.1.0",
+  "identifier": "com.pktstorm.headstate.companion",
+  "build": {
+    "beforeDevCommand": "VITE_TARGET=mobile yarn dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "VITE_TARGET=mobile yarn build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Headstate Companion",
+        "label": "main",
+        "theme": "Dark",
+        "backgroundColor": "#0d1117"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data: https://avatars.githubusercontent.com; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "icon": [
+      "icons/icon.png"
+    ]
+  }
+}
