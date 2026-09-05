@@ -1,4 +1,4 @@
-import type { UnlistenFn } from "@tauri-apps/api/event";
+import type { UnlistenFn } from "./transport";
 
 /// Call a Tauri `unlisten` without letting a teardown race become an error.
 ///

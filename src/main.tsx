@@ -5,6 +5,7 @@ import App from "./App";
 import { Toaster } from "sonner";
 import { AuthGate } from "./components/AuthGate";
 import { ErrorBoundary } from "./components/ErrorBoundary";
+import { PairingRequestModal } from "./components/PairingRequestModal";
 import { PERSIST_KEY } from "./store/filters";
 import { initSplash } from "./splash";
 import "./index.css";
@@ -37,6 +38,10 @@ createRoot(document.getElementById("root") as HTMLElement).render(
         {/* Dark to match the app, and bottom-right so it never covers the
             list the user is acting on. */}
         <Toaster theme="dark" position="bottom-right" richColors />
+        {/* Beside the toaster, not inside App: a phone can scan the
+            pairing code whether or not GitHub is signed in, and the
+            request must reach a person either way. */}
+        <PairingRequestModal />
       </QueryClientProvider>
     </ErrorBoundary>
   </StrictMode>,

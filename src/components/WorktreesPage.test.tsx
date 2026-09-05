@@ -1,7 +1,8 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Worktree, WorktreeRepo } from "@/types/pr";
 import { useFilters } from "@/store/filters";
+import { stubViewport } from "@/test-utils";
 
 const state = vi.hoisted(() => ({
   repos: undefined as WorktreeRepo[] | undefined,
@@ -118,6 +119,69 @@ const wt = (over: Partial<Worktree>): Worktree => ({
 
 const EMPTY = { "my-prs": {}, "to-review": {}, worktrees: {},
   branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {} } as const;
+
+describe("WorktreesPage on a phone", () => {
+  beforeEach(() => {
+    dockerImages.mockReturnValue([]);
+    Object.assign(state, {
+      repos: [{ identity: null, name: "proj", path: "/code/proj", worktrees: [wt({})] }],
+      isLoading: false,
+      isError: false,
+      classified: [wt({ safety: { kind: "safe" } })],
+      classifying: false,
+      sizes: undefined,
+      allSizes: undefined,
+      sizesPending: 0,
+      sizesTotal: 0,
+      sizing: false,
+      assessed: [],
+      prs: [],
+    });
+    useFilters.setState({
+      filtersByView: { ...EMPTY, worktrees: { repo: "/code/proj" } },
+      view: "worktrees",
+    } as never);
+  });
+  afterEach(() => stubViewport(null));
+
+  it("stacks a worktree row: name and size, then safety, then the action", () => {
+    stubViewport(390);
+    render(<WorktreesPage />);
+    const branch = screen.getByText("feature");
+    const nameLine = branch.parentElement?.parentElement as HTMLElement;
+    const size = screen.getByText("1.0 KB");
+    expect(size.parentElement).toBe(nameLine);
+    const remove = screen.getByRole("button", { name: /^remove$/i });
+    // The action sits on its own line, not squeezed beside the path.
+    expect(remove.closest("div")).not.toBe(nameLine);
+    expect(nameLine.parentElement?.className).toContain("flex-col");
+    // The safety verdict is still stated, in full rather than truncated.
+    expect(screen.getByText(/safe to delete/i)).toBeTruthy();
+    fireEvent.click(remove);
+    expect(screen.getByRole("dialog")).toBeTruthy();
+  });
+
+  it("keeps the desktop worktree row on one line", () => {
+    stubViewport(1400);
+    render(<WorktreesPage />);
+    const branch = screen.getByText("feature");
+    const nameLine = branch.parentElement?.parentElement as HTMLElement;
+    expect(screen.getByText("1.0 KB").parentElement).toBe(nameLine);
+    expect(screen.getByRole("button", { name: /^remove$/i }).closest("div")).toBe(nameLine);
+    expect(nameLine.className).not.toContain("flex-col");
+  });
+
+  it("wraps the all-repositories rollup rows so the path gets its own line", () => {
+    stubViewport(390);
+    useFilters.setState({ filtersByView: { ...EMPTY }, view: "worktrees" } as never);
+    render(<WorktreesPage />);
+    const row = screen.getByTitle(/open this repository/i);
+    expect(row.className).toContain("flex-wrap");
+    expect(within(row).getByText("proj")).toBeTruthy();
+    expect(within(row).getByText("proj-a")).toBeTruthy();
+    expect(within(row).getByText("1.0 KB")).toBeTruthy();
+  });
+});
 
 describe("WorktreesPage", () => {
   beforeEach(() => {

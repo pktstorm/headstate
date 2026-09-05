@@ -1,6 +1,6 @@
 import { fireEvent, screen } from "@testing-library/react";
-import { renderWithQuery as render } from "@/test-utils";
-import { describe, expect, it, vi } from "vitest";
+import { renderWithQuery as render, stubViewport } from "@/test-utils";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { PullRequest } from "@/types/pr";
 import { PR_FIXTURES } from "@/fixtures/prs";
@@ -69,6 +69,46 @@ describe("PrRow", () => {
     unmount();
     render(<PrRow pr={pr({ comment_count: 0 })} />);
     expect(screen.queryByText("0")).toBeNull();
+  });
+});
+
+describe("PrRow layout", () => {
+  afterEach(() => stubViewport(null));
+
+  /// The desktop row is a single line: the repo sits in its own column
+  /// on the right, beside the kebab. Asserting the STRUCTURE, not just
+  /// the text, is the point -- the phone layout moves the same text and
+  /// this is what proves the desktop did not move with it.
+  it("keeps the repo in a trailing column at the desktop width", () => {
+    stubViewport(1400);
+    render(<PrRow pr={pr()} onOpen={() => {}} />);
+    const row = screen.getByRole("button", { name: /add retry/i });
+    const repo = screen.getByText("octocat/hello-world");
+    expect(repo.parentElement).toBe(row);
+    expect(screen.getByText("Add retry to the fetch client")).toBeTruthy();
+  });
+
+  it("moves the repo above the title on a phone, so nothing sits beside the text", () => {
+    stubViewport(390);
+    render(<PrRow pr={pr()} onOpen={() => {}} />);
+    const row = screen.getByRole("button", { name: /add retry/i });
+    const repo = screen.getByText("octocat/hello-world");
+    const title = screen.getByText("Add retry to the fetch client");
+    // Inside the text column, not a sibling of it.
+    expect(repo.parentElement).not.toBe(row);
+    expect(repo.compareDocumentPosition(title) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // Everything the row says is still said.
+    expect(screen.getByText(/opened .* by octocat/)).toBeTruthy();
+    expect(screen.getByLabelText(/CI/)).toBeTruthy();
+  });
+
+  it("names the repo exactly once in either layout", () => {
+    for (const width of [1400, 390]) {
+      stubViewport(width);
+      const { unmount } = render(<PrRow pr={pr()} onOpen={() => {}} />);
+      expect(screen.getAllByText("octocat/hello-world")).toHaveLength(1);
+      unmount();
+    }
   });
 });
 

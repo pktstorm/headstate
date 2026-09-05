@@ -41,6 +41,9 @@ vi.mock("../api/hooks", () => ({
   useCleanupPrefs: () => ({ prefs: cleanupPrefs.current, set: setCleanup }),
   useAutostart: () => ({ enabled: false, set: () => Promise.resolve() }),
   useRemoteEnabled: () => ({ enabled: false, set: () => Promise.resolve() }),
+  useIssuePairingToken: () => () => Promise.reject("not in this test"),
+  usePairedDevices: () => ({ data: [], isLoading: false, error: null }),
+  useRevokePairedDevice: () => () => Promise.resolve(),
   usePollInterval: () => ({ seconds: 120, set: setInterval_ }),
   useWorktreeDirs: () => ({ dirs: dirs.current, set: setDirs }),
   // Defaults, matching the Rust side: absent prefs mean everything on.
@@ -306,6 +309,25 @@ describe("the settings sections", () => {
     expect(notifications.getAttribute("aria-current")).toBeNull();
     fireEvent.click(notifications);
     expect(notifications.getAttribute("aria-current")).toBe("page");
+  });
+
+  /// The phone's connection banner opens Settings straight on the
+  /// Phone topic: that is the only reason it was tapped.
+  it("opens on the topic it is asked to", () => {
+    render(<SettingsDialog open onOpenChange={() => {}} initialSection="phone" />);
+    const nav = screen.getByRole("navigation", { name: /settings sections/i });
+    expect(within(nav).getByRole("button", { name: "Phone" }).getAttribute("aria-current")).toBe(
+      "page",
+    );
+    expect(within(nav).getByRole("button", { name: "General" }).getAttribute("aria-current")).toBeNull();
+  });
+
+  it("defaults to General", () => {
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+    const nav = screen.getByRole("navigation", { name: /settings sections/i });
+    expect(within(nav).getByRole("button", { name: "General" }).getAttribute("aria-current")).toBe(
+      "page",
+    );
   });
 
   /// The constraint from the issue: a reorganisation that HIDES a

@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DockerBuild, DockerImage, DockerState } from "@/types/pr";
+import { stubViewport } from "@/test-utils";
 
 const state = vi.hoisted(() => ({
   docker: { kind: "running" } as DockerState,
@@ -97,6 +98,40 @@ beforeEach(() => {
   containersFn.mockClear();
   toastSuccess.mockClear();
   toastError.mockClear();
+});
+
+describe("DockerPage on a phone", () => {
+  afterEach(() => stubViewport(null));
+
+  it("stacks each image row: name and Remove first, then state, age and size", () => {
+    stubViewport(390);
+    state.images = [img()];
+    render(<DockerPage />);
+    const name = screen.getByRole("button", { name: /registry\/app:13901886/ });
+    const remove = screen.getByRole("button", { name: /^remove$/i });
+    const size = within(name.closest(".border-b") as HTMLElement).getByText(/GB$/);
+    // Name beside its action; the facts on their own line beneath.
+    expect(remove.parentElement).toBe(name.parentElement);
+    expect(size.parentElement).not.toBe(name.parentElement);
+    expect(name.parentElement?.parentElement?.className).toContain("flex-col");
+    // Still expandable, still removable.
+    fireEvent.click(name);
+    expect(screen.getByText("Image ID")).toBeTruthy();
+    fireEvent.click(remove);
+    expect(screen.getByRole("dialog")).toBeTruthy();
+  });
+
+  it("keeps the desktop image row on one line", () => {
+    stubViewport(1400);
+    state.images = [img()];
+    render(<DockerPage />);
+    const name = screen.getByRole("button", { name: /registry\/app:13901886/ });
+    const remove = screen.getByRole("button", { name: /^remove$/i });
+    const size = within(name.closest(".border-b") as HTMLElement).getByText(/GB$/);
+    expect(remove.parentElement).toBe(name.parentElement);
+    expect(size.parentElement).toBe(name.parentElement);
+    expect(name.parentElement?.className).not.toContain("flex-col");
+  });
 });
 
 describe("DockerPage", () => {

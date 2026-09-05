@@ -1,6 +1,7 @@
 import { emit } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { useEffect, useRef } from "react";
+import { Menu } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import {
   usePullRequests,
   useRefreshRequested,
@@ -39,8 +40,11 @@ import { QueryError, errorMessage } from "./components/QueryError";
 import { RepoSidebar } from "./components/RepoSidebar";
 import { StatusBar } from "./components/StatusBar";
 import { StatsPage } from "./components/StatsPage";
+import { ConnectionBanner } from "./components/ConnectionBanner";
+import { Sheet, SheetContent, SheetTitle } from "./components/ui/sheet";
 import { applyFilters, hasActiveFilters, sortPrs } from "./lib/derive";
 import { shortcutFor } from "./lib/shortcuts";
+import { useIsMobile } from "./lib/useIsMobile";
 import { useActiveFilters, useFilters } from "./store/filters";
 
 /// The assembled app shell. `AuthGate` already wraps this component once in
@@ -57,7 +61,24 @@ export default function App() {
     dataUpdatedAt,
   } = usePullRequests();
   const filters = useActiveFilters();
-  const { view, panel, selectedPr, selectPr, applyPreset } = useFilters();
+  const { view, panel: storedPanel, selectedPr, selectPr, applyPreset } = useFilters();
+  const isMobile = useIsMobile();
+  // Stats is desktop-only in the companion's first release. The panel
+  // persists across launches, so a desktop closed on Stats would
+  // otherwise open a phone on a page the phone does not offer -- with
+  // no sidebar entry to leave it by, since that entry is hidden too.
+  const panel = isMobile && storedPanel === "stats" ? "list" : storedPanel;
+  // The sidebar is a sheet on the phone, opened from a button in the
+  // header. Any navigation closes it: the point of picking a repo is
+  // to look at it, and a sheet still covering the list would hide the
+  // very thing that was picked. "Open" is therefore recorded AGAINST
+  // the place it was opened from, so moving anywhere else makes it
+  // closed by derivation rather than by an effect that runs a render
+  // late.
+  const navKey = `${view}|${panel}|${filters.repo ?? ""}`;
+  const [navOpenedAt, setNavOpenedAt] = useState<string | null>(null);
+  const navOpen = navOpenedAt === navKey;
+  const setNavOpen = (open: boolean) => setNavOpenedAt(open ? navKey : null);
   // The main panel is the scroll container for every view, so the reset
   // hangs off it rather than off each page.
   const mainRef = useRef<HTMLElement>(null);
@@ -211,25 +232,60 @@ export default function App() {
   // every label present across all open PRs, not shrink to only the labels
   // that survive whatever filter is already active, which would make some
   // combinations unreachable.
+  const sidebar =
+    view === "packages" || view === "claude-md" ? (
+      <RepoPickerSidebar reviewingCount={reviewingCount} />
+    ) : view === "artifacts" ? (
+      <ArtifactSidebar reviewingCount={reviewingCount} />
+    ) : view === "docker" ? (
+      <DockerSidebar viewCounts={{ "to-review": reviewingCount }} />
+    ) : view === "worktrees" || view === "branches" ? (
+      // Same repository list: Branches acts on the same checkouts
+      // Worktrees does, so a second sidebar would be the same rows
+      // under a different name.
+      <WorktreeSidebar viewCounts={{ "to-review": reviewingCount }} />
+    ) : (
+      <RepoSidebar prs={source} viewCounts={{ "to-review": reviewingCount }} />
+    );
+
   return (
     <div className="flex h-screen flex-col bg-[#0d1117] text-[#e6edf3]">
+      {/* Above everything, including the header: it says which
+          desktop the whole screen is describing. Renders nothing on
+          the desktop itself. */}
+      <ConnectionBanner />
       <div className="flex min-h-0 flex-1">
-      {view === "packages" || view === "claude-md" ? (
-        <RepoPickerSidebar reviewingCount={reviewingCount} />
-      ) : view === "artifacts" ? (
-        <ArtifactSidebar reviewingCount={reviewingCount} />
-      ) : view === "docker" ? (
-        <DockerSidebar viewCounts={{ "to-review": reviewingCount }} />
-      ) : view === "worktrees" || view === "branches" ? (
-        // Same repository list: Branches acts on the same checkouts
-        // Worktrees does, so a second sidebar would be the same rows
-        // under a different name.
-        <WorktreeSidebar viewCounts={{ "to-review": reviewingCount }} />
+      {isMobile ? (
+        // The same sidebar component, in a sheet. Its own `w-64` and
+        // right border are for sitting beside the list; here it fills
+        // the sheet instead. Overridden from outside rather than by a
+        // prop on five sidebars, so the desktop render of each is
+        // byte-for-byte what it was.
+        <Sheet open={navOpen} onOpenChange={setNavOpen}>
+          <SheetContent
+            side="left"
+            showCloseButton={false}
+            className="w-72 gap-0 border-[#30363d] bg-[#0d1117] p-0 text-[#e6edf3] [&>nav]:min-h-0 [&>nav]:w-full [&>nav]:flex-1 [&>nav]:border-r-0"
+          >
+            <SheetTitle className="sr-only">Navigation</SheetTitle>
+            {sidebar}
+          </SheetContent>
+        </Sheet>
       ) : (
-        <RepoSidebar prs={source} viewCounts={{ "to-review": reviewingCount }} />
+        sidebar
       )}
       <main ref={mainRef} className="flex-1 overflow-auto">
         <header className="flex items-center gap-2 border-b border-[#30363d] px-4 py-3">
+          {isMobile ? (
+            <button
+              type="button"
+              onClick={() => setNavOpen(true)}
+              aria-label="Open navigation"
+              className="-ml-1 rounded p-1 hover:bg-[#161b22]"
+            >
+              <Menu className="h-4 w-4" aria-hidden="true" />
+            </button>
+          ) : null}
           {/* View selection lives in the sidebar ("Stats", pinned to its
               bottom) rather than as a per-page tab pair here: the sidebar is
               already where you choose what you are looking at, and a tab row
