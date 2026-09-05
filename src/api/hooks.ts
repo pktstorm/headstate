@@ -27,6 +27,12 @@ import {
   getPollInterval,
   getRemoteEnabled,
   setRemoteEnabled,
+  issuePairingToken,
+  listPairedDevices,
+  respondToPairing,
+  revokePairedDevice,
+  type PairingQrPayload,
+  type PairingRequest,
   actOnPr,
   getPrDetail,
   getWorktreeDirs,
@@ -1407,6 +1413,100 @@ export function useRemoteEnabled() {
       qc.invalidateQueries({ queryKey: ["remote-enabled"] }),
     );
   return { enabled: query.data ?? false, set };
+}
+
+// ---------------------------------------------------------------------
+// Phone pairing. Rust side: src-tauri/src/remote/pairing.rs
+// ---------------------------------------------------------------------
+
+/// Settings > Paired devices.
+export function usePairedDevices() {
+  return useQuery({
+    queryKey: ["paired-devices"],
+    queryFn: listPairedDevices,
+    staleTime: 30_000,
+  });
+}
+
+/// Settings > Pair a phone. Turns the listener on first when it is
+/// off: a QR code for a port nothing is bound to would send the phone
+/// to "connection refused" with no way to tell why. The box on the same
+/// panel is refreshed so it shows the switch that just flipped.
+///
+/// A refused start rejects BEFORE minting -- there is no point issuing
+/// a token the phone cannot present.
+export function useIssuePairingToken() {
+  const qc = useQueryClient();
+  return async (): Promise<PairingQrPayload> => {
+    if (!(await getRemoteEnabled())) {
+      try {
+        await setRemoteEnabled(true);
+      } finally {
+        await qc.invalidateQueries({ queryKey: ["remote-enabled"] });
+      }
+    }
+    return issuePairingToken();
+  };
+}
+
+/// Answer a `pairing-request`. Rejects with the Rust side's message
+/// when the name is already taken and `replaceExisting` was not given;
+/// the request stays pending, so the caller asks and answers again.
+export function useRespondToPairing() {
+  const qc = useQueryClient();
+  return async (requestId: number, approve: boolean, replaceExisting?: boolean) => {
+    await respondToPairing(requestId, approve, replaceExisting);
+    if (approve) await qc.invalidateQueries({ queryKey: ["paired-devices"] });
+  };
+}
+
+/// Revoke one phone. The list is refreshed whichever way the call
+/// ends: a revoke that failed half-way still changed what is stored.
+export function useRevokePairedDevice() {
+  const qc = useQueryClient();
+  return async (id: number) => {
+    try {
+      await revokePairedDevice(id);
+    } finally {
+      await qc.invalidateQueries({ queryKey: ["paired-devices"] });
+    }
+  };
+}
+
+/// The phone waiting on the user's decision, or null.
+///
+/// A queue rather than "latest wins": two phones scanning in quick
+/// succession must each get a decision, and swapping the modal's
+/// contents while the user is comparing fingerprints is exactly the
+/// confusion the modal exists to prevent. `dismiss` moves to the next.
+export function usePairingRequest(): { request: PairingRequest | null; dismiss: () => void } {
+  const [queue, setQueue] = useState<PairingRequest[]>([]);
+
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    listen<PairingRequest>("pairing-request", (e) => {
+      // One entry per request id. A duplicate delivery would otherwise
+      // re-show a request already answered, with a dialog whose Approve
+      // can only fail -- seen in dev, where StrictMode's double-mount
+      // met a listener that had not really been unlistened.
+      setQueue((q) =>
+        q.some((r) => r.request_id === e.payload.request_id) ? q : [...q, e.payload],
+      );
+    }).then((fn) => {
+      if (cancelled) safeUnlisten(fn);
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      if (unlisten) safeUnlisten(unlisten);
+    };
+  }, []);
+
+  return {
+    request: queue[0] ?? null,
+    dismiss: () => setQueue((q) => q.slice(1)),
+  };
 }
 
 /// How far a bulk worktree removal has got, or null when idle.

@@ -2,6 +2,8 @@ import { useState } from "react";
 import { toast } from "sonner";
 import { revealLog } from "@/api/tauri";
 import { HelpButton } from "./HelpButton";
+import { PairPhonePanel } from "./PairPhonePanel";
+import { PairedDevicesList } from "./PairedDevicesList";
 import {
   useAutostart,
   useNotifyPrefs,
@@ -545,7 +547,7 @@ export function SettingsDialog({
         {/* The companion app's switch. Off by default and phrased for
             what it does -- opens a port -- rather than as a feature
             name, so nobody turns it on to see what happens. Pairing
-            and the paired-device list join this panel later. */}
+            and the paired-device list follow it below. */}
         <div className="mt-5 flex flex-col gap-2">
           <span className="text-sm font-medium">Phone</span>
           <label className="flex items-center gap-2 text-sm">
@@ -575,6 +577,8 @@ export function SettingsDialog({
             </p>
           ) : null}
         </div>
+        <PairPhonePanel />
+        <PairedDevicesList />
             </div>
             {/* Rendered always, hidden with CSS -- never unmounted and
                 never the `hidden` ATTRIBUTE.
