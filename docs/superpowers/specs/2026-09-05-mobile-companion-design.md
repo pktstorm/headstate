@@ -560,11 +560,81 @@ a section covering:
   the existing Linux, macOS, and Windows jobs.
 - A new `mobile` job runs `cargo check` and `cargo test` for `src-mobile`
   on Linux with the Android target, and `cargo check` for the iOS target on
-  a macOS runner. Store builds are manual until the pairing walkthrough has
-  been done twice without findings.
+  a macOS runner. It runs on every push and produces no installable
+  artifact.
+- A separate `mobile-release` job, described under Release, builds signed
+  store artifacts and runs only on a tag.
 - `scripts/check-privacy.sh` runs on the new paths as it does today; the
   QR example in this document uses documentation addresses and synthetic
   names for that reason.
+
+## Release
+
+The desktop ships through GitHub Releases with signed updater artifacts
+and updates itself. Neither applies to the phone: the stores distribute
+the app, and there is no self-update path. The mobile release process is
+therefore separate from the desktop's and versioned separately.
+
+### Versioning and compatibility
+
+- `src-mobile` carries its own version, tagged `mobile-vX.Y.Z`, independent
+  of the desktop's `vX.Y.Z`.
+- The wire protocol has its own integer version, returned by `/v1/hello`
+  and embedded in the pairing QR as `v`. The phone refuses to talk to a
+  desktop whose protocol version is lower than it requires and shows an
+  "update Headstate on your desktop" banner naming the minimum. The
+  desktop accepts any phone at or below its own protocol version.
+- A protocol bump is a deliberate change to `remote/surface.rs` or the
+  pairing payload, recorded in the spec, never a side effect of a
+  release.
+
+### Signing
+
+- **iOS**: an Apple Developer Program distribution certificate and an App
+  Store provisioning profile, plus an App Store Connect API key for
+  upload. Stored as repository secrets: the certificate as a base64 `.p12`
+  with its password, the profile as base64, the API key as its three
+  parts. The macOS runner installs them into a temporary keychain for the
+  duration of the job and deletes it after.
+- **Android**: an upload keystore, with Play App Signing holding the
+  release key so the upload key can be rotated without a new listing.
+  Stored as a base64 secret with its passwords.
+- No signing material is ever committed, and the release job is the only
+  workflow with access to these secrets.
+
+### The release job
+
+`mobile-release` runs on a `mobile-v*` tag:
+
+1. Check out, install the mobile toolchains, run the `mobile` checks.
+2. Build the signed IPA with `tauri ios build` and the signed AAB with
+   `tauri android build`, injecting the version from the tag.
+3. Upload the IPA to TestFlight and the AAB to the Play internal testing
+   track, using the platform APIs directly. This is as far as automation
+   goes.
+4. Attach both artifacts and their checksums to a GitHub pre-release for
+   the tag, for provenance, not for distribution.
+
+Promotion from TestFlight and internal testing to the public stores is a
+manual step, taken after the pairing walkthrough has passed on a real
+device from that exact build. The walkthrough checklist records the build
+number it was run against.
+
+### Store listings
+
+Both listings say plainly that the app requires a desktop running
+Headstate and does nothing on its own, since a reviewer without one will
+see an unpairable app. Provide a review note with a short video of the
+pairing flow. The privacy declarations are: local network access, for
+discovery and pairing; biometrics, for the step-up key; no data collected
+by the developer, because there is no server. Screenshots use synthetic
+repositories per `CONTRIBUTING.md`.
+
+### First release gate
+
+Store builds stay manual until the pairing walkthrough has been done twice
+without findings. After that the release job is enabled and every tag
+produces a TestFlight and internal-testing build.
 
 ## Open questions
 
@@ -597,8 +667,10 @@ a section covering:
 4. **Allowlist and step-up.** Full read and write surface, destructive
    signature, desktop notification.
 5. **Responsive pass.** PR list, detail, nudge, cleanup, connection banner.
-6. **Security Policy update and pairing walkthrough.** Then a TestFlight
-   and Play internal build.
+6. **Security Policy update and pairing walkthrough.** Then a first
+   manual TestFlight and Play internal build.
+7. **Release pipeline.** Signing secrets, the `mobile-release` job, store
+   listings, and the first public store submission.
 
 ## References
 
