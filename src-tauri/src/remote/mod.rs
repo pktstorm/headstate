@@ -7,6 +7,7 @@
 //!
 //! See `docs/superpowers/specs/2026-09-05-mobile-companion-design.md`.
 
+pub mod events;
 pub mod gate;
 pub mod identity;
 pub mod listener;
