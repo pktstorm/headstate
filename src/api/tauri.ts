@@ -5,8 +5,13 @@
 /// to distinguish "not authenticated" from a network failure should inspect
 /// the rejection message; `AuthGate` covers the common case by gating
 /// render on `get_auth_state` before anything else calls in.
+///
+/// Each wrapper goes through `transport.call` rather than Tauri's
+/// `invoke` directly, so the same signatures can be served by a network
+/// client on the mobile companion. On the desktop the transport IS
+/// `invoke`; see `transport.ts`.
 
-import { invoke } from "@tauri-apps/api/core";
+import { call } from "./transport";
 import type {
   Artifact,
   Branch,
@@ -46,11 +51,11 @@ export interface AuthState {
 /// The cached snapshot. Never talks to GitHub. Returns `[]` both when
 /// nothing has ever been polled and when auth failed at startup -- callers
 /// must consult `getAuthState` to tell those apart.
-export const getCached = () => invoke<PullRequest[]>("get_cached");
+export const getCached = () => call<PullRequest[]>("get_cached");
 
 /// A user-initiated, out-of-band fetch. Does not persist to SQLite and does
 /// not affect the poll loop's cadence.
-export const refreshNow = () => invoke<PullRequest[]>("refresh_now");
+export const refreshNow = () => call<PullRequest[]>("refresh_now");
 
 /// Interface preferences. Mirrors the Rust `UiPrefs`.
 export interface UiPrefs {
@@ -68,30 +73,30 @@ export interface UiPrefs {
   stale_venv_days: number;
 }
 
-export const getUiPrefs = () => invoke<UiPrefs>("get_ui_prefs");
-export const setUiPrefs = (prefs: UiPrefs) => invoke<void>("set_ui_prefs", { prefs });
+export const getUiPrefs = () => call<UiPrefs>("get_ui_prefs");
+export const setUiPrefs = (prefs: UiPrefs) => call<void>("set_ui_prefs", { prefs });
 
 /// Whether the app starts at login.
 ///
 /// Asked of the OS rather than stored: the user can turn it off in
 /// System Settings, and a stored flag would then disagree with reality.
-export const getAutostart = () => invoke<boolean>("get_autostart");
+export const getAutostart = () => call<boolean>("get_autostart");
 export const setAutostart = (enabled: boolean) =>
-  invoke<void>("set_autostart", { enabled });
+  call<void>("set_autostart", { enabled });
 /// Whether phones can connect to this desktop right now.
 ///
 /// The live state rather than the stored setting, for the same reason
 /// as autostart: the two differ when the port could not be bound at
 /// startup, and the checkbox should say what is true.
-export const getRemoteEnabled = () => invoke<boolean>("get_remote_enabled");
+export const getRemoteEnabled = () => call<boolean>("get_remote_enabled");
 export const setRemoteEnabled = (enabled: boolean) =>
-  invoke<void>("set_remote_enabled", { enabled });
+  call<void>("set_remote_enabled", { enabled });
 /// What the app already knows about a worktree's unmerged work.
 ///
 /// Per row rather than per scan: several git calls each, so this is
 /// asked only when a user actually opens a row.
 export const assessWorktree = (repoPath: string, worktreePath: string, branch: string) =>
-  invoke<Assessment>("assess_worktree", { repoPath, worktreePath, branch });
+  call<Assessment>("assess_worktree", { repoPath, worktreePath, branch });
 
 /// Which desktop notifications the user wants.
 ///
@@ -106,10 +111,10 @@ export interface NotifyPrefs {
   ready_to_review: boolean;
 }
 
-export const getNotifyPrefs = () => invoke<NotifyPrefs>("get_notify_prefs");
+export const getNotifyPrefs = () => call<NotifyPrefs>("get_notify_prefs");
 
 export const setNotifyPrefs = (prefs: NotifyPrefs) =>
-  invoke<void>("set_notify_prefs", { prefs });
+  call<void>("set_notify_prefs", { prefs });
 
 /// Re-run the failed jobs of a pull request's CI.
 ///
@@ -117,25 +122,25 @@ export const setNotifyPrefs = (prefs: NotifyPrefs) =>
 /// failed job in that run, and a per-check call could not restart a job
 /// that never started because an earlier one failed.
 export const rerunChecks = (repo: string, number: number, runId: number) =>
-  invoke<void>("rerun_checks", { repo, number, runId });
+  call<void>("rerun_checks", { repo, number, runId });
 
 /// The platform and architecture this build was compiled for.
 ///
 /// From Rust compile-time constants rather than the webview, so it
 /// cannot disagree with the binary the user is running.
-export const buildTarget = () => invoke<[string, string]>("build_target");
+export const buildTarget = () => call<[string, string]>("build_target");
 
 /// How many pull requests await the user's review.
 ///
 /// A count, not a list: the sidebar badge needs a number on every view,
 /// and asking for the list costs 6 rate-limit points and ~4s against 1
 /// and ~0.9s for this.
-export const countReviewing = () => invoke<number>("count_reviewing");
+export const countReviewing = () => call<number>("count_reviewing");
 
 /// The authenticated user's login.
 ///
 /// Asked once and cached forever: it cannot change during a session.
-export const getViewer = () => invoke<string>("get_viewer");
+export const getViewer = () => call<string>("get_viewer");
 
 /// A review verdict. Mirrors the Rust `ReviewVerdict`; the strings must
 /// match `parse_verdict` in commands.rs exactly, which rejects anything
@@ -156,19 +161,19 @@ export const reviewPr = (
   number: number,
   verdict: ReviewVerdictName,
   body: string,
-) => invoke<void>("review_pr", { id, repo, number, verdict, body });
+) => call<void>("review_pr", { id, repo, number, verdict, body });
 
 /// Comment on a pull request without reviewing it.
 export const commentOnPr = (id: string, repo: string, number: number, body: string) =>
-  invoke<void>("comment_on_pr", { id, repo, number, body });
+  call<void>("comment_on_pr", { id, repo, number, body });
 
 /// Resolve a review conversation. Takes the THREAD's id, not the PR's.
 export const resolveThread = (threadId: string, repo: string, number: number) =>
-  invoke<void>("resolve_thread", { threadId, repo, number });
+  call<void>("resolve_thread", { threadId, repo, number });
 
 /// Reopen a resolved conversation -- the undo for `resolveThread`.
 export const unresolveThread = (threadId: string, repo: string, number: number) =>
-  invoke<void>("unresolve_thread", { threadId, repo, number });
+  call<void>("unresolve_thread", { threadId, repo, number });
 
 /// Reply inside a conversation, keeping the answer attached to the code
 /// it is about rather than starting a new top-level comment.
@@ -177,21 +182,21 @@ export const replyToThread = (
   repo: string,
   number: number,
   body: string,
-) => invoke<void>("reply_to_thread", { threadId, repo, number, body });
+) => call<void>("reply_to_thread", { threadId, repo, number, body });
 
 /// `Stats.merged_week`/`merged_month` are real; the other five fields
 /// always come back zero today. Does not persist to SQLite.
-export const getStats = () => invoke<Stats>("get_stats");
+export const getStats = () => call<Stats>("get_stats");
 
 /// Repos and their worktrees, WITHOUT safety classification.
 ///
 /// ~800ms for 37 repos and 295 worktrees; safe to block a view on.
-export const listWorktrees = () => invoke<WorktreeRepo[]>("list_worktrees");
+export const listWorktrees = () => call<WorktreeRepo[]>("list_worktrees");
 
 /// Classify one repo's worktrees. Four git calls each, ~16s across all
 /// 295 -- so this is per repo, filling in as results arrive.
 export const classifyWorktrees = (repoPath: string) =>
-  invoke<Worktree[]>("classify_worktrees", { repoPath });
+  call<Worktree[]>("classify_worktrees", { repoPath });
 
 /// Apply an action to a pull request.
 ///
@@ -202,7 +207,7 @@ export const actOnPr = (
   repo: string,
   number: number,
   action: PrActionName,
-) => invoke<void>("act_on_pr", { id, repo, number, action });
+) => call<void>("act_on_pr", { id, repo, number, action });
 
 /// One worktree's outcome in a bulk removal. `error` is null on success.
 export interface RemovalOutcome {
@@ -214,43 +219,43 @@ export interface RemovalOutcome {
 /// time. Resolves with an outcome per worktree rather than throwing on
 /// the first refusal: partial failure is the normal case.
 export const removeWorktrees = (repoPath: string, worktreePaths: string[]) =>
-  invoke<RemovalOutcome[]>("remove_worktrees", { repoPath, worktreePaths });
+  call<RemovalOutcome[]>("remove_worktrees", { repoPath, worktreePaths });
 
 /// The newest published release, or null when this build is current.
 ///
 /// Distribution is dmg/exe/deb/AppImage, so no package manager carries
 /// updates: a user on a version with a launch-blocking bug otherwise has
 /// no way to learn a fix exists.
-export const latestRelease = () => invoke<string | null>("latest_release");
+export const latestRelease = () => call<string | null>("latest_release");
 
 /// --- Docker -------------------------------------------------------
 
-export const dockerState = () => invoke<DockerState>("docker_state");
-export const dockerBuilds = () => invoke<DockerBuild[]>("docker_builds");
-export const dockerImages = () => invoke<DockerImage[]>("docker_images");
-export const dockerDiskUsage = () => invoke<DockerDiskUsage>("docker_disk_usage");
+export const dockerState = () => call<DockerState>("docker_state");
+export const dockerBuilds = () => call<DockerBuild[]>("docker_builds");
+export const dockerImages = () => call<DockerImage[]>("docker_images");
+export const dockerDiskUsage = () => call<DockerDiskUsage>("docker_disk_usage");
 export const dockerRemoveImages = (ids: string[]) =>
-  invoke<ImageRemovalOutcome[]>("docker_remove_images", { ids });
-export const dockerDanglingVolumes = () => invoke<DanglingVolume[]>("docker_dangling_volumes");
+  call<ImageRemovalOutcome[]>("docker_remove_images", { ids });
+export const dockerDanglingVolumes = () => call<DanglingVolume[]>("docker_dangling_volumes");
 export const dockerRemoveVolume = (name: string) =>
-  invoke<void>("docker_remove_volume", { name });
+  call<void>("docker_remove_volume", { name });
 /// Returns bytes actually freed, read from the command's own output
 /// rather than echoed from an estimate.
 export const dockerPruneCache = (until?: string) =>
-  invoke<number>("docker_prune_cache", { until });
-export const dockerRunningContainers = () => invoke<string[]>("docker_running_containers");
-export const dockerRestart = () => invoke<void>("docker_restart");
-export const dockerStart = () => invoke<void>("docker_start");
+  call<number>("docker_prune_cache", { until });
+export const dockerRunningContainers = () => call<string[]>("docker_running_containers");
+export const dockerRestart = () => call<void>("docker_restart");
+export const dockerStart = () => call<void>("docker_start");
 
 /// Worktrees handed to Claude Code and still at the head they were
 /// assessed at. A branch that has moved since is dropped: the assessment
 /// described a different state.
-export const assessedWorktrees = () => invoke<string[]>("assessed_worktrees");
+export const assessedWorktrees = () => call<string[]>("assessed_worktrees");
 
 /// Remove a worktree the safety gate refuses. Reached only from a
 /// confirmation opened after reading an assessment of that worktree.
 export const removeWorktreeForced = (repoPath: string, worktreePath: string) =>
-  invoke<void>("remove_worktree_forced", { repoPath, worktreePath });
+  call<void>("remove_worktree_forced", { repoPath, worktreePath });
 
 /// The clipboard payload for Claudify, plus whether Claude Code was
 /// found. `claude_installed` is advisory: the command is returned either
@@ -268,7 +273,7 @@ export interface ClaudifyCommand {
 /// lands the user in their own shell, where `claude` resolves even
 /// though a GUI app's PATH does not include it.
 export const claudifyCommand = (repoPath: string, worktreePath: string, branch: string) =>
-  invoke<ClaudifyCommand>("claudify_command", { repoPath, worktreePath, branch });
+  call<ClaudifyCommand>("claudify_command", { repoPath, worktreePath, branch });
 
 /// Merge a pull request when its checks pass, or cancel that.
 ///
@@ -281,7 +286,7 @@ export const setAutoMerge = (
   number: number,
   expectedHead: string,
   enable: boolean,
-) => invoke<void>("set_auto_merge", { id, repo, number, expectedHead, enable });
+) => call<void>("set_auto_merge", { id, repo, number, expectedHead, enable });
 
 /// Delete a merged pull request's head branch.
 ///
@@ -293,7 +298,7 @@ export const deleteHeadBranch = (
   number: number,
   branch: string,
   merged: boolean,
-) => invoke<void>("delete_head_branch", { refId, repo, number, branch, merged });
+) => call<void>("delete_head_branch", { refId, repo, number, branch, merged });
 
 /// Merge the base branch into a pull request's head -- GitHub's "Update
 /// branch" button.
@@ -307,7 +312,7 @@ export const updatePrBranch = (
   repo: string,
   number: number,
   expectedHead: string,
-) => invoke<void>("update_pr_branch", { id, repo, number, expectedHead });
+) => call<void>("update_pr_branch", { id, repo, number, expectedHead });
 /// One pull request's outcome in a batch. `error` is null on success.
 export interface BatchOutcome {
   repo: string;
@@ -323,7 +328,7 @@ export interface BatchOutcome {
 export const actOnPrs = (
   prs: [string, string, number][],
   action: PrActionName,
-) => invoke<BatchOutcome[]>("act_on_prs", { prs, action });
+) => call<BatchOutcome[]>("act_on_prs", { prs, action });
 
 /// The actions the backend accepts. A union rather than `string`, so a
 /// typo is a compile error instead of a runtime "unknown action".
@@ -338,105 +343,105 @@ export type PrActionName =
 
 /// Everything the detail view shows for one pull request. Cost 1.
 export const getPrDetail = (repo: string, number: number) =>
-  invoke<PrDetail>("get_pr_detail", { repo, number });
+  call<PrDetail>("get_pr_detail", { repo, number });
 
 /// Disk sizes for one repo's worktrees, as `[path, bytes]` pairs.
 ///
 /// A full tree walk -- ~13s for 147 worktrees -- so it is a separate
 /// query from listing and classification, and arrives last.
 export const sizeWorktrees = (repoPath: string) =>
-  invoke<[string, number][]>("size_worktrees", { repoPath });
+  call<[string, number][]>("size_worktrees", { repoPath });
 
 /// Remove a worktree. Rejects anything not provably safe; the gate is
 /// re-evaluated on the Rust side rather than trusted from the last scan.
 /// Fast-forward a checkout to its upstream. Refuses on a dirty tree and
 /// fast-forwards only; returns git's own output or its own refusal.
-export const pullCheckout = (path: string) => invoke<string>("pull_checkout", { path });
+export const pullCheckout = (path: string) => call<string>("pull_checkout", { path });
 
 /// Delete an orphaned worktree directory.
 ///
 /// Separate from `removeWorktree` because git cannot remove it -- the
 /// repository that owned it is gone. The Rust side re-checks that the
 /// path is still orphaned before deleting anything.
-export const removeOrphan = (path: string) => invoke<void>("remove_orphan", { path });
+export const removeOrphan = (path: string) => call<void>("remove_orphan", { path });
 
 export const removeWorktree = (repoPath: string, worktreePath: string) =>
-  invoke<void>("remove_worktree", { repoPath, worktreePath });
+  call<void>("remove_worktree", { repoPath, worktreePath });
 
 /// Tell the poll loop whether the active view needs live PR data.
 export const setViewNeedsGithub = (needs: boolean) =>
-  invoke<void>("set_view_needs_github", { needs });
+  call<void>("set_view_needs_github", { needs });
 
 /// Directories scanned for git checkouts. Defaults to `~/code`.
-export const getWorktreeDirs = () => invoke<string[]>("get_worktree_dirs");
+export const getWorktreeDirs = () => call<string[]>("get_worktree_dirs");
 
 /// Replace the scanned directories. Rejects paths that are not
 /// directories, so a typo fails here rather than yielding an empty view.
 export const setWorktreeDirs = (dirs: string[]) =>
-  invoke<string[]>("set_worktree_dirs", { dirs });
+  call<string[]>("set_worktree_dirs", { dirs });
 
 /// The configured focused poll interval, in seconds.
-export const getPollInterval = () => invoke<number>("get_poll_interval");
+export const getPollInterval = () => call<number>("get_poll_interval");
 
 /// Set the poll interval. Returns the value actually applied, which may be
 /// clamped -- the UI shows what the backend accepted, not what was asked.
 export const setPollInterval = (secs: number) =>
-  invoke<number>("set_poll_interval", { secs });
+  call<number>("set_poll_interval", { secs });
 
 /// PRs awaiting the user's review. Rides along in the same GraphQL
 /// document as the authored list, so it costs no extra rate limit.
-export const getReviewing = () => invoke<PullRequest[]>("get_reviewing");
+export const getReviewing = () => call<PullRequest[]>("get_reviewing");
 /// The last successful review list, straight from SQLite. Never talks
 /// to GitHub.
-export const getCachedReviewing = () => invoke<PullRequest[]>("get_cached_reviewing");
+export const getCachedReviewing = () => call<PullRequest[]>("get_cached_reviewing");
 
 /// Median cycle time this week against last, in one request.
-export const getCycleTrend = () => invoke<CycleTrend>("get_cycle_trend");
+export const getCycleTrend = () => call<CycleTrend>("get_cycle_trend");
 
 /// The period comparisons alone -- one small request (~1.6s) so the delta
 /// cards paint without waiting on the daily series.
-export const getPeriods = () => invoke<Periods>("get_periods");
+export const getPeriods = () => call<Periods>("get_periods");
 
 /// The daily opened/merged series plus period comparisons. Fetched as
 /// concurrent chunks on the Rust side. `days` is clamped to 1..=90.
-export const getHistory = (days: number) => invoke<History>("get_history", { days });
+export const getHistory = (days: number) => call<History>("get_history", { days });
 
 /// Aggregates over the most recent 100 merged PRs. A separate command from
 /// `getHistory` on purpose: it is the more expensive of the two and only
 /// the insight row needs it, so a failure here must not blank the chart.
-export const getMergedDetail = () => invoke<MergedDetail>("get_merged_detail");
+export const getMergedDetail = () => call<MergedDetail>("get_merged_detail");
 
 /// Computed once at startup from the `gh` CLI token. `ok: false` means the
 /// user needs to run `gh auth login`; `message` is ready-to-display prose.
-export const getAuthState = () => invoke<AuthState>("get_auth_state");
+export const getAuthState = () => call<AuthState>("get_auth_state");
 
 /// Regenerable build output under the configured scan roots.
 ///
 /// Discovery only: every `size_bytes` comes back null. See
 /// `sizeArtifacts` for the second pass.
-export const scanArtifacts = () => invoke<Artifact[]>("scan_artifacts");
+export const scanArtifacts = () => call<Artifact[]>("scan_artifacts");
 
 /// Sizes for specific artifact directories, as
 /// `[path, bytes, secsSinceWrite]`.
 export const sizeArtifacts = (paths: string[]) =>
-  invoke<[string, number, number | null][]>("size_artifacts", { paths });
+  call<[string, number, number | null][]>("size_artifacts", { paths });
 
 /// Remove artifact directories. Each is re-verified at delete time, so a
 /// stale row is refused rather than acted on.
 export const removeArtifacts = (paths: string[]) =>
-  invoke<ArtifactRemoval[]>("remove_artifacts", { paths });
+  call<ArtifactRemoval[]>("remove_artifacts", { paths });
 
 /// Poetry virtualenvs, classified. Discovery only: sizes and idle times
 /// come from `sizeVenvs`.
-export const scanVenvs = () => invoke<Venv[]>("scan_venvs");
+export const scanVenvs = () => call<Venv[]>("scan_venvs");
 
 /// Sizes and idle times, as `[path, bytes, idleSecs]`.
 export const sizeVenvs = (paths: string[]) =>
-  invoke<[string, number, number | null][]>("size_venvs", { paths });
+  call<[string, number, number | null][]>("size_venvs", { paths });
 
 /// Remove virtualenvs. Each is re-verified at delete time.
 export const removeVenvs = (paths: string[]) =>
-  invoke<VenvRemoval[]>("remove_venvs", { paths });
+  call<VenvRemoval[]>("remove_venvs", { paths });
 
 /// Record that a human read an assessment for this worktree.
 ///
@@ -444,35 +449,35 @@ export const removeVenvs = (paths: string[]) =>
 /// start of an assessment, and the flag this sets unlocks removing a
 /// worktree past its safety gate.
 export const markAssessed = (worktreePath: string) =>
-  invoke<void>("mark_assessed", { worktreePath });
+  call<void>("mark_assessed", { worktreePath });
 
 /// Forget that a worktree was assessed, restoring its Claudify action.
 export const clearAssessed = (worktreePath: string) =>
-  invoke<void>("clear_assessed", { worktreePath });
+  call<void>("clear_assessed", { worktreePath });
 
 /// Run the cleanup pass now and return what it WOULD remove.
 ///
 /// Preview only: the backend has no removal path for this, so it cannot
 /// delete regardless of what it is called with.
-export const previewCleanup = () => invoke<LedgerEntry[]>("preview_cleanup");
+export const previewCleanup = () => call<LedgerEntry[]>("preview_cleanup");
 
 /// The cleanup ledger, newest first.
-export const cleanupLog = () => invoke<LedgerEntry[]>("cleanup_log");
+export const cleanupLog = () => call<LedgerEntry[]>("cleanup_log");
 
-export const getCleanupPrefs = () => invoke<CleanupPrefs>("get_cleanup_prefs");
+export const getCleanupPrefs = () => call<CleanupPrefs>("get_cleanup_prefs");
 export const setCleanupPrefs = (prefs: CleanupPrefs) =>
-  invoke<void>("set_cleanup_prefs", { prefs });
+  call<void>("set_cleanup_prefs", { prefs });
 
 /// Which dependencies are out of date in one repository.
 export const checkPackages = (repoPath: string) =>
-  invoke<ProjectReport[]>("check_packages", { repoPath });
+  call<ProjectReport[]>("check_packages", { repoPath });
 
 /// The updates as markdown, for handing to an agent.
 export const packagesMarkdown = (
   repoPath: string,
   reports: ProjectReport[],
   filter: UpdateFilter,
-) => invoke<string>("packages_markdown", { repoPath, reports, filter });
+) => call<string>("packages_markdown", { repoPath, reports, filter });
 
 /// Create a worktree and apply updates in it. Does NOT push.
 ///
@@ -482,14 +487,14 @@ export const packagesMarkdown = (
 
 
 /// Reveal the diagnostic log in the file manager. Returns its path.
-export const revealLog = () => invoke<string>("reveal_log");
+export const revealLog = () => call<string>("reveal_log");
 
 /// Every CLAUDE.md in a repository, with its import tree resolved.
 export const scanClaudeMd = (repoPath: string) =>
-  invoke<ClaudeFile[]>("scan_claude_md", { repoPath });
+  call<ClaudeFile[]>("scan_claude_md", { repoPath });
 
 /// The text of one file, for rendering.
-export const readClaudeMd = (path: string) => invoke<string>("read_claude_md", { path });
+export const readClaudeMd = (path: string) => call<string>("read_claude_md", { path });
 
 /// Every branch in a repository, classified.
 ///
@@ -497,18 +502,18 @@ export const readClaudeMd = (path: string) => invoke<string>("read_claude_md", {
 /// patch-id comparison that finds squash merges. The caller shows a
 /// loading state rather than pretending this is instant.
 export const listBranches = (repoPath: string) =>
-  invoke<Branch[]>("list_branches", { repoPath });
+  call<Branch[]>("list_branches", { repoPath });
 
 /// Delete local branches. Each one is re-checked at delete time.
 export const deleteBranches = (repoPath: string, names: string[]) =>
-  invoke<DeleteOutcome[]>("delete_branches", { repoPath, names });
+  call<DeleteOutcome[]>("delete_branches", { repoPath, names });
 
 /// Delete branches ON THE REMOTE.
 ///
 /// Deliberately a different function from `deleteBranches`: this is a
 /// push to shared state that no reflog can undo.
 export const deleteRemoteBranches = (repoPath: string, names: string[]) =>
-  invoke<DeleteOutcome[]>("delete_remote_branches", { repoPath, names });
+  call<DeleteOutcome[]>("delete_remote_branches", { repoPath, names });
 
 /// Apply updates and open a pull request, in the background.
 ///
@@ -520,7 +525,7 @@ export const applyUpdatesInBackground = (
   repoPath: string,
   requests: UpdateRequest[],
   branch?: string,
-) => invoke<void>("apply_updates_in_background", { repoPath, requests, branch });
+) => call<void>("apply_updates_in_background", { repoPath, requests, branch });
 
 /// What a background update run produced.
 export interface UpdateRunDone {
@@ -561,7 +566,7 @@ export interface PairingQrPayload {
 /// returns what to render as a QR code. Rejects until the desktop has a
 /// certificate.
 export const issuePairingToken = () =>
-  invoke<PairingQrPayload>("issue_pairing_token");
+  call<PairingQrPayload>("issue_pairing_token");
 
 /// Payload of the `pairing-request` event: a phone has proved it holds
 /// the token and is waiting on the user's decision.
@@ -588,7 +593,7 @@ export const respondToPairing = (
   approve: boolean,
   replaceExisting?: boolean,
 ) =>
-  invoke<void>("respond_to_pairing", {
+  call<void>("respond_to_pairing", {
     requestId,
     approve,
     replaceExisting: replaceExisting ?? null,
@@ -608,9 +613,9 @@ export interface PairedDevice {
 }
 
 export const listPairedDevices = () =>
-  invoke<PairedDevice[]>("list_paired_devices");
+  call<PairedDevice[]>("list_paired_devices");
 
 /// Delete the row and close that phone's open connections. A second
 /// click on an already-revoked device resolves rather than rejects.
 export const revokePairedDevice = (id: number) =>
-  invoke<void>("revoke_paired_device", { id });
+  call<void>("revoke_paired_device", { id });

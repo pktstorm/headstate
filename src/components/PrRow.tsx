@@ -15,6 +15,7 @@ import { prKey } from "@/components/BulkBar";
 import { useFilters } from "@/store/filters";
 import { needsAttention, pendingReviewers } from "@/lib/derive";
 import { relativeTime } from "@/lib/time";
+import { useIsMobile } from "@/lib/useIsMobile";
 
 /// A check for green, an X for red, and an amber dot while CI is running.
 ///
@@ -176,6 +177,10 @@ export function PrRow({
   const { checked, toggleChecked, anchor, setAnchor, density } = useFilters();
   const dense = density === "dense";
   const key = prKey(pr);
+  // On a phone the repo moves from its own column on the right to a
+  // line above the title. A trailing column is what stops a title from
+  // using the width it has, and 390 pixels has none to spare.
+  const isMobile = useIsMobile();
   return (
     // The row opens the detail view; the title anchor still opens GitHub,
     // and stops propagation so a deliberate click on it is not hijacked.
@@ -239,6 +244,7 @@ export function PrRow({
         aria-label={state.label}
       />
       <div className="min-w-0 flex-1">
+        {isMobile ? <div className="truncate text-xs text-[#8b949e]">{pr.repo}</div> : null}
         <div className="flex flex-wrap items-center gap-2">
           {/* The title opens the DETAIL VIEW, not github.com.
               
@@ -374,7 +380,7 @@ export function PrRow({
         </div>
         )}
       </div>
-      <div className="shrink-0 text-xs text-[#8b949e]">{pr.repo}</div>
+      {isMobile ? null : <div className="shrink-0 text-xs text-[#8b949e]">{pr.repo}</div>}
       <PrKebab pr={pr} canWrite={canWrite} />
     </div>
   );

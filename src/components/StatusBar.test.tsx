@@ -1,5 +1,6 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { stubViewport } from "@/test-utils";
 
 const state = vi.hoisted(() => ({
   current: "idle" as "idle" | "fetching" | "retrying",
@@ -45,6 +46,27 @@ vi.mock("../api/hooks", () => ({
 }));
 
 import { StatusBar } from "./StatusBar";
+
+describe("StatusBar on a phone", () => {
+  afterEach(() => stubViewport(null));
+
+  /// The poll cadence is the desktop's setting and lives in Settings
+  /// too; on a 390px bar it cost the "Up to date" line its one line.
+  it("drops the poll-interval control but keeps state, version and settings", () => {
+    stubViewport(390);
+    render(<StatusBar updatedAt={Date.now() - 90_000} />);
+    expect(screen.queryByLabelText("Poll interval")).toBeNull();
+    expect(screen.getByText(/up to date/i)).toBeTruthy();
+    expect(screen.getByText(/updated/i)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Settings" })).toBeTruthy();
+  });
+
+  it("keeps the poll-interval control on the desktop", () => {
+    stubViewport(1400);
+    render(<StatusBar updatedAt={Date.now() - 90_000} />);
+    expect(screen.getByLabelText("Poll interval")).toBeTruthy();
+  });
+});
 
 describe("StatusBar", () => {
   it("shows when the data was last updated", () => {

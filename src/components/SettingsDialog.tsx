@@ -58,9 +58,14 @@ type SectionId = (typeof SECTIONS)[number]["id"];
 export function SettingsDialog({
   open,
   onOpenChange,
+  initialSection = "general",
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /// Which topic to show first. The status bar's gear opens on
+  /// General; the phone's connection banner opens straight on Phone,
+  /// since that is the only reason it was tapped.
+  initialSection?: SectionId;
 }) {
   const { seconds, set: setInterval } = usePollInterval();
   const { dirs, set: setDirs } = useWorktreeDirs();
@@ -71,7 +76,7 @@ export function SettingsDialog({
   const [autostartError, setAutostartError] = useState<string | null>(null);
   const { enabled: remote, set: setRemote } = useRemoteEnabled();
   const [remoteError, setRemoteError] = useState<string | null>(null);
-  const [section, setSection] = useState<SectionId>("general");
+  const [section, setSection] = useState<SectionId>(initialSection);
   const [draft, setDraft] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 

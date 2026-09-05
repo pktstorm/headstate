@@ -13,6 +13,7 @@ import { useState } from "react";
 import type { ReviewVerdictName } from "../api/tauri";
 import { agentPrompt, toAgentContext } from "../lib/agentPrompt";
 import { rerunnableRun } from "../lib/rerun";
+import { useIsMobile } from "../lib/useIsMobile";
 import { Markdown } from "./Markdown";
 import { copyText } from "../lib/clipboard";
 import { CommentRow } from "./CommentRow";
@@ -84,6 +85,10 @@ export function PrDetailView({
   const rerun = useRerunChecks();
   const [rerunning, setRerunning] = useState(false);
   const rerunnable = pr ? rerunnableRun(pr.checks) : null;
+  // The same actions in a different arrangement: on a phone the sticky
+  // header stacks the action buttons under the back link, and the
+  // footer wraps, rather than dropping anything.
+  const isMobile = useIsMobile();
   // The viewer's own verdict, read the same way ReviewBox reads it: the
   // pull request's aggregate `review` says CHANGES_REQUESTED when
   // somebody ELSE blocked it, which says nothing about whether this
@@ -172,6 +177,53 @@ export function PrDetailView({
     );
   }
 
+  /// The pinned actions, built once so the phone and desktop headers
+  /// place the same elements rather than two copies that drift.
+  const pinnedActions = (
+    <>
+      {/* The two the user actually reaches for, in the order they
+          reach for them. Approve is absent: it needs the comment box
+          that only makes sense in the body, and a bare approve
+          button here would submit an empty review from a header the
+          user may have scrolled past without reading. */}
+      {/* Approve, pinned.
+
+          Deliberately omitted at first because it submits a review
+          with no comment from a bar the user may have scrolled
+          past. Added on request -- and GitHub allows an empty
+          approval, so the objection was about accident, not
+          validity. The guards that make it safe are the same ones
+          ReviewBox applies: hidden on your own pull request, which
+          GitHub refuses outright, and showing "Approved" rather
+          than offering a second one once your approval is on
+          record. */}
+      {viewer !== undefined && viewer !== pr.author ? (
+        <button
+          type="button"
+          disabled={approvedByViewer || reviewing !== null}
+          onClick={() => submitReview("approve", "")}
+          title={
+            approvedByViewer
+              ? "You have already approved this pull request"
+              : "Approve without a comment"
+          }
+          className={`rounded px-2.5 py-1 text-sm font-medium ${
+            approvedByViewer || reviewing !== null
+              ? "border border-[#30363d] text-[#8b949e] opacity-50"
+              : "bg-[#238636] text-white hover:bg-[#2ea043]"
+          }`}
+        >
+          {reviewing === "approve"
+            ? "Working…"
+            : approvedByViewer
+              ? "Approved"
+              : "Approve"}
+        </button>
+      ) : null}
+      <PrActions pr={pr} compact />
+    </>
+  );
+
   return (
     // `max-w-4xl mx-auto`: the body is prose and prose needs a measure.
     // At full window width a description ran the entire monitor, which
@@ -195,7 +247,13 @@ export function PrDetailView({
           The scroll container is `<main>` in App, which is this
           element's scrolling ancestor -- that is what makes `sticky`
           work here at all. */}
-      <div className="sticky top-0 z-10 -mx-4 flex items-center gap-2 border-b border-[#30363d] bg-[#0d1117] px-4 py-2">
+      <div
+        className={
+          isMobile
+            ? "sticky top-0 z-10 -mx-4 flex flex-wrap items-center gap-2 border-b border-[#30363d] bg-[#0d1117] px-4 py-2"
+            : "sticky top-0 z-10 -mx-4 flex items-center gap-2 border-b border-[#30363d] bg-[#0d1117] px-4 py-2"
+        }
+      >
         <button
           type="button"
           onClick={onBack}
@@ -205,53 +263,14 @@ export function PrDetailView({
           Back to list
         </button>
         {/* No title or number here on purpose.
-            
+
             Both are already in the <h2> immediately below, so putting
             them in the header repeats the same words at the top of the
             page and makes them ambiguous to a screen reader, which
             reads every copy. Only one pull request is ever open, so
             the pinned buttons cannot be about a different one. */}
         <div className="ml-auto flex shrink-0 items-center gap-2">
-          {/* The two the user actually reaches for, in the order they
-              reach for them. Approve is absent: it needs the comment box
-              that only makes sense in the body, and a bare approve
-              button here would submit an empty review from a header the
-              user may have scrolled past without reading. */}
-          {/* Approve, pinned.
-              
-              Deliberately omitted at first because it submits a review
-              with no comment from a bar the user may have scrolled
-              past. Added on request -- and GitHub allows an empty
-              approval, so the objection was about accident, not
-              validity. The guards that make it safe are the same ones
-              ReviewBox applies: hidden on your own pull request, which
-              GitHub refuses outright, and showing "Approved" rather
-              than offering a second one once your approval is on
-              record. */}
-          {viewer !== undefined && viewer !== pr.author ? (
-            <button
-              type="button"
-              disabled={approvedByViewer || reviewing !== null}
-              onClick={() => submitReview("approve", "")}
-              title={
-                approvedByViewer
-                  ? "You have already approved this pull request"
-                  : "Approve without a comment"
-              }
-              className={`rounded px-2.5 py-1 text-sm font-medium ${
-                approvedByViewer || reviewing !== null
-                  ? "border border-[#30363d] text-[#8b949e] opacity-50"
-                  : "bg-[#238636] text-white hover:bg-[#2ea043]"
-              }`}
-            >
-              {reviewing === "approve"
-                ? "Working…"
-                : approvedByViewer
-                  ? "Approved"
-                  : "Approve"}
-            </button>
-          ) : null}
-          <PrActions pr={pr} compact />
+          {isMobile ? null : pinnedActions}
           <ExternalLink
             href={pr.url}
             className="flex items-center gap-1.5 rounded border border-[#30363d] px-2.5 py-1 text-sm hover:bg-[#161b22]"
@@ -260,6 +279,12 @@ export function PrDetailView({
             GitHub
           </ExternalLink>
         </div>
+        {/* A second, full-width line on the phone: back and GitHub
+            fit beside each other, but Approve and Merge on the same
+            line would push GitHub off the screen. */}
+        {isMobile ? (
+          <div className="flex basis-full flex-wrap items-center gap-2">{pinnedActions}</div>
+        ) : null}
       </div>
 
       <div>
@@ -417,7 +442,7 @@ export function PrDetailView({
         </Section>
       ) : null}
 
-      <div className="flex items-center gap-2">
+      <div className={isMobile ? "flex flex-wrap items-center gap-2" : "flex items-center gap-2"}>
         <ExternalLink
           href={pr.url}
           className="flex w-fit items-center gap-1.5 rounded border border-[#30363d] px-3 py-1.5 text-sm hover:bg-[#161b22]"
