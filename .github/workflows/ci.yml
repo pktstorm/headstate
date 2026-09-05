@@ -270,3 +270,128 @@ jobs:
       - name: Build the app
         shell: bash
         run: yarn tauri build --no-bundle
+
+  # The mobile companion crate (`src-mobile`), on the two targets it ships
+  # for. Neither job is a required check yet, for the same reason the
+  # platform jobs were not on day one: they have never run, and a required
+  # check that is red blocks every unrelated PR. Promote them in the
+  # ruleset once they are reliably green.
+  #
+  # Linux carries the host-side gates (fmt, clippy, tests, cargo-deny) as
+  # well as the Android cross-check, so a fresh clone with an NDK and this
+  # file agree on what "the mobile crate passes" means.
+  mobile-android:
+    runs-on: ubuntu-latest
+    env:
+      # Pinned rather than `$ANDROID_NDK_HOME`, which is whatever the
+      # runner image calls its default that month. `sdkmanager` below is
+      # a no-op while the image ships this version and an install when
+      # it stops, so the toolchain is the same either way.
+      NDK_VERSION: 27.3.13750724
+      # Tauri's minimum Android SDK; the NDK ships one clang wrapper per
+      # API level, and this picks the one matching the app's floor.
+      ANDROID_API: "24"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The host-side steps (clippy, tests) compile the tauri crate for
+      # Linux, which needs the WebKit and GTK headers. No appindicator:
+      # phones have no tray and this crate does not enable it.
+      - name: Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev
+
+      - uses: ./.github/actions/setup
+        with:
+          rust-components: clippy, rustfmt
+          rust-workspaces: src-mobile
+
+      # The runner image ships the SDK and an NDK; this pins which NDK
+      # and exports the variables the Tauri CLI and cc-rs read.
+      #
+      # `aws-lc-sys` compiles C and assembly through cc-rs, which finds an
+      # Android compiler only by name on PATH (`aarch64-linux-android21-clang`
+      # and friends) and otherwise fails with "failed to find tool", the
+      # error #533 hit locally. Setting the per-target CC/AR variables is
+      # the documented, deterministic form of the same thing.
+      - name: Android NDK
+        run: |
+          set -euo pipefail
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION"
+          NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"
+          TOOLCHAIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          test -x "$TOOLCHAIN/aarch64-linux-android$ANDROID_API-clang"
+          {
+            echo "NDK_HOME=$NDK_HOME"
+            echo "ANDROID_NDK_HOME=$NDK_HOME"
+            echo "ANDROID_NDK_ROOT=$NDK_HOME"
+            echo "CC_aarch64_linux_android=aarch64-linux-android$ANDROID_API-clang"
+            echo "CXX_aarch64_linux_android=aarch64-linux-android$ANDROID_API-clang++"
+            echo "AR_aarch64_linux_android=llvm-ar"
+            echo "RANLIB_aarch64_linux_android=llvm-ranlib"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=aarch64-linux-android$ANDROID_API-clang"
+          } >> "$GITHUB_ENV"
+          echo "$TOOLCHAIN" >> "$GITHUB_PATH"
+
+      - name: Rust target
+        run: rustup target add aarch64-linux-android
+
+      - name: Rust formatting and Clippy
+        run: make lint-mobile
+
+      - name: Rust tests
+        run: make test-mobile
+
+      - name: Check the Android target
+        run: make check-mobile-android
+
+      # `gen/android` is the Android Studio project, committed like
+      # `gen/apple` once it exists (see .gitignore). Nobody on this project
+      # has an Android SDK locally yet, so the first run of this job
+      # generates it and uploads it for the commit that checks it in;
+      # once that lands this step reports "committed" and does nothing.
+      - name: Android Studio project
+        id: gen-android
+        run: |
+          set -euo pipefail
+          if [ -d src-mobile/gen/android ]; then
+            echo "src-mobile/gen/android is committed; nothing to generate."
+            echo "generated=false" >> "$GITHUB_OUTPUT"
+          else
+            make android-init
+            test -f src-mobile/gen/android/build.gradle.kts
+            echo "generated=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.gen-android.outputs.generated == 'true'
+        with:
+          name: src-mobile-gen-android
+          path: src-mobile/gen/android
+          # The template writes a .gitignore for build products; it is
+          # part of what gets committed.
+          include-hidden-files: true
+          if-no-files-found: error
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: cargo-deny
+        run: make deny-mobile
+
+  # `cargo check` for the iOS target only. Building the app archives and
+  # exports, which needs a development team; the simulator run in #533 is
+  # the proof the toolchain gives without one, and store builds stay
+  # manual until the pairing walkthrough has passed twice.
+  mobile-ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup
+        with:
+          rust-workspaces: src-mobile
+      - name: Rust target
+        run: rustup target add aarch64-apple-ios
+      - name: Check the iOS target
+        run: make check-mobile-ios
