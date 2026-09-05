@@ -57,3 +57,10 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", 
 # reason as above: the default `ring` feature would compile a second
 # crypto library into the phone.
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+# LAN discovery of the paired desktop (src/discovery.rs): browse for
+# `_headstate._tcp` and match the TXT fingerprint prefix before trying the
+# addresses stored at pairing. The same crate the desktop advertises with,
+# so the record shape is agreed by construction. Pure Rust, so nothing to
+# link on iOS beyond the entitlement the plist already declares. No
+# `async`: `browse` is a blocking call the client runs on a blocking task.
+mdns-sd = { version = "0.21", default-features = false, features = ["logging"] }

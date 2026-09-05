@@ -171,6 +171,14 @@ p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 # digest 0.10 predates the Wycheproof and use_hint fixes in 0.1.0 and is
 # not an option for a verifier.
 ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc"] }
+# LAN discovery (remote/discovery.rs). Advertises `_headstate._tcp` while
+# the listener is up so a phone whose stored address went stale can still
+# find this desktop. Pure Rust over `socket2` and the `if-addrs` above --
+# no Bonjour, Avahi, or dns-sd FFI, which is what makes Windows and Linux
+# best-effort rather than a build dependency. No `async` feature: the
+# daemon runs its own thread and the handful of calls we make are channel
+# sends, so pulling flume's async half in would buy nothing.
+mdns-sd = { version = "0.21", default-features = false, features = ["logging"] }
 
 [dev-dependencies]
 temp-env = "0.3"
