@@ -1,0 +1,260 @@
+# Mobile companion: pairing walkthrough
+
+The manual test that gates every mobile release. It exercises the parts of
+the companion that no automated test can reach: a real phone, its secure
+hardware, its biometric prompt, the platform's local-network permission,
+and a person comparing two fingerprints on two screens.
+
+Design: [Mobile Companion Design](superpowers/specs/2026-09-05-mobile-companion-design.md)
+(see *Pairing*, *Step-up for destructive commands*, *Reachability*,
+*Testing*, and *Release*).
+
+## The release rule
+
+- Run this walkthrough once on a **real iPhone** and once on a **real
+  Android device** before every mobile release. Simulators and emulators
+  do not count: they have no Secure Enclave, no Keystore-backed biometric
+  gate, and iOS does not show the local-network prompt in the simulator.
+- Store builds (TestFlight and the Play internal-testing track) are
+  produced manually until this walkthrough has passed **twice with no
+  findings**. After two clean runs the `mobile-release` job is enabled and
+  every `mobile-v*` tag produces both builds.
+- Promotion from TestFlight and internal testing to the public stores is a
+  manual step taken only after a clean run against **that exact build
+  number**.
+
+Keep every completed run. Copy this file, fill in the header, tick the
+boxes, and commit the copy under `docs/walkthroughs/` named
+`YYYY-MM-DD-<platform>.md`. Runs are evidence, not paperwork: a run with a
+finding is more useful than one without.
+
+## Run record
+
+Fill in before starting. Every field is required.
+
+| Field | Value |
+|---|---|
+| Date | |
+| Desktop Headstate version (About box) | |
+| Desktop OS and version | |
+| Mobile build number (TestFlight / Play build, or local build hash) | |
+| Device model | |
+| Device OS version | |
+| Tester | |
+| Network (same wifi / overlay / both) | |
+| Result (clean / findings) | |
+
+Findings go in the last section. A run is *clean* only if every box that
+applies to the platform is ticked and the findings section is empty.
+
+## Before you start
+
+Use synthetic data throughout. Names and addresses in this document are
+placeholders: `octocat's laptop`, `Octocat's phone`, `192.0.2.10` (RFC 5737
+documentation range), `100.64.0.7` (CGNAT range, standing in for an overlay
+address). Never paste a real repository, hostname, or address into a
+committed run record.
+
+- [ ] Desktop Headstate is installed, signed in, and showing at least one
+      pull request. A throwaway checkout of `octocat/hello-world` is a fine
+      source.
+- [ ] Desktop Settings has **Allow phone connections** *off* and **Paired
+      devices** empty. If a device from an earlier run is listed, revoke it
+      first so the run starts from nothing.
+- [ ] A throwaway git worktree exists on the desktop for the destructive
+      step, for example a worktree of `octocat/hello-world` on a branch named
+      `walkthrough-scratch`. It must contain nothing you want to keep.
+- [ ] Note the desktop's poll interval in Settings; the write step changes
+      it and the walkthrough restores it.
+- [ ] The phone has a biometric enrolled (Face ID, Touch ID, or Android
+      fingerprint / face) and a device passcode set.
+- [ ] The phone is on the same wifi as the desktop. If you also test over an
+      overlay network, do the same-wifi run first.
+- [ ] The companion app is installed fresh, or has been unpaired
+      (*Settings*, *Forget desktop*) so it opens on the pairing screen.
+- [ ] Desktop and phone clocks agree to within a few seconds. Destructive
+      requests are rejected beyond sixty seconds of skew, and a clock
+      finding is not a signature finding.
+
+## 1. Pair
+
+- [ ] 1.1 On the desktop open Settings and choose **Pair a phone**. The
+      listener turns on if it was off (the **Allow phone connections**
+      toggle flips on its own) and a QR code appears with a visible
+      two-minute countdown.
+- [ ] 1.2 On the phone tap **Scan** and scan the QR. The phone reports the
+      desktop name from the payload (`octocat's laptop`) and shows a
+      fingerprint.
+- [ ] 1.3 The desktop shows a modal naming the phone (`Octocat's phone`)
+      and the same fingerprint, plus a line saying whether the phone
+      offered a post-quantum (ML-DSA-65) signing key. Record that line in
+      the findings section, whatever it says; a phone without ML-DSA is
+      expected on Android 16 and older, and on any device whose keystore
+      lacks it.
+- [ ] 1.4 Compare the fingerprint on both screens **in groups of four**
+      hex characters, start to end, reading each group aloud from one
+      screen and checking it on the other. Do not stop after the first
+      group. Both screens must render the same grouping (`ab12 cd34 ef56 …`).
+- [ ] 1.5 Approve on the desktop. The phone moves to the PR list and the
+      connection banner reads "Connected to octocat's laptop" with a last
+      poll time.
+- [ ] 1.6 Desktop Settings, **Paired devices**, lists `Octocat's phone` with
+      a *paired at* time and a *last seen* time within the last minute.
+- [ ] 1.7 Negative: start a second **Pair a phone**, let the countdown
+      expire without scanning, then scan the stale QR. The phone shows a
+      clear "pairing expired" error and stays on the pairing screen; the
+      desktop shows no approval modal and adds no row.
+
+## 2. One read command
+
+- [ ] 2.1 The PR list on the phone matches the desktop's list: same
+      repositories, same PR numbers, same CI and mergeable states.
+- [ ] 2.2 Pull to refresh on the phone (`refresh_now`). The desktop's
+      last-poll time advances and the phone's banner shows the new time
+      within a few seconds; the phone did not talk to GitHub itself.
+- [ ] 2.3 Open one PR's detail on the phone (`get_pr_detail`). Title, checks,
+      reviews, and threads match the desktop.
+- [ ] 2.4 No biometric prompt appeared for any of the above.
+
+## 3. One write command
+
+Use a write that changes desktop state but not GitHub, so the run is safe to
+repeat: the poll interval.
+
+- [ ] 3.1 On the phone open Settings and change the poll interval
+      (`set_poll_interval`) to a value different from the one noted in
+      *Before you start*.
+- [ ] 3.2 Desktop Settings shows the new interval without a restart.
+- [ ] 3.3 No biometric prompt appeared. Writes carry no signature by
+      design; a prompt here is a finding.
+- [ ] 3.4 Restore the original interval from the phone and confirm the
+      desktop follows.
+
+## 4. One destructive command, with the biometric prompt
+
+- [ ] 4.1 On the phone open Cleanup, Worktrees, and select the throwaway
+      worktree from *Before you start*. Confirm it is the only one selected.
+- [ ] 4.2 Tap Remove. **The platform biometric prompt appears** (Face ID,
+      Touch ID, or the Android biometric sheet) before anything is
+      deleted. The prompt names Headstate.
+- [ ] 4.3 Negative first: **cancel** the prompt. The phone shows the
+      command as cancelled, the worktree still exists on the desktop, and
+      the desktop's cleanup log has no new entry.
+- [ ] 4.4 Tap Remove again and pass the biometric. The worktree disappears
+      from the desktop's Cleanup view and from disk.
+- [ ] 4.5 The desktop posts a native notification for the removal that
+      names the device (`Octocat's phone`).
+- [ ] 4.6 The desktop's cleanup log (Cleanup, *Log*) records the removal
+      with the same detail a local removal gets.
+- [ ] 4.7 Android only: lock the phone, unlock with the passcode rather than
+      a biometric, and repeat a destructive command on a second throwaway
+      worktree. The keystore access control must still prompt; passcode
+      fallback is acceptable, silent success is a finding.
+
+## 5. Revoke on the desktop
+
+- [ ] 5.1 Leave the phone app open in the foreground on the PR list.
+- [ ] 5.2 Desktop Settings, **Paired devices**, **Revoke** next to
+      `Octocat's phone`. The row disappears.
+- [ ] 5.3 Any open event stream from the phone closes: within a few seconds
+      the phone's banner leaves "Connected".
+
+## 6. Confirm the phone is refused
+
+- [ ] 6.1 Pull to refresh on the phone. The request is refused at the TLS
+      handshake, not with an HTTP error: the phone shows its `revoked`
+      state and **returns to the pairing screen**, with a message saying
+      the desktop no longer recognises it.
+- [ ] 6.2 Background the app, wait a minute, and bring it back. It stays on
+      the pairing screen; it does not retry into a loop of errors.
+- [ ] 6.3 Desktop **Paired devices** is still empty and the desktop log
+      shows the refused handshake without a stack trace or a crash.
+- [ ] 6.4 The desktop's *Allow phone connections* toggle is still on;
+      revoking a device does not stop the listener.
+
+## 7. Re-pair, including the same-name replacement
+
+- [ ] 7.1 Repeat step 1 in full. The phone offers the same device name
+      (`Octocat's phone`). Pairing succeeds and the PR list loads.
+- [ ] 7.2 Same-name replacement: without revoking, on the phone choose
+      *Forget desktop* and pair again with the same name. The desktop's
+      approval modal says a device with this name is already paired and
+      asks whether to **replace** it.
+- [ ] 7.3 Choose replace. **Paired devices** shows exactly one
+      `Octocat's phone` row with a new *paired at* time, and the old
+      fingerprint no longer appears.
+- [ ] 7.4 Repeat 7.2 and choose *keep both*. **Paired devices** shows two
+      rows with the same name and different fingerprints. Revoke the older
+      one and confirm the newer phone is still connected.
+- [ ] 7.5 Run one read and one destructive command against the re-paired
+      device to confirm the new keys work end to end (steps 2.2 and 4.4).
+
+## 8. iOS: local-network permission and Bonjour (iPhone only)
+
+The Bonjour checks verify the plist entries, which the simulator does not
+enforce and no CI job can.
+
+- [ ] 8.1 On a fresh install, the **first** scan-and-connect shows the iOS
+      "would like to find and connect to devices on your local network"
+      prompt, with Headstate's own explanation text
+      (`NSLocalNetworkUsageDescription`). Allow it.
+- [ ] 8.2 Negative: reinstall, deny the prompt, and attempt to pair. The
+      phone shows a message pointing at Settings, Privacy, Local Network,
+      rather than a generic timeout. Re-enable it there and continue.
+- [ ] 8.3 With the desktop on the same wifi, change the desktop's LAN
+      address (reconnect wifi or toggle it) and reopen the app. The phone
+      finds the desktop again through mDNS (`_headstate._tcp`) rather than
+      only the addresses stored at pairing. Confirm in the desktop log that
+      the connection came from the new address.
+- [ ] 8.4 In the iOS Console (or a Bonjour browser on the same network)
+      confirm `_headstate._tcp` is the only service type the app resolves,
+      and that the TXT record carries the port and the first sixteen hex
+      characters of the desktop fingerprint. Any other service type in the
+      app's `NSBonjourServiceTypes` is a finding.
+
+## 9. Desktop closed: the unreachable banner
+
+- [ ] 9.1 With the phone connected, quit desktop Headstate.
+- [ ] 9.2 Within a short interval the phone's banner reads "octocat's
+      laptop is unreachable" with the last-seen time.
+- [ ] 9.3 The PR list is still rendered from the cached snapshot, marked
+      stale, with every action disabled. Tapping an action does nothing and
+      shows no biometric prompt.
+- [ ] 9.4 Relaunch the desktop with the listener on. The phone reconnects
+      on its own, the banner returns to "Connected", and the list refreshes
+      without re-pairing.
+- [ ] 9.5 Overlay only, if testing one: move the phone off the wifi to
+      mobile data with the overlay up. The phone fails the LAN address and
+      succeeds on the overlay address (`100.64.0.7`) without user action.
+
+## 10. Protocol mismatch: the "update Headstate on your desktop" banner
+
+*Mark "when available" until a desktop build with a lower protocol version
+than the phone requires exists to test against.*
+
+- [ ] 10.1 Run a desktop build whose `/v1/hello` reports a protocol version
+      lower than the phone's minimum.
+- [ ] 10.2 The phone refuses to use it and shows the "update Headstate on
+      your desktop" banner naming the minimum protocol version.
+- [ ] 10.3 No command can be issued from that state; the banner links to
+      the desktop release.
+- [ ] 10.4 The reverse holds: a desktop on a newer protocol version accepts
+      the older phone, with no banner.
+
+## Findings
+
+Record everything that did not match the checklist, one item per line, with
+the step number. Include the ML-DSA line from step 1.3 even on a clean run.
+If there are no findings, write `none`.
+
+```
+1.3  Post-quantum signing key: <offered / not offered> (<reason if shown>)
+```
+
+## Sign-off
+
+| | |
+|---|---|
+| Result | clean / findings |
+| Counts toward the two clean runs for enabling store builds | yes / no |
+| Tester | |
