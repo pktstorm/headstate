@@ -35,7 +35,7 @@ ALLOWED_EMAIL_DOMAIN='users\.noreply\.github\.com'
 
 # Lockfiles are machine-generated dependency graphs naming hundreds of
 # upstream repos; they are not a leak vector for private names.
-EXCLUDES=(':!scripts/check-privacy.sh' ':!yarn.lock' ':!src-tauri/Cargo.lock')
+EXCLUDES=(':!scripts/check-privacy.sh' ':!yarn.lock' ':!src-tauri/Cargo.lock' ':!src-mobile/Cargo.lock')
 
 # This gate is the only thing between a private repo name and a permanent
 # public leak, so it must never fail open. `git grep` exits 1 for "no match"

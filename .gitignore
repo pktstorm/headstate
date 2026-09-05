@@ -3,6 +3,13 @@ dist/
 target/
 src-tauri/target/
 src-tauri/gen/
+# The mobile crate's `gen/apple` (and `gen/android`, once generated) ARE
+# committed: they are the Xcode and Android Studio projects, which carry
+# hand edits and which `tauri ios build` needs. Each has its own
+# .gitignore for build products. Only the per-machine schema dump is
+# ignored, as it is for the desktop.
+src-mobile/target/
+src-mobile/gen/schemas/
 coverage/
 .DS_Store
 
