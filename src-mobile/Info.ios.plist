@@ -35,5 +35,10 @@
        with an authentication error instead of a prompt. -->
   <key>NSFaceIDUsageDescription</key>
   <string>Headstate Companion confirms it is you before deleting anything on your desktop.</string>
+  <!-- The pairing QR is scanned with the camera (tauri-plugin-barcode-
+       scanner, #514). iOS terminates an app that opens the camera
+       without this string. Wording from docs/mobile-store-listings.md. -->
+  <key>NSCameraUsageDescription</key>
+  <string>Headstate Companion uses the camera to scan the pairing code shown on your desktop.</string>
 </dict>
 </plist>

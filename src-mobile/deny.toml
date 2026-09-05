@@ -22,6 +22,14 @@ ignore = [
   "RUSTSEC-2025-0081",  # unic-char-property unmaintained
   "RUSTSEC-2025-0098",  # unic-ucd-version unmaintained
   "RUSTSEC-2025-0100",  # unic-ucd-ident unmaintained
+  # Both reach us only through tauri-plugin-stronghold -> iota_stronghold
+  # (the settings store, #514) and are "unmaintained" notices, not
+  # vulnerabilities. bincode 1.3.3 is the format the stronghold snapshot
+  # is written in; its team declared that version complete. paste is a
+  # proc-macro that runs at build time and ships no code in the binary.
+  # Revisit when the stronghold plugin moves off them.
+  "RUSTSEC-2025-0141",  # bincode 1.x unmaintained
+  "RUSTSEC-2024-0436",  # paste unmaintained
 ]
 
 [licenses]
