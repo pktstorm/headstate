@@ -7,6 +7,7 @@ import {
   useNotifyPrefs,
   usePollInterval,
   useCleanupPrefs,
+  useRemoteEnabled,
   useUiPrefs,
   useWorktreeDirs,
 } from "../api/hooks";
@@ -46,6 +47,7 @@ const SECTIONS = [
   { id: "repositories", label: "Repositories" },
   { id: "notifications", label: "Notifications" },
   { id: "cleanup", label: "Cleanup" },
+  { id: "phone", label: "Phone" },
   { id: "views", label: "Views" },
 ] as const;
 
@@ -65,6 +67,8 @@ export function SettingsDialog({
   const { prefs: cleanup, set: setCleanup } = useCleanupPrefs();
   const { enabled: autostart, set: setAutostart } = useAutostart();
   const [autostartError, setAutostartError] = useState<string | null>(null);
+  const { enabled: remote, set: setRemote } = useRemoteEnabled();
+  const [remoteError, setRemoteError] = useState<string | null>(null);
   const [section, setSection] = useState<SectionId>("general");
   const [draft, setDraft] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -534,6 +538,43 @@ export function SettingsDialog({
             anywhere in the UI. Escape is the notable one: it hides the
             whole window to the tray, which is genuinely surprising the
             first time someone presses it to dismiss a menu. */}
+            </div>
+            {/* Rendered always, hidden with CSS, for the reasons given
+                on the panels above. */}
+            <div className={section === "phone" ? "" : "hidden"}>
+        {/* The companion app's switch. Off by default and phrased for
+            what it does -- opens a port -- rather than as a feature
+            name, so nobody turns it on to see what happens. Pairing
+            and the paired-device list join this panel later. */}
+        <div className="mt-5 flex flex-col gap-2">
+          <span className="text-sm font-medium">Phone</span>
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={remote}
+              onChange={() => {
+                setRemoteError(null);
+                // Binds a port and, the first time, writes to the
+                // keychain; either can refuse. Like autostart, the
+                // error is shown and the box reflects what happened.
+                void setRemote(!remote).catch((e: unknown) =>
+                  setRemoteError(typeof e === "string" ? e : "Could not change this"),
+                );
+              }}
+            />
+            Allow phone connections
+          </label>
+          <p className="text-xs text-[#8b949e]">
+            Lets the Headstate companion app reach this desktop on port 41919.
+            Only phones you have paired are let in; anything else is refused
+            before it can send a request.
+          </p>
+          {remoteError ? (
+            <p role="alert" className="text-xs text-[#f85149]">
+              {remoteError}
+            </p>
+          ) : null}
+        </div>
             </div>
             {/* Rendered always, hidden with CSS -- never unmounted and
                 never the `hidden` ATTRIBUTE.
