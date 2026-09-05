@@ -28,6 +28,7 @@ import {
   recentCacheHealth,
 } from "../lib/buildJoin";
 import { relativeTime } from "../lib/time";
+import { useIsMobile } from "../lib/useIsMobile";
 
 import type { DanglingVolume, DockerBuild, DockerImage } from "../types/pr";
 import { QueryError, errorMessage } from "./QueryError";
@@ -152,12 +153,13 @@ function ImageRow({
   // one part that says what the image IS, was on the type the whole
   // time. This fix previously landed only on the untagged branch.
   const name = imageName(img);
-
-  return (
-    <div className="border-b border-[#30363d] px-4 py-2.5 text-sm last:border-b-0">
-      <div className="flex items-baseline gap-3">
-      {/* The whole row toggles, so the hit target is the row rather
-          than a chevron the user has to aim at. */}
+  // The cells, built once. The desktop lays them out on one line; the
+  // phone puts the name beside its action and the state, age and size
+  // on a line beneath.
+  const isMobile = useIsMobile();
+  const nameCell = (
+      /* The whole row toggles, so the hit target is the row rather
+          than a chevron the user has to aim at. */
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
@@ -174,13 +176,19 @@ function ImageRow({
           <span className="ml-2 text-xs text-[#8b949e]">{img.origin.subject}</span>
         ) : null}
       </button>
+  );
+  const facts = (
+    <>
       <span className={`shrink-0 text-xs ${imageTone(img)}`}>{imageState(img)}</span>
       {img.created ? (
         <span className="shrink-0 text-xs text-[#8b949e]">{relativeTime(img.created)}</span>
       ) : null}
-      <span className="w-20 shrink-0 text-right tabular-nums text-xs text-[#8b949e]">
+      <span className={isMobile ? "shrink-0 tabular-nums text-xs text-[#8b949e]" : "w-20 shrink-0 text-right tabular-nums text-xs text-[#8b949e]"}>
         {formatDockerSize(img.size_bytes)}
       </span>
+    </>
+  );
+  const removeButton = (
       <button
         type="button"
         disabled={img.in_use !== false || removing}
@@ -200,7 +208,25 @@ function ImageRow({
       >
         {removing ? "Removing…" : "Remove"}
       </button>
+  );
+
+  return (
+    <div className="border-b border-[#30363d] px-4 py-2.5 text-sm last:border-b-0">
+      {isMobile ? (
+        <div className="flex flex-col gap-1">
+          <div className="flex items-baseline gap-3">
+            {nameCell}
+            {removeButton}
+          </div>
+          <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5">{facts}</div>
+        </div>
+      ) : (
+      <div className="flex items-baseline gap-3">
+      {nameCell}
+      {facts}
+      {removeButton}
       </div>
+      )}
       {/* The long fields, kept out of the collapsed row. The problem
           was never density -- it was that the identifying detail had
           nowhere to live. */}

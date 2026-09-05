@@ -2,6 +2,7 @@ import { BarChart3 } from "lucide-react";
 import { useWorktrees } from "../api/hooks";
 import { type View, useActiveFilters, useFilters } from "../store/filters";
 import { isOrphaned, ORPHAN_FILTER } from "../lib/worktrees";
+import { useIsMobile } from "../lib/useIsMobile";
 import { ViewSwitcher } from "./ViewSwitcher";
 
 /// Repos that have worktrees.
@@ -17,6 +18,9 @@ export function WorktreeSidebar({
   const { data: repos } = useWorktrees();
   const filters = useActiveFilters();
   const { setFilter, setView, setPanel } = useFilters();
+  // Stats is desktop-only in the companion's first release, so the
+  // phone gets no entry that leads to it.
+  const isMobile = useIsMobile();
 
   const rowClass = (active: boolean) =>
     `flex w-full items-center justify-between rounded px-3 py-2 text-sm ${
@@ -134,6 +138,7 @@ export function WorktreeSidebar({
       {/* Stats belongs to My PRs, so selecting it also switches view --
           otherwise the stats page would render beside a worktree sidebar
           listing repos it knows nothing about. */}
+      {isMobile ? null : (
       <div className="mt-2 shrink-0 border-t border-[#30363d] pt-2">
         <button
           type="button"
@@ -149,6 +154,7 @@ export function WorktreeSidebar({
           </span>
         </button>
       </div>
+      )}
     </nav>
   );
 }

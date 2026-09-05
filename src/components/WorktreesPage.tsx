@@ -40,6 +40,7 @@ import { WorktreeKebab } from "./WorktreeKebab";
 import { claudifyCommand } from "../api/tauri";
 import { copyText } from "../lib/clipboard";
 import { relativeTime } from "../lib/time";
+import { useIsMobile } from "../lib/useIsMobile";
 import { assessmentSummary } from "../lib/assessment";
 import { rollupRepos } from "../lib/rollup";
 import { useActiveFilters, useFilters } from "../store/filters";
@@ -131,9 +132,12 @@ function Row({
     open ? wt.path : null,
     open ? wt.branch : null,
   );
-  return (
-    <div className="border-b border-[#30363d] last:border-b-0">
-    <div className="flex items-baseline gap-3 px-4 py-2.5 text-sm">
+  // The cells, built once. The desktop lays them out on one line; the
+  // phone stacks them -- name and size, then the verdict, then the
+  // action -- so the verdict can wrap instead of truncating and the
+  // action is never squeezed against the path.
+  const isMobile = useIsMobile();
+  const nameCell = (
       <span className="min-w-0 flex-1 truncate font-mono text-[#e6edf3]">
         {pathBasename(wt.path)}
         {wt.branch ? (
@@ -142,8 +146,10 @@ function Row({
           <span className="ml-2 text-xs text-[#8b949e]">detached</span>
         )}
       </span>
+  );
+  const safetyCell = (
       <span
-        className={`shrink-0 text-xs ${safetyTone(wt.safety)}`}
+        className={`${isMobile ? "" : "shrink-0 "}text-xs ${safetyTone(wt.safety)}`}
         // The whole row is one live region while it fills in, so a
         // screen reader hears the resolved value once rather than
         // announcing each cell as it lands.
@@ -201,6 +207,8 @@ function Row({
           <span className="text-[#8b949e]"> · {relativeTime(wt.last_commit)}</span>
         ) : null}
       </span>
+  );
+  const sizeCell = (
       <span className="w-20 shrink-0 text-right tabular-nums text-xs text-[#8b949e]">
         {/* An em dash here read as "measured, and the answer is nothing".
             A skeleton says a number is still coming. */}
@@ -210,6 +218,9 @@ function Row({
           formatSize(wt.size_bytes)
         )}
       </span>
+  );
+  const actionCells = (
+    <>
       {/* One action per row, never two: the row is already dense. Safe
           rows get Remove; the 124 that cannot be removed get Claudify,
           which answers the question that actually applies to them --
@@ -223,7 +234,13 @@ function Row({
       {/* Fixed width still, but wider: the assessed state now holds a
           button AND a kebab, and the point of the fixed cell is that a
           row's layout never depends on which action it offers. */}
-      <span className="flex w-40 shrink-0 items-center justify-end gap-1">
+      <span
+        className={
+          isMobile
+            ? "flex shrink-0 items-center gap-1"
+            : "flex w-40 shrink-0 items-center justify-end gap-1"
+        }
+      >
       {claudifiable && assessed ? (
         // Only after an assessment of THIS worktree. Otherwise this is a
         // "delete anything" button with extra steps.
@@ -331,7 +348,27 @@ function Row({
           {open ? "Hide" : "What's in it?"}
         </button>
       ) : null}
+    </>
+  );
+  return (
+    <div className="border-b border-[#30363d] last:border-b-0">
+    {isMobile ? (
+      <div className="flex flex-col gap-1 px-4 py-2.5 text-sm">
+        <div className="flex items-baseline gap-3">
+          {nameCell}
+          {sizeCell}
+        </div>
+        {safetyCell}
+        <div className="flex flex-wrap items-center gap-2">{actionCells}</div>
+      </div>
+    ) : (
+    <div className="flex items-baseline gap-3 px-4 py-2.5 text-sm">
+      {nameCell}
+      {safetyCell}
+      {sizeCell}
+      {actionCells}
     </div>
+    )}
     {open ? (
       <div className="px-4 pb-2.5 text-xs text-[#8b949e]">
         {assessing ? (
@@ -415,6 +452,7 @@ export function WorktreesPage() {
   const { data: repos, isLoading, isError, error, refetch } = useWorktrees();
   const filters = useActiveFilters();
   const { setFilter } = useFilters();
+  const isMobile = useIsMobile();
 
   const selected = repos?.find((r) => r.path === filters.repo) ?? repos?.[0];
   const {
@@ -705,10 +743,32 @@ export function WorktreesPage() {
             key={wt.path}
             onClick={() => setFilter("repo", wt.repoPath)}
             title="Open this repository to act on it"
-            className="flex w-full items-baseline gap-3 border-b border-[#30363d] px-4 py-2.5 text-left text-sm last:border-b-0 hover:bg-[#161b22]"
+            // On the phone the row wraps: repository and size on the
+            // first line, the worktree's path on its own line beneath,
+            // where it has the full width rather than what a fixed
+            // 10rem repository column leaves over.
+            className={
+              isMobile
+                ? "flex w-full flex-wrap items-baseline gap-x-3 gap-y-0.5 border-b border-[#30363d] px-4 py-2.5 text-left text-sm last:border-b-0 hover:bg-[#161b22]"
+                : "flex w-full items-baseline gap-3 border-b border-[#30363d] px-4 py-2.5 text-left text-sm last:border-b-0 hover:bg-[#161b22]"
+            }
           >
-            <span className="w-40 shrink-0 truncate text-[#8b949e]">{wt.repoName}</span>
-            <span className="min-w-0 flex-1 truncate font-mono text-[#e6edf3]">
+            <span
+              className={
+                isMobile
+                  ? "min-w-0 flex-1 truncate text-[#8b949e]"
+                  : "w-40 shrink-0 truncate text-[#8b949e]"
+              }
+            >
+              {wt.repoName}
+            </span>
+            <span
+              className={
+                isMobile
+                  ? "order-last min-w-0 basis-full truncate font-mono text-[#e6edf3]"
+                  : "min-w-0 flex-1 truncate font-mono text-[#e6edf3]"
+              }
+            >
               {pathBasename(wt.path)}
             </span>
             <span className="w-20 shrink-0 text-right tabular-nums text-xs text-[#8b949e]">

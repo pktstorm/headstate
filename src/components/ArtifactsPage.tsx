@@ -4,6 +4,7 @@ import type { Artifact, ArtifactKind } from "@/types/pr";
 import { useArtifacts, useArtifactSizes, useRemoveArtifacts, useVenvs } from "@/api/hooks";
 import { useActiveFilters } from "@/store/filters";
 import { relativeSeconds } from "@/lib/time";
+import { useIsMobile } from "@/lib/useIsMobile";
 import { diagMark } from "@/api/diag";
 import { GROUP_LABEL, VENV_GROUP } from "./ArtifactSidebar";
 import { toast } from "sonner";
@@ -69,6 +70,7 @@ const ACTIVE_SECS = 60 * 60;
 /// structurally could not reach 99.7% of the largest thing on the disk.
 export function ArtifactsPage() {
   const filters = useActiveFilters();
+  const isMobile = useIsMobile();
   // `repo` is the sidebar's selection key across every view; here it
   // holds an artifact KIND rather than a path. Reusing it keeps one
   // selection mechanism instead of a second parallel one.
@@ -165,7 +167,9 @@ export function ArtifactsPage() {
   return (
     <div className="p-4">
       {showArtifacts ? (
-      <div className="mb-3 flex items-center gap-2 text-sm">
+      // Wraps on the phone: six items on one 390px line broke "3
+      // directories" and "4.8 GB" across lines mid-phrase.
+      <div className={isMobile ? "mb-3 flex flex-wrap items-center gap-2 text-sm" : "mb-3 flex items-center gap-2 text-sm"}>
         <HardDrive className="h-4 w-4 shrink-0 text-[#8b949e]" aria-hidden="true" />
         <span className="font-semibold text-[#e6edf3]">
           {artifacts.length} director{artifacts.length === 1 ? "y" : "ies"}
@@ -386,8 +390,12 @@ function ArtifactRow({
   onToggle: () => void;
 }) {
   const active = ageSecs !== undefined && ageSecs < ACTIVE_SECS;
-  return (
-    <li className="flex items-center gap-3 rounded border border-[#30363d] px-3 py-2 text-sm">
+  // The cells, built once. The desktop lays them out on one line; the
+  // phone puts the checkbox, path and size on the first line and the
+  // kind, age and rebuild hint beneath, so the path keeps most of the
+  // width rather than being squeezed between five fixed columns.
+  const isMobile = useIsMobile();
+  const checkbox = (
       <input
         type="checkbox"
         checked={checked}
@@ -397,12 +405,19 @@ function ArtifactRow({
         aria-label={`Select ${artifact.path}`}
         className="shrink-0"
       />
+  );
+  const kind = (
       <span className="shrink-0 rounded-full border border-[#30363d] px-2 py-0.5 text-xs text-[#8b949e]">
         {LABEL[artifact.kind]}
       </span>
+  );
+  const path = (
       <span className="min-w-0 flex-1 truncate font-mono text-xs text-[#e6edf3]">
         {artifact.path}
       </span>
+  );
+  const facts = (
+    <>
       {active ? (
         // Surfaced rather than hidden: this is the one hazard git cannot
         // see, and the user is the only one who knows whether a build is
@@ -416,16 +431,42 @@ function ArtifactRow({
           delete. How long ago it was written is the discriminator.
           Undefined renders as a skeleton, never as "just now" -- the
           same rule the size column follows for "not measured yet". */}
-      <span className="w-24 shrink-0 text-right text-xs text-[#8b949e]">
+      <span className={isMobile ? "shrink-0 text-xs text-[#8b949e]" : "w-24 shrink-0 text-right text-xs text-[#8b949e]"}>
         {ageSecs === undefined ? (
           <Skeleton className="ml-auto w-16" />
         ) : (
           relativeSeconds(ageSecs)
         )}
       </span>
+    </>
+  );
+  const size = (
       <span className="w-20 shrink-0 text-right tabular-nums">
         {bytes === undefined ? <Skeleton className="ml-auto w-14" /> : formatSize(bytes)}
       </span>
+  );
+  if (isMobile) {
+    return (
+      <li className="flex flex-col gap-1 rounded border border-[#30363d] px-3 py-2 text-sm">
+        <div className="flex items-center gap-3">
+          {checkbox}
+          {path}
+          {size}
+        </div>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pl-7">
+          {kind}
+          {facts}
+        </div>
+      </li>
+    );
+  }
+  return (
+    <li className="flex items-center gap-3 rounded border border-[#30363d] px-3 py-2 text-sm">
+      {checkbox}
+      {kind}
+      {path}
+      {facts}
+      {size}
     </li>
   );
 }

@@ -4,6 +4,7 @@ import type { Venv, VenvState } from "@/types/pr";
 import { useRemoveVenvs, useVenvs, useVenvSizes } from "@/api/hooks";
 import { formatSize } from "@/lib/worktrees";
 import { relativeSeconds } from "@/lib/time";
+import { useIsMobile } from "@/lib/useIsMobile";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 import { HelpButton } from "./HelpButton";
 
@@ -68,6 +69,7 @@ const TONE: Record<VenvState, string> = {
 /// caches" across two views would make a user check two places for one
 /// answer.
 export function VenvSection() {
+  const isMobile = useIsMobile();
   // `isLoading` as well as the data: the `= []` default made "still
   // scanning" and "there are none" the SAME value, and the early
   // return below then removed the section entirely. On a real machine
@@ -223,11 +225,10 @@ export function VenvSection() {
       <ul className="flex flex-col gap-1">
         {rows.map(({ v, state }) => {
           const removable = isRemovable(v, state);
-          return (
-            <li
-              key={v.path}
-              className="flex items-center gap-3 rounded border border-[#30363d] px-3 py-2 text-sm"
-            >
+          // The cells, built once. The desktop lays them out on one
+          // line; the phone puts the checkbox, project and size first
+          // and the verdict, its evidence and the age beneath.
+          const checkbox = (
               <input
                 type="checkbox"
                 checked={checked.has(v.path)}
@@ -249,17 +250,25 @@ export function VenvSection() {
                 }
                 className="shrink-0 disabled:opacity-30"
               />
-              <span className="shrink-0 font-semibold text-[#e6edf3]">{v.project}</span>
+          );
+          const project = (
+              <span className={isMobile ? "min-w-0 flex-1 truncate font-semibold text-[#e6edf3]" : "shrink-0 font-semibold text-[#e6edf3]"}>{v.project}</span>
+          );
+          const verdict = (
               <span className={`shrink-0 rounded-full px-2 py-0.5 text-xs ${TONE[state]}`}>
                 {state}
               </span>
-              {/* The SOURCE is the evidence for the verdict. For a live
+          );
+          const source = (
+              /* The SOURCE is the evidence for the verdict. For a live
                   or stale venv it names the directory that still exists,
-                  which is what lets someone disagree with the label. */}
+                  which is what lets someone disagree with the label. */
               <span className="min-w-0 flex-1 truncate font-mono text-xs text-[#8b949e]">
                 {v.source ?? "no project directory found"}
               </span>
-              {/* AGE, for the same reason the artifacts list got it in
+          );
+          const age = (
+              /* AGE, for the same reason the artifacts list got it in
                   #417: size cannot rank these rows. The idle time was
                   already being fetched and used ONLY to compute the
                   stale badge -- the number itself was never shown, so
@@ -267,13 +276,46 @@ export function VenvSection() {
 
                   Unknown renders as an em dash, never as "just now":
                   reading not-yet-measured as brand new would hide
-                  exactly the venvs worth removing. */}
-              <span className="w-24 shrink-0 text-right text-xs text-[#8b949e]">
+                  exactly the venvs worth removing. */
+              <span className={isMobile ? "shrink-0 text-xs text-[#8b949e]" : "w-24 shrink-0 text-right text-xs text-[#8b949e]"}>
                 {idle.has(v.path) ? relativeSeconds(idle.get(v.path) ?? 0) : "—"}
               </span>
+          );
+          const size = (
               <span className="w-20 shrink-0 text-right text-xs tabular-nums text-[#8b949e]">
                 {sizes.has(v.path) ? formatSize(sizes.get(v.path) ?? 0) : "—"}
               </span>
+          );
+          if (isMobile) {
+            return (
+              <li
+                key={v.path}
+                className="flex flex-col gap-1 rounded border border-[#30363d] px-3 py-2 text-sm"
+              >
+                <div className="flex items-center gap-3">
+                  {checkbox}
+                  {project}
+                  {size}
+                </div>
+                <div className="flex items-center gap-3 pl-7">
+                  {verdict}
+                  {source}
+                  {age}
+                </div>
+              </li>
+            );
+          }
+          return (
+            <li
+              key={v.path}
+              className="flex items-center gap-3 rounded border border-[#30363d] px-3 py-2 text-sm"
+            >
+              {checkbox}
+              {project}
+              {verdict}
+              {source}
+              {age}
+              {size}
             </li>
           );
         })}

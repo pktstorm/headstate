@@ -1,6 +1,7 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Venv } from "@/types/pr";
+import { stubViewport } from "@/test-utils";
 
 // Typed so a test can resolve with real outcomes: a bare
 // `Promise.resolve([])` infers `never[]`, which rejects every fixture.
@@ -51,6 +52,40 @@ beforeEach(() => {
   state.sizes = new Map();
   state.idle = new Map();
   state.measuring = false;
+});
+
+describe("VenvSection on a phone", () => {
+  afterEach(() => stubViewport(null));
+
+  it("stacks each row, keeping project, state, source, age and size", () => {
+    stubViewport(390);
+    const v = venv({ source: "/code/mls-delivery-service", state: "stale" });
+    state.venvs = [v];
+    state.sizes = new Map([[v.path, 1024]]);
+    state.idle = new Map([[v.path, 86_400 * 3]]);
+    render(<VenvSection />);
+    const row = screen.getByRole("checkbox").closest("li") as HTMLElement;
+    expect(row.className).toContain("flex-col");
+    expect(within(row).getByText("mls-delivery-service")).toBeTruthy();
+    expect(within(row).getByText("stale")).toBeTruthy();
+    expect(within(row).getByText("/code/mls-delivery-service")).toBeTruthy();
+    expect(within(row).getByText("3 days ago")).toBeTruthy();
+    expect(within(row).getByText("1.0 KB")).toBeTruthy();
+    fireEvent.click(within(row).getByRole("checkbox"));
+    expect(screen.getByRole("button", { name: /remove 1 /i })).toBeTruthy();
+  });
+
+  it("keeps the desktop row on one line", () => {
+    stubViewport(1400);
+    const v = venv();
+    state.venvs = [v];
+    state.sizes = new Map([[v.path, 1024]]);
+    render(<VenvSection />);
+    const row = screen.getByRole("checkbox").closest("li") as HTMLElement;
+    expect(row.className).not.toContain("flex-col");
+    expect(within(row).getByText("1.0 KB").parentElement).toBe(row);
+    expect(within(row).getByText("mls-delivery-service").parentElement).toBe(row);
+  });
 });
 
 describe("VenvSection", () => {
