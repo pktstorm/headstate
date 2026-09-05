@@ -142,6 +142,22 @@ rand = "0.9"
 # -- std has no interface enumeration. One crate over `getifaddrs` with
 # only `libc` beneath it, which is already in the tree.
 if-addrs = "0.15"
+# Step-up signatures on destructive remote commands (remote/stepup.rs):
+# the classical half of the hybrid. 0.13 rather than 0.14 because it
+# shares `digest` 0.10, `sha2` 0.10 and `signature` 2.2 with the crates
+# already in the tree; 0.14 would bring a second copy of each. `ecdsa`
+# alone: the phone's key arrives as raw SEC1 bytes and its signature as
+# raw r||s, so there is no PEM or PKCS#8 to parse. Signing is compiled
+# in only so the tests can make keys; the desktop never signs.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+# The post-quantum half: ML-DSA-65 verification, FIPS 204 final. Chosen
+# over `libcrux-ml-dsa` for reasons recorded in remote/stepup.rs. No
+# build script; `alloc` boxes the large intermediate matrices instead of
+# putting them on a tokio worker's stack. Brings its own `digest` 0.11
+# through `shake`, so this IS a second digest stack; ml-dsa 0.0.x on
+# digest 0.10 predates the Wycheproof and use_hint fixes in 0.1.0 and is
+# not an option for a verifier.
+ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 temp-env = "0.3"
