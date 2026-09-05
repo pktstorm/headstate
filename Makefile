@@ -21,12 +21,15 @@
 mobile-frontend:
 	VITE_TARGET=mobile yarn build
 
+# `--workspace`: src-mobile is a small workspace whose members are the
+# in-repo plugins under src-mobile/plugins; without the flag only the
+# app crate is linted and tested.
 lint-mobile:
 	cd src-mobile && cargo fmt --check
-	cd src-mobile && cargo clippy --all-targets -- -D warnings
+	cd src-mobile && cargo clippy --workspace --all-targets -- -D warnings
 
 test-mobile:
-	cd src-mobile && cargo test
+	cd src-mobile && cargo test --workspace
 
 # Proves the phone-only dependencies (reqwest on rustls/aws-lc-rs, rcgen)
 # cross-compile: aws-lc-sys builds C and assembly for the target, which
