@@ -36,6 +36,12 @@ pub fn run() {
             background::install(app.handle());
             Ok(())
         })
+        // Hardware-backed step-up keys and the session identity (#513).
+        // On a desktop host it registers a stub whose every call is
+        // `Error::Unavailable`, so this `run` compiles and tests here.
+        // The client (#514) reaches it through
+        // `tauri_plugin_headstate_keys::HeadstateKeysExt::headstate_keys`.
+        .plugin(tauri_plugin_headstate_keys::init())
         .invoke_handler(tauri::generate_handler![])
         .run(tauri::generate_context!())
         .expect("error while running Headstate Companion");

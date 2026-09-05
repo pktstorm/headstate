@@ -1,0 +1,59 @@
+[package]
+name = "tauri-plugin-headstate-keys"
+version = "0.1.0"
+license = "Apache-2.0"
+description = "Hardware-backed step-up signing keys and the TLS session identity for Headstate Companion."
+repository = "https://github.com/pktstorm/headstate"
+edition = "2021"
+# Required by `tauri_plugin::Builder`: the build script publishes the
+# plugin's permission set under this name.
+links = "tauri-plugin-headstate-keys"
+
+[lib]
+name = "tauri_plugin_headstate_keys"
+path = "src/lib.rs"
+
+[build-dependencies]
+# Generates the permission files and, on a mobile target, copies the
+# Tauri Swift/Kotlin API next to the native sources and links the Swift
+# package into the app's static library. Same line as the mobile crate's
+# other Tauri crates.
+tauri-plugin = { version = "2.6", features = ["build"] }
+
+[dependencies]
+# No default features: the plugin needs only the plugin-handle API, and
+# the app decides what else Tauri links.
+tauri = { version = "2.11", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4.33"
+thiserror = "2"
+# The native sides speak JSON, and JSON has no bytes: every key,
+# signature and DER blob crosses the bridge as standard base64 with
+# padding, the same encoding the pair request uses for the public keys.
+base64 = "0.22"
+# The session certificate. rustls needs the private key bytes to present
+# a client identity, so the session key is made here, not in the
+# keystore (see the crate docs). On aws-lc-rs like the rest of the
+# mobile crate; no `pem`, the phone only ever handles DER.
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+# `register_ios_plugin` lives behind `wry`; Tauri's own mobile plugins
+# declare it the same way.
+tauri = { version = "2.11", default-features = false, features = ["wry"] }
+
+[dev-dependencies]
+# The fake backend the tests run against signs in software with the same
+# crates, versions and features the desktop verifier (src-tauri
+# remote/stepup.rs) uses, so "the fake's signature verifies here" means
+# "a signature in this encoding verifies there". Neither crate is linked
+# into the phone: on a device the signer is the Secure Enclave or the
+# Android Keystore.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc"] }
+# SHA256 of the canonical-bytes test vector, pinned to the desktop's.
+sha2 = "0.10"
+# Proves the session identity is what rustls wants: the key loads and
+# matches the certificate. Already in the mobile crate's graph.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }

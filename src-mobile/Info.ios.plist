@@ -28,5 +28,12 @@
   <array>
     <string>fetch</string>
   </array>
+  <!-- The step-up signing keys (plugins/headstate-keys) carry a
+       `.userPresence` access control, so signing raises the system's
+       Face ID / Touch ID / passcode sheet. Without this key iOS refuses
+       Face ID for the app outright and every destructive command fails
+       with an authentication error instead of a prompt. -->
+  <key>NSFaceIDUsageDescription</key>
+  <string>Headstate Companion confirms it is you before deleting anything on your desktop.</string>
 </dict>
 </plist>
