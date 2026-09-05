@@ -118,7 +118,7 @@ afterEach(() => {
 describe("App shell on the desktop", () => {
   it("renders the repo sidebar inline, with no menu button and no banner", () => {
     stubViewport(1400);
-    connection.current = { kind: "connected", desktop: "octocat's laptop", lastPoll: null };
+    connection.current = { kind: "connected", desktop: "octocat's laptop", lastPoll: null, protocolVersion: 1 };
     renderApp();
     const nav = screen.getByRole("navigation");
     expect(within(nav).getByText("All repositories")).toBeTruthy();
@@ -135,6 +135,7 @@ describe("App shell on a phone", () => {
       kind: "connected",
       desktop: "octocat's laptop",
       lastPoll: new Date(Date.now() - 3 * 60_000).toISOString(),
+      protocolVersion: 1,
     };
   });
 
