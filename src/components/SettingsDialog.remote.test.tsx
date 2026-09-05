@@ -18,6 +18,9 @@ vi.mock("../api/hooks", () => ({
     set: () => Promise.resolve(),
   }),
   useRemoteEnabled: () => ({ enabled: remoteState.enabled, set: setRemote }),
+  useIssuePairingToken: () => () => Promise.reject("not in this test"),
+  usePairedDevices: () => ({ data: [], isLoading: false, error: null }),
+  useRevokePairedDevice: () => () => Promise.resolve(),
 }));
 
 import { SettingsDialog } from "./SettingsDialog";
@@ -77,5 +80,12 @@ describe("phone connections setting", () => {
   it("names the port, so the user knows what was opened", () => {
     show();
     expect(screen.getByText(/41919/)).toBeTruthy();
+  });
+
+  // Same topic as the switch: pairing is the only reason to turn it on.
+  it("offers pairing and the paired-device list on the same topic", () => {
+    show();
+    expect(screen.getByRole("button", { name: /pair a phone/i })).toBeTruthy();
+    expect(screen.getByText(/paired devices/i)).toBeTruthy();
   });
 });

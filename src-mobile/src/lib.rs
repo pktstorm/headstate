@@ -5,7 +5,12 @@
 //! keys and forwards every command to a paired desktop; it never holds a
 //! GitHub token and never talks to GitHub. The modules the spec names --
 //! `keys`, `client`, `pairing`, `events` -- arrive with #514; what is here
-//! is the shell those plug into.
+//! is the shell those plug into, plus `discovery`, which finds the paired
+//! desktop on the LAN when its stored address has gone stale.
+
+pub mod discovery;
+
+pub mod background;
 
 /// The shared frontend in `src/` is built with `VITE_TARGET=mobile`; its
 /// `transport.ts` picks the remote transport on that value. Until #514
@@ -23,6 +28,14 @@ pub fn run() {
                 .level(log::LevelFilter::Info)
                 .build(),
         )
+        // Opportunistic background refresh (#516): the OS-granted window
+        // on each platform, running whatever `background::install` put
+        // in state. On a desktop host it registers an inert scheduler.
+        .plugin(tauri_plugin_headstate_refresh::init())
+        .setup(|app| {
+            background::install(app.handle());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![])
         .run(tauri::generate_context!())
         .expect("error while running Headstate Companion");
@@ -82,5 +95,14 @@ mod tests {
             locked_crates().contains(&"aws-lc-rs"),
             "aws-lc-rs missing from the lock"
         );
+    }
+
+    /// The background refresh plugin is registered and given a
+    /// refresher; without `install` a window would find nothing to run.
+    #[test]
+    fn the_background_refresh_is_wired() {
+        let src = include_str!("lib.rs");
+        assert!(src.contains(".plugin(tauri_plugin_headstate_refresh::init())"));
+        assert!(src.contains("background::install(app.handle())"));
     }
 }
