@@ -1,0 +1,40 @@
+[package]
+name = "tauri-plugin-headstate-refresh"
+version = "0.1.0"
+license = "Apache-2.0"
+description = "Opportunistic background refresh for Headstate Companion: BGAppRefreshTask on iOS, WorkManager on Android."
+repository = "https://github.com/pktstorm/headstate"
+edition = "2021"
+# Required by `tauri_plugin::Builder`: the build script publishes the
+# plugin's permission set under this name.
+links = "tauri-plugin-headstate-refresh"
+
+[lib]
+name = "tauri_plugin_headstate_refresh"
+path = "src/lib.rs"
+
+[build-dependencies]
+# Generates the permission files and, on a mobile target, copies the
+# Tauri Swift/Kotlin API next to the native sources and links the Swift
+# package into the app's static library. Same line as the mobile crate's
+# other Tauri crates.
+tauri-plugin = { version = "2.6", features = ["build"] }
+
+[dependencies]
+# No default features: the plugin needs the plugin-handle API and the
+# `Channel` the native side calls Rust back on; the app decides what
+# else Tauri links.
+tauri = { version = "2.11", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4.33"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+# `register_ios_plugin` lives behind `wry`; Tauri's own mobile plugins
+# declare it the same way.
+tauri = { version = "2.11", default-features = false, features = ["wry"] }
+
+[dev-dependencies]
+# `Notify`, to hold a fake refresh open until the test expires its
+# window. Already in the graph: the Tauri runtime is tokio.
+tokio = { version = "1", features = ["sync"] }
