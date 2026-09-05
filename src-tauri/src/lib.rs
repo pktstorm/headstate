@@ -10,6 +10,7 @@ pub mod docker;
 pub mod github;
 pub mod packages;
 pub mod poll;
+pub mod remote;
 pub mod store;
 pub mod tray;
 mod worktrees;
