@@ -24,9 +24,15 @@
 //! handshake, so a device revoked mid-connection is refused on its next
 //! request, not only its next handshake. Handlers find who is calling
 //! in the [`Peer`] request extension.
+//!
+//! The one request that outlives that check is `GET /v1/events`, a
+//! server-sent event stream that stays open for as long as the phone
+//! is; `remote/events.rs` watches the pairing task's revocation
+//! broadcast to cut it.
 
+use crate::remote::events::{self, Hub};
 use crate::remote::identity::{fingerprint_of, Identity};
-use axum::extract::{Request, State};
+use axum::extract::{Extension, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -46,7 +52,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
 
@@ -105,6 +111,12 @@ pub struct ListenerConfig {
     /// for the reason `latest_release` gives.
     pub desktop_version: String,
     pub viewer_login: ViewerLookup,
+    /// The event fan-out `/v1/events` subscribers hang off. Lives in
+    /// `gate::Remote` across listener restarts.
+    pub events: Arc<Hub>,
+    /// `PairingState::subscribe_revocations()`. Each event stream
+    /// `resubscribe`s so a revocation reaches every open stream.
+    pub revocations: broadcast::Receiver<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -131,6 +143,8 @@ struct AppState {
     desktop_version: String,
     viewer_login: ViewerLookup,
     viewer_cache: tokio::sync::OnceCell<String>,
+    events: Arc<Hub>,
+    revocations: broadcast::Receiver<String>,
 }
 
 /// A running listener. Dropping it stops accepting; [`Handle::stop`]
@@ -304,9 +318,23 @@ async fn hello(State(st): State<Arc<AppState>>) -> Json<Hello> {
     })
 }
 
+/// `GET /v1/events`: the stream described in `remote/events.rs`.
+async fn events(State(st): State<Arc<AppState>>, Extension(peer): Extension<Peer>) -> Response {
+    let sub = events::Subscriber {
+        fingerprint: peer.fingerprint,
+        revocations: st.revocations.resubscribe(),
+        paired: st.paired.clone(),
+    };
+    match events::subscribe(&st.events, sub).await {
+        Some(sse) => sse.into_response(),
+        None => (StatusCode::FORBIDDEN, "not paired").into_response(),
+    }
+}
+
 fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/hello", get(hello))
+        .route(events::PATH, get(events))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_paired,
@@ -339,6 +367,8 @@ pub async fn start(cfg: ListenerConfig) -> Result<Handle, ListenerError> {
         desktop_version: cfg.desktop_version,
         viewer_login: cfg.viewer_login,
         viewer_cache: tokio::sync::OnceCell::new(),
+        events: cfg.events,
+        revocations: cfg.revocations,
     });
     let app = router(state);
     let acceptor = TlsAcceptor::from(Arc::new(tls));
@@ -424,9 +454,12 @@ async fn serve_connection(tcp: TcpStream, from: SocketAddr, acceptor: TlsAccepto
     }
 }
 
+/// `pub(crate)`: `remote/events.rs` drives its stream tests through the
+/// same in-memory pairing store and pinned client as the tests here.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::remote::events::SnapshotSource;
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use rustls::pki_types::ServerName;
     use rustls::{ClientConfig, NamedGroup};
@@ -437,16 +470,16 @@ mod tests {
 
     /// The in-memory `PairedCerts` the spec's verifier tests run against.
     #[derive(Default)]
-    struct MemoryCerts {
+    pub(crate) struct MemoryCerts {
         paired: Mutex<HashSet<String>>,
         window: AtomicBool,
     }
 
     impl MemoryCerts {
-        fn pair(&self, fp: &str) {
+        pub(crate) fn pair(&self, fp: &str) {
             self.paired.lock().unwrap().insert(fp.to_string());
         }
-        fn revoke(&self, fp: &str) {
+        pub(crate) fn revoke(&self, fp: &str) {
             self.paired.lock().unwrap().remove(fp);
         }
         fn open_window(&self, open: bool) {
@@ -510,28 +543,48 @@ mod tests {
         }
     }
 
-    struct Server {
-        handle: Handle,
-        fp: String,
-        certs: Arc<MemoryCerts>,
+    pub(crate) struct Server {
+        pub(crate) handle: Handle,
+        pub(crate) fp: String,
+        pub(crate) certs: Arc<MemoryCerts>,
+        /// The pairing task's side of the revocation broadcast.
+        pub(crate) revocations: broadcast::Sender<String>,
+    }
+
+    /// A hub with nothing to snapshot, for tests that never open the
+    /// event stream.
+    pub(crate) fn no_snapshot() -> SnapshotSource {
+        Arc::new(|| Box::pin(async { None }))
     }
 
     async fn serve(certs: Arc<MemoryCerts>) -> Server {
+        serve_with(certs, Arc::new(Hub::new(no_snapshot()))).await
+    }
+
+    pub(crate) async fn serve_with(certs: Arc<MemoryCerts>, events: Arc<Hub>) -> Server {
         let identity = Identity::generate().unwrap();
         let fp = identity.fingerprint();
+        let (revocations, rx) = broadcast::channel(16);
         let handle = start(ListenerConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
             identity,
             paired: certs.clone(),
             desktop_version: "9.9.9".into(),
             viewer_login: Arc::new(|| Box::pin(async { Some("octocat".to_string()) })),
+            events,
+            revocations: rx,
         })
         .await
         .unwrap();
-        Server { handle, fp, certs }
+        Server {
+            handle,
+            fp,
+            certs,
+            revocations,
+        }
     }
 
-    fn client_config(phone: Option<&Identity>, server_fp: &str) -> Arc<ClientConfig> {
+    pub(crate) fn client_config(phone: Option<&Identity>, server_fp: &str) -> Arc<ClientConfig> {
         let provider = Arc::new(provider());
         let verifier = PinnedServer {
             fp: server_fp.to_string(),
@@ -780,6 +833,8 @@ mod tests {
             paired: certs.clone(),
             desktop_version: "9.9.9".into(),
             viewer_login: Arc::new(|| Box::pin(async { None })),
+            events: Arc::new(Hub::new(no_snapshot())),
+            revocations: broadcast::channel(1).1,
         })
         .await
         .unwrap();
@@ -818,6 +873,8 @@ mod tests {
             paired: certs,
             desktop_version: "9.9.9".into(),
             viewer_login: Arc::new(|| Box::pin(async { None })),
+            events: Arc::new(Hub::new(no_snapshot())),
+            revocations: broadcast::channel(1).1,
         })
         .await
         .err()

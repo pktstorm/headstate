@@ -12,8 +12,10 @@
 //! swap the stub [`NoPairedDevices`] for the real store in [`setup`].
 
 use crate::commands::db_path;
+use crate::remote::events::{Hub, SnapshotSource};
 use crate::remote::identity::{self, Identity, PlatformStore};
 use crate::remote::listener::{self, Handle, ListenerConfig, PairedCerts, ViewerLookup, PORT};
+use crate::remote::pairing::PairingState;
 use crate::store::{self, settings};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
@@ -41,14 +43,18 @@ pub struct Remote {
     /// Loaded once per process; the keychain may prompt on macOS, and
     /// asking on every enable would prompt on every enable.
     identity: OnceLock<Identity>,
+    /// The event fan-out for `/v1/events`. Outlives any one listener so
+    /// toggling the setting off and on does not re-tap the app's events.
+    events: Arc<Hub>,
 }
 
 impl Remote {
-    pub fn new(paired: Arc<dyn PairedCerts>) -> Self {
+    pub fn new(paired: Arc<dyn PairedCerts>, events: Arc<Hub>) -> Self {
         Self {
             listener: tokio::sync::Mutex::new(None),
             paired,
             identity: OnceLock::new(),
+            events,
         }
     }
 
@@ -85,7 +91,12 @@ pub fn install_crypto_provider() {
 /// Called from Tauri's `setup`, which is synchronous and outside the
 /// runtime, hence `block_on`.
 pub fn setup(app: &AppHandle) {
-    app.manage(Remote::new(Arc::new(NoPairedDevices)));
+    // Tapped whether or not the listener is on: the events are cheap
+    // to forward to nobody, and attaching lazily would mean a poll
+    // that fired between "enable" and "attached" reached no phone.
+    let events = Arc::new(Hub::new(snapshot_source(app)));
+    events.attach(app);
+    app.manage(Remote::new(Arc::new(NoPairedDevices), events));
     if !read_enabled(app) {
         return;
     }
@@ -128,6 +139,33 @@ fn viewer_lookup(app: &AppHandle) -> ViewerLookup {
     })
 }
 
+/// The opening `prs-updated` frame of `/v1/events`: the list the
+/// webview's `get_cached` returns, through the same function, so the
+/// phone's first paint is the desktop's first paint. rusqlite is
+/// synchronous, so it runs off the async workers.
+fn snapshot_source(app: &AppHandle) -> SnapshotSource {
+    let app = app.clone();
+    Arc::new(move || {
+        let app = app.clone();
+        Box::pin(async move {
+            let loaded =
+                tauri::async_runtime::spawn_blocking(move || crate::commands::get_cached(app))
+                    .await;
+            match loaded {
+                Ok(Ok(prs)) => serde_json::to_string(&prs).ok(),
+                Ok(Err(e)) => {
+                    log::warn!("remote: could not load the snapshot for a phone: {e}");
+                    None
+                }
+                Err(e) => {
+                    log::warn!("remote: the snapshot task failed: {e}");
+                    None
+                }
+            }
+        })
+    })
+}
+
 /// Where the Linux fallback file goes; see `PlatformStore`.
 fn fallback_path(app: &AppHandle) -> std::path::PathBuf {
     db_path(app).with_file_name("remote-identity.json")
@@ -165,6 +203,9 @@ pub async fn start(app: &AppHandle) -> Result<SocketAddr, String> {
         paired: remote.paired.clone(),
         desktop_version: app.package_info().version.to_string(),
         viewer_login: viewer_lookup(app),
+        events: remote.events.clone(),
+        // Managed in `lib.rs` before this module is set up.
+        revocations: app.state::<Arc<PairingState>>().subscribe_revocations(),
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -220,7 +261,10 @@ mod tests {
 
     #[tokio::test]
     async fn remote_starts_with_no_listener_and_no_identity() {
-        let remote = Remote::new(Arc::new(NoPairedDevices));
+        let remote = Remote::new(
+            Arc::new(NoPairedDevices),
+            Arc::new(Hub::new(Arc::new(|| Box::pin(async { None })))),
+        );
         assert!(!remote.is_running().await);
         assert_eq!(remote.fingerprint(), None);
     }

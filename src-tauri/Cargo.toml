@@ -100,6 +100,12 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 hyper = { version = "1", default-features = false, features = ["server", "http1"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 tower-service = "0.3"
+# The `/v1/events` stream (`remote/events.rs`): axum's `Sse` takes a
+# `Stream`, and `stream::unfold` is what turns a broadcast receiver plus
+# a revocation watch into one without a hand-written poll function.
+# Already in the tree via axum and hyper; default features off so it
+# stays the subset they already compile.
+futures-util = { version = "0.3", default-features = false }
 # The desktop identity's private key goes in the platform keychain --
 # Keychain Services on macOS, Credential Manager on Windows, the
 # Secret Service (via a pure-Rust D-Bus client, no libdbus) on Linux.
