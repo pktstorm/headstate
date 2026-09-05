@@ -1,6 +1,6 @@
 .PHONY: dev build test test-rust test-ui lint lint-rust lint-ui fmt icons \
 	mobile-frontend lint-mobile test-mobile check-mobile-ios check-mobile-android \
-	deny-mobile ios-init icons-mobile
+	deny-mobile ios-init android-init icons-mobile
 
 # ---- Mobile companion (src-mobile) ---------------------------------------
 #
@@ -52,6 +52,11 @@ deny-mobile:
 # when Tauri's template changes, and review the diff.
 ios-init:
 	TAURI_APP_PATH=src-mobile yarn tauri ios init --ci
+
+# Same for gen/android. Needs an Android SDK with ANDROID_HOME and
+# NDK_HOME set; the `mobile-android` CI job is the machine that has one.
+android-init:
+	TAURI_APP_PATH=src-mobile yarn tauri android init --ci
 
 # The companion's icons, from the same master as the desktop. `yarn tauri
 # icon` emits every platform's variant; the phone keeps the iOS and
