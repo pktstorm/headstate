@@ -174,7 +174,7 @@ impl SseParser {
 
     fn dispatch(&mut self) -> Option<Frame> {
         let event = self.event.take();
-        let data: Vec<String> = self.data.drain(..).collect();
+        let data = std::mem::take(&mut self.data);
         if data.is_empty() {
             return None;
         }
