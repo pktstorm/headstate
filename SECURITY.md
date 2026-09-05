@@ -54,7 +54,14 @@ GitHub client. It is a remote control for the one you already have.
 On first enable, the desktop generates its own ECDSA P-256 key pair and a
 self-signed certificate (ten-year validity, not tied to a hostname). The
 **private key is stored in the platform keychain** — the first and only
-keychain entry Headstate makes. It is the TLS server identity for the
+keychain entry Headstate makes. One exception, on Linux only: the
+keychain there is the freedesktop Secret Service, which needs a daemon
+(gnome-keyring, KWallet, KeePassXC) on the session bus, and a headless
+box, a CI runner, or a bare window manager has none. When no Secret
+Service is available, the key is kept instead in a file in Headstate's
+own data directory, readable by the owning user only (mode 0600), and
+the step down is logged at every start. macOS and Windows never fall
+back. Wherever it lives, the key is the TLS server identity for the
 listener, and nothing else: it is not a GitHub credential, it cannot be
 used to talk to GitHub, and it never leaves the machine.
 
@@ -142,8 +149,12 @@ token, never talks to `api.github.com`, and has no poll loop of its own.
 It sees only what the desktop sends it over `/v1/events` and `/v1/call`,
 and it can act only by asking the desktop to act. A stolen phone whose
 pairing has been revoked has nothing: no credential, no access, and a
-cached PR snapshot it can no longer refresh. The phone's own keys live in
-the Secure Enclave or Android Keystore and are not exportable.
+cached PR snapshot it can no longer refresh. The phone's step-up signing
+keys live in the Secure Enclave or Android Keystore and are not
+exportable; its TLS session key is software-backed, because rustls must
+hold the private key bytes to present a client certificate, and is kept
+in the phone's keychain (an iOS Keychain item, or on Android a
+preference encrypted under a Keystore-held AES key).
 
 ### Step-up for destructive commands
 

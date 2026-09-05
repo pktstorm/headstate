@@ -9,6 +9,12 @@ Design: [Mobile Companion Design](superpowers/specs/2026-09-05-mobile-companion-
 (see *Pairing*, *Step-up for destructive commands*, *Reachability*,
 *Testing*, and *Release*).
 
+Desktop labels below are the ones Settings ships on its **Phone** topic
+(`PairPhonePanel`, `PairingRequestModal`, `PairedDevicesList`), and the
+banner lines are `src/components/ConnectionBanner.tsx`'s. Phone-side
+labels (*Scan*, *Forget desktop*) are the design's; no shipped screen
+carries them yet.
+
 ## The release rule
 
 - Run this walkthrough once on a **real iPhone** and once on a **real
@@ -58,9 +64,10 @@ committed run record.
 - [ ] Desktop Headstate is installed, signed in, and showing at least one
       pull request. A throwaway checkout of `octocat/hello-world` is a fine
       source.
-- [ ] Desktop Settings has **Allow phone connections** *off* and **Paired
-      devices** empty. If a device from an earlier run is listed, revoke it
-      first so the run starts from nothing.
+- [ ] Desktop Settings, **Phone**, has **Allow phone connections** *off*
+      and **Paired devices** reading *No phones paired yet.* If a device
+      from an earlier run is listed, revoke it first so the run starts
+      from nothing.
 - [ ] A throwaway git worktree exists on the desktop for the destructive
       step, for example a worktree of `octocat/hello-world` on a branch named
       `walkthrough-scratch`. It must contain nothing you want to keep.
@@ -78,32 +85,43 @@ committed run record.
 
 ## 1. Pair
 
-- [ ] 1.1 On the desktop open Settings and choose **Pair a phone**. The
-      listener turns on if it was off (the **Allow phone connections**
-      toggle flips on its own) and a QR code appears with a visible
-      two-minute countdown.
+- [ ] 1.1 On the desktop open Settings, **Phone**, and press **Pair a
+      phone**. The listener turns on if it was off (the **Allow phone
+      connections** box ticks itself) and a QR code appears with the
+      desktop's fingerprint beside it under *Fingerprint (SHA256)* and an
+      *Expires in* countdown from two minutes.
 - [ ] 1.2 On the phone tap **Scan** and scan the QR. The phone reports the
       desktop name from the payload (`octocat's laptop`) and shows a
       fingerprint.
-- [ ] 1.3 The desktop shows a modal naming the phone (`Octocat's phone`)
-      and the same fingerprint, plus a line saying whether the phone
-      offered a post-quantum (ML-DSA-65) signing key. Record that line in
-      the findings section, whatever it says; a phone without ML-DSA is
-      expected on Android 16 and older, and on any device whose keystore
-      lacks it.
+- [ ] 1.3 The desktop shows a dialog titled **Pair Octocat's phone?** with
+      the same fingerprint and one of two lines: *Offered a post-quantum
+      signing key (ML-DSA-65) as well as ECDSA.* or *No post-quantum
+      signing key offered; this phone will sign with ECDSA only.* Record
+      which in the findings section, whatever it says; a phone without
+      ML-DSA is expected on Android 16 and older, and on any device whose
+      keystore lacks it. The dialog counts down *Denied automatically in*
+      from two minutes and offers **Deny** and **Approve**.
 - [ ] 1.4 Compare the fingerprint on both screens **in groups of four**
       hex characters, start to end, reading each group aloud from one
       screen and checking it on the other. Do not stop after the first
       group. Both screens must render the same grouping (`ab12 cd34 ef56 …`).
-- [ ] 1.5 Approve on the desktop. The phone moves to the PR list and the
-      connection banner reads "Connected to octocat's laptop" with a last
-      poll time.
-- [ ] 1.6 Desktop Settings, **Paired devices**, lists `Octocat's phone` with
-      a *paired at* time and a *last seen* time within the last minute.
-- [ ] 1.7 Negative: start a second **Pair a phone**, let the countdown
-      expire without scanning, then scan the stale QR. The phone shows a
-      clear "pairing expired" error and stays on the pairing screen; the
-      desktop shows no approval modal and adds no row.
+- [ ] 1.5 **Approve** on the desktop. The phone moves to the PR list and
+      the connection banner reads *octocat's laptop · reachable · last
+      poll …* with a green dot. Tapping the banner opens Settings on the
+      **Phone** topic.
+- [ ] 1.6 Desktop Settings, **Phone**, **Paired devices**, lists
+      `Octocat's phone` with *Paired <today's date>*, its fingerprint in
+      groups of four, and a *post-quantum* badge when step 1.3 said the
+      key was offered. The same line reads *Never connected* or *Last
+      seen …*: the desktop does not yet write `last_seen` (follow-up from
+      #543), so *Never connected* is the expected reading until that
+      lands, not a finding.
+- [ ] 1.7 Negative: start a second **Pair a phone**, photograph or
+      screenshot the QR, and let the countdown expire (the code blanks to
+      *Expired* and the panel says *This code has expired. Generate a new
+      one to try again.*). Scan the stale copy. The phone shows a clear
+      "pairing expired" error and stays on the pairing screen; the
+      desktop shows no approval dialog and adds no row.
 
 ## 2. One read command
 
@@ -154,17 +172,20 @@ repeat: the poll interval.
 ## 5. Revoke on the desktop
 
 - [ ] 5.1 Leave the phone app open in the foreground on the PR list.
-- [ ] 5.2 Desktop Settings, **Paired devices**, **Revoke** next to
-      `Octocat's phone`. The row disappears.
+- [ ] 5.2 Desktop Settings, **Phone**, **Paired devices**, **Revoke** next
+      to `Octocat's phone`, then **Revoke** again in the *Revoke Octocat's
+      phone?* dialog. The row disappears and the list reads *No phones
+      paired yet.*
 - [ ] 5.3 Any open event stream from the phone closes: within a few seconds
-      the phone's banner leaves "Connected".
+      the phone's banner leaves *reachable*.
 
 ## 6. Confirm the phone is refused
 
 - [ ] 6.1 Pull to refresh on the phone. The request is refused at the TLS
       handshake, not with an HTTP error: the phone shows its `revoked`
-      state and **returns to the pairing screen**, with a message saying
-      the desktop no longer recognises it.
+      state (banner: *octocat's laptop revoked this phone · pair again*)
+      and **returns to the pairing screen**, with a message saying the
+      desktop no longer recognises it.
 - [ ] 6.2 Background the app, wait a minute, and bring it back. It stays on
       the pairing screen; it does not retry into a loop of errors.
 - [ ] 6.3 Desktop **Paired devices** is still empty and the desktop log
@@ -177,15 +198,19 @@ repeat: the poll interval.
 - [ ] 7.1 Repeat step 1 in full. The phone offers the same device name
       (`Octocat's phone`). Pairing succeeds and the PR list loads.
 - [ ] 7.2 Same-name replacement: without revoking, on the phone choose
-      *Forget desktop* and pair again with the same name. The desktop's
-      approval modal says a device with this name is already paired and
-      asks whether to **replace** it.
-- [ ] 7.3 Choose replace. **Paired devices** shows exactly one
-      `Octocat's phone` row with a new *paired at* time, and the old
-      fingerprint no longer appears.
-- [ ] 7.4 Repeat 7.2 and choose *keep both*. **Paired devices** shows two
-      rows with the same name and different fingerprints. Revoke the older
-      one and confirm the newer phone is still connected.
+      *Forget desktop* and pair again with the same name. Press
+      **Approve**: the dialog changes to **Replace the existing pairing
+      for Octocat's phone?**, says that replacing revokes the old one and
+      keeping both leaves two devices with the same name, and offers
+      **Cancel**, **Keep both**, and **Replace**.
+- [ ] 7.3 Choose **Replace**. **Paired devices** shows exactly one
+      `Octocat's phone` row, its fingerprint is the phone's current one,
+      and the old fingerprint no longer appears.
+- [ ] 7.4 Repeat 7.2 and choose **Keep both**. **Paired devices** shows two
+      rows with the same name and different fingerprints (both paired
+      today, so tell them apart by fingerprint). Revoke the one whose
+      fingerprint the phone no longer shows and confirm the newer phone is
+      still connected.
 - [ ] 7.5 Run one read and one destructive command against the re-paired
       device to confirm the new keys work end to end (steps 2.2 and 4.4).
 
@@ -215,14 +240,14 @@ enforce and no CI job can.
 ## 9. Desktop closed: the unreachable banner
 
 - [ ] 9.1 With the phone connected, quit desktop Headstate.
-- [ ] 9.2 Within a short interval the phone's banner reads "octocat's
-      laptop is unreachable" with the last-seen time.
+- [ ] 9.2 Within a short interval the phone's banner reads *octocat's
+      laptop is unreachable · last seen …* with an amber dot.
 - [ ] 9.3 The PR list is still rendered from the cached snapshot, marked
       stale, with every action disabled. Tapping an action does nothing and
       shows no biometric prompt.
 - [ ] 9.4 Relaunch the desktop with the listener on. The phone reconnects
-      on its own, the banner returns to "Connected", and the list refreshes
-      without re-pairing.
+      on its own, the banner returns to *reachable*, and the list
+      refreshes without re-pairing.
 - [ ] 9.5 Overlay only, if testing one: move the phone off the wifi to
       mobile data with the overlay up. The phone fails the LAN address and
       succeeds on the overlay address (`100.64.0.7`) without user action.
@@ -234,10 +259,12 @@ than the phone requires exists to test against.*
 
 - [ ] 10.1 Run a desktop build whose `/v1/hello` reports a protocol version
       lower than the phone's minimum.
-- [ ] 10.2 The phone refuses to use it and shows the "update Headstate on
-      your desktop" banner naming the minimum protocol version.
-- [ ] 10.3 No command can be issued from that state; the banner links to
-      the desktop release.
+- [ ] 10.2 The phone refuses to use it and shows the banner *Update
+      Headstate on your desktop · this app needs protocol N, octocat's
+      laptop has M*, naming both versions.
+- [ ] 10.3 No command can be issued from that state; the banner is an
+      *Update* link to the desktop's latest release rather than a button
+      into pairing settings.
 - [ ] 10.4 The reverse holds: a desktop on a newer protocol version accepts
       the older phone, with no banner.
 
