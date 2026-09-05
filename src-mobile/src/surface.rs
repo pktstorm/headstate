@@ -117,6 +117,12 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("docker_restart", Class::Local),
     ("docker_start", Class::Local),
     ("set_view_needs_github", Class::Local),
+    ("issue_pairing_token", Class::Local),
+    ("respond_to_pairing", Class::Local),
+    ("list_paired_devices", Class::Local),
+    ("revoke_paired_device", Class::Local),
+    ("get_remote_enabled", Class::Local),
+    ("set_remote_enabled", Class::Local),
 ];
 
 /// The class of a command, or `None` when the desktop has no such
