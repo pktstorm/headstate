@@ -97,6 +97,32 @@ const MIGRATIONS: &[&str] = &[
         error TEXT
      );
      CREATE INDEX IF NOT EXISTS cleanup_log_at ON cleanup_log (at DESC);",
+    // 6: phones paired with this desktop (mobile companion, Storage
+    // section of the design spec).
+    //
+    // `cert_fp` is the lowercase hex SHA256 of `cert_der`, UNIQUE
+    // because the TLS client-certificate verifier looks a presented
+    // certificate up by exactly this string and one certificate can only
+    // belong to one device. `name` is deliberately NOT unique: the spec
+    // lets two devices with the same name coexist unless the user
+    // chooses to replace the old one at re-pairing.
+    //
+    // `ecdsa_pubkey` is the P-256 step-up key, SEC1 uncompressed (65
+    // bytes). `mldsa_pubkey` is the ML-DSA-65 step-up key (1952 bytes),
+    // NULL when the phone's keystore could not produce one -- the
+    // desktop verifies exactly the signatures this row says to expect.
+    //
+    // Timestamps are RFC 3339 text, matching `cleanup_log.at`.
+    "CREATE TABLE IF NOT EXISTS paired_devices (
+        id              INTEGER PRIMARY KEY,
+        name            TEXT NOT NULL,
+        cert_fp         TEXT NOT NULL UNIQUE,
+        cert_der        BLOB NOT NULL,
+        ecdsa_pubkey    BLOB NOT NULL,
+        mldsa_pubkey    BLOB,
+        paired_at       TEXT NOT NULL,
+        last_seen       TEXT
+     );",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
@@ -169,6 +195,45 @@ mod tests {
             "dead table must be dropped"
         );
         assert!(has_table(&conn, "snapshot"), "the real cache must survive");
+    }
+
+    /// Migration 6 adds `paired_devices` to a database that stopped at
+    /// version 5, which is every install that predates the mobile
+    /// companion. Checked from a real v5 state rather than a fresh
+    /// database, so a migration that only works when it runs first in
+    /// the list would be caught.
+    #[test]
+    fn migration_six_adds_paired_devices_to_a_v5_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE snapshot (id INTEGER PRIMARY KEY, payload TEXT NOT NULL,
+                fetched_at TEXT NOT NULL);
+             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE cleanup_log (id INTEGER PRIMARY KEY, at TEXT NOT NULL,
+                kind TEXT NOT NULL, target TEXT NOT NULL, detail TEXT, bytes INTEGER,
+                action TEXT NOT NULL, error TEXT);",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 5i64).unwrap();
+
+        migrate(&conn).unwrap();
+
+        assert!(has_table(&conn, "paired_devices"));
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 6);
+
+        // The fingerprint is the verifier's lookup key; two rows with the
+        // same one would make "which device is this" ambiguous.
+        let insert = "INSERT INTO paired_devices
+            (name, cert_fp, cert_der, ecdsa_pubkey, paired_at)
+            VALUES (?1, 'ab', x'00', x'04', '2026-01-01T00:00:00Z')";
+        conn.execute(insert, ["a"]).unwrap();
+        assert!(
+            conn.execute(insert, ["b"]).is_err(),
+            "cert_fp must be unique"
+        );
     }
 
     #[test]

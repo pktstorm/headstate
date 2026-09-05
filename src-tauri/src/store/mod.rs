@@ -19,14 +19,16 @@
 //! unobserved days, which is tracked separately.
 
 mod cache;
+pub mod devices;
 mod schema;
 pub mod settings;
 
 pub use cache::{load_snapshot, save_snapshot, CachedList};
 pub use schema::{open_db, StoreError};
 
+/// Test-only: the remote pairing tests migrate an in-memory connection.
 #[cfg(test)]
-use schema::migrate;
+pub(crate) use schema::migrate;
 
 #[cfg(test)]
 mod tests {

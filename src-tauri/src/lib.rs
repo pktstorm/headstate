@@ -175,6 +175,10 @@ pub fn run() {
             commands::get_cycle_trend,
             commands::get_merged_detail,
             commands::get_auth_state,
+            remote::pairing::issue_pairing_token,
+            remote::pairing::respond_to_pairing,
+            remote::pairing::list_paired_devices,
+            remote::pairing::revoke_paired_device,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -265,6 +269,15 @@ pub fn run() {
             // Starts true: the app opens on a PR view.
             let needs_gh = Arc::new(AtomicBool::new(true));
             app.manage(poll::ViewNeedsGithub(needs_gh.clone()));
+
+            // Phone pairing. Managed whether or not the listener is on,
+            // because Settings lists and revokes paired devices either
+            // way. The identity is a stub until `remote/identity.rs`
+            // lands; the listener's integration swaps the real one in.
+            app.manage(remote::pairing::new_state(handle.clone()));
+            app.manage(remote::pairing::DesktopIdentity(Arc::new(
+                remote::pairing::StubIdentity,
+            )));
 
             log::info!(
                 "headstate v{} starting (authenticated: {})",

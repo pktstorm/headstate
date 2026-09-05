@@ -526,3 +526,94 @@ export interface UpdateRunDone {
   /// Why there is no pull request, when there is none.
   error: string | null;
 }
+
+// ---------------------------------------------------------------------
+// Phone pairing (mobile companion). Rust side: src-tauri/src/remote/pairing.rs
+//
+// The Settings screens that call these (QR, confirmation modal, paired
+// devices list) are a separate task, so for now nothing imports them.
+// `@public` tells knip that is deliberate; drop the tags once the
+// screens land and knip can see real callers.
+// ---------------------------------------------------------------------
+
+/// What the pairing QR code encodes. Field names are the wire format the
+/// phone parses, so they stay snake_case and terse.
+/** @public */
+export interface PairingQrPayload {
+  v: 1;
+  name: string;
+  /// Every non-loopback address of this machine, IPv4 first, overlay
+  /// addresses included; the phone tries them in order.
+  addrs: string[];
+  port: number;
+  /// `sha256:<hex>` of the desktop certificate.
+  fp: string;
+  /// base64url, single use, expires at `exp`.
+  token: string;
+  /// Unix seconds.
+  exp: number;
+}
+
+/// Settings > Pair a phone. Mints a two-minute, single-use token and
+/// returns what to render as a QR code. Rejects until the desktop has a
+/// certificate.
+/** @public */
+export const issuePairingToken = () =>
+  invoke<PairingQrPayload>("issue_pairing_token");
+
+/// Payload of the `pairing-request` event: a phone has proved it holds
+/// the token and is waiting on the user's decision.
+/** @public */
+export interface PairingRequest {
+  request_id: number;
+  device_name: string;
+  /// Lowercase hex, no prefix. Show it in blocks of four; the phone shows
+  /// the same string so the two can be compared.
+  fingerprint: string;
+  /// Whether the phone offered a post-quantum step-up key.
+  has_mldsa: boolean;
+}
+
+/// Answer a `pairing-request`.
+///
+/// `replaceExisting` matters only when a device with the same name is
+/// already paired (check `listPairedDevices` when the event arrives):
+/// `true` replaces it, `false` keeps both, and leaving it out rejects
+/// with a message naming the device while the request stays pending --
+/// so the modal can ask "replace or keep both?" and answer again. The
+/// desktop never picks either on its own.
+/** @public */
+export const respondToPairing = (
+  requestId: number,
+  approve: boolean,
+  replaceExisting?: boolean,
+) =>
+  invoke<void>("respond_to_pairing", {
+    requestId,
+    approve,
+    replaceExisting: replaceExisting ?? null,
+  });
+
+/// A paired phone as Settings lists it. No key material.
+/** @public */
+export interface PairedDevice {
+  id: number;
+  name: string;
+  /// Lowercase hex, no prefix.
+  cert_fp: string;
+  has_mldsa: boolean;
+  /// RFC 3339.
+  paired_at: string;
+  /// RFC 3339, or null until the device's first connection after pairing.
+  last_seen: string | null;
+}
+
+/** @public */
+export const listPairedDevices = () =>
+  invoke<PairedDevice[]>("list_paired_devices");
+
+/// Delete the row and close that phone's open connections. A second
+/// click on an already-revoked device resolves rather than rejects.
+/** @public */
+export const revokePairedDevice = (id: number) =>
+  invoke<void>("revoke_paired_device", { id });
