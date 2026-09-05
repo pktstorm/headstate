@@ -1,9 +1,15 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ConnectionState } from "@/api/connection";
+import { REQUIRED_PROTOCOL_VERSION } from "@/lib/protocol";
 import { stubViewport } from "@/test-utils";
 
 const connection = vi.hoisted(() => ({ current: { kind: "local" } as ConnectionState }));
+
+// The update banner is an ExternalLink, which opens through the opener
+// plugin; there is no plugin in jsdom.
+const openUrl = vi.hoisted(() => vi.fn<(url: string) => Promise<void>>(() => Promise.resolve()));
+vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: (u: string) => openUrl(u) }));
 
 vi.mock("@/api/connection", () => ({
   useConnectionState: () => connection.current,
@@ -28,7 +34,7 @@ afterEach(() => {
 describe("ConnectionBanner", () => {
   it("renders nothing on the desktop layout", () => {
     stubViewport(1400);
-    connection.current = { kind: "connected", desktop: "octocat's laptop", lastPoll: null };
+    connection.current = { kind: "connected", desktop: "octocat's laptop", lastPoll: null, protocolVersion: 1 };
     const { container } = render(<ConnectionBanner />);
     expect(container.innerHTML).toBe("");
   });
@@ -48,11 +54,56 @@ describe("ConnectionBanner", () => {
       kind: "connected",
       desktop: "octocat's laptop",
       lastPoll: tenMinutesAgo,
+      protocolVersion: 1,
     };
     render(<ConnectionBanner />);
     const banner = screen.getByRole("button", { name: /octocat's laptop/ });
     expect(banner.textContent).toContain("reachable");
     expect(banner.textContent).toContain("last poll 10 minutes ago");
+  });
+
+  it("tells the user to update the desktop when its protocol is too old", () => {
+    stubViewport(390);
+    connection.current = {
+      kind: "connected",
+      desktop: "octocat's laptop",
+      lastPoll: null,
+      protocolVersion: REQUIRED_PROTOCOL_VERSION - 1,
+    };
+    render(<ConnectionBanner />);
+    // A link to the desktop release, not a button into pairing
+    // settings: pairing cannot fix an old desktop.
+    expect(screen.queryByRole("button")).toBeNull();
+    const banner = screen.getByRole("link");
+    expect(banner.getAttribute("href")).toBe(
+      "https://github.com/pktstorm/headstate/releases/latest",
+    );
+    expect(banner.textContent).toContain("Update Headstate on your desktop");
+    // Names the minimum, and what the desktop reported.
+    expect(banner.textContent).toContain(`needs protocol ${REQUIRED_PROTOCOL_VERSION}`);
+    expect(banner.textContent).toContain(
+      `octocat's laptop has ${REQUIRED_PROTOCOL_VERSION - 1}`,
+    );
+    expect(banner.textContent).not.toContain("reachable");
+    fireEvent.click(banner);
+    expect(openUrl).toHaveBeenCalledWith("https://github.com/pktstorm/headstate/releases/latest");
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("shows the ordinary connected line for a desktop at or above the required protocol", () => {
+    stubViewport(390);
+    for (const protocolVersion of [REQUIRED_PROTOCOL_VERSION, REQUIRED_PROTOCOL_VERSION + 1, null]) {
+      connection.current = {
+        kind: "connected",
+        desktop: "octocat's laptop",
+        lastPoll: null,
+        protocolVersion,
+      };
+      const { unmount } = render(<ConnectionBanner />);
+      expect(screen.getByRole("button").textContent).toContain("reachable");
+      expect(screen.queryByRole("link")).toBeNull();
+      unmount();
+    }
   });
 
   it("says when the desktop is away and when it was last seen", () => {
