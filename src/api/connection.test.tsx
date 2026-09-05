@@ -64,7 +64,12 @@ describe("useConnectionState", () => {
     const useConnectionState = await load("mobile");
     mockIPC((cmd) =>
       cmd === "connection_state"
-        ? { state: "connected", desktop: "octocat's laptop", last_poll: "2026-09-04T10:00:00Z" }
+        ? {
+            state: "connected",
+            desktop: "octocat's laptop",
+            last_poll: "2026-09-04T10:00:00Z",
+            protocol_version: 1,
+          }
         : undefined,
     );
     const { result } = renderHook(() => useConnectionState(), { wrapper });
@@ -73,8 +78,42 @@ describe("useConnectionState", () => {
         kind: "connected",
         desktop: "octocat's laptop",
         lastPoll: "2026-09-04T10:00:00Z",
+        protocolVersion: 1,
       }),
     );
+  });
+
+  it("reads a missing protocol version as unknown, not as zero", async () => {
+    // A report from before the field existed must not read as a
+    // desktop on protocol 0, which the banner would tell the user to
+    // update.
+    const useConnectionState = await load("mobile");
+    mockIPC(() => ({ state: "connected", desktop: "octocat's laptop", last_poll: null }));
+    const { result } = renderHook(() => useConnectionState(), { wrapper });
+    await waitFor(() => expect(result.current.kind).toBe("connected"));
+    expect(result.current).toEqual({
+      kind: "connected",
+      desktop: "octocat's laptop",
+      lastPoll: null,
+      protocolVersion: null,
+    });
+  });
+
+  it("carries no protocol version on the states that cannot issue commands", async () => {
+    const useConnectionState = await load("mobile");
+    mockIPC(() => ({
+      state: "connecting",
+      desktop: "octocat's laptop",
+      last_poll: null,
+      protocol_version: 1,
+    }));
+    const { result } = renderHook(() => useConnectionState(), { wrapper });
+    await waitFor(() => expect(result.current.kind).toBe("connecting"));
+    expect(result.current).toEqual({
+      kind: "connecting",
+      desktop: "octocat's laptop",
+      lastPoll: null,
+    });
   });
 
   it("maps unpaired to a state with no desktop", async () => {
