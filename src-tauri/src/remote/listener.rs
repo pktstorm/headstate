@@ -1,18 +1,21 @@
 //! The mTLS listener a paired phone talks to.
 //!
-//! axum on a tokio task, port [`PORT`] on every interface, TLS 1.3 only,
-//! rustls on the aws-lc-rs provider. Client certificates are required at
-//! the handshake and checked by fingerprint against the paired devices
-//! -- no CA, no chain -- so an unpaired client never reaches HTTP.
+//! axum on a tokio task, port [`PORT`] on every interface (IPv4 and
+//! IPv6 on one dual-stack socket), TLS 1.3 only, rustls on the aws-lc-rs
+//! provider. Client certificates are required at the handshake and
+//! checked by fingerprint against the paired devices -- no CA, no chain
+//! -- so an unpaired client never reaches HTTP.
 //!
-//! # The pairing seam
+//! # The seams
 //!
-//! The verifier does not know how devices are stored. It asks a
-//! [`PairedCerts`] -- "is this fingerprint paired?" and "is a pairing
-//! window open?" -- and the pairing task (#507) supplies the answer from
-//! the `paired_devices` table and its live token. Until it lands,
-//! `gate.rs` wires in a stub that pairs nothing and never opens the
-//! window, so the listener can be enabled and refuses everyone.
+//! The listener does not know how devices are stored or how commands
+//! run. It asks a [`PairedCerts`] -- "is this fingerprint paired, and
+//! what are its keys?" and "is a pairing window open?" -- which
+//! `gate.rs` implements over the pairing state's in-memory copy of
+//! `paired_devices`; and it hands each `/v1/call` to a [`CommandHost`],
+//! which `gate.rs` implements over `surface::dispatch`. Both are traits
+//! so the whole surface can be driven end to end on loopback with no
+//! database file and no Tauri app (`remote/loopback_tests.rs`).
 //!
 //! # What the handshake admits, and what HTTP then allows
 //!
@@ -24,13 +27,42 @@
 //! handshake, so a device revoked mid-connection is refused on its next
 //! request, not only its next handshake. Handlers find who is calling
 //! in the [`Peer`] request extension.
+//!
+//! Revocation also closes the connections a revoked certificate already
+//! has open, as the spec says: every connection task watches the
+//! pairing task's revocation broadcast and, on its own fingerprint,
+//! shuts the HTTP connection down gracefully -- an in-flight response
+//! finishes (the `/v1/events` stream ends itself on the same broadcast)
+//! and nothing further is served -- with a short deadline after which
+//! the connection is dropped regardless.
+//!
+//! # Routes and statuses
+//!
+//! - `GET /v1/hello`, `GET /v1/events`: see [`Hello`] and `remote/events.rs`.
+//! - `POST /v1/pair`: `remote/pairing.rs`. 200 with a `PairOutcome`;
+//!   400 for a body that does not decode; otherwise `PairError::http_status`.
+//! - `POST /v1/call/{command}`: `remote/surface.rs` and `remote/stepup.rs`.
+//!   200 with the command's JSON result; 404 unknown command, 403
+//!   desktop-only command or not paired, 400 for a body that is not JSON
+//!   or does not decode as the command's arguments, 500 when the command
+//!   itself failed (the body is its message); a destructive command's
+//!   signature is checked first and refused with `StepUpError::http_status`.
+//!
+//! Error bodies are plain text: the message the matching error type
+//! prints, which is written to be safe to send.
 
+use crate::remote::events::{self, Hub};
 use crate::remote::identity::{fingerprint_of, Identity};
-use axum::extract::{Request, State};
-use axum::http::StatusCode;
+use crate::remote::pairing::{self, PairRequest, PairingState, PeerCert};
+use crate::remote::stepup::{self, NonceWindow};
+use crate::remote::surface::{self, Class, RemoteError};
+use crate::store::devices::PairedDevice;
+use axum::body::Bytes;
+use axum::extract::{Extension, Path, Request, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use hyper_util::rt::TokioIo;
 use rustls::crypto::{aws_lc_rs, CryptoProvider, WebPkiSupportedAlgorithms};
@@ -41,12 +73,15 @@ use rustls::{
     SignatureScheme,
 };
 use serde::Serialize;
+use serde_json::Value;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
+use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::{broadcast, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
 
@@ -58,16 +93,23 @@ pub const PORT: u16 = 41919;
 /// payload changes shape. Returned by `/v1/hello` and embedded in the QR.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// The one path an unpaired peer may reach. The pairing task mounts its
-/// handler here.
+/// The one path an unpaired peer may reach.
 pub const PAIR_PATH: &str = "/v1/pair";
+
+/// The prefix of the command route; the command name is the rest.
+pub const CALL_PREFIX: &str = "/v1/call/";
+
+/// How long a revoked device's connection gets to finish what it was
+/// sending before it is dropped. Long enough for an event stream to
+/// write its final chunk; far shorter than any phone's retry.
+const REVOKE_GRACE: Duration = Duration::from_secs(5);
 
 /// What the verifier needs to know about paired devices.
 ///
-/// Implemented over `paired_devices` by the pairing task; over a
-/// `HashSet` in the tests below. Both methods are called on the TLS
-/// handshake path and on every request, so they must be cheap and must
-/// not block: read an in-memory set, not the database.
+/// Implemented over the pairing state's copy of `paired_devices` in
+/// `gate.rs`; over a `HashMap` in the tests below. Every method is
+/// called on the TLS handshake path or on a request, so they must be
+/// cheap and must not block: read memory, not the database.
 pub trait PairedCerts: Send + Sync {
     /// Whether a device with this certificate fingerprint (lowercase hex
     /// SHA256 of its DER) is currently paired. Revocation is this
@@ -76,6 +118,30 @@ pub trait PairedCerts: Send + Sync {
     /// Whether a pairing token is live, so an unpaired certificate may
     /// be admitted to reach `/v1/pair`.
     fn pairing_window_open(&self) -> bool;
+    /// The paired device's row -- its name for the log and its step-up
+    /// keys for `/v1/call` -- or `None` when not paired.
+    fn device(&self, sha256_fp_hex: &str) -> Option<PairedDevice>;
+}
+
+/// Where `/v1/call` sends a command once the listener has admitted it.
+///
+/// A trait rather than a direct call to `surface::dispatch` because
+/// that needs the live `AppHandle`, which no test can construct; the
+/// loopback test supplies a host that records what it was asked. The
+/// listener has already checked that the command exists, is not
+/// desktop-only, and (when destructive) carried a valid signature.
+pub trait CommandHost: Send + Sync {
+    /// Run `command` with `args` on behalf of the named device;
+    /// `surface::dispatch` in production.
+    fn dispatch<'a>(
+        &'a self,
+        command: &'a str,
+        args: Value,
+        device_name: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, RemoteError>> + Send + 'a>>;
+    /// A destructive command just ran for the named device;
+    /// `stepup::notify_destructive` in production.
+    fn notify_destructive(&self, device_name: &str, command: &str);
 }
 
 /// Who is on the other end of the connection. Inserted into every
@@ -85,6 +151,8 @@ pub trait PairedCerts: Send + Sync {
 pub struct Peer {
     /// Lowercase hex SHA256 of the peer's certificate DER.
     pub fingerprint: String,
+    /// The certificate itself, which `/v1/pair` stores.
+    pub der: Vec<u8>,
 }
 
 /// How `/v1/hello` learns the signed-in GitHub login. A closure rather
@@ -97,14 +165,27 @@ pub type ViewerLookup =
 
 /// Everything `start` needs.
 pub struct ListenerConfig {
-    /// `0.0.0.0:41919` in production; `127.0.0.1:0` in tests.
+    /// `[::]:41919` in production, which binds IPv6 AND IPv4 on one
+    /// socket (falling back to `0.0.0.0` where IPv6 is disabled), so
+    /// every address the QR lists is one the listener answers on;
+    /// `127.0.0.1:0` in tests.
     pub bind: SocketAddr,
     pub identity: Identity,
     pub paired: Arc<dyn PairedCerts>,
+    /// The pairing protocol behind `POST /v1/pair`.
+    pub pairing: Arc<PairingState>,
+    /// Where `POST /v1/call/{command}` runs commands.
+    pub host: Arc<dyn CommandHost>,
     /// The RUNTIME version from `package_info()`, not `CARGO_PKG_VERSION`,
     /// for the reason `latest_release` gives.
     pub desktop_version: String,
     pub viewer_login: ViewerLookup,
+    /// The event fan-out `/v1/events` subscribers hang off. Lives in
+    /// `gate::Remote` across listener restarts.
+    pub events: Arc<Hub>,
+    /// `PairingState::subscribe_revocations()`. Each event stream
+    /// `resubscribe`s so a revocation reaches every open stream.
+    pub revocations: broadcast::Receiver<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -128,9 +209,18 @@ pub struct Hello {
 
 struct AppState {
     paired: Arc<dyn PairedCerts>,
+    pairing: Arc<PairingState>,
+    host: Arc<dyn CommandHost>,
+    /// The desktop certificate's fingerprint, the second half of the
+    /// pairing proof.
+    server_fp: String,
+    /// One replay window for the whole listener, as `stepup` asks.
+    nonces: NonceWindow,
     desktop_version: String,
     viewer_login: ViewerLookup,
     viewer_cache: tokio::sync::OnceCell<String>,
+    events: Arc<Hub>,
+    revocations: broadcast::Receiver<String>,
 }
 
 /// A running listener. Dropping it stops accepting; [`Handle::stop`]
@@ -304,14 +394,164 @@ async fn hello(State(st): State<Arc<AppState>>) -> Json<Hello> {
     })
 }
 
+/// `GET /v1/events`: the stream described in `remote/events.rs`.
+async fn events(State(st): State<Arc<AppState>>, Extension(peer): Extension<Peer>) -> Response {
+    let sub = events::Subscriber {
+        fingerprint: peer.fingerprint,
+        revocations: st.revocations.resubscribe(),
+        paired: st.paired.clone(),
+    };
+    match events::subscribe(&st.events, sub).await {
+        Some(sse) => sse.into_response(),
+        None => (StatusCode::FORBIDDEN, "not paired").into_response(),
+    }
+}
+
+/// A plain-text error response with the status an error type chose.
+fn refusal(status: u16, message: String) -> Response {
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (status, message).into_response()
+}
+
+/// The request body as the JSON the command expects, or the 400 message
+/// to send. Empty means "no arguments", which `surface::dispatch` reads
+/// as `{}`.
+fn parse_body(body: &Bytes) -> Result<Value, String> {
+    if body.is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_slice(body).map_err(|e| format!("request body is not JSON: {e}"))
+}
+
+/// `POST /v1/pair`: the handshake in `remote/pairing.rs`, for the
+/// certificate this connection presented.
+async fn pair(
+    State(st): State<Arc<AppState>>,
+    Extension(peer): Extension<Peer>,
+    body: Bytes,
+) -> Response {
+    let req: PairRequest = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(e) => return refusal(400, format!("bad pair request: {e}")),
+    };
+    let client = PeerCert {
+        fingerprint: peer.fingerprint,
+        der: peer.der,
+    };
+    match pairing::handle_pair(&st.pairing, req, &client, &st.server_fp).await {
+        Ok(outcome) => Json(outcome).into_response(),
+        Err(e) => refusal(e.http_status(), e.to_string()),
+    }
+}
+
+/// `POST /v1/call/{command}`: the contract in `remote/surface.rs`, with
+/// the step-up check from `remote/stepup.rs` in front of a destructive
+/// command.
+async fn call(
+    State(st): State<Arc<AppState>>,
+    Extension(peer): Extension<Peer>,
+    Path(command): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    // The gate admitted the fingerprint; the row is what the signature
+    // check and the log line need. Gone between the two means revoked.
+    let Some(device) = st.paired.device(&peer.fingerprint) else {
+        return refusal(403, "not paired".into());
+    };
+    let class = match surface::class_of(&command) {
+        None => return refusal_for(RemoteError::Unknown(command)),
+        Some(Class::Local) => return refusal_for(RemoteError::Local(command)),
+        Some(class) => class,
+    };
+    let args = match parse_body(&body) {
+        Ok(args) => args,
+        Err(message) => return refusal(400, message),
+    };
+    if class == Class::Destructive {
+        // A header that is not even ASCII is a header the phone built
+        // wrong, not a missing one; `""` parses as malformed.
+        let header = headers
+            .get(stepup::HEADER)
+            .map(|v| v.to_str().unwrap_or(""));
+        let now = chrono::Utc::now().timestamp();
+        if let Err(e) = stepup::verify(&device, &command, &args, header, now, &st.nonces) {
+            log::warn!(
+                "remote: refused a destructive {command} from {}: {e}",
+                device.name
+            );
+            return refusal(e.http_status(), e.to_string());
+        }
+    }
+    let result = st.host.dispatch(&command, args, &device.name).await;
+    if class == Class::Destructive {
+        // The attempt is the news, whether or not it succeeded.
+        st.host.notify_destructive(&device.name, &command);
+    }
+    match result {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => refusal_for(e),
+    }
+}
+
+fn refusal_for(e: RemoteError) -> Response {
+    refusal(e.http_status(), e.to_string())
+}
+
 fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/hello", get(hello))
+        .route(events::PATH, get(events))
+        .route(PAIR_PATH, post(pair))
+        .route(&format!("{CALL_PREFIX}{{command}}"), post(call))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_paired,
         ))
         .with_state(state)
+}
+
+/// A bound, listening socket at `addr`.
+///
+/// Not `TcpListener::bind`, because an IPv6 wildcard bound that way is
+/// IPv6-only on Windows (`IPV6_V6ONLY` defaults on there, off on Linux
+/// and macOS), and the QR lists the machine's IPv4 addresses too. The
+/// option is cleared explicitly so one socket serves both families on
+/// all three platforms. `SO_REUSEADDR` matches what tokio sets on unix,
+/// so toggling the feature off and on does not wait out `TIME_WAIT`;
+/// it is not set on Windows, where it means something else.
+fn bind_socket(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(false)?;
+    }
+    #[cfg(not(windows))]
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(128)?;
+    Ok(socket.into())
+}
+
+/// `bind_socket`, with the IPv4 wildcard as the fallback when the IPv6
+/// wildcard cannot be bound at all -- a kernel booted with IPv6 off.
+/// A port in use fails the same way on both and is reported as such.
+fn bind(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
+    match bind_socket(addr) {
+        Ok(listener) => Ok(listener),
+        Err(e) if addr.is_ipv6() && addr.ip().is_unspecified() => {
+            let v4 = SocketAddr::from((Ipv4Addr::UNSPECIFIED, addr.port()));
+            log::warn!("remote: could not listen on {addr} ({e}); trying {v4}");
+            bind_socket(v4)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Bind, then serve on a spawned task until the handle is stopped.
@@ -321,29 +561,40 @@ fn router(state: Arc<AppState>) -> Router {
 /// error, not logged from a task nobody is watching.
 pub async fn start(cfg: ListenerConfig) -> Result<Handle, ListenerError> {
     let tls = server_config(&cfg.identity, cfg.paired.clone())?;
-    let listener = TcpListener::bind(cfg.bind)
-        .await
-        .map_err(|source| ListenerError::Bind {
-            addr: cfg.bind,
-            source,
-        })?;
-    let addr = listener
-        .local_addr()
-        .map_err(|source| ListenerError::Bind {
-            addr: cfg.bind,
-            source,
-        })?;
+    let bind_err = |source| ListenerError::Bind {
+        addr: cfg.bind,
+        source,
+    };
+    let listener = bind(cfg.bind)
+        .and_then(TcpListener::from_std)
+        .map_err(bind_err)?;
+    let addr = listener.local_addr().map_err(bind_err)?;
 
+    let revocations = cfg.revocations.resubscribe();
     let state = Arc::new(AppState {
         paired: cfg.paired,
+        pairing: cfg.pairing,
+        host: cfg.host,
+        server_fp: cfg.identity.fingerprint(),
+        nonces: NonceWindow::new(),
         desktop_version: cfg.desktop_version,
         viewer_login: cfg.viewer_login,
         viewer_cache: tokio::sync::OnceCell::new(),
+        events: cfg.events,
+        revocations: cfg.revocations,
     });
+    let paired = state.paired.clone();
     let app = router(state);
     let acceptor = TlsAcceptor::from(Arc::new(tls));
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let task = tokio::spawn(accept_loop(listener, acceptor, app, shutdown_rx));
+    let task = tokio::spawn(accept_loop(
+        listener,
+        acceptor,
+        app,
+        paired,
+        revocations,
+        shutdown_rx,
+    ));
 
     log::info!("remote: listening on {addr}");
     Ok(Handle {
@@ -357,6 +608,8 @@ async fn accept_loop(
     listener: TcpListener,
     acceptor: TlsAcceptor,
     app: Router,
+    paired: Arc<dyn PairedCerts>,
+    revocations: broadcast::Receiver<String>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let mut conns: JoinSet<()> = JoinSet::new();
@@ -365,7 +618,14 @@ async fn accept_loop(
             _ = &mut shutdown => break,
             accepted = listener.accept() => match accepted {
                 Ok((tcp, from)) => {
-                    conns.spawn(serve_connection(tcp, from, acceptor.clone(), app.clone()));
+                    conns.spawn(serve_connection(
+                        tcp,
+                        from,
+                        acceptor.clone(),
+                        app.clone(),
+                        paired.clone(),
+                        revocations.resubscribe(),
+                    ));
                 }
                 Err(e) => {
                     // Out of file descriptors, most likely. Do not spin.
@@ -383,8 +643,16 @@ async fn accept_loop(
     log::info!("remote: listener stopped");
 }
 
-/// One connection: handshake, then HTTP/1.1 until it closes.
-async fn serve_connection(tcp: TcpStream, from: SocketAddr, acceptor: TlsAcceptor, app: Router) {
+/// One connection: handshake, then HTTP/1.1 until it closes -- or until
+/// the certificate it presented is revoked.
+async fn serve_connection(
+    tcp: TcpStream,
+    from: SocketAddr,
+    acceptor: TlsAcceptor,
+    app: Router,
+    paired: Arc<dyn PairedCerts>,
+    mut revocations: broadcast::Receiver<String>,
+) {
     let tls = match acceptor.accept(tcp).await {
         Ok(tls) => tls,
         Err(e) => {
@@ -397,56 +665,123 @@ async fn serve_connection(tcp: TcpStream, from: SocketAddr, acceptor: TlsAccepto
     // The verifier has already approved this certificate; here it is
     // only named. Client auth is mandatory, so a handshake that
     // completed presented one.
-    let Some(fp) = tls
+    let Some(der) = tls
         .get_ref()
         .1
         .peer_certificates()
         .and_then(|chain| chain.first())
-        .map(|cert| fingerprint_of(cert.as_ref()))
+        .map(|cert| cert.as_ref().to_vec())
     else {
         log::error!("remote: a handshake completed without a client certificate");
         return;
     };
-    let peer = Peer { fingerprint: fp };
+    let fp = fingerprint_of(&der);
+    let peer = Peer {
+        fingerprint: fp.clone(),
+        der,
+    };
 
     let service = hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
         req.extensions_mut().insert(peer.clone());
         let mut app = app.clone();
         async move { tower_service::Service::call(&mut app, req).await }
     });
-    if let Err(e) = hyper::server::conn::http1::Builder::new()
-        .serve_connection(TokioIo::new(tls), service)
-        .await
-    {
+    let conn =
+        hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(tls), service);
+    tokio::pin!(conn);
+    let result = tokio::select! {
+        result = &mut conn => result,
+        _ = revoked(&mut revocations, &fp, paired.as_ref()) => {
+            log::info!("remote: closing the connection from {from}: its device was revoked");
+            // Graceful: an in-flight response completes and no further
+            // request is served. The event stream ends itself on the
+            // same broadcast, so "in flight" is bounded -- and the
+            // deadline is for anything that is not.
+            conn.as_mut().graceful_shutdown();
+            match tokio::time::timeout(REVOKE_GRACE, &mut conn).await {
+                Ok(result) => result,
+                Err(_) => {
+                    log::info!("remote: dropped the connection from {from} after the grace period");
+                    return;
+                }
+            }
+        }
+    };
+    if let Err(e) = result {
         // A phone going out of range closes mid-request; that is
         // ordinary and not worth a warning.
         log::debug!("remote: connection from {from} ended: {e}");
     }
 }
 
+/// Resolves when `fp` is revoked. A lagged broadcast may have carried
+/// this device's revocation, so it falls back to asking; a closed one
+/// means the pairing state is gone and nothing can revoke anymore, and
+/// the connection is left to the per-request gate.
+async fn revoked(rx: &mut broadcast::Receiver<String>, fp: &str, paired: &dyn PairedCerts) {
+    loop {
+        match rx.recv().await {
+            Ok(revoked) if revoked == fp => return,
+            Ok(_) => {}
+            Err(RecvError::Lagged(_)) => {
+                if !paired.is_paired(fp) {
+                    return;
+                }
+            }
+            Err(RecvError::Closed) => std::future::pending::<()>().await,
+        }
+    }
+}
+
+/// `pub(crate)`: `remote/events.rs` drives its stream tests through the
+/// same in-memory pairing store and pinned client as the tests here.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::remote::events::SnapshotSource;
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use rustls::pki_types::ServerName;
     use rustls::{ClientConfig, NamedGroup};
-    use std::collections::HashSet;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::client::TlsStream;
 
     /// The in-memory `PairedCerts` the spec's verifier tests run against.
     #[derive(Default)]
-    struct MemoryCerts {
-        paired: Mutex<HashSet<String>>,
+    pub(crate) struct MemoryCerts {
+        paired: Mutex<HashMap<String, PairedDevice>>,
         window: AtomicBool,
     }
 
-    impl MemoryCerts {
-        fn pair(&self, fp: &str) {
-            self.paired.lock().unwrap().insert(fp.to_string());
+    /// A row for a device the tests only ever identify by fingerprint.
+    /// The keys are placeholders; a test that verifies signatures pairs
+    /// a real row with `pair_device`.
+    pub(crate) fn placeholder_device(fp: &str) -> PairedDevice {
+        PairedDevice {
+            id: 1,
+            name: "Octocat's phone".into(),
+            cert_fp: fp.to_string(),
+            cert_der: vec![0x30],
+            ecdsa_pubkey: vec![0x04; 65],
+            mldsa_pubkey: None,
+            paired_at: "2026-09-05T00:00:00Z".into(),
+            last_seen: None,
         }
-        fn revoke(&self, fp: &str) {
+    }
+
+    impl MemoryCerts {
+        pub(crate) fn pair(&self, fp: &str) {
+            self.pair_device(placeholder_device(fp));
+        }
+        pub(crate) fn pair_device(&self, device: PairedDevice) {
+            self.paired
+                .lock()
+                .unwrap()
+                .insert(device.cert_fp.clone(), device);
+        }
+        pub(crate) fn revoke(&self, fp: &str) {
             self.paired.lock().unwrap().remove(fp);
         }
         fn open_window(&self, open: bool) {
@@ -456,10 +791,50 @@ mod tests {
 
     impl PairedCerts for MemoryCerts {
         fn is_paired(&self, fp: &str) -> bool {
-            self.paired.lock().unwrap().contains(fp)
+            self.paired.lock().unwrap().contains_key(fp)
         }
         fn pairing_window_open(&self) -> bool {
             self.window.load(Ordering::SeqCst)
+        }
+        fn device(&self, fp: &str) -> Option<PairedDevice> {
+            self.paired.lock().unwrap().get(fp).cloned()
+        }
+    }
+
+    /// A `CommandHost` that runs nothing and remembers everything: what
+    /// it was asked to dispatch, and which destructive calls it was told
+    /// to announce. Answers `{"ran": <command>}` unless told to fail.
+    #[derive(Default)]
+    pub(crate) struct RecordingHost {
+        pub(crate) calls: Mutex<Vec<(String, Value, String)>>,
+        pub(crate) notices: Mutex<Vec<(String, String)>>,
+        pub(crate) fail_with: Mutex<Option<RemoteError>>,
+    }
+
+    impl CommandHost for RecordingHost {
+        fn dispatch<'a>(
+            &'a self,
+            command: &'a str,
+            args: Value,
+            device_name: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, RemoteError>> + Send + 'a>> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push((
+                    command.to_string(),
+                    args,
+                    device_name.to_string(),
+                ));
+                match self.fail_with.lock().unwrap().clone() {
+                    Some(e) => Err(e),
+                    None => Ok(serde_json::json!({ "ran": command })),
+                }
+            })
+        }
+        fn notify_destructive(&self, device_name: &str, command: &str) {
+            self.notices
+                .lock()
+                .unwrap()
+                .push((device_name.to_string(), command.to_string()));
         }
     }
 
@@ -510,28 +885,67 @@ mod tests {
         }
     }
 
-    struct Server {
-        handle: Handle,
-        fp: String,
-        certs: Arc<MemoryCerts>,
+    pub(crate) struct Server {
+        pub(crate) handle: Handle,
+        pub(crate) fp: String,
+        pub(crate) certs: Arc<MemoryCerts>,
+        /// The pairing task's side of the revocation broadcast.
+        pub(crate) revocations: broadcast::Sender<String>,
+        pub(crate) host: Arc<RecordingHost>,
+    }
+
+    /// A hub with nothing to snapshot, for tests that never open the
+    /// event stream.
+    pub(crate) fn no_snapshot() -> SnapshotSource {
+        Arc::new(|| Box::pin(async { None }))
+    }
+
+    /// A pairing state whose modal nobody answers, for tests that never
+    /// post to `/v1/pair`.
+    pub(crate) fn idle_pairing() -> Arc<PairingState> {
+        Arc::new(PairingState::new(|_| {}))
     }
 
     async fn serve(certs: Arc<MemoryCerts>) -> Server {
+        serve_with(certs, Arc::new(Hub::new(no_snapshot()))).await
+    }
+
+    pub(crate) async fn serve_with(certs: Arc<MemoryCerts>, events: Arc<Hub>) -> Server {
+        serve_at("127.0.0.1:0".parse().unwrap(), certs, events).await
+    }
+
+    pub(crate) async fn serve_at(
+        bind: SocketAddr,
+        certs: Arc<MemoryCerts>,
+        events: Arc<Hub>,
+    ) -> Server {
         let identity = Identity::generate().unwrap();
         let fp = identity.fingerprint();
+        let (revocations, rx) = broadcast::channel(16);
+        let host = Arc::new(RecordingHost::default());
         let handle = start(ListenerConfig {
-            bind: "127.0.0.1:0".parse().unwrap(),
+            bind,
             identity,
             paired: certs.clone(),
+            pairing: idle_pairing(),
+            host: host.clone(),
             desktop_version: "9.9.9".into(),
             viewer_login: Arc::new(|| Box::pin(async { Some("octocat".to_string()) })),
+            events,
+            revocations: rx,
         })
         .await
         .unwrap();
-        Server { handle, fp, certs }
+        Server {
+            handle,
+            fp,
+            certs,
+            revocations,
+            host,
+        }
     }
 
-    fn client_config(phone: Option<&Identity>, server_fp: &str) -> Arc<ClientConfig> {
+    pub(crate) fn client_config(phone: Option<&Identity>, server_fp: &str) -> Arc<ClientConfig> {
         let provider = Arc::new(provider());
         let verifier = PinnedServer {
             fp: server_fp.to_string(),
@@ -551,35 +965,61 @@ mod tests {
         Arc::new(cfg)
     }
 
-    struct Reply {
-        status: u16,
-        body: String,
-        kx: Option<NamedGroup>,
+    pub(crate) struct Reply {
+        pub(crate) status: u16,
+        pub(crate) body: String,
+        pub(crate) kx: Option<NamedGroup>,
     }
 
-    /// One HTTP/1.1 GET over a fresh mTLS connection. `Err` for any
-    /// failure at any layer -- a refused handshake shows up as the
-    /// server's alert on the first read, after the client believed its
-    /// half of the TLS 1.3 handshake was complete.
+    /// A fresh mTLS connection to the listener, handshake complete.
+    pub(crate) async fn connect(
+        addr: SocketAddr,
+        phone: Option<&Identity>,
+        server_fp: &str,
+    ) -> Result<TlsStream<TcpStream>, String> {
+        let connector = tokio_rustls::TlsConnector::from(client_config(phone, server_fp));
+        let tcp = TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
+        let name = ServerName::try_from("localhost").unwrap();
+        connector
+            .connect(name, tcp)
+            .await
+            .map_err(|e| format!("handshake: {e}"))
+    }
+
+    /// One HTTP/1.1 GET over a fresh mTLS connection; see `request`.
     async fn get(
         addr: SocketAddr,
         path: &str,
         phone: Option<&Identity>,
         server_fp: &str,
     ) -> Result<Reply, String> {
-        let connector = tokio_rustls::TlsConnector::from(client_config(phone, server_fp));
-        let tcp = TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
-        let name = ServerName::try_from("localhost").unwrap();
-        let mut tls = connector
-            .connect(name, tcp)
+        request(addr, phone, server_fp, "GET", path, &[], None).await
+    }
+
+    /// One HTTP/1.1 request over a fresh mTLS connection. `Err` for any
+    /// failure at any layer -- a refused handshake shows up as the
+    /// server's alert on the first read, after the client believed its
+    /// half of the TLS 1.3 handshake was complete.
+    pub(crate) async fn request(
+        addr: SocketAddr,
+        phone: Option<&Identity>,
+        server_fp: &str,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&str>,
+    ) -> Result<Reply, String> {
+        let mut tls = connect(addr, phone, server_fp).await?;
+        let mut head =
+            format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
+        for (name, value) in headers {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+        let body = body.unwrap_or("");
+        head.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
+        tls.write_all(head.as_bytes())
             .await
-            .map_err(|e| format!("handshake: {e}"))?;
-        tls.write_all(
-            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-                .as_bytes(),
-        )
-        .await
-        .map_err(|e| format!("write: {e}"))?;
+            .map_err(|e| format!("write: {e}"))?;
         let mut raw = Vec::new();
         // The server closes after the response (Connection: close); a
         // refusal closes without one.
@@ -696,8 +1136,8 @@ mod tests {
 
     /// While a pairing window is open the handshake admits an unpaired
     /// certificate -- and the path gate then allows it `/v1/pair` only.
-    /// 404 rather than 403 on the pair path proves it got past the gate
-    /// (no handler is mounted there yet; that is the pairing task's).
+    /// 405 rather than 403 on a GET of the pair path proves it got past
+    /// the gate and reached the (POST-only) handler.
     #[tokio::test]
     async fn an_open_pairing_window_admits_an_unpaired_phone_to_pair_and_nothing_else() {
         let certs = Arc::new(MemoryCerts::default());
@@ -710,11 +1150,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hello.status, 403);
+        let call = request(
+            addr,
+            Some(&phone),
+            &server.fp,
+            "POST",
+            "/v1/call/get_cached",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(call.status, 403);
+        assert!(server.host.calls.lock().unwrap().is_empty());
 
         let pair = get(addr, PAIR_PATH, Some(&phone), &server.fp)
             .await
             .unwrap();
-        assert_eq!(pair.status, 404);
+        assert_eq!(pair.status, 405);
 
         // Window closed again: back to failing the handshake.
         server.certs.open_window(false);
@@ -778,8 +1231,12 @@ mod tests {
             bind: "127.0.0.1:0".parse().unwrap(),
             identity,
             paired: certs.clone(),
+            pairing: idle_pairing(),
+            host: Arc::new(RecordingHost::default()),
             desktop_version: "9.9.9".into(),
             viewer_login: Arc::new(|| Box::pin(async { None })),
+            events: Arc::new(Hub::new(no_snapshot())),
+            revocations: broadcast::channel(1).1,
         })
         .await
         .unwrap();
@@ -816,14 +1273,91 @@ mod tests {
             bind: server.handle.local_addr(),
             identity: Identity::generate().unwrap(),
             paired: certs,
+            pairing: idle_pairing(),
+            host: Arc::new(RecordingHost::default()),
             desktop_version: "9.9.9".into(),
             viewer_login: Arc::new(|| Box::pin(async { None })),
+            events: Arc::new(Hub::new(no_snapshot())),
+            revocations: broadcast::channel(1).1,
         })
         .await
         .err()
         .expect("binding a taken port must fail");
         assert!(matches!(err, ListenerError::Bind { .. }));
         assert!(err.to_string().contains("could not listen on"));
+        server.handle.stop().await;
+    }
+
+    /// Production binds the IPv6 wildcard, and the QR lists IPv4
+    /// addresses: a phone on IPv4 must reach it. On a runner with IPv6
+    /// off the fallback to `0.0.0.0` makes the same test pass, which is
+    /// the property wanted either way.
+    #[tokio::test]
+    async fn the_ipv6_wildcard_answers_on_ipv4_too() {
+        let certs = Arc::new(MemoryCerts::default());
+        let server = serve_at(
+            "[::]:0".parse().unwrap(),
+            certs,
+            Arc::new(Hub::new(no_snapshot())),
+        )
+        .await;
+        let phone = Identity::generate().unwrap();
+        server.certs.pair(&phone.fingerprint());
+        let port = server.handle.local_addr().port();
+
+        let v4 = SocketAddr::from(([127, 0, 0, 1], port));
+        let reply = get(v4, "/v1/hello", Some(&phone), &server.fp)
+            .await
+            .expect("reachable over IPv4 loopback");
+        assert_eq!(reply.status, 200);
+        server.handle.stop().await;
+    }
+
+    /// Revocation closes what the device already has open, not only
+    /// what it opens next: an idle keep-alive connection is shut by the
+    /// desktop when the broadcast names its certificate.
+    #[tokio::test]
+    async fn revoking_a_device_closes_its_idle_connection() {
+        let certs = Arc::new(MemoryCerts::default());
+        let server = serve(certs).await;
+        let phone = Identity::generate().unwrap();
+        server.certs.pair(&phone.fingerprint());
+        let other = Identity::generate().unwrap();
+        server.certs.pair(&other.fingerprint());
+        let addr = server.handle.local_addr();
+
+        let open = |id: &Identity| {
+            let fp = server.fp.clone();
+            let id = id.clone();
+            async move {
+                let mut tls = connect(addr, Some(&id), &fp).await.unwrap();
+                tls.write_all(b"GET /v1/hello HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut buf = vec![0u8; 4096];
+                let n = tls.read(&mut buf).await.unwrap();
+                assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+                tls
+            }
+        };
+        let mut revoked = open(&phone).await;
+        let mut kept = open(&other).await;
+
+        server.certs.revoke(&phone.fingerprint());
+        server.revocations.send(phone.fingerprint()).unwrap();
+
+        let mut buf = [0u8; 16];
+        let closed = tokio::time::timeout(Duration::from_secs(5), revoked.read(&mut buf)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+            "the revoked device's connection must be closed: {closed:?}"
+        );
+        // The other device's connection still serves.
+        kept.write_all(b"GET /v1/hello HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let n = kept.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
         server.handle.stop().await;
     }
 }

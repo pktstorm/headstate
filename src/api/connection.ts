@@ -10,11 +10,14 @@ import { invoke } from "@tauri-apps/api/core";
 /// `desktop` is the paired desktop's name from the pairing QR, null
 /// while unpaired; `last_poll` is when the desktop last reported a
 /// successful GitHub poll over `/v1/events`, ISO 8601, null before the
-/// first one.
+/// first one; `protocol_version` is what the desktop's `/v1/hello`
+/// answered, absent or null until the phone has heard one. A report
+/// from before the field existed reads the same as "not known".
 interface ConnectionReport {
   state: "unpaired" | "connecting" | "connected" | "unreachable" | "revoked";
   desktop: string | null;
   last_poll: string | null;
+  protocol_version?: number | null;
 }
 
 /// The connection as the UI sees it.
@@ -24,13 +27,24 @@ interface ConnectionReport {
 /// the mobile build before `connection_state` has answered -- including
 /// when the command is not there, which is the case until #514 lands.
 /// The rest are the command's own states, with the desktop's name
-/// attached because every banner line needs it.
+/// attached because every banner line needs it. `connected` also
+/// carries the desktop's protocol version, because that is the one
+/// state in which the phone would otherwise go on to issue commands: a
+/// desktop older than `REQUIRED_PROTOCOL_VERSION` (`src/lib/protocol.ts`)
+/// is reachable and yet must not be driven, and the banner says so.
 export type ConnectionState =
   | { kind: "local" }
   | { kind: "unknown" }
   | { kind: "unpaired" }
   | {
-      kind: "connecting" | "connected" | "unreachable" | "revoked";
+      kind: "connected";
+      desktop: string;
+      lastPoll: string | null;
+      /// Null while unknown; never null once the desktop has answered.
+      protocolVersion: number | null;
+    }
+  | {
+      kind: "connecting" | "unreachable" | "revoked";
       desktop: string;
       lastPoll: string | null;
     };
@@ -50,14 +64,22 @@ function connectionState(): Promise<ConnectionReport> {
 
 function fromReport(report: ConnectionReport): ConnectionState {
   if (report.state === "unpaired") return { kind: "unpaired" };
-  return {
-    kind: report.state,
-    // A paired desktop always has a name -- it came from the QR -- but
-    // the wire type allows null, and a banner reading "null is
-    // unreachable" is worse than a generic noun.
-    desktop: report.desktop ?? "Desktop",
-    lastPoll: report.last_poll,
-  };
+  // A paired desktop always has a name -- it came from the QR -- but
+  // the wire type allows null, and a banner reading "null is
+  // unreachable" is worse than a generic noun.
+  const desktop = report.desktop ?? "Desktop";
+  if (report.state === "connected") {
+    return {
+      kind: "connected",
+      desktop,
+      lastPoll: report.last_poll,
+      // Missing and null both mean "not known": the banner treats an
+      // unknown version as fine, so a report that predates the field
+      // does not turn into an update demand.
+      protocolVersion: report.protocol_version ?? null,
+    };
+  }
+  return { kind: report.state, desktop, lastPoll: report.last_poll };
 }
 
 const LOCAL: ConnectionState = { kind: "local" };

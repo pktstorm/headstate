@@ -14,5 +14,19 @@
   <array>
     <string>_headstate._tcp</string>
   </array>
+  <!-- Opportunistic background refresh (plugins/headstate-refresh,
+       #516). BGTaskScheduler refuses to register or submit a task whose
+       identifier is not listed here, and grants app-refresh windows
+       only to an app that declares the `fetch` background mode. This is
+       a window a few seconds long every fifteen minutes at best, not a
+       stream; nothing here keeps the app alive. -->
+  <key>BGTaskSchedulerPermittedIdentifiers</key>
+  <array>
+    <string>com.pktstorm.headstate.companion.refresh</string>
+  </array>
+  <key>UIBackgroundModes</key>
+  <array>
+    <string>fetch</string>
+  </array>
 </dict>
 </plist>

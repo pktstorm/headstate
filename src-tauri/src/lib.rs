@@ -279,12 +279,9 @@ pub fn run() {
 
             // Phone pairing. Managed whether or not the listener is on,
             // because Settings lists and revokes paired devices either
-            // way. The identity is a stub until `remote/identity.rs`
-            // lands; the listener's integration swaps the real one in.
+            // way. `remote::gate::setup` below loads its device list
+            // and manages the desktop identity it reads.
             app.manage(remote::pairing::new_state(handle.clone()));
-            app.manage(remote::pairing::DesktopIdentity(Arc::new(
-                remote::pairing::StubIdentity,
-            )));
 
             log::info!(
                 "headstate v{} starting (authenticated: {})",

@@ -100,6 +100,19 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 hyper = { version = "1", default-features = false, features = ["server", "http1"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 tower-service = "0.3"
+# The `/v1/events` stream (`remote/events.rs`): axum's `Sse` takes a
+# `Stream`, and `stream::unfold` is what turns a broadcast receiver plus
+# a revocation watch into one without a hand-written poll function.
+# Already in the tree via axum and hyper; default features off so it
+# stays the subset they already compile.
+futures-util = { version = "0.3", default-features = false }
+# The listener's dual-stack socket (`remote/listener.rs`). Binding the
+# IPv6 wildcard through `TcpListener::bind` gives an IPv6-ONLY socket on
+# Windows (`IPV6_V6ONLY` defaults on there and off on Linux and macOS),
+# while the pairing QR lists the machine's IPv4 addresses too; std has
+# no way to clear the option, socket2 does. Already in the tree via
+# tokio and hyper-util, at this version.
+socket2 = "0.6"
 # The desktop identity's private key goes in the platform keychain --
 # Keychain Services on macOS, Credential Manager on Windows, the
 # Secret Service (via a pure-Rust D-Bus client, no libdbus) on Linux.
@@ -158,6 +171,14 @@ p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 # digest 0.10 predates the Wycheproof and use_hint fixes in 0.1.0 and is
 # not an option for a verifier.
 ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc"] }
+# LAN discovery (remote/discovery.rs). Advertises `_headstate._tcp` while
+# the listener is up so a phone whose stored address went stale can still
+# find this desktop. Pure Rust over `socket2` and the `if-addrs` above --
+# no Bonjour, Avahi, or dns-sd FFI, which is what makes Windows and Linux
+# best-effort rather than a build dependency. No `async` feature: the
+# daemon runs its own thread and the handful of calls we make are channel
+# sends, so pulling flume's async half in would buy nothing.
+mdns-sd = { version = "0.21", default-features = false, features = ["logging"] }
 
 [dev-dependencies]
 temp-env = "0.3"

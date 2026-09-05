@@ -24,6 +24,14 @@ edition = "2021"
 #
 # The cost is a second lockfile and a second `cargo deny` run; both are
 # wired into the Makefile.
+#
+# This crate IS the root of its own small workspace, so the in-repo
+# plugins under `plugins/` share this lockfile and are covered by the
+# same `cargo test --workspace`, `cargo clippy --workspace` and `cargo
+# deny` runs. Everything above about what the lock proves applies to
+# them too.
+[workspace]
+members = ["plugins/headstate-refresh"]
 
 [lib]
 name = "headstate_companion_lib"
@@ -57,3 +65,15 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", 
 # reason as above: the default `ring` feature would compile a second
 # crypto library into the phone.
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+# LAN discovery of the paired desktop (src/discovery.rs): browse for
+# `_headstate._tcp` and match the TXT fingerprint prefix before trying the
+# addresses stored at pairing. The same crate the desktop advertises with,
+# so the record shape is agreed by construction. Pure Rust, so nothing to
+# link on iOS beyond the entitlement the plist already declares. No
+# `async`: `browse` is a blocking call the client runs on a blocking task.
+mdns-sd = { version = "0.21", default-features = false, features = ["logging"] }
+# The opportunistic background refresh window on each platform (#516).
+# In-repo: Swift and Kotlin sides live under plugins/headstate-refresh.
+# The version is stated so the path dependency is not a wildcard for
+# `cargo deny`.
+tauri-plugin-headstate-refresh = { version = "0.1.0", path = "plugins/headstate-refresh" }

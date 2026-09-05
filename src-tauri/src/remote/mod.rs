@@ -7,9 +7,16 @@
 //!
 //! See `docs/superpowers/specs/2026-09-05-mobile-companion-design.md`.
 
+pub mod discovery;
+pub mod events;
 pub mod gate;
 pub mod identity;
 pub mod listener;
 pub mod pairing;
 pub mod stepup;
 pub mod surface;
+
+/// The whole surface, end to end, over loopback: the spec's "loopback
+/// integration test".
+#[cfg(test)]
+mod loopback_tests;
