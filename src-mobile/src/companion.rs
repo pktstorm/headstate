@@ -304,7 +304,14 @@ mod tests {
         let fp = server.requests()[0].peer_fp.clone();
         server.pair(&fp);
         server.open_window(false);
-        until(|| c.connection_state().state == State::Connected).await;
+        // Connected is set after `hello`; the snapshot frame that fills in
+        // `last_poll` arrives a moment later on the stream. Wait for both, or
+        // a busy runner reads the report between the two.
+        until(|| {
+            let r = c.connection_state();
+            r.state == State::Connected && r.last_poll.is_some()
+        })
+        .await;
         (server, store, rec, c)
     }
 
