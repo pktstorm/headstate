@@ -279,39 +279,115 @@ later. This design therefore:
   Biometric gating is done by the platform's access control on the key
   itself, not by a separate prompt, so a signature cannot be produced
   without the check.
-- The desktop verifies ML-DSA-65 with a pure-Rust implementation. Two
-  candidates: the RustCrypto `ml-dsa` crate, which implements the final
-  FIPS 204 and is unaudited, and Cryspen's `libcrux-ml-dsa`, whose core
-  is formally verified. Verification is the safe side to be on here; the
-  desktop never holds an ML-DSA private key. aws-lc-rs also ships
-  ML-DSA, but its API has moved between the unstable and stable modules
-  across recent releases, so pin whichever crate the spike settles on.
+- The desktop verifies ML-DSA-65 with RustCrypto's `ml-dsa` crate,
+  pinned at 0.1.1, alongside `p256` 0.13 for the ECDSA half. The other
+  candidate was Cryspen's `libcrux-ml-dsa` 0.0.10, whose core is
+  formally verified; both implement final FIPS 204, and a cross-check
+  during implementation showed each verifies the other's signatures and
+  derives the same public key from the same seed. `ml-dsa` won on the
+  build: no build scripts, fifteen new lock entries all from RustCrypto,
+  and the `signature` traits `p256` already uses, against three
+  `build.rs` files, twenty-nine new entries including `hax-lib` proc
+  macros and a `cfg`-gated `bindgen` chain, and a 0.0.x API. The audit
+  gap is accepted because the desktop only verifies: formal verification
+  mostly protects a signer's secrets, and the only ML-DSA signer is the
+  phone's secure hardware. The header grammar, canonical bytes, and a
+  byte-exact test vector for the phone to match live in
+  `src-tauri/src/remote/stepup.rs`. aws-lc-rs also ships ML-DSA, but its
+  API has moved between the unstable and stable modules across recent
+  releases, so it was not considered.
 - The desktop's own identity key stays P256 in v1, for the same reason as
   the certificates.
 
-**Verify during the mobile crate spike.** These are the claims this
-section rests on that could not be confirmed from documentation alone:
+**Verified during the mobile crate spike** (#512, September 2026). These
+are the claims this section rests on that could not be confirmed from
+documentation alone when it was written. Each is now either resolved with
+its source, or marked unconfirmed with what was tried.
 
-- That `SecureEnclave.MLDSA65.PrivateKey` accepts the same access control
-  and authentication context parameters as the existing P256 Secure
-  Enclave key, so it can be biometric-gated. The P256 key does; the
-  ML-DSA documentation fetched for this design showed the type and its
-  availability but not its initialisers.
-- Which Secure Enclave generations support ML-DSA. Apple's session on the
-  topic named no hardware floor, but the API is only available on OS 26.
-- What Android Keystore does on a device running 17 whose KeyMint lacks
-  ML-DSA: a software-backed key or an exception. The plugin treats either
-  as "no ML-DSA" and pairs with ECDSA alone, and the pairing UI says so.
-- Whether `setUserAuthenticationRequired` applies to ML-DSA keys exactly
-  as it does to EC keys. Nothing suggests otherwise.
-- That aws-lc-rs cross-compiles cleanly for `aarch64-apple-ios` and
-  `aarch64-linux-android` under the toolchains Tauri mobile already
-  requires. It is the only way to get ML-KEM into rustls today; the ring
-  provider has no post-quantum key exchange.
-- That the desktop, which already links octocrab with the ring provider,
-  can add the aws-lc-rs provider for the listener without the two
-  colliding. rustls requires an explicit process-level default when both
-  are compiled in, so this is a one-line fix, but it has to be made.
+- **Resolved: `SecureEnclave.MLDSA65.PrivateKey` is biometric-gatable the
+  same way as the P256 key.** Apple's reference lists four initialisers:
+  `init(accessControl:)`, `init(accessControl:authenticationContext:)`,
+  `init(dataRepresentation:)`, and
+  `init(dataRepresentation:authenticationContext:)`, with the full
+  signature `init(accessControl: SecAccessControl = ..., authenticationContext:
+  LAContext? = nil) throws`. That is the P256 key's shape minus the
+  `compactRepresentable:` parameter, which has no meaning for a lattice
+  key. Available on iOS 26.0+ and every other Apple platform at 26.0.
+  Source: <https://developer.apple.com/documentation/cryptokit/secureenclave/mldsa65/privatekey>
+  and its `init(accesscontrol:authenticationcontext:)` page, read on
+  2026-09-04.
+- **Unconfirmed: which Secure Enclave generations support ML-DSA.** No
+  Apple source names a hardware floor. Tried: the `SecureEnclave.MLDSA65`
+  reference (availability is by OS version only, 26.0 everywhere); the
+  Platform Security guide's "Quantum-secure cryptography in Apple
+  operating systems" and "The Secure Enclave" pages (neither ties ML-DSA
+  to a chip); and the WWDC25 session 314 transcript, which says only that
+  "the ML-DSA implementation has Secure Enclave support". What is known:
+  iOS 26 itself requires A13 or later, so on iPhone the floor is at least
+  A13 by OS support alone. The plugin therefore does not test for a chip;
+  it calls `SecureEnclave.MLDSA65.PrivateKey(accessControl:)` at pairing
+  and treats a throw as "no ML-DSA", which is the same rule Android gets
+  below. Record the result per device in the pairing walkthrough.
+- **Resolved, with one gap: Android's behaviour when KeyMint lacks
+  ML-DSA.** The `KeyGenParameterSpec` reference states: "ML-DSA support
+  is only available on devices with a Trusted Execution Environment
+  running KeyMint version >= 5. Support can be determined by checking
+  that `PackageManager.FEATURE_HARDWARE_KEYSTORE` has a value >= 500."
+  So the plugin checks `hasSystemFeature(FEATURE_HARDWARE_KEYSTORE, 500)`
+  before generating and pairs with ECDSA alone when it is false; there is
+  no documented software-backed ML-DSA path. The gap: the documentation
+  does not say which exception `generateKeyPair()` throws on a device
+  that fails that check, so the plugin also treats any exception there as
+  "no ML-DSA", and after a successful generation it confirms
+  `KeyInfo.getSecurityLevel()` is TEE or StrongBox before advertising the
+  key. `KeyProperties.KEY_ALGORITHM_ML_DSA_65` is "Added in API level
+  37". Source: <https://developer.android.com/reference/android/security/keystore/KeyGenParameterSpec>
+  ("Example: ML-DSA key pair for signing") and
+  <https://developer.android.com/reference/android/security/keystore/KeyProperties>,
+  read on 2026-09-04.
+- **Resolved by documentation, not yet by a device: `setUserAuthenticationRequired`
+  applies to ML-DSA keys.** The method's reference is algorithm-agnostic
+  ("This authorization applies only to secret key and private key
+  operations. Public key operations are not restricted.") and the same
+  `KeyGenParameterSpec` page documents ML-DSA-specific constraints on its
+  sibling builder methods (digest must be `DIGEST_NONE`; `setKeySize` is
+  ignored), which shows ML-DSA keys go through the same spec and the
+  same authorisations. No source says otherwise. Confirm on a real
+  Android 17 device in the pairing walkthrough: one Face/fingerprint
+  prompt per destructive command.
+  Source: <https://developer.android.com/reference/android/security/keystore/KeyGenParameterSpec.Builder#setUserAuthenticationRequired(boolean)>.
+- **Resolved for iOS, deferred to CI for Android: aws-lc-rs
+  cross-compiles.** `cargo check --target aarch64-apple-ios` and
+  `cargo build --target aarch64-apple-ios --lib` of `src-mobile` (reqwest
+  0.13 on rustls 0.23/aws-lc-rs 1.18.1, rcgen 0.14 on aws-lc-rs) succeed
+  with Xcode 26.6 and the stock `aarch64-apple-ios` Rust target;
+  `aws-lc-sys` 0.45.0 compiled its C and assembly for the target,
+  including the `mldsa_*_aarch64_asm.o` objects. Android is unverified on
+  the spike machine: with no NDK, `cargo check --target
+  aarch64-linux-android` fails inside `aws-lc-sys` with `failed to find
+  tool "aarch64-linux-android-clang"`, which is the toolchain being
+  absent, not a compile error. The `mobile` CI job (#518) runs that check
+  with the NDK installed and is the verification of record.
+- **Resolved: aws-lc-rs exposes ML-DSA in its stable module.** At 1.18.0,
+  the version in `src-tauri/Cargo.lock`, `aws_lc_rs::signature`
+  re-exports `PqdsaKeyPair`, `PqdsaPrivateKey`, `PqdsaPublicKey`, and the
+  `ML_DSA_44`, `ML_DSA_65`, `ML_DSA_87` algorithms from `crate::pqdsa`
+  (`src/signature.rs`, lines 309-310), and `aws_lc_rs::unstable::signature`
+  is a module of deprecated aliases whose doc comment reads "The ML-DSA
+  signature APIs have been stabilized; use `crate::signature` instead."
+  The same is true of 1.18.1, which `src-mobile/Cargo.lock` resolved.
+  So aws-lc-rs is a third candidate for the desktop's ML-DSA-65
+  verifier, alongside RustCrypto `ml-dsa` and `libcrux-ml-dsa`, and it is
+  already in the desktop's lock through octocrab. Source: the crate
+  source in the local cargo registry, and
+  <https://docs.rs/aws-lc-rs/1.18.0/aws_lc_rs/unstable/index.html>.
+- **Still open: the desktop's two providers.** The desktop links octocrab
+  on the ring provider and will add aws-lc-rs for the listener. rustls
+  requires an explicit process-level default when both are compiled in,
+  so this is a one-line `CryptoProvider::install_default` in the
+  listener's start-up, but it has to be made and belongs to the listener
+  work, not the mobile crate. The mobile crate avoids the question: it
+  is a separate crate with its own lockfile, on aws-lc-rs only.
 
 ## Pairing
 

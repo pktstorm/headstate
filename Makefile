@@ -1,4 +1,63 @@
-.PHONY: dev build test test-rust test-ui lint lint-rust lint-ui fmt icons
+.PHONY: dev build test test-rust test-ui lint lint-rust lint-ui fmt icons \
+	mobile-frontend lint-mobile test-mobile check-mobile-ios check-mobile-android \
+	deny-mobile ios-init icons-mobile
+
+# ---- Mobile companion (src-mobile) ---------------------------------------
+#
+# A separate crate with its own lockfile; see src-mobile/Cargo.toml for
+# why. None of these targets is part of `lint` or `test` above: the
+# desktop gates stay exactly what CI runs, and the mobile ones need the
+# iOS or Android toolchain (#518 gives them their own CI job).
+#
+# `TAURI_APP_PATH` is load-bearing on every `yarn tauri` call. Yarn runs
+# package scripts from the workspace root, and from there the Tauri CLI
+# finds `src-tauri` first -- so without it `yarn tauri ios init` sets up
+# the DESKTOP crate for iOS. This was observed, not inferred.
+#
+# The shared frontend, built for the phone. `tauri ios build` runs this
+# itself through `beforeBuildCommand`; it is here for anyone driving
+# xcodebuild directly. `cargo check` and `cargo test` do NOT need it:
+# the crate was verified to compile with `dist/` absent.
+mobile-frontend:
+	VITE_TARGET=mobile yarn build
+
+lint-mobile:
+	cd src-mobile && cargo fmt --check
+	cd src-mobile && cargo clippy --all-targets -- -D warnings
+
+test-mobile:
+	cd src-mobile && cargo test
+
+# Proves the phone-only dependencies (reqwest on rustls/aws-lc-rs, rcgen)
+# cross-compile: aws-lc-sys builds C and assembly for the target, which
+# a host `cargo check` never exercises.
+check-mobile-ios:
+	rustup target add aarch64-apple-ios
+	cd src-mobile && cargo check --target aarch64-apple-ios
+
+# Needs an Android NDK: aws-lc-sys looks for `aarch64-linux-android-clang`
+# and fails without one (observed). Run through `yarn tauri android`
+# tooling or with NDK_HOME set.
+check-mobile-android:
+	rustup target add aarch64-linux-android
+	cd src-mobile && cargo check --target aarch64-linux-android
+
+deny-mobile:
+	cd src-mobile && cargo deny check
+
+# Regenerates gen/apple. The generated project is committed; re-run only
+# when Tauri's template changes, and review the diff.
+ios-init:
+	TAURI_APP_PATH=src-mobile yarn tauri ios init --ci
+
+# The companion's icons, from the same master as the desktop. `yarn tauri
+# icon` emits every platform's variant; the phone keeps the iOS and
+# Android sets plus the 1024px source, and the desktop's icons are not
+# touched.
+icons-mobile:
+	yarn tauri icon src-tauri/icons/icon-master.png -o src-mobile/icons
+	cd src-mobile/icons && rm -f 128x128.png 128x128@2x.png 32x32.png 64x64.png \
+		icon.icns icon.ico Square*.png StoreLogo.png
 
 dev:
 	yarn tauri dev
