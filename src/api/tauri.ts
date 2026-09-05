@@ -542,16 +542,11 @@ export interface UpdateRunDone {
 
 // ---------------------------------------------------------------------
 // Phone pairing (mobile companion). Rust side: src-tauri/src/remote/pairing.rs
-//
-// The Settings screens that call these (QR, confirmation modal, paired
-// devices list) are a separate task, so for now nothing imports them.
-// `@public` tells knip that is deliberate; drop the tags once the
-// screens land and knip can see real callers.
+// Callers: the pairing hooks in hooks.ts, behind Settings > Phone.
 // ---------------------------------------------------------------------
 
 /// What the pairing QR code encodes. Field names are the wire format the
 /// phone parses, so they stay snake_case and terse.
-/** @public */
 export interface PairingQrPayload {
   v: 1;
   name: string;
@@ -570,13 +565,11 @@ export interface PairingQrPayload {
 /// Settings > Pair a phone. Mints a two-minute, single-use token and
 /// returns what to render as a QR code. Rejects until the desktop has a
 /// certificate.
-/** @public */
 export const issuePairingToken = () =>
   call<PairingQrPayload>("issue_pairing_token");
 
 /// Payload of the `pairing-request` event: a phone has proved it holds
 /// the token and is waiting on the user's decision.
-/** @public */
 export interface PairingRequest {
   request_id: number;
   device_name: string;
@@ -595,7 +588,6 @@ export interface PairingRequest {
 /// with a message naming the device while the request stays pending --
 /// so the modal can ask "replace or keep both?" and answer again. The
 /// desktop never picks either on its own.
-/** @public */
 export const respondToPairing = (
   requestId: number,
   approve: boolean,
@@ -608,7 +600,6 @@ export const respondToPairing = (
   });
 
 /// A paired phone as Settings lists it. No key material.
-/** @public */
 export interface PairedDevice {
   id: number;
   name: string;
@@ -621,12 +612,10 @@ export interface PairedDevice {
   last_seen: string | null;
 }
 
-/** @public */
 export const listPairedDevices = () =>
   call<PairedDevice[]>("list_paired_devices");
 
 /// Delete the row and close that phone's open connections. A second
 /// click on an already-revoked device resolves rather than rejects.
-/** @public */
 export const revokePairedDevice = (id: number) =>
   call<void>("revoke_paired_device", { id });
