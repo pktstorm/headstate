@@ -1,0 +1,639 @@
+name: Mobile release
+
+# The phone app's release pipeline: a `mobile-v*` tag becomes a TestFlight
+# build and a Play internal-testing build, plus a GitHub pre-release that
+# holds both artifacts and their checksums for provenance.
+#
+# Separate from release.yml on purpose. The desktop ships through GitHub
+# Releases and updates itself; the phone is distributed by the stores and
+# has no self-update path, so the two are versioned and released
+# independently (spec: "Release"). Nothing here touches the desktop.
+#
+# Promotion from TestFlight / internal testing to the public stores is a
+# manual step, taken after the pairing walkthrough has passed on a real
+# device against the build number this job printed. See
+# docs/mobile-release-process.md.
+on:
+  push:
+    tags: ["mobile-v*"]
+  # A rehearsal. Builds both apps UNSIGNED, uploads them as workflow
+  # artifacts, and touches neither store nor a release -- so it needs no
+  # secrets and no enable flag. GitHub only offers the dispatch button
+  # for a workflow file that exists on the default branch, so this
+  # becomes available once the file is on main.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build unsigned; skip signing, store uploads and the pre-release"
+        type: boolean
+        default: true
+
+# Least privilege: contents:write solely to create the pre-release and
+# upload its assets. The store uploads use their own credentials.
+permissions:
+  contents: write
+
+env:
+  # Load-bearing on every `yarn tauri` call, and ABSOLUTE rather than the
+  # Makefile's `src-mobile`: yarn runs package scripts from the workspace
+  # root, where the CLI finds `src-tauri` first (observed, see the
+  # Makefile), and the generated Android project re-invokes `yarn tauri`
+  # from `src-mobile` itself (BuildTask.kt sets workingDir to rootDirRel),
+  # where a relative value would resolve to src-mobile/src-mobile.
+  TAURI_APP_PATH: ${{ github.workspace }}/src-mobile
+  # `inputs` is empty on a tag push, so this is "false" there.
+  DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+  # ONE build number for both stores, so the walkthrough's run record
+  # names a single number. It becomes CFBundleVersion on iOS and
+  # versionCode on Android; the version string from the tag becomes
+  # CFBundleShortVersionString and versionName. Both stores require it
+  # to increase, and run_number only ever increases for this workflow
+  # FILE -- renaming the file resets it to 1, so do not.
+  BUILD_NUMBER: ${{ github.run_number }}
+
+jobs:
+  # --- First release gate ---------------------------------------------
+  #
+  # Both build jobs are disabled until the repository variable
+  # MOBILE_RELEASE_ENABLED is `true` (Settings > Secrets and variables >
+  # Actions > Variables). The spec's "First release gate" keeps store
+  # builds manual until the pairing walkthrough has passed twice with no
+  # findings; flipping the variable is the act of enabling them, and
+  # needs no workflow edit. A dry run is exempt because it cannot reach a
+  # store: rehearsing the pipeline is how you find out it works BEFORE
+  # enabling it.
+  ios-release:
+    if: vars.MOBILE_RELEASE_ENABLED == 'true' || (github.event_name == 'workflow_dispatch' && inputs.dry_run)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # A signed release must come from a tag, and must have every secret
+      # it will need BEFORE spending twenty minutes building. Checked
+      # here in one place so a missing secret fails with its name rather
+      # than as "failed to import keychain certificate" deep in the build.
+      - name: Preflight
+        env:
+          IOS_DIST_CERT_P12_BASE64: ${{ secrets.IOS_DIST_CERT_P12_BASE64 }}
+          IOS_DIST_CERT_PASSWORD: ${{ secrets.IOS_DIST_CERT_PASSWORD }}
+          IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+          APPSTORE_API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          APPSTORE_API_ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
+          APPSTORE_API_PRIVATE_KEY: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run: unsigned build, no store upload, no release."
+            exit 0
+          fi
+          case "$GITHUB_REF" in
+            refs/tags/mobile-v*) ;;
+            *) echo "A signed release needs a mobile-v* tag; dispatch with dry_run for a rehearsal." >&2; exit 1 ;;
+          esac
+          missing=""
+          for name in IOS_DIST_CERT_P12_BASE64 IOS_DIST_CERT_PASSWORD \
+                      IOS_PROVISIONING_PROFILE_BASE64 APPSTORE_API_KEY_ID \
+                      APPSTORE_API_ISSUER_ID APPSTORE_API_PRIVATE_KEY; do
+            [ -n "${!name:-}" ] || missing="$missing $name"
+          done
+          if [ -n "$missing" ]; then
+            echo "Missing repository secrets:$missing" >&2
+            echo "See docs/mobile-release-process.md for how to generate each." >&2
+            exit 1
+          fi
+
+      - uses: ./.github/actions/setup
+        with:
+          rust-components: clippy, rustfmt
+          rust-workspaces: src-mobile
+
+      - name: Rust target
+        run: rustup target add aarch64-apple-ios
+
+      # The tag is the single source of truth for the version, exactly as
+      # release.yml does for the desktop: stamped into the crate and the
+      # Tauri config for this build, never committed. Tauri writes the
+      # stamped version into the Xcode project's Info.plist at build time
+      # (CFBundleShortVersionString), so the committed 0.1.0 there is
+      # not a third place to edit. A dry run from a branch builds
+      # whatever version the tree declares.
+      - name: Version from tag
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF" in
+            refs/tags/mobile-v*)
+              VERSION="${GITHUB_REF_NAME#mobile-v}"
+              if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+                echo "Tag '$GITHUB_REF_NAME' is not mobile-vMAJOR.MINOR.PATCH" >&2
+                exit 1
+              fi
+              python3 scripts/stamp-mobile-version.py "$VERSION"
+              ;;
+            *)
+              VERSION=$(python3 scripts/stamp-mobile-version.py --show)
+              echo "Not a mobile-v tag; building the tree's own version $VERSION"
+              ;;
+          esac
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Version $VERSION, build $BUILD_NUMBER"
+
+      # The mobile checks, the same targets ci.yml's mobile-ios job runs
+      # plus the host-side gates. A tag on a crate that does not pass them
+      # fails here instead of shipping.
+      - name: Rust formatting and Clippy
+        run: make lint-mobile
+      - name: Rust tests
+        run: make test-mobile
+      - name: Check the iOS target
+        run: make check-mobile-ios
+
+      # --- Signing material -------------------------------------------
+      #
+      # A throwaway keychain for this job, deleted by the last step. The
+      # distribution certificate goes in it, the App Store provisioning
+      # profile goes where Xcode looks for profiles, and the App Store
+      # Connect API key goes where altool looks for keys. The keychain
+      # password is random and used only here.
+      #
+      # The Tauri CLI ALSO reads the certificate and profile from the
+      # IOS_CERTIFICATE / IOS_MOBILE_PROVISION environment (set on the
+      # build step): that is what makes it switch the Xcode project to
+      # manual signing, set the identity, team and profile on it, and
+      # write signingCertificate/teamID/provisioningProfiles into
+      # ExportOptions.plist. It imports into a temporary keychain of its
+      # own that it deletes on exit. This keychain is the one that
+      # survives a killed job long enough for the cleanup step to name
+      # it, and the one `security find-identity` below proves works.
+      - name: Import signing material
+        if: env.DRY_RUN != 'true'
+        env:
+          IOS_DIST_CERT_P12_BASE64: ${{ secrets.IOS_DIST_CERT_P12_BASE64 }}
+          IOS_DIST_CERT_PASSWORD: ${{ secrets.IOS_DIST_CERT_PASSWORD }}
+          IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+          APPSTORE_API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          APPSTORE_API_PRIVATE_KEY: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/mobile-release.keychain-db"
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 24)
+          echo "KEYCHAIN_PATH=$KEYCHAIN" >> "$GITHUB_ENV"
+
+          echo "$IOS_DIST_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/dist.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/dist.p12" -k "$KEYCHAIN" \
+            -P "$IOS_DIST_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          # Put it on the search list (so codesign and Xcode find it) and
+          # make it the default, as release.yml does for the desktop.
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          security default-keychain -s "$KEYCHAIN"
+          rm -f "$RUNNER_TEMP/dist.p12"
+          # Fails the job if the p12 held no distribution identity.
+          security find-identity -v -p codesigning "$KEYCHAIN" | grep -q "Apple Distribution\|iPhone Distribution"
+
+          echo "$IOS_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/dist.mobileprovision"
+          security cms -D -i "$RUNNER_TEMP/dist.mobileprovision" > "$RUNNER_TEMP/profile.plist"
+          UUID=$(plutil -extract UUID raw -o - "$RUNNER_TEMP/profile.plist")
+          echo "PROFILE_UUID=$UUID" >> "$GITHUB_ENV"
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$RUNNER_TEMP/dist.mobileprovision" "$HOME/Library/MobileDevice/Provisioning Profiles/$UUID.mobileprovision"
+          echo "Installed provisioning profile $(plutil -extract Name raw -o - "$RUNNER_TEMP/profile.plist")"
+
+          # altool searches $API_PRIVATE_KEYS_DIR for AuthKey_<KEY_ID>.p8
+          # (xcrun altool --help, Xcode 26).
+          mkdir -p "$RUNNER_TEMP/private_keys"
+          printf '%s\n' "$APPSTORE_API_PRIVATE_KEY" > "$RUNNER_TEMP/private_keys/AuthKey_${APPSTORE_API_KEY_ID}.p8"
+          chmod 600 "$RUNNER_TEMP/private_keys/AuthKey_${APPSTORE_API_KEY_ID}.p8"
+
+      # Flags per the Tauri 2.11 CLI reference (`tauri ios build`,
+      # https://v2.tauri.app/reference/cli/): `--export-method
+      # app-store-connect` is the archive export for App Store Connect
+      # and TestFlight; `--ci` skips prompts; `--config` merges a JSON
+      # string into tauri.conf.json, here `bundle.iOS.bundleVersion`,
+      # which the CLI applies as CFBundleVersion; `--no-sign` skips code
+      # signing and zips the archive into an IPA itself.
+      #
+      # NOT `--build-number`: that flag APPENDS to the version, giving
+      # CFBundleVersion four components, and App Store Connect accepts
+      # at most three. A bare integer is one.
+      #
+      # The signing vars are set ONLY when signing, with the same two
+      # guards release.yml uses: the expression keeps the secrets out of
+      # the env on a dry run, and the script unsets them regardless, so
+      # it does not matter whether Actions omits an empty value or
+      # exports an empty string (Tauri treats a present IOS_CERTIFICATE
+      # as "sign this").
+      - name: Build the IPA
+        env:
+          IOS_CERTIFICATE: ${{ env.DRY_RUN != 'true' && secrets.IOS_DIST_CERT_P12_BASE64 || '' }}
+          IOS_CERTIFICATE_PASSWORD: ${{ env.DRY_RUN != 'true' && secrets.IOS_DIST_CERT_PASSWORD || '' }}
+          IOS_MOBILE_PROVISION: ${{ env.DRY_RUN != 'true' && secrets.IOS_PROVISIONING_PROFILE_BASE64 || '' }}
+        run: |
+          set -euo pipefail
+          CONFIG=$(printf '{"bundle":{"iOS":{"bundleVersion":"%s"}}}' "$BUILD_NUMBER")
+          if [ "$DRY_RUN" = "true" ]; then
+            unset IOS_CERTIFICATE IOS_CERTIFICATE_PASSWORD IOS_MOBILE_PROVISION
+            echo "Dry run: building an unsigned IPA."
+            yarn tauri ios build --ci --no-sign --config "$CONFIG"
+          else
+            yarn tauri ios build --ci --export-method app-store-connect --config "$CONFIG"
+          fi
+
+      - name: Collect the IPA
+        run: |
+          set -euo pipefail
+          IPA=$(find src-mobile/gen/apple/build -type f -name '*.ipa' | head -1)
+          if [ -z "$IPA" ]; then
+            echo "Tauri did not produce an IPA under src-mobile/gen/apple/build" >&2
+            exit 1
+          fi
+          NAME="Headstate-Companion-${VERSION}-build${BUILD_NUMBER}.ipa"
+          mkdir -p release-assets
+          cp "$IPA" "release-assets/$NAME"
+          if [ "$DRY_RUN" != "true" ]; then
+            # A signed App Store build carries the provisioning profile;
+            # an IPA without one would be rejected at upload, so catch it
+            # here where the log says why.
+            unzip -l "release-assets/$NAME" | grep -q 'embedded.mobileprovision' \
+              || { echo "IPA has no embedded provisioning profile; it is not signed for the App Store." >&2; exit 1; }
+          fi
+          (cd release-assets && shasum -a 256 "$NAME" | tee "$NAME.sha256")
+          echo "IPA=release-assets/$NAME" >> "$GITHUB_ENV"
+
+      # `xcrun altool --upload-package` with API-key authentication is the
+      # form Xcode 26's altool documents (its own --help examples;
+      # `--upload-app` is still listed but is the legacy form). The
+      # Xcode 26 altool does not always exit non-zero on a rejected
+      # upload, so the JSON result is inspected for product-errors
+      # rather than trusting the exit code.
+      - name: Upload to TestFlight
+        if: env.DRY_RUN != 'true'
+        env:
+          APPSTORE_API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          APPSTORE_API_ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
+          API_PRIVATE_KEYS_DIR: ${{ runner.temp }}/private_keys
+        run: |
+          set -euo pipefail
+          xcrun altool --upload-package "$IPA" --type ios \
+            --api-key "$APPSTORE_API_KEY_ID" --api-issuer "$APPSTORE_API_ISSUER_ID" \
+            --output-format json | tee "$RUNNER_TEMP/altool.json"
+          python3 - "$RUNNER_TEMP/altool.json" <<'PY'
+          import json, sys
+          text = open(sys.argv[1]).read()
+          # altool prints a "Running altool at path" line before the JSON.
+          start = text.find("{")
+          result = json.loads(text[start:]) if start >= 0 else {}
+          errors = result.get("product-errors") or []
+          if errors:
+              for e in errors:
+                  print(f"::error::{e.get('message', e)}")
+              sys.exit(1)
+          if "success-message" not in result:
+              print("::warning::altool reported neither success-message nor product-errors; check App Store Connect.")
+          else:
+              print(result["success-message"])
+          PY
+          echo "TestFlight: version $VERSION, build $BUILD_NUMBER. Processing takes a few minutes."
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mobile-ios
+          path: release-assets/*
+          if-no-files-found: error
+
+      # Runs whether the build passed or not, so a failed job never leaves
+      # the distribution identity in a keychain (spec: "deletes it after").
+      - name: Remove signing material
+        if: always() && env.DRY_RUN != 'true'
+        run: |
+          set -u
+          if [ -n "${KEYCHAIN_PATH:-}" ] && [ -f "$KEYCHAIN_PATH" ]; then
+            security default-keychain -s "$HOME/Library/Keychains/login.keychain-db" || true
+            security delete-keychain "$KEYCHAIN_PATH" && echo "Deleted $KEYCHAIN_PATH"
+          fi
+          if [ -n "${PROFILE_UUID:-}" ]; then
+            rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+          fi
+          rm -rf "$RUNNER_TEMP/private_keys" "$RUNNER_TEMP/profile.plist" \
+            "$RUNNER_TEMP/dist.p12" "$RUNNER_TEMP/dist.mobileprovision" "$RUNNER_TEMP/altool.json"
+
+  android-release:
+    if: vars.MOBILE_RELEASE_ENABLED == 'true' || (github.event_name == 'workflow_dispatch' && inputs.dry_run)
+    runs-on: ubuntu-latest
+    env:
+      # Pinned rather than `$ANDROID_NDK_HOME`, which is whatever the
+      # runner image calls its default that month. `sdkmanager` below is
+      # a no-op while the image ships this version and an install when
+      # it stops, so the toolchain is the same either way.
+      NDK_VERSION: 27.3.13750724
+      # Tauri's minimum Android SDK; the NDK ships one clang wrapper per
+      # API level, and this picks the one matching the app's floor.
+      ANDROID_API: "24"
+      PACKAGE: com.pktstorm.headstate.companion
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Preflight
+        env:
+          ANDROID_UPLOAD_KEYSTORE_BASE64: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run: unsigned build, no store upload, no release."
+            exit 0
+          fi
+          case "$GITHUB_REF" in
+            refs/tags/mobile-v*) ;;
+            *) echo "A signed release needs a mobile-v* tag; dispatch with dry_run for a rehearsal." >&2; exit 1 ;;
+          esac
+          missing=""
+          for name in ANDROID_UPLOAD_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD \
+                      ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD PLAY_SERVICE_ACCOUNT_JSON; do
+            [ -n "${!name:-}" ] || missing="$missing $name"
+          done
+          if [ -n "$missing" ]; then
+            echo "Missing repository secrets:$missing" >&2
+            echo "See docs/mobile-release-process.md for how to generate each." >&2
+            exit 1
+          fi
+
+      # The host-side steps (clippy, tests) compile the tauri crate for
+      # Linux, which needs the WebKit and GTK headers. No appindicator:
+      # phones have no tray and this crate does not enable it.
+      - name: Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev
+
+      - uses: ./.github/actions/setup
+        with:
+          rust-components: clippy, rustfmt
+          rust-workspaces: src-mobile
+
+      # The runner image ships the SDK and an NDK; this pins which NDK
+      # and exports the variables the Tauri CLI and cc-rs read.
+      #
+      # `aws-lc-sys` compiles C and assembly through cc-rs, which finds an
+      # Android compiler only by name on PATH (`aarch64-linux-android21-clang`
+      # and friends) and otherwise fails with "failed to find tool", the
+      # error #533 hit locally. Setting the per-target CC/AR variables is
+      # the documented, deterministic form of the same thing.
+      #
+      # Kept identical to ci.yml's mobile-android job: one definition of
+      # "the Android toolchain" means the release cannot build with a
+      # toolchain CI never checked.
+      - name: Android NDK
+        run: |
+          set -euo pipefail
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION"
+          NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"
+          TOOLCHAIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          test -x "$TOOLCHAIN/aarch64-linux-android$ANDROID_API-clang"
+          {
+            echo "NDK_HOME=$NDK_HOME"
+            echo "ANDROID_NDK_HOME=$NDK_HOME"
+            echo "ANDROID_NDK_ROOT=$NDK_HOME"
+            echo "CC_aarch64_linux_android=aarch64-linux-android$ANDROID_API-clang"
+            echo "CXX_aarch64_linux_android=aarch64-linux-android$ANDROID_API-clang++"
+            echo "AR_aarch64_linux_android=llvm-ar"
+            echo "RANLIB_aarch64_linux_android=llvm-ranlib"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=aarch64-linux-android$ANDROID_API-clang"
+          } >> "$GITHUB_ENV"
+          echo "$TOOLCHAIN" >> "$GITHUB_PATH"
+          # Gradle and the Android Gradle plugin need a JDK 17+; the image
+          # ships several and this pins which.
+          echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
+
+      - name: Rust target
+        run: rustup target add aarch64-linux-android
+
+      - name: Version from tag
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF" in
+            refs/tags/mobile-v*)
+              VERSION="${GITHUB_REF_NAME#mobile-v}"
+              if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+                echo "Tag '$GITHUB_REF_NAME' is not mobile-vMAJOR.MINOR.PATCH" >&2
+                exit 1
+              fi
+              python3 scripts/stamp-mobile-version.py "$VERSION"
+              ;;
+            *)
+              VERSION=$(python3 scripts/stamp-mobile-version.py --show)
+              echo "Not a mobile-v tag; building the tree's own version $VERSION"
+              ;;
+          esac
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Version $VERSION, build $BUILD_NUMBER"
+
+      # The mobile checks, the same targets ci.yml's mobile-android job
+      # runs.
+      - name: Rust formatting and Clippy
+        run: make lint-mobile
+      - name: Rust tests
+        run: make test-mobile
+      - name: Check the Android target
+        run: make check-mobile-android
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: cargo-deny
+        run: make deny-mobile
+
+      # `gen/android` is the Android Studio project, committed like
+      # `gen/apple` once it exists (see .gitignore). Until that commit
+      # lands this generates it, exactly as ci.yml's mobile-android job
+      # does; after it, this reports "committed" and does nothing.
+      - name: Android Studio project
+        run: |
+          set -euo pipefail
+          if [ -d src-mobile/gen/android ]; then
+            echo "src-mobile/gen/android is committed; nothing to generate."
+          else
+            make android-init
+            test -f src-mobile/gen/android/app/build.gradle.kts
+          fi
+
+      # Adds the `signingConfigs` block from Tauri's Android signing guide
+      # (https://v2.tauri.app/distribute/sign/android/), guarded so an
+      # unsigned dry run still builds. Idempotent, so it is safe on a
+      # committed gen/android that already carries it.
+      - name: Release signing configuration
+        run: python3 scripts/android-release-signing.py
+
+      # keystore.properties in the layout Tauri's guide reads (storeFile,
+      # keyAlias, and the passwords), which the Gradle block above loads.
+      # Written next to the project, in a path the generated .gitignore
+      # and the root .gitignore both exclude, and removed by the last
+      # step.
+      - name: Write the upload keystore
+        if: env.DRY_RUN != 'true'
+        env:
+          ANDROID_UPLOAD_KEYSTORE_BASE64: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYSTORE="$RUNNER_TEMP/upload-keystore.jks"
+          echo "$ANDROID_UPLOAD_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE"
+          chmod 600 "$KEYSTORE"
+          # Fails here, by name, if the alias or password is wrong --
+          # rather than inside Gradle's stack trace.
+          keytool -list -keystore "$KEYSTORE" -storepass "$ANDROID_KEYSTORE_PASSWORD" -alias "$ANDROID_KEY_ALIAS" >/dev/null
+          umask 077
+          {
+            echo "storeFile=$KEYSTORE"
+            echo "storePassword=$ANDROID_KEYSTORE_PASSWORD"
+            echo "keyAlias=$ANDROID_KEY_ALIAS"
+            echo "keyPassword=$ANDROID_KEY_PASSWORD"
+          } > src-mobile/gen/android/keystore.properties
+
+      # Flags per the Tauri 2.11 CLI reference (`tauri android build`,
+      # https://v2.tauri.app/reference/cli/): `--aab` builds the App
+      # Bundle Play requires (no `--apk`); `--target aarch64` builds the
+      # one ABI every phone sold in years has, which is also the one the
+      # NDK step above wires cc-rs for; `--ci` skips prompts; `--config`
+      # merges `bundle.android.versionCode`, which the CLI writes into
+      # app/tauri.properties for Gradle to read. Signing comes from the
+      # keystore.properties above, not from flags.
+      - name: Build the AAB
+        run: |
+          set -euo pipefail
+          CONFIG=$(printf '{"bundle":{"android":{"versionCode":%s}}}' "$BUILD_NUMBER")
+          if [ "$DRY_RUN" = "true" ]; then
+            rm -f src-mobile/gen/android/keystore.properties
+            echo "Dry run: building an unsigned AAB."
+          fi
+          yarn tauri android build --ci --aab --target aarch64 --config "$CONFIG"
+
+      - name: Collect the AAB
+        run: |
+          set -euo pipefail
+          AAB=$(find src-mobile/gen/android/app/build/outputs/bundle -type f -name '*.aab' | head -1)
+          if [ -z "$AAB" ]; then
+            echo "Gradle did not produce an AAB under src-mobile/gen/android/app/build/outputs/bundle" >&2
+            exit 1
+          fi
+          NAME="Headstate-Companion-${VERSION}-build${BUILD_NUMBER}.aab"
+          mkdir -p release-assets
+          cp "$AAB" "release-assets/$NAME"
+          if [ "$DRY_RUN" != "true" ]; then
+            # An AAB is a signed jar; `jarsigner -verify` says "jar
+            # verified" for a signed one and exits 0 either way, so the
+            # text is what is checked.
+            jarsigner -verify "release-assets/$NAME" | grep -q 'jar verified' \
+              || { echo "AAB is not signed; Play would reject it." >&2; exit 1; }
+          fi
+          (cd release-assets && sha256sum "$NAME" | tee "$NAME.sha256")
+          echo "AAB=release-assets/$NAME" >> "$GITHUB_ENV"
+
+      # Straight to the Play Developer API (scripts/play-upload.py), in a
+      # throwaway virtualenv with pinned dependencies. `internal` is the
+      # internal-testing track; `completed` makes the build available to
+      # its testers, which is what "upload to internal testing" means.
+      - name: Upload to the Play internal track
+        if: env.DRY_RUN != 'true'
+        env:
+          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "$PLAY_SERVICE_ACCOUNT_JSON" > "$RUNNER_TEMP/play-service-account.json"
+          python3 -m venv "$RUNNER_TEMP/play-venv"
+          "$RUNNER_TEMP/play-venv/bin/pip" install --quiet 'google-auth==2.57.1' 'requests==2.34.2'
+          "$RUNNER_TEMP/play-venv/bin/python" scripts/play-upload.py \
+            --package "$PACKAGE" --aab "$AAB" --track internal \
+            --service-account "$RUNNER_TEMP/play-service-account.json" \
+            --release-name "$VERSION ($BUILD_NUMBER)"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mobile-android
+          path: release-assets/*
+          if-no-files-found: error
+
+      - name: Remove signing material
+        if: always() && env.DRY_RUN != 'true'
+        run: |
+          rm -f src-mobile/gen/android/keystore.properties \
+            "$RUNNER_TEMP/upload-keystore.jks" "$RUNNER_TEMP/play-service-account.json"
+          rm -rf "$RUNNER_TEMP/play-venv"
+
+  # One job creates the pre-release, after BOTH platforms have built and
+  # uploaded. `needs` means one platform failing blocks the release: a
+  # pre-release advertising two stores and holding one artifact is worse
+  # than none. Pre-release, not release: the assets are for provenance
+  # (spec: "for provenance, not for distribution"), and the stores are
+  # where users get the app.
+  publish:
+    needs: [ios-release, android-release]
+    if: startsWith(github.ref, 'refs/tags/mobile-v') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+    runs-on: ubuntu-latest
+    steps:
+      # `gh release create` resolves the repository from the git remote,
+      # and --generate-notes needs the previous tag, which a depth-1
+      # clone does not have.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#mobile-v}"
+          cd release-assets
+          # One SHA256SUMS in `sha256sum -c` format, verified here against
+          # the bytes that were uploaded, so the file the release carries
+          # is known to describe the assets next to it.
+          cat ./*.sha256 > SHA256SUMS
+          rm -f ./*.sha256
+          sha256sum -c SHA256SUMS
+          cd ..
+          ASSETS=()
+          while IFS= read -r f; do ASSETS+=("$f"); done < <(
+            find release-assets -maxdepth 1 -type f | sort
+          )
+          [ ${#ASSETS[@]} -gt 0 ] || { echo "no assets to publish" >&2; exit 1; }
+          printf 'publishing %s\n' "${ASSETS[@]}"
+
+          NOTES="Mobile companion **$VERSION**, build **$BUILD_NUMBER** (CFBundleVersion on iOS, versionCode on Android).
+
+          Uploaded to TestFlight and the Play internal-testing track. Install from there, not from these assets: they are here for provenance. Run \`docs/mobile-pairing-walkthrough.md\` on a real device against build $BUILD_NUMBER before promoting either build (\`docs/mobile-release-process.md\`)."
+
+          # Notes diff against the previous MOBILE tag. Without
+          # --notes-start-tag, --generate-notes picks the most recent tag
+          # of any kind, which is usually a desktop release, and the
+          # changelog would be the desktop's.
+          PREV=$(git tag --list 'mobile-v*' --sort=-v:refname | grep -vx "$GITHUB_REF_NAME" | head -1 || true)
+          START=()
+          if [ -n "$PREV" ]; then START=(--notes-start-tag "$PREV"); fi
+
+          # Idempotent: a rerun after a partial failure uploads to the
+          # existing release rather than failing on "already exists".
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release exists; uploading assets to it."
+            gh release upload "$GITHUB_REF_NAME" "${ASSETS[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --prerelease \
+              --title "Headstate Companion $VERSION" \
+              --notes "$NOTES" \
+              --generate-notes "${START[@]}" \
+              "${ASSETS[@]}"
+          fi
