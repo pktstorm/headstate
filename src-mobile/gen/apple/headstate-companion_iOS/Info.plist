@@ -54,5 +54,7 @@
 	<array>
 		<string>fetch</string>
 	</array>
+	<key>NSFaceIDUsageDescription</key>
+	<string>Headstate Companion confirms it is you before deleting anything on your desktop.</string>
 </dict>
 </plist>

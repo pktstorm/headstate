@@ -31,7 +31,7 @@ edition = "2021"
 # deny` runs. Everything above about what the lock proves applies to
 # them too.
 [workspace]
-members = ["plugins/headstate-refresh"]
+members = ["plugins/headstate-keys", "plugins/headstate-refresh"]
 
 [lib]
 name = "headstate_companion_lib"
@@ -77,3 +77,8 @@ mdns-sd = { version = "0.21", default-features = false, features = ["logging"] }
 # The version is stated so the path dependency is not a wildcard for
 # `cargo deny`.
 tauri-plugin-headstate-refresh = { version = "0.1.0", path = "plugins/headstate-refresh" }
+# The step-up signing keys in the Secure Enclave / Android Keystore and
+# the TLS session identity (#513). In-repo: Swift and Kotlin sides live
+# under plugins/headstate-keys. The version is stated so the path
+# dependency is not a wildcard for `cargo deny`.
+tauri-plugin-headstate-keys = { version = "0.1.0", path = "plugins/headstate-keys" }
