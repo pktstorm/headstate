@@ -1,0 +1,501 @@
+//! The spec's loopback integration test: the listener in-process on a
+//! loopback port, driven by a synthetic phone through every route, on
+//! an in-memory SQLite store, with no Tauri app and no network.
+//!
+//! What stands in for the app is exactly the two seams `gate.rs` fills
+//! in production: the pairing state is the real one (`PairingState` is
+//! the listener's `PairedCerts`, as in `gate.rs`), and the command
+//! host is a recorder, because `surface::dispatch` needs the live
+//! `AppHandle` no test can construct. So this proves the transport,
+//! the gate, pairing, the allowlist, the step-up check, the status
+//! mapping, the event stream, and revocation -- everything up to the
+//! `commands::*` call, which `surface.rs` covers on the source.
+
+use crate::remote::events::tests::SseClient;
+use crate::remote::events::Hub;
+use crate::remote::identity::Identity;
+use crate::remote::listener::tests::{connect, request, RecordingHost, Reply};
+use crate::remote::listener::{self, ListenerConfig, PairedCerts};
+use crate::remote::pairing::{
+    self, PairDecision, PairOutcome, PairRequest, PairingConfig, PairingRequestEvent, PairingState,
+    SameName, SigningKeys,
+};
+use crate::remote::stepup;
+use crate::remote::surface::RemoteError;
+use crate::store::devices;
+use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD as BASE64URL};
+use base64::Engine;
+use ml_dsa::{MlDsa65, Seed};
+use p256::ecdsa::signature::Signer;
+use rusqlite::Connection;
+use serde_json::{json, Value};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
+
+/// The phone: a self-signed session certificate (what `rcgen` gives
+/// the mobile crate too), a P-256 step-up key, and an ML-DSA-65 one.
+struct Phone {
+    cert: Identity,
+    ecdsa: p256::ecdsa::SigningKey,
+    mldsa: ml_dsa::SigningKey<MlDsa65>,
+}
+
+impl Phone {
+    fn new() -> Self {
+        Self {
+            cert: Identity::generate().unwrap(),
+            ecdsa: p256::ecdsa::SigningKey::from_bytes(&[7u8; 32].into()).unwrap(),
+            mldsa: ml_dsa::SigningKey::<MlDsa65>::from_seed(&Seed::from([7u8; 32])),
+        }
+    }
+
+    fn fingerprint(&self) -> String {
+        self.cert.fingerprint()
+    }
+
+    /// The `signing_keys` object of the pair request.
+    fn signing_keys(&self) -> SigningKeys {
+        SigningKeys {
+            ecdsa_p256: BASE64.encode(
+                self.ecdsa
+                    .verifying_key()
+                    .to_encoded_point(false)
+                    .as_bytes(),
+            ),
+            mldsa_65: Some(BASE64.encode(self.mldsa.expanded_key().verifying_key().encode())),
+        }
+    }
+
+    /// A hybrid `X-Headstate-Signature` for one call, exactly as the
+    /// mobile crate will build it.
+    fn signature(&self, command: &str, args: &Value, nonce: &[u8; 16], ts: i64) -> String {
+        let nonce = BASE64URL.encode(nonce);
+        let msg = stepup::canonical_bytes(command, args, &nonce, ts);
+        let ecdsa: p256::ecdsa::Signature = self.ecdsa.sign(&msg);
+        let mldsa = self
+            .mldsa
+            .expanded_key()
+            .sign_deterministic(&msg, b"")
+            .unwrap();
+        format!(
+            "v1;ts={ts};nonce={nonce};ecdsa={};mldsa={}",
+            BASE64URL.encode(ecdsa.to_bytes()),
+            BASE64URL.encode(mldsa.encode())
+        )
+    }
+}
+
+/// The desktop: the real pairing state over an in-memory store, the
+/// real listener, a recording command host.
+struct Desktop {
+    addr: SocketAddr,
+    fp: String,
+    conn: Connection,
+    pairing: Arc<PairingState>,
+    /// What the `pairing-request` Tauri event would carry.
+    requests: mpsc::UnboundedReceiver<PairingRequestEvent>,
+    hub: Arc<Hub>,
+    host: Arc<RecordingHost>,
+    handle: listener::Handle,
+}
+
+async fn desktop() -> Desktop {
+    let conn = Connection::open_in_memory().unwrap();
+    crate::store::migrate(&conn).unwrap();
+    let (tx, requests) = mpsc::unbounded_channel();
+    let pairing = Arc::new(PairingState::with_config(
+        PairingConfig {
+            token_ttl: Duration::from_secs(60),
+            decision_timeout: Duration::from_secs(10),
+        },
+        move |event| {
+            let _ = tx.send(event);
+        },
+    ));
+    let hub = Arc::new(Hub::new(Arc::new(|| {
+        Box::pin(async { Some("[]".to_string()) })
+    })));
+    let host = Arc::new(RecordingHost::default());
+    let identity = Identity::generate().unwrap();
+    let fp = identity.fingerprint();
+    let handle = listener::start(ListenerConfig {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        identity,
+        paired: pairing.clone(),
+        revocations: pairing.subscribe_revocations(),
+        pairing: pairing.clone(),
+        host: host.clone(),
+        desktop_version: "9.9.9".into(),
+        viewer_login: Arc::new(|| Box::pin(async { Some("octocat".to_string()) })),
+        events: hub.clone(),
+    })
+    .await
+    .unwrap();
+    Desktop {
+        addr: handle.local_addr(),
+        fp,
+        conn,
+        pairing,
+        requests,
+        hub,
+        host,
+        handle,
+    }
+}
+
+impl Desktop {
+    /// `GET /v1/hello`; `Err` when the handshake itself is refused.
+    async fn hello(&self, phone: &Phone) -> Result<Reply, String> {
+        request(
+            self.addr,
+            Some(&phone.cert),
+            &self.fp,
+            "GET",
+            "/v1/hello",
+            &[],
+            None,
+        )
+        .await
+    }
+
+    async fn post(
+        &self,
+        phone: &Phone,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&str>,
+    ) -> Result<Reply, String> {
+        request(
+            self.addr,
+            Some(&phone.cert),
+            &self.fp,
+            "POST",
+            path,
+            headers,
+            body,
+        )
+        .await
+    }
+
+    async fn call(
+        &self,
+        phone: &Phone,
+        command: &str,
+        headers: &[(&str, &str)],
+        body: Option<&str>,
+    ) -> Reply {
+        self.post(phone, &format!("/v1/call/{command}"), headers, body)
+            .await
+            .unwrap()
+    }
+
+    /// Step 1 of the spec's flow: Settings > Pair a phone.
+    fn issue_qr(&self) -> pairing::IssuedToken {
+        self.pairing.issue_token()
+    }
+
+    /// Steps 2-4: the phone posts `/v1/pair`, the desktop asks the
+    /// user, the user approves. Returns what the phone received.
+    async fn pair(&mut self, phone: &Phone, device_name: &str) -> PairOutcome {
+        let issued = self.issue_qr();
+        let token = BASE64URL.decode(&issued.token).unwrap();
+        let req = PairRequest {
+            token: issued.token,
+            device_name: device_name.into(),
+            signing_keys: phone.signing_keys(),
+            proof: pairing::proof(&token, &phone.fingerprint(), &self.fp),
+        };
+        let body = serde_json::to_string(&req).unwrap();
+        let reply = {
+            let addr = self.addr;
+            let fp = self.fp.clone();
+            let cert = phone.cert.clone();
+            tokio::spawn(async move {
+                request(addr, Some(&cert), &fp, "POST", "/v1/pair", &[], Some(&body)).await
+            })
+        };
+
+        // The modal: the event names the device and its fingerprint,
+        // and says it offered a post-quantum key.
+        let event = tokio::time::timeout(Duration::from_secs(5), self.requests.recv())
+            .await
+            .expect("the pairing-request event fires")
+            .unwrap();
+        assert_eq!(event.device_name, device_name);
+        assert_eq!(event.fingerprint, phone.fingerprint());
+        assert!(event.has_mldsa);
+        self.pairing
+            .respond(
+                &self.conn,
+                event.request_id,
+                PairDecision::Approve {
+                    same_name: SameName::Undecided,
+                },
+            )
+            .unwrap();
+
+        let reply = reply.await.unwrap().expect("the pair request completes");
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        serde_json::from_str(&reply.body).unwrap()
+    }
+}
+
+/// The spec's checklist, in order, on one desktop and one phone: start,
+/// pair, one command per class (a destructive one with a hybrid
+/// signature, and without), an event, revoke, refused.
+#[tokio::test]
+async fn a_phone_pairs_calls_listens_and_is_revoked() {
+    let mut desktop = desktop().await;
+    let phone = Phone::new();
+
+    // Before pairing, with no window open: the handshake fails.
+    assert!(desktop.hello(&phone).await.is_err());
+
+    // Pair.
+    let outcome = desktop.pair(&phone, "Octocat's phone").await;
+    assert_eq!(outcome.device_name, "Octocat's phone");
+    let row = devices::find_by_fingerprint(&desktop.conn, &phone.fingerprint())
+        .unwrap()
+        .expect("approve inserted the row");
+    assert_eq!(row.id, outcome.device_id);
+    assert_eq!(row.cert_der, phone.cert.cert().as_ref());
+    assert!(desktop.pairing.is_paired(&phone.fingerprint()));
+    assert!(!desktop.pairing.pairing_window_open(), "the token is spent");
+
+    // Paired: ordinary mTLS from here on.
+    let hello = desktop.hello(&phone).await.unwrap();
+    assert_eq!(hello.status, 200);
+    let v: Value = serde_json::from_str(&hello.body).unwrap();
+    assert_eq!(v["viewer_login"], "octocat");
+
+    // Read.
+    let reply = desktop.call(&phone, "get_cached", &[], None).await;
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.body, r#"{"ran":"get_cached"}"#);
+
+    // Write, with arguments as the webview would send them.
+    let reply = desktop
+        .call(&phone, "set_poll_interval", &[], Some(r#"{"secs": 120}"#))
+        .await;
+    assert_eq!(reply.status, 200);
+
+    // Destructive without a signature: refused, never dispatched.
+    let args = json!({
+        "repoPath": "/home/octocat/src/hello-world",
+        "worktreePath": "/home/octocat/src/hello-world/.worktrees/feature",
+    });
+    let body = serde_json::to_string(&args).unwrap();
+    let reply = desktop
+        .call(&phone, "remove_worktree", &[], Some(&body))
+        .await;
+    assert_eq!(reply.status, 403);
+    assert_eq!(reply.body, stepup::StepUpError::Missing.to_string());
+
+    // Destructive with a valid hybrid signature: dispatched and announced.
+    let now = chrono::Utc::now().timestamp();
+    let sig = phone.signature("remove_worktree", &args, &[1u8; 16], now);
+    let reply = desktop
+        .call(
+            &phone,
+            "remove_worktree",
+            &[(stepup::HEADER, &sig)],
+            Some(&body),
+        )
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+
+    // The same signature again: the nonce is spent.
+    let reply = desktop
+        .call(
+            &phone,
+            "remove_worktree",
+            &[(stepup::HEADER, &sig)],
+            Some(&body),
+        )
+        .await;
+    assert_eq!(reply.status, 403);
+    assert_eq!(reply.body, stepup::StepUpError::NonceReused.to_string());
+
+    // What reached the host, in order, with the device's name and the
+    // parsed arguments; and exactly one destructive notice.
+    let calls = desktop.host.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        vec![
+            (
+                "get_cached".to_string(),
+                Value::Null,
+                "Octocat's phone".to_string()
+            ),
+            (
+                "set_poll_interval".to_string(),
+                json!({"secs": 120}),
+                "Octocat's phone".to_string()
+            ),
+            (
+                "remove_worktree".to_string(),
+                args.clone(),
+                "Octocat's phone".to_string()
+            ),
+        ]
+    );
+    assert_eq!(
+        *desktop.host.notices.lock().unwrap(),
+        vec![("Octocat's phone".to_string(), "remove_worktree".to_string())]
+    );
+
+    // An event: the snapshot on connect, then what the desktop emits.
+    let mut stream = SseClient::connect(desktop.addr, &phone.cert, &desktop.fp).await;
+    assert_eq!(stream.status, 200);
+    assert_eq!(
+        stream.next_frame().await,
+        Some(("prs-updated".into(), "[]".into()))
+    );
+    desktop.hub.publish("poll-state", "\"fetching\"".into());
+    assert_eq!(
+        stream.next_frame().await,
+        Some(("poll-state".into(), "\"fetching\"".into()))
+    );
+
+    // An idle keep-alive connection, to prove revocation closes it.
+    let mut idle = connect(desktop.addr, Some(&phone.cert), &desktop.fp)
+        .await
+        .unwrap();
+    idle.write_all(b"GET /v1/hello HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = vec![0u8; 4096];
+    let n = idle.read(&mut buf).await.unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+
+    // Revoke, from Settings.
+    desktop
+        .pairing
+        .revoke(&desktop.conn, outcome.device_id)
+        .unwrap();
+    assert!(devices::list(&desktop.conn).unwrap().is_empty());
+
+    // The open stream ends, cleanly.
+    assert_eq!(stream.next_frame().await, None);
+    assert!(stream.body().1, "the stream's body is finished, not cut");
+    // The idle connection is closed by the desktop.
+    let closed = tokio::time::timeout(Duration::from_secs(5), idle.read(&mut buf)).await;
+    assert!(
+        matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+        "the revoked device's idle connection must be closed: {closed:?}"
+    );
+    // The next handshake is refused.
+    assert!(desktop.hello(&phone).await.is_err());
+
+    desktop.handle.stop().await;
+}
+
+/// The refusals `/v1/call` owes the phone, each with the status the
+/// module docs promise, and none of them reaching the host.
+#[tokio::test]
+async fn call_refuses_what_the_allowlist_and_the_body_rule_out() {
+    let mut desktop = desktop().await;
+    let phone = Phone::new();
+    desktop.pair(&phone, "Octocat's phone").await;
+
+    let unknown = desktop.call(&phone, "drop_database", &[], None).await;
+    assert_eq!(unknown.status, 404);
+    assert_eq!(
+        unknown.body,
+        RemoteError::Unknown("drop_database".into()).to_string()
+    );
+
+    let local = desktop.call(&phone, "reveal_log", &[], None).await;
+    assert_eq!(local.status, 403);
+    assert_eq!(
+        local.body,
+        RemoteError::Local("reveal_log".into()).to_string()
+    );
+
+    let revoke = desktop
+        .call(&phone, "revoke_paired_device", &[], None)
+        .await;
+    assert_eq!(revoke.status, 403, "a phone cannot revoke a phone");
+
+    let not_json = desktop
+        .call(&phone, "get_history", &[], Some("days=14"))
+        .await;
+    assert_eq!(not_json.status, 400);
+    assert!(not_json.body.starts_with("request body is not JSON"));
+
+    let malformed_sig = desktop
+        .call(
+            &phone,
+            "remove_worktree",
+            &[(stepup::HEADER, "v2;nope")],
+            Some("{}"),
+        )
+        .await;
+    assert_eq!(malformed_sig.status, 400);
+
+    assert!(desktop.host.calls.lock().unwrap().is_empty());
+
+    // What the host itself reports comes back as its status and text.
+    *desktop.host.fail_with.lock().unwrap() = Some(RemoteError::Command("boom".into()));
+    let failed = desktop.call(&phone, "get_cached", &[], None).await;
+    assert_eq!(failed.status, 500);
+    assert_eq!(failed.body, "boom");
+    *desktop.host.fail_with.lock().unwrap() = Some(RemoteError::BadArgs {
+        command: "get_history".into(),
+        message: "missing required argument `days`".into(),
+    });
+    let bad_args = desktop.call(&phone, "get_history", &[], None).await;
+    assert_eq!(bad_args.status, 400);
+
+    desktop.handle.stop().await;
+}
+
+/// Pairing's refusals over the wire: a body that does not decode is
+/// 400 and keeps the token; a denied request is 403 and pairs nothing.
+#[tokio::test]
+async fn pair_refuses_a_bad_body_and_a_denied_request() {
+    let mut desktop = desktop().await;
+    let phone = Phone::new();
+
+    desktop.issue_qr();
+    let reply = desktop
+        .post(&phone, "/v1/pair", &[], Some("not json"))
+        .await
+        .unwrap();
+    assert_eq!(reply.status, 400);
+    assert!(reply.body.starts_with("bad pair request"));
+    assert!(desktop.pairing.pairing_window_open());
+
+    let issued = desktop.issue_qr();
+    let token = BASE64URL.decode(&issued.token).unwrap();
+    let req = PairRequest {
+        token: issued.token,
+        device_name: "Octocat's phone".into(),
+        signing_keys: phone.signing_keys(),
+        proof: pairing::proof(&token, &phone.fingerprint(), &desktop.fp),
+    };
+    let body = serde_json::to_string(&req).unwrap();
+    let reply = {
+        let addr = desktop.addr;
+        let fp = desktop.fp.clone();
+        let cert = phone.cert.clone();
+        tokio::spawn(async move {
+            request(addr, Some(&cert), &fp, "POST", "/v1/pair", &[], Some(&body)).await
+        })
+    };
+    let event = desktop.requests.recv().await.unwrap();
+    desktop
+        .pairing
+        .respond(&desktop.conn, event.request_id, PairDecision::Deny)
+        .unwrap();
+    let reply = reply.await.unwrap().unwrap();
+    assert_eq!(reply.status, 403);
+    assert_eq!(reply.body, pairing::PairError::Denied.to_string());
+    assert!(devices::list(&desktop.conn).unwrap().is_empty());
+    assert!(!desktop.pairing.is_paired(&phone.fingerprint()));
+
+    desktop.handle.stop().await;
+}

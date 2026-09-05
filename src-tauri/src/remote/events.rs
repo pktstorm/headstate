@@ -243,8 +243,10 @@ fn live(
     })
 }
 
+/// `pub(crate)`: the loopback test in `remote/loopback_tests.rs` reads
+/// the event stream through the same client as the tests here.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::remote::identity::Identity;
     use crate::remote::listener::tests::{client_config, serve_with, MemoryCerts};
@@ -344,17 +346,17 @@ mod tests {
 
     /// A phone's view of the stream: one mTLS connection, the HTTP/1.1
     /// response head, then SSE frames out of hyper's chunked body.
-    struct SseClient {
+    pub(crate) struct SseClient {
         tls: TlsStream<TcpStream>,
         raw: Vec<u8>,
-        status: u16,
-        content_type: String,
+        pub(crate) status: u16,
+        pub(crate) content_type: String,
         body_start: usize,
         delivered: usize,
     }
 
     impl SseClient {
-        async fn connect(addr: SocketAddr, phone: &Identity, server_fp: &str) -> Self {
+        pub(crate) async fn connect(addr: SocketAddr, phone: &Identity, server_fp: &str) -> Self {
             let connector = tokio_rustls::TlsConnector::from(client_config(Some(phone), server_fp));
             let tcp = TcpStream::connect(addr).await.unwrap();
             let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
@@ -406,14 +408,14 @@ mod tests {
 
         /// The SSE body decoded so far, plus whether the final chunk
         /// has arrived.
-        fn body(&self) -> (Vec<u8>, bool) {
+        pub(crate) fn body(&self) -> (Vec<u8>, bool) {
             dechunk(&self.raw[self.body_start..])
         }
 
         /// The next `(event, data)` frame, or `None` once the server has
         /// finished the body. Panics on silence, so a hang is a failure
         /// rather than a wait.
-        async fn next_frame(&mut self) -> Option<(String, String)> {
+        pub(crate) async fn next_frame(&mut self) -> Option<(String, String)> {
             loop {
                 let (body, done) = self.body();
                 let frames = parse_frames(&body);

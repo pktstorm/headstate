@@ -106,6 +106,13 @@ tower-service = "0.3"
 # Already in the tree via axum and hyper; default features off so it
 # stays the subset they already compile.
 futures-util = { version = "0.3", default-features = false }
+# The listener's dual-stack socket (`remote/listener.rs`). Binding the
+# IPv6 wildcard through `TcpListener::bind` gives an IPv6-ONLY socket on
+# Windows (`IPV6_V6ONLY` defaults on there and off on Linux and macOS),
+# while the pairing QR lists the machine's IPv4 addresses too; std has
+# no way to clear the option, socket2 does. Already in the tree via
+# tokio and hyper-util, at this version.
+socket2 = "0.6"
 # The desktop identity's private key goes in the platform keychain --
 # Keychain Services on macOS, Credential Manager on Windows, the
 # Secret Service (via a pure-Rust D-Bus client, no libdbus) on Linux.
