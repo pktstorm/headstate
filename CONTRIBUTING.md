@@ -174,7 +174,13 @@ repo. Getting a Developer ID Application certificate requires its own
 paid Apple Developer account. Until that exists, don't close #23 — the
 plumbing is ready, but nothing is actually signed.
 
-v1 is read-only by design — no PR mutation of any kind (no merge, comment,
-approve, close, or merge-queue action). If you're proposing a change that
-would have Headstate write to GitHub, expect that to be a bigger
-conversation about scope, not a quick PR.
+Headstate started strictly read-only. Since the write path landed it can
+also act on a pull request — merge, close, mark as draft, enqueue,
+approve, request changes, comment, resolve or reply to a review thread,
+re-run checks, update the branch, toggle auto-merge, and open a
+package-update PR — but **only when you click that action in the app**.
+Nothing runs on a timer, nothing is batched, and each write goes through
+one module (`src-tauri/src/github/mutate.rs`) so the full list is in one
+place. If you're proposing a change that would have Headstate write to
+GitHub on its own initiative, expect that to be a bigger conversation
+about scope, not a quick PR.
