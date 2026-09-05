@@ -23,7 +23,9 @@ ALLOWED='octocat|pktstorm|tauri-apps|shadcn-ui|rust-lang|actions|dtolnay|Swatine
 
 # Ticket-ID-shaped tokens (PREFIX-NUMBER) that are legitimate public
 # identifiers, not internal tracker references.
-ALLOWED_TICKET_PREFIX='RUSTSEC|CVE|GHSA'
+# DSA and KEM cover the NIST post-quantum parameter sets (ML-DSA-65,
+# ML-KEM-768), which share the PREFIX-NUMBER shape.
+ALLOWED_TICKET_PREFIX='RUSTSEC|CVE|GHSA|DSA|KEM'
 
 # Mail domains that cannot carry a private address by construction.
 # GitHub's no-reply domain exists so a commit is attributed without

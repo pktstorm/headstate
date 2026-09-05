@@ -65,6 +65,8 @@ the TLS session and the device key; the webview never sees a certificate.
 | Desktop listener is reachable from the internet | Listener is off by default and binds only when the user enables it; even when on, unpaired clients are refused at the handshake |
 | A paired phone issues a command the desktop UI could not | The remote surface is an explicit allowlist, enumerated in one Rust file, with local-only commands excluded |
 | Request replay | Every write carries a nonce and timestamp; the desktop rejects duplicates and clock skew beyond sixty seconds |
+| Traffic recorded today, decrypted by a future quantum computer | TLS key exchange is hybrid X25519 plus ML-KEM-768 by default |
+| Step-up signatures forged by a future quantum computer | The step-up key is a hybrid of ECDSA P256 and ML-DSA-65, held in the phone's secure hardware where the platform supports it |
 
 ## Architecture
 
@@ -84,7 +86,7 @@ src-tauri/src (desktop, existing)
 src-mobile/ (new Tauri mobile crate)
 ├── src/
 │   ├── lib.rs        mobile_entry_point; registers the client commands
-│   ├── keys.rs       session key + biometric-gated signing key
+│   ├── keys.rs       session key + biometric-gated hybrid signing keys
 │   ├── client.rs     reqwest with client identity and server pinning
 │   ├── pairing.rs    scan QR, connect, prove token, store fingerprint
 │   └── events.rs     SSE subscriber; re-emits as Tauri events
@@ -186,27 +188,130 @@ presumably sitting in front of.
 
 ### Step-up for destructive commands
 
-The phone holds two keys, both generated at pairing and both
-non-exportable:
+The phone holds a session key and a signing key pair, all generated at
+pairing and all non-exportable:
 
-- A **session key**, whose certificate is the TLS client identity. Usable
-  whenever the app is open.
-- A **signing key**, an Ed25519 key whose use requires biometric or device
-  passcode confirmation through `tauri-plugin-biometric` and the platform
-  keystore's access control.
+- A **session key**, ECDSA P256, whose certificate is the TLS client
+  identity. Usable whenever the app is open.
+- A **signing key pair** used only for step-up: an ECDSA P256 key and,
+  where the platform can hold one, an ML-DSA-65 key. Both are generated
+  in the platform's secure hardware with biometric or device passcode
+  access control, through a small Tauri mobile plugin described under
+  Post-quantum posture.
 
 A destructive request carries a header, `X-Headstate-Signature`, over the
-canonical JSON of `{command, args, nonce, timestamp}` signed with the
-signing key. The desktop verifies against the signing public key stored at
-pairing, checks the timestamp is within sixty seconds, and records the
-nonce for that window. Read and write requests carry no signature. The
-result is that deleting a worktree from the phone costs one Face ID
-prompt, which matches the weight of the action, while approving a PR does
-not.
+canonical JSON of `{command, args, nonce, timestamp}`. The header holds
+two signatures when the ML-DSA key exists and one when it does not; the
+desktop verifies every signature the pairing record says to expect and
+refuses the request if any is missing or invalid. It also checks the
+timestamp is within sixty seconds and records the nonce for that window.
+Read and write requests carry no signature. The result is that deleting a
+worktree from the phone costs one Face ID prompt, which matches the weight
+of the action, while approving a PR does not.
 
 The desktop also posts a native notification for every destructive command
 it executes on behalf of a phone, naming the device. That is a second,
 independent signal that something happened, and it costs nothing.
+
+### Post-quantum posture
+
+The question asked of this design was whether the step-up key can be
+post-quantum. As of September 2026 it can, in hardware, on both platforms,
+with a fallback that Android makes unavoidable.
+
+**What the platforms offer.**
+
+- iOS 26, released September 2025, added ML-DSA-65 and ML-DSA-87 to
+  CryptoKit, with Secure Enclave variants: `SecureEnclave.MLDSA65` and
+  `SecureEnclave.MLDSA87` each expose a `PrivateKey` on every Apple
+  platform at version 26. Apple's own guidance is that the ML-DSA API is
+  meant for building hybrid signatures at the application level.
+- Android 17, released 16 June 2026, added ML-DSA-65 and ML-DSA-87 to
+  Android Keystore through the standard `KeyPairGenerator`, `KeyFactory`,
+  and `Signature` APIs, with keys generated in secure hardware on
+  supported devices. The qualifier matters: the OS ships on Pixel first,
+  other manufacturers follow over the next year or two, and a device on
+  Android 16 or older has no ML-DSA in its keystore at all.
+
+**What that means for the design.** A post-quantum-only signing key would
+exclude most Android phones for years. A classical-only key would leave
+the step-up signature forgeable by a future quantum computer. The hybrid
+above takes both: ECDSA P256 is always present and always in hardware, and
+ML-DSA-65 is added whenever the keystore can generate one. The pairing
+record says which keys the phone has, so a device that pairs without
+ML-DSA and later upgrades can re-pair to add it, and the desktop never
+silently accepts a downgrade.
+
+ML-DSA-65 rather than 87 because it is NIST security category 3, a
+3,309-byte public key, and a 3,309-byte signature, which is already
+larger than everything else in a request combined; category 5 buys
+nothing for a signature that only has to hold until the device is
+revoked.
+
+**Why signatures are the second priority, not the first.** A quantum
+adversary attacks the two halves of this protocol differently. Recorded
+traffic can be stored today and decrypted once a large enough machine
+exists, so key exchange has to be post-quantum now. A signature only has
+to be unforgeable at the moment it is checked, so a classical signature
+scheme is safe until such a machine actually exists, and can be swapped
+later. This design therefore:
+
+1. Makes the TLS key exchange hybrid now. rustls with the aws-lc-rs
+   provider prefers X25519MLKEM768 by default, so PR titles and file
+   listings recorded off the wire today stay private.
+2. Makes the step-up signature hybrid now, because the platform keys are
+   available and the cost is one extra signature on a rare request.
+3. Leaves the TLS certificates themselves on ECDSA P256 for v1. ML-DSA in
+   TLS 1.3 is still an IETF draft, and rustls is in the middle of turning
+   it on by default for its 0.23 line; the pull request to do so was
+   marked ready for review on 4 September 2026 and was open when this
+   was written. Because both ends pin the peer's fingerprint rather than
+   validating a chain, migrating the certificates later is a matter of
+   regenerating them and re-pairing, and the plan is to do that once
+   rustls ships it.
+
+**Implementation.**
+
+- A custom Tauri mobile plugin, `tauri-plugin-headstate-keys`, with a
+  Swift side over CryptoKit and a Kotlin side over Android Keystore. It
+  exposes `generate()`, `public_keys()`, and `sign(bytes)`; `sign`
+  returns the ECDSA signature and, when present, the ML-DSA signature.
+  Biometric gating is done by the platform's access control on the key
+  itself, not by a separate prompt, so a signature cannot be produced
+  without the check.
+- The desktop verifies ML-DSA-65 with a pure-Rust implementation. Two
+  candidates: the RustCrypto `ml-dsa` crate, which implements the final
+  FIPS 204 and is unaudited, and Cryspen's `libcrux-ml-dsa`, whose core
+  is formally verified. Verification is the safe side to be on here; the
+  desktop never holds an ML-DSA private key. aws-lc-rs also ships
+  ML-DSA, but its API has moved between the unstable and stable modules
+  across recent releases, so pin whichever crate the spike settles on.
+- The desktop's own identity key stays P256 in v1, for the same reason as
+  the certificates.
+
+**Verify during the mobile crate spike.** These are the claims this
+section rests on that could not be confirmed from documentation alone:
+
+- That `SecureEnclave.MLDSA65.PrivateKey` accepts the same access control
+  and authentication context parameters as the existing P256 Secure
+  Enclave key, so it can be biometric-gated. The P256 key does; the
+  ML-DSA documentation fetched for this design showed the type and its
+  availability but not its initialisers.
+- Which Secure Enclave generations support ML-DSA. Apple's session on the
+  topic named no hardware floor, but the API is only available on OS 26.
+- What Android Keystore does on a device running 17 whose KeyMint lacks
+  ML-DSA: a software-backed key or an exception. The plugin treats either
+  as "no ML-DSA" and pairs with ECDSA alone, and the pairing UI says so.
+- Whether `setUserAuthenticationRequired` applies to ML-DSA keys exactly
+  as it does to EC keys. Nothing suggests otherwise.
+- That aws-lc-rs cross-compiles cleanly for `aarch64-apple-ios` and
+  `aarch64-linux-android` under the toolchains Tauri mobile already
+  requires. It is the only way to get ML-KEM into rustls today; the ring
+  provider has no post-quantum key exchange.
+- That the desktop, which already links octocrab with the ring provider,
+  can add the aws-lc-rs provider for the listener without the two
+  colliding. rustls requires an explicit process-level default when both
+  are compiled in, so this is a one-line fix, but it has to be made.
 
 ## Pairing
 
@@ -248,7 +353,10 @@ intended pairing from an opportunistic one.
    {
      "token": "…",
      "device_name": "Octocat's phone",
-     "signing_pubkey": "…base64…",
+     "signing_keys": {
+       "ecdsa_p256": "…base64…",
+       "mldsa_65": "…base64… or absent"
+     },
      "proof": "HMAC-SHA256(token, client_fp || server_fp)"
    }
    ```
@@ -257,10 +365,11 @@ intended pairing from an opportunistic one.
    transit is useless without the matching client key.
 
 4. Desktop verifies the proof, invalidates the token, and shows a modal:
-   "Pair *Octocat's phone*? Fingerprint `ab12 cd34 …`". The phone shows the
-   same fingerprint so the user can compare. On approve, the desktop
-   inserts the row and returns `200`; on deny or timeout it returns `403`
-   and the phone discards its keys.
+   "Pair *Octocat's phone*? Fingerprint `ab12 cd34 …`", with a line
+   saying whether the phone offered a post-quantum signing key. The phone
+   shows the same fingerprint so the user can compare. On approve, the
+   desktop inserts the row and returns `200`; on deny or timeout it
+   returns `403` and the phone discards its keys.
 
 5. Phone stores `{name, addrs, port, fp}` in its own settings store. From
    here on, every connection is ordinary mTLS.
@@ -281,7 +390,8 @@ CREATE TABLE paired_devices (
   name            TEXT NOT NULL,
   cert_fp         TEXT NOT NULL UNIQUE,   -- sha256 of the session cert, hex
   cert_der        BLOB NOT NULL,          -- for the verifier
-  signing_pubkey  BLOB NOT NULL,          -- ed25519, 32 bytes
+  ecdsa_pubkey    BLOB NOT NULL,          -- P256, SEC1 uncompressed, 65 bytes
+  mldsa_pubkey    BLOB,                   -- ML-DSA-65, 1952 bytes, NULL if the phone has none
   paired_at       TEXT NOT NULL,
   last_seen       TEXT
 );
@@ -341,10 +451,10 @@ have different bundle identifiers, icons, and store listings.
 | Crate | Purpose |
 |---|---|
 | `tauri` 2 | app shell, mobile entry point |
-| `reqwest` with `rustls` and `native-tls` off | HTTPS client; `Identity` from the session key, custom verifier for the pinned server fingerprint |
+| `reqwest` with `rustls` on the aws-lc-rs provider, `native-tls` off | HTTPS client; `Identity` from the session key, custom verifier for the pinned server fingerprint, X25519MLKEM768 key exchange |
 | `rcgen` | self-signed session certificate |
-| `ed25519-dalek` | signing key operations when the platform keystore cannot hold an Ed25519 key directly; see Open questions |
-| `tauri-plugin-biometric` | gate the signing key |
+| `tauri-plugin-headstate-keys` (new, in-repo) | Swift and Kotlin sides that generate and use the hardware-backed session, ECDSA, and ML-DSA keys; see Post-quantum posture |
+| `tauri-plugin-biometric` | prompt wording and availability checks; the actual gate is the keystore access control on the key |
 | `tauri-plugin-stronghold` | encrypted local settings: desktop fingerprint, addresses |
 | `tauri-plugin-barcode-scanner` | scan the pairing QR |
 | `mdns-sd` | LAN discovery |
@@ -394,6 +504,23 @@ over `/v1/events` is cached in the phone's settings store so the list
 renders while unreachable, marked stale, with actions disabled. There is
 no local poll loop and no GitHub token to run one with.
 
+### What the phone does when it is in the background
+
+Also nothing, and this is a decision rather than an open question. iOS
+suspends an app shortly after it leaves the foreground and a streaming
+connection dies with it; background URL sessions exist for discrete
+downloads and uploads, not for a held-open event stream. The only way to
+be told about a change while suspended is a push notification, and a push
+needs a server, which this design does not have. Android is more lenient
+but its background limits point the same way.
+
+So the phone catches up on resume: reopen the event stream, receive the
+current snapshot, and refresh whatever view is showing. The one cheap
+improvement worth taking is a background refresh task on each platform,
+which the OS grants opportunistically for a few seconds at a time; it can
+fetch `/v1/hello` and the cached list so the app opens fresh. It is not a
+stream and must not be designed as one.
+
 ## Security Policy changes
 
 `SECURITY.md` currently states that Headstate stores no credentials of its
@@ -415,7 +542,9 @@ a section covering:
 - **Allowlist test**: every command in `generate_handler!` appears in
   exactly one class in `surface.rs`.
 - **Signature tests**: destructive call without signature refused, with a
-  stale timestamp refused, with a reused nonce refused, valid accepted.
+  stale timestamp refused, with a reused nonce refused, valid accepted;
+  a pairing that recorded an ML-DSA key refuses a request carrying only
+  the ECDSA signature.
 - **Transport tests** in `src/api`: `tauri.ts` wrappers produce identical
   calls through the local and remote transports; events arrive under the
   same names.
@@ -439,13 +568,9 @@ a section covering:
 
 ## Open questions
 
-- **Ed25519 in the platform keystore.** iOS Secure Enclave and Android
-  StrongBox hold NIST P256 keys natively; Ed25519 is not universal. The
-  safe choice is ECDSA over P256 for the signing key on both platforms and
-  drop `ed25519-dalek`. Decide during the mobile crate spike.
-- **Background execution.** iOS suspends the SSE stream within seconds of
-  the app leaving the foreground. v1 accepts that the phone catches up on
-  resume. Background refresh is out of scope because there is no push path.
+- **Post-quantum TLS certificates.** Decided as a follow-up rather than
+  v1; see Post-quantum posture. The trigger is rustls enabling ML-DSA
+  signature schemes by default in a released version.
 - **Multiple desktops.** The phone's settings store is designed as a list
   of desktops even though the UI shows one, so adding a switcher later is
   a frontend change only.
@@ -467,9 +592,27 @@ a section covering:
    migration, Settings UI for enable, pair, and revoke, loopback
    integration test. Ships behind the off-by-default toggle.
 3. **Mobile crate spike.** `src-mobile` builds for both targets, pairs
-   against a desktop on the same wifi, and runs `get_cached`.
+   against a desktop on the same wifi, and runs `get_cached`. Includes
+   the keys plugin and the checks listed under Post-quantum posture.
 4. **Allowlist and step-up.** Full read and write surface, destructive
    signature, desktop notification.
 5. **Responsive pass.** PR list, detail, nudge, cleanup, connection banner.
 6. **Security Policy update and pairing walkthrough.** Then a TestFlight
    and Play internal build.
+
+## References
+
+Consulted on 2026-09-05 for the post-quantum section.
+
+- Apple, "Get ahead with quantum-secure cryptography", WWDC25 session
+  314: <https://developer.apple.com/videos/play/wwdc2025/314/>
+- Apple, `SecureEnclave.MLDSA65` reference:
+  <https://developer.apple.com/documentation/cryptokit/secureenclave/mldsa65>
+- Android Developers, "Android 17 is here", 16 June 2026:
+  <https://developer.android.com/blog/posts/android-17-is-here>
+- Android Developers, "The Fourth Beta of Android 17":
+  <https://developer.android.com/blog/posts/the-fourth-beta-of-android-17>
+- IETF, "Use of ML-DSA in TLS 1.3", draft-ietf-tls-mldsa.
+- rustls, pull request "[0.23] Enable ML-DSA by default", open as of
+  4 September 2026.
+- RustCrypto `ml-dsa` and Cryspen `libcrux-ml-dsa` on crates.io.
