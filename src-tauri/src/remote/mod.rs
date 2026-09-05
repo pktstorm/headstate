@@ -14,3 +14,8 @@ pub mod listener;
 pub mod pairing;
 pub mod stepup;
 pub mod surface;
+
+/// The whole surface, end to end, over loopback: the spec's "loopback
+/// integration test".
+#[cfg(test)]
+mod loopback_tests;

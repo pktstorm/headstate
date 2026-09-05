@@ -35,31 +35,23 @@
 //! - [`PairingState::subscribe_revocations`]: a broadcast of
 //!   fingerprints whose rows were just deleted. The listener drops every
 //!   open connection presenting that certificate.
+//! - [`PairingState::is_device_paired`] and [`PairingState::paired_device`]:
+//!   the verifier's per-handshake and per-request lookups, answered from
+//!   an in-memory copy of `paired_devices` that [`PairingState::respond`]
+//!   and [`PairingState::revoke`] refresh, so neither touches SQLite.
+//!   `remote/gate.rs` implements the listener's `PairedCerts` over these
+//!   and loads the copy once at startup.
 //! - The desktop's own fingerprint and display name come from
-//!   [`IdentityInfo`], which `remote/identity.rs` implements. Until it
-//!   does, [`StubIdentity`] is managed in its place and
-//!   `issue_pairing_token` fails with a message that says so.
+//!   [`IdentityInfo`], which `remote/gate.rs` implements over the
+//!   identity the listener loaded.
 //!
-//! # Mounting on `POST /v1/pair`
-//!
-//! ```ignore
-//! // Inside the axum router, with `Arc<PairingState>` and the desktop
-//! // identity reachable from the app handle:
-//! async fn pair(app: AppHandle, peer_der: Vec<u8>, req: PairRequest) -> (u16, String) {
-//!     let state = app.state::<Arc<PairingState>>();
-//!     let server = app.state::<DesktopIdentity>().0.identity()?;
-//!     let client = PeerCert { fingerprint: fingerprint_hex(&peer_der), der: peer_der };
-//!     match handle_pair(&state, req, &client, &server.fingerprint).await {
-//!         Ok(outcome) => (200, serde_json::to_string(&outcome)?),
-//!         Err(e) => (e.http_status(), e.to_string()),
-//!     }
-//! }
-//! ```
-//!
-//! `handle_pair` is `Send` and holds no lock across an await, so it can
-//! run directly inside a tokio handler. It blocks for as long as the
-//! user takes to answer the modal, up to [`DECISION_TIMEOUT`]; the
-//! listener should not put a shorter request timeout in front of it.
+//! `POST /v1/pair` is mounted in `remote/listener.rs`: it decodes the
+//! body, builds the [`PeerCert`] from the handshake's client certificate,
+//! and maps [`handle_pair`]'s result with [`PairError::http_status`].
+//! `handle_pair` is `Send` and holds no lock across an await, so it runs
+//! directly inside the tokio handler. It blocks for as long as the user
+//! takes to answer the modal, up to [`DECISION_TIMEOUT`]; the listener
+//! puts no shorter request timeout in front of it.
 
 use crate::store::devices::{self, NewDevice, PairedDevice};
 use crate::store::{open_db, StoreError};
@@ -71,7 +63,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use tauri::{AppHandle, Emitter, State};
@@ -97,7 +89,7 @@ const ECDSA_P256_LEN: usize = 65;
 const MLDSA_65_LEN: usize = 1952;
 
 // ---------------------------------------------------------------------
-// Identity seam (implemented by remote/identity.rs)
+// Identity seam (implemented by remote/gate.rs)
 // ---------------------------------------------------------------------
 
 /// What pairing needs to know about this desktop.
@@ -109,27 +101,19 @@ pub struct Identity {
     pub display_name: String,
 }
 
-/// The desktop's certificate identity. `remote/identity.rs` owns the key
-/// pair and implements this; pairing only ever reads the two strings.
+/// The desktop's certificate identity. `remote/gate.rs` implements this
+/// over the key pair `remote/identity.rs` owns; pairing only ever reads
+/// the two strings.
 pub trait IdentityInfo: Send + Sync {
     /// Fails when the desktop has no certificate yet, with a message the
-    /// UI can show.
+    /// UI can show. Never invents a fingerprint: a QR code carrying a
+    /// made-up `fp` would let a phone pin the wrong thing, and nothing
+    /// downstream could tell.
     fn identity(&self) -> Result<Identity, String>;
 }
 
 /// Managed Tauri state holding whichever [`IdentityInfo`] is wired in.
 pub struct DesktopIdentity(pub Arc<dyn IdentityInfo>);
-
-/// Stand-in until the real identity module lands. Refuses rather than
-/// inventing a fingerprint: a QR code carrying a made-up `fp` would let
-/// a phone pin the wrong thing, and nothing downstream could tell.
-pub struct StubIdentity;
-
-impl IdentityInfo for StubIdentity {
-    fn identity(&self) -> Result<Identity, String> {
-        Err("this desktop has no certificate yet; phone pairing is not available".into())
-    }
-}
 
 // ---------------------------------------------------------------------
 // Wire shapes
@@ -342,6 +326,12 @@ pub struct PairingState {
     notify: Box<dyn Fn(PairingRequestEvent) + Send + Sync>,
     revocations: broadcast::Sender<String>,
     config: PairingConfig,
+    /// `paired_devices` by fingerprint, for the listener. The TLS
+    /// verifier asks on every handshake and the path gate on every
+    /// request, from tokio workers that must not wait on SQLite; this
+    /// copy answers both, and every write to the table in this module
+    /// refreshes it before the caller hears the outcome.
+    devices: RwLock<HashMap<String, PairedDevice>>,
 }
 
 impl PairingState {
@@ -364,6 +354,7 @@ impl PairingState {
             notify: Box::new(notify),
             revocations,
             config,
+            devices: RwLock::new(HashMap::new()),
         }
     }
 
@@ -372,6 +363,46 @@ impl PairingState {
         // token and some pending replies, none of which a panic can
         // leave half-written in a way that matters.
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Replace the in-memory copy of `paired_devices` with the table's
+    /// current rows. Called once at startup by `remote/gate.rs`, and by
+    /// [`respond`](Self::respond) and [`revoke`](Self::revoke) after
+    /// every write, so the listener's answers are never staler than the
+    /// last change made through this module.
+    pub fn reload_devices(&self, conn: &Connection) -> Result<(), StoreError> {
+        let rows = devices::list(conn)?;
+        let map = rows.into_iter().map(|d| (d.cert_fp.clone(), d)).collect();
+        *self.devices.write().unwrap_or_else(|e| e.into_inner()) = map;
+        Ok(())
+    }
+
+    /// Reload after a write, or say so: the write itself succeeded and
+    /// the caller must still hear that, but a listener that cannot see
+    /// it is worth a warning.
+    fn refresh_devices(&self, conn: &Connection) {
+        if let Err(e) = self.reload_devices(conn) {
+            log::warn!("could not refresh the paired devices the listener checks: {e}");
+        }
+    }
+
+    /// Whether a device with this fingerprint is paired, from the
+    /// in-memory copy. Cheap and non-blocking: the TLS handshake path.
+    pub fn is_device_paired(&self, cert_fp: &str) -> bool {
+        self.devices
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(cert_fp)
+    }
+
+    /// The paired device presenting this fingerprint, with its step-up
+    /// keys, for `/v1/call`. `None` when not paired.
+    pub fn paired_device(&self, cert_fp: &str) -> Option<PairedDevice> {
+        self.devices
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(cert_fp)
+            .cloned()
     }
 
     /// Mint a new token, replacing any outstanding one.
@@ -515,6 +546,10 @@ impl PairingState {
             })
         })();
 
+        // Before the phone hears 200: its very next handshake must find
+        // the row. Also after a failure, since a replace may have
+        // deleted the old row before the insert failed.
+        self.refresh_devices(conn);
         match result {
             Ok(outcome) => {
                 let _ = pending.reply.send(Ok(outcome));
@@ -535,6 +570,9 @@ impl PairingState {
         let removed = devices::revoke(conn, id)?;
         if let Some(device) = &removed {
             log::info!("revoked device {id} ({})", device.name);
+            // The copy first, then the broadcast: a listener reacting to
+            // the broadcast by re-checking must already see it gone.
+            self.refresh_devices(conn);
             let _ = self.revocations.send(device.cert_fp.clone());
         }
         Ok(removed)
@@ -723,12 +761,22 @@ pub fn new_state(app: AppHandle) -> Arc<PairingState> {
 }
 
 /// Settings > Pair a phone. Mints a token and returns what the QR code
-/// should encode. Fails until the desktop has a certificate.
+/// should encode.
+///
+/// Starts the listener first if it is not already up -- "the desktop
+/// enables the listener if it is not already on" in the spec -- because
+/// the identity whose fingerprint the QR carries is loaded by that
+/// start, and a QR pointing at a port nothing answers on is worse than
+/// an error. The Settings screen turns the setting on before calling
+/// this, so the start here is normally a no-op; it is the guarantee,
+/// not the usual path.
 #[tauri::command]
-pub fn issue_pairing_token(
+pub async fn issue_pairing_token(
+    app: AppHandle,
     state: State<'_, Arc<PairingState>>,
     identity: State<'_, DesktopIdentity>,
 ) -> Result<QrPayload, String> {
+    crate::remote::gate::start(&app).await?;
     let identity = identity.0.identity()?;
     let addrs = local_addrs()?;
     if addrs.is_empty() {
@@ -1323,8 +1371,63 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_stub_identity_refuses_rather_than_inventing_a_fingerprint() {
-        assert!(StubIdentity.identity().is_err());
+    /// The listener's copy follows every write made through this module
+    /// and a reload from the table, and nothing else.
+    #[tokio::test]
+    async fn the_device_copy_follows_approve_revoke_and_reload() {
+        let (state, mut events) = state(quick());
+        let conn = db();
+        assert!(!state.is_device_paired(CLIENT_FP));
+        assert_eq!(state.paired_device(CLIENT_FP), None);
+
+        // A row written behind the module's back is invisible until a
+        // reload, which is why gate.rs reloads once at startup.
+        devices::insert(
+            &conn,
+            &NewDevice {
+                name: "Tablet".into(),
+                cert_fp: "0ld".into(),
+                cert_der: vec![1],
+                ecdsa_pubkey: vec![0x04; ECDSA_P256_LEN],
+                mldsa_pubkey: None,
+            },
+        )
+        .unwrap();
+        assert!(!state.is_device_paired("0ld"));
+        state.reload_devices(&conn).unwrap();
+        assert!(state.is_device_paired("0ld"));
+
+        // Approve: visible before the phone hears 200, with its keys.
+        let issued = state.issue_token();
+        let req = request(&issued, "Octocat's phone", true);
+        let handshake = {
+            let state = state.clone();
+            tokio::spawn(async move { handle_pair(&state, req, &client(), SERVER_FP).await })
+        };
+        let event = events.recv().await.unwrap();
+        state
+            .respond(
+                &conn,
+                event.request_id,
+                PairDecision::Approve {
+                    same_name: SameName::Undecided,
+                },
+            )
+            .unwrap();
+        let outcome = handshake.await.unwrap().unwrap();
+        let device = state
+            .paired_device(CLIENT_FP)
+            .expect("paired after approve");
+        assert_eq!(device.id, outcome.device_id);
+        assert_eq!(device.name, "Octocat's phone");
+        assert_eq!(device.ecdsa_pubkey, vec![0x04; ECDSA_P256_LEN]);
+        assert_eq!(device.mldsa_pubkey, Some(vec![0x11; MLDSA_65_LEN]));
+
+        // Revoke: gone before the broadcast is sent.
+        let mut revoked = state.subscribe_revocations();
+        state.revoke(&conn, outcome.device_id).unwrap();
+        assert!(!state.is_device_paired(CLIENT_FP));
+        assert!(state.is_device_paired("0ld"), "only the revoked one goes");
+        assert_eq!(revoked.try_recv().unwrap(), CLIENT_FP);
     }
 }

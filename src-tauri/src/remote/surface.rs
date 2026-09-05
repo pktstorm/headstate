@@ -144,6 +144,16 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("docker_restart", Class::Local),
     ("docker_start", Class::Local),
     ("set_view_needs_github", Class::Local),
+    // The remote feature's own commands. Pairing and the on/off switch
+    // are decisions the desktop's user makes at the desktop: a phone
+    // that could approve its own pairing request, revoke a rival, or
+    // turn the listener off would defeat the point of each.
+    ("issue_pairing_token", Class::Local),
+    ("respond_to_pairing", Class::Local),
+    ("list_paired_devices", Class::Local),
+    ("revoke_paired_device", Class::Local),
+    ("get_remote_enabled", Class::Local),
+    ("set_remote_enabled", Class::Local),
 ];
 
 /// The class of a registered command, or `None` when no such command
@@ -173,6 +183,19 @@ pub enum RemoteError {
     /// Suggested status: 500.
     #[error("{0}")]
     Command(String),
+}
+
+impl RemoteError {
+    /// The statuses suggested on each variant, for the `/v1/call`
+    /// handler in `remote/listener.rs`.
+    pub fn http_status(&self) -> u16 {
+        match self {
+            RemoteError::Unknown(_) => 404,
+            RemoteError::Local(_) => 403,
+            RemoteError::BadArgs { .. } => 400,
+            RemoteError::Command(_) => 500,
+        }
+    }
 }
 
 /// The gate `dispatch` applies before touching any argument: known and
@@ -493,21 +516,35 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// The `commands::name` entries inside `generate_handler![...]` in
+    /// The `path::name` entries inside `generate_handler![...]` in
     /// `lib.rs`, read from the source at test time so the desktop's real
-    /// registration is what is compared, not a copy of it.
+    /// registration is what is compared, not a copy of it. Any module
+    /// path counts -- `commands::x` and `remote::pairing::x` alike --
+    /// because a command registered under a path the parser ignored
+    /// would be neither classified nor caught.
     fn registered_commands() -> Vec<String> {
         let src = include_str!("../lib.rs");
+        let open = "generate_handler![";
         let start = src
-            .find("generate_handler![")
+            .find(open)
             .expect("lib.rs must register commands with generate_handler!");
-        let block = &src[start..];
+        let block = &src[start + open.len()..];
         let end = block.find(']').expect("generate_handler! block must close");
         block[..end]
             .split_whitespace()
-            .filter_map(|tok| tok.strip_prefix("commands::"))
-            .map(|name| name.trim_end_matches(',').to_string())
+            .map(|tok| tok.trim_end_matches(','))
+            .filter(|tok| tok.contains("::"))
+            .filter_map(|tok| tok.rsplit("::").next())
+            .map(str::to_string)
             .collect()
+    }
+
+    #[test]
+    fn the_parser_sees_commands_under_every_module_path() {
+        let registered = registered_commands();
+        for name in ["get_cached", "issue_pairing_token", "set_remote_enabled"] {
+            assert!(registered.iter().any(|r| r == name), "{name} not parsed");
+        }
     }
 
     #[test]
@@ -554,6 +591,12 @@ mod tests {
             "set_autostart",
             "assess_worktree",
             "docker_restart",
+            "issue_pairing_token",
+            "respond_to_pairing",
+            "list_paired_devices",
+            "revoke_paired_device",
+            "get_remote_enabled",
+            "set_remote_enabled",
         ] {
             assert_eq!(
                 admit(name),
@@ -561,6 +604,18 @@ mod tests {
                 "{name} must be refused as local"
             );
         }
+    }
+
+    #[test]
+    fn each_error_maps_to_the_status_its_docs_suggest() {
+        assert_eq!(RemoteError::Unknown("x".into()).http_status(), 404);
+        assert_eq!(RemoteError::Local("x".into()).http_status(), 403);
+        let bad = RemoteError::BadArgs {
+            command: "x".into(),
+            message: "m".into(),
+        };
+        assert_eq!(bad.http_status(), 400);
+        assert_eq!(RemoteError::Command("m".into()).http_status(), 500);
     }
 
     #[test]
