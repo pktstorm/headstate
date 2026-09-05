@@ -279,13 +279,23 @@ later. This design therefore:
   Biometric gating is done by the platform's access control on the key
   itself, not by a separate prompt, so a signature cannot be produced
   without the check.
-- The desktop verifies ML-DSA-65 with a pure-Rust implementation. Two
-  candidates: the RustCrypto `ml-dsa` crate, which implements the final
-  FIPS 204 and is unaudited, and Cryspen's `libcrux-ml-dsa`, whose core
-  is formally verified. Verification is the safe side to be on here; the
-  desktop never holds an ML-DSA private key. aws-lc-rs also ships
-  ML-DSA, but its API has moved between the unstable and stable modules
-  across recent releases, so pin whichever crate the spike settles on.
+- The desktop verifies ML-DSA-65 with RustCrypto's `ml-dsa` crate,
+  pinned at 0.1.1, alongside `p256` 0.13 for the ECDSA half. The other
+  candidate was Cryspen's `libcrux-ml-dsa` 0.0.10, whose core is
+  formally verified; both implement final FIPS 204, and a cross-check
+  during implementation showed each verifies the other's signatures and
+  derives the same public key from the same seed. `ml-dsa` won on the
+  build: no build scripts, fifteen new lock entries all from RustCrypto,
+  and the `signature` traits `p256` already uses, against three
+  `build.rs` files, twenty-nine new entries including `hax-lib` proc
+  macros and a `cfg`-gated `bindgen` chain, and a 0.0.x API. The audit
+  gap is accepted because the desktop only verifies: formal verification
+  mostly protects a signer's secrets, and the only ML-DSA signer is the
+  phone's secure hardware. The header grammar, canonical bytes, and a
+  byte-exact test vector for the phone to match live in
+  `src-tauri/src/remote/stepup.rs`. aws-lc-rs also ships ML-DSA, but its
+  API has moved between the unstable and stable modules across recent
+  releases, so it was not considered.
 - The desktop's own identity key stays P256 in v1, for the same reason as
   the certificates.
 
