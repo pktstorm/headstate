@@ -1,0 +1,272 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { renderHook } from "@testing-library/react";
+import { createElement, type ReactNode } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type {
+  CleanupPrefs,
+  ProjectReport,
+  UpdateFilter,
+  UpdateRequest,
+} from "../types/pr";
+
+/// The local transport is the ONLY thing mocked. Everything above it --
+/// `transport.ts`, `tauri.ts`, the hooks -- is real, so what the mock
+/// records is exactly what would reach `@tauri-apps/api` on the desktop.
+const local = vi.hoisted(() => ({
+  call: vi.fn<(name: string, args?: Record<string, unknown>) => Promise<unknown>>(() =>
+    Promise.resolve(undefined),
+  ),
+  listen: vi.fn<(event: string, cb: unknown) => Promise<() => void>>(() =>
+    Promise.resolve(() => {}),
+  ),
+}));
+vi.mock("./local", () => ({ local }));
+
+import * as api from "./tauri";
+import * as hooks from "./hooks";
+import { call, listen } from "./transport";
+import type { NotifyPrefs, UiPrefs } from "./tauri";
+
+beforeEach(() => {
+  local.call.mockClear();
+  local.listen.mockClear();
+});
+
+// Sample arguments. Values are arbitrary; what matters is that each one
+// arrives under the SAME key the Rust command expects, which is the
+// shorthand-property key in `tauri.ts`.
+const id = "PR_kwDOAbCdEf";
+const repo = "octocat/hello-world";
+const number = 7;
+const runId = 42;
+const threadId = "PRRT_kwDOAbCdEf";
+const refId = "REF_kwDOAbCdEf";
+const branch = "feature/spoon";
+const merged = true;
+const expectedHead = "0123abcd";
+const enable = true;
+const enabled = true;
+const needs = true;
+const secs = 60;
+const days = 30;
+const path = "/home/octocat/code/hello-world";
+const repoPath = "/home/octocat/code/hello-world";
+const worktreePath = "/home/octocat/code/hello-world/.worktrees/feature-spoon";
+const worktreePaths = [worktreePath];
+const paths = [path];
+const ids = ["sha256:abc"];
+const names = ["feature/spoon"];
+const dirs = ["/home/octocat/code"];
+const name = "hello-world_data";
+const until = "24h";
+const body = "Looks good.";
+const verdict = "approve" as const;
+const action = "merge" as const;
+const prs: [string, string, number][] = [[id, repo, number]];
+const requestId = 11;
+const approve = true;
+const replaceExisting = false;
+const deviceId = 3;
+const uiPrefs = { hidden_views: [] } as unknown as UiPrefs;
+const notifyPrefs = { enabled: true } as unknown as NotifyPrefs;
+const cleanupPrefs = { enabled: false } as unknown as CleanupPrefs;
+const reports = [] as ProjectReport[];
+const requests = [] as UpdateRequest[];
+const filter = {} as unknown as UpdateFilter;
+
+type Wrapper = (...a: never[]) => Promise<unknown>;
+interface Row {
+  fn: Wrapper;
+  args: unknown[];
+  command: string;
+  expected: Record<string, unknown> | undefined;
+}
+const row = (
+  fn: Wrapper,
+  args: unknown[],
+  command: string,
+  expected?: Record<string, unknown>,
+): Row => ({ fn, args, command, expected });
+
+/// One row per exported wrapper: the command name and argument object
+/// each one sent to `invoke` before the seam existed.
+const ROWS: Row[] = [
+  row(api.getCached, [], "get_cached"),
+  row(api.refreshNow, [], "refresh_now"),
+  row(api.getUiPrefs, [], "get_ui_prefs"),
+  row(api.setUiPrefs, [uiPrefs], "set_ui_prefs", { prefs: uiPrefs }),
+  row(api.getAutostart, [], "get_autostart"),
+  row(api.setAutostart, [enabled], "set_autostart", { enabled }),
+  row(api.getRemoteEnabled, [], "get_remote_enabled"),
+  row(api.setRemoteEnabled, [enabled], "set_remote_enabled", { enabled }),
+  row(api.assessWorktree, [repoPath, worktreePath, branch], "assess_worktree", { repoPath, worktreePath, branch }),
+  row(api.getNotifyPrefs, [], "get_notify_prefs"),
+  row(api.setNotifyPrefs, [notifyPrefs], "set_notify_prefs", { prefs: notifyPrefs }),
+  row(api.rerunChecks, [repo, number, runId], "rerun_checks", { repo, number, runId }),
+  row(api.buildTarget, [], "build_target"),
+  row(api.countReviewing, [], "count_reviewing"),
+  row(api.getViewer, [], "get_viewer"),
+  row(api.reviewPr, [id, repo, number, verdict, body], "review_pr", { id, repo, number, verdict, body }),
+  row(api.commentOnPr, [id, repo, number, body], "comment_on_pr", { id, repo, number, body }),
+  row(api.resolveThread, [threadId, repo, number], "resolve_thread", { threadId, repo, number }),
+  row(api.unresolveThread, [threadId, repo, number], "unresolve_thread", { threadId, repo, number }),
+  row(api.replyToThread, [threadId, repo, number, body], "reply_to_thread", { threadId, repo, number, body }),
+  row(api.getStats, [], "get_stats"),
+  row(api.listWorktrees, [], "list_worktrees"),
+  row(api.classifyWorktrees, [repoPath], "classify_worktrees", { repoPath }),
+  row(api.actOnPr, [id, repo, number, action], "act_on_pr", { id, repo, number, action }),
+  row(api.removeWorktrees, [repoPath, worktreePaths], "remove_worktrees", { repoPath, worktreePaths }),
+  row(api.latestRelease, [], "latest_release"),
+  row(api.dockerState, [], "docker_state"),
+  row(api.dockerBuilds, [], "docker_builds"),
+  row(api.dockerImages, [], "docker_images"),
+  row(api.dockerDiskUsage, [], "docker_disk_usage"),
+  row(api.dockerRemoveImages, [ids], "docker_remove_images", { ids }),
+  row(api.dockerDanglingVolumes, [], "docker_dangling_volumes"),
+  row(api.dockerRemoveVolume, [name], "docker_remove_volume", { name }),
+  row(api.dockerPruneCache, [until], "docker_prune_cache", { until }),
+  row(api.dockerRunningContainers, [], "docker_running_containers"),
+  row(api.dockerRestart, [], "docker_restart"),
+  row(api.dockerStart, [], "docker_start"),
+  row(api.assessedWorktrees, [], "assessed_worktrees"),
+  row(api.removeWorktreeForced, [repoPath, worktreePath], "remove_worktree_forced", { repoPath, worktreePath }),
+  row(api.claudifyCommand, [repoPath, worktreePath, branch], "claudify_command", { repoPath, worktreePath, branch }),
+  row(api.setAutoMerge, [id, repo, number, expectedHead, enable], "set_auto_merge", { id, repo, number, expectedHead, enable }),
+  row(api.deleteHeadBranch, [refId, repo, number, branch, merged], "delete_head_branch", { refId, repo, number, branch, merged }),
+  row(api.updatePrBranch, [id, repo, number, expectedHead], "update_pr_branch", { id, repo, number, expectedHead }),
+  row(api.actOnPrs, [prs, action], "act_on_prs", { prs, action }),
+  row(api.getPrDetail, [repo, number], "get_pr_detail", { repo, number }),
+  row(api.sizeWorktrees, [repoPath], "size_worktrees", { repoPath }),
+  row(api.pullCheckout, [path], "pull_checkout", { path }),
+  row(api.removeOrphan, [path], "remove_orphan", { path }),
+  row(api.removeWorktree, [repoPath, worktreePath], "remove_worktree", { repoPath, worktreePath }),
+  row(api.setViewNeedsGithub, [needs], "set_view_needs_github", { needs }),
+  row(api.getWorktreeDirs, [], "get_worktree_dirs"),
+  row(api.setWorktreeDirs, [dirs], "set_worktree_dirs", { dirs }),
+  row(api.getPollInterval, [], "get_poll_interval"),
+  row(api.setPollInterval, [secs], "set_poll_interval", { secs }),
+  row(api.getReviewing, [], "get_reviewing"),
+  row(api.getCachedReviewing, [], "get_cached_reviewing"),
+  row(api.getCycleTrend, [], "get_cycle_trend"),
+  row(api.getPeriods, [], "get_periods"),
+  row(api.getHistory, [days], "get_history", { days }),
+  row(api.getMergedDetail, [], "get_merged_detail"),
+  row(api.getAuthState, [], "get_auth_state"),
+  row(api.scanArtifacts, [], "scan_artifacts"),
+  row(api.sizeArtifacts, [paths], "size_artifacts", { paths }),
+  row(api.removeArtifacts, [paths], "remove_artifacts", { paths }),
+  row(api.scanVenvs, [], "scan_venvs"),
+  row(api.sizeVenvs, [paths], "size_venvs", { paths }),
+  row(api.removeVenvs, [paths], "remove_venvs", { paths }),
+  row(api.markAssessed, [worktreePath], "mark_assessed", { worktreePath }),
+  row(api.clearAssessed, [worktreePath], "clear_assessed", { worktreePath }),
+  row(api.previewCleanup, [], "preview_cleanup"),
+  row(api.cleanupLog, [], "cleanup_log"),
+  row(api.getCleanupPrefs, [], "get_cleanup_prefs"),
+  row(api.setCleanupPrefs, [cleanupPrefs], "set_cleanup_prefs", { prefs: cleanupPrefs }),
+  row(api.checkPackages, [repoPath], "check_packages", { repoPath }),
+  row(api.packagesMarkdown, [repoPath, reports, filter], "packages_markdown", { repoPath, reports, filter }),
+  row(api.revealLog, [], "reveal_log"),
+  row(api.scanClaudeMd, [repoPath], "scan_claude_md", { repoPath }),
+  row(api.readClaudeMd, [path], "read_claude_md", { path }),
+  row(api.listBranches, [repoPath], "list_branches", { repoPath }),
+  row(api.deleteBranches, [repoPath, names], "delete_branches", { repoPath, names }),
+  row(api.deleteRemoteBranches, [repoPath, names], "delete_remote_branches", { repoPath, names }),
+  row(api.applyUpdatesInBackground, [repoPath, requests, branch], "apply_updates_in_background", { repoPath, requests, branch }),
+  row(api.issuePairingToken, [], "issue_pairing_token"),
+  // `replaceExisting` is sent as null when omitted, so the key is always
+  // present; this row pins the explicit-value shape.
+  row(api.respondToPairing, [requestId, approve, replaceExisting], "respond_to_pairing", { requestId, approve, replaceExisting }),
+  row(api.listPairedDevices, [], "list_paired_devices"),
+  row(api.revokePairedDevice, [deviceId], "revoke_paired_device", { id: deviceId }),
+];
+
+describe("tauri.ts wrappers through the transport", () => {
+  it.each(ROWS.map((r) => [r.command, r] as const))("%s", async (_command, r) => {
+    await (r.fn as (...a: unknown[]) => Promise<unknown>)(...r.args);
+    expect(local.call).toHaveBeenCalledTimes(1);
+    expect(local.call).toHaveBeenCalledWith(r.command, r.expected);
+  });
+
+  it("covers every wrapper tauri.ts exports", () => {
+    // A wrapper added without a row here would otherwise be the one
+    // whose arguments silently drift.
+    const exported = Object.values(api).filter((v) => typeof v === "function");
+    const covered = new Set<unknown>(ROWS.map((r) => r.fn));
+    for (const fn of exported) expect(covered.has(fn)).toBe(true);
+    expect(ROWS).toHaveLength(exported.length);
+  });
+
+  it("resolves with what the transport returns and rejects with what it throws", async () => {
+    local.call.mockResolvedValueOnce([]);
+    await expect(api.getCached()).resolves.toEqual([]);
+    local.call.mockRejectedValueOnce("not authenticated");
+    await expect(api.refreshNow()).rejects.toBe("not authenticated");
+  });
+});
+
+/// The events the desktop poll loop emits, and the hook that subscribes
+/// to each. The remote transport will re-emit them under these names,
+/// so the hooks must reach them through the seam and nowhere else.
+const POLL_EVENTS: [string, () => unknown][] = [
+  ["prs-updated", hooks.usePullRequests],
+  ["poll-state", hooks.usePollState],
+  ["poll-error", hooks.usePollError],
+  ["prs-truncated", hooks.useTruncation],
+  ["prs-incomplete", hooks.useIncomplete],
+  ["store-error", hooks.useStoreError],
+  ["worktree-removal-progress", hooks.useRemovalProgress],
+  ["reviewing-short", hooks.useReviewShortfall],
+  ["update-run-done", hooks.useUpdateRunOutcome],
+];
+
+function wrapper({ children }: { children: ReactNode }) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return createElement(QueryClientProvider, { client: qc }, children);
+}
+
+describe("poll-loop events through the transport", () => {
+  it.each(POLL_EVENTS)("%s is subscribed via transport.listen", (event, hook) => {
+    const { unmount } = renderHook(() => hook(), { wrapper });
+    const events = local.listen.mock.calls.map((c) => c[0]);
+    expect(events).toContain(event);
+    unmount();
+  });
+
+  it("passes the event name and callback through unchanged", async () => {
+    const cb = () => {};
+    const un = await listen("prs-updated", cb);
+    expect(local.listen).toHaveBeenCalledWith("prs-updated", cb);
+    expect(typeof un).toBe("function");
+  });
+
+  it("call passes name and args through unchanged", async () => {
+    await call("get_history", { days: 7 });
+    expect(local.call).toHaveBeenCalledWith("get_history", { days: 7 });
+  });
+});
+
+describe("transport selection", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it("defaults to desktop when VITE_TARGET is unset", () => {
+    // The Vite define fills in the default at build time; the test
+    // environment has no .env, so this is the define at work.
+    expect(import.meta.env.VITE_TARGET).toBe("desktop");
+  });
+
+  it("refuses mobile until the remote transport exists", async () => {
+    vi.stubEnv("VITE_TARGET", "mobile");
+    vi.resetModules();
+    await expect(import("./transport")).rejects.toThrow(/remote transport not built/);
+  });
+
+  it("refuses a target it does not know", async () => {
+    vi.stubEnv("VITE_TARGET", "toaster");
+    vi.resetModules();
+    await expect(import("./transport")).rejects.toThrow(/VITE_TARGET/);
+  });
+});
