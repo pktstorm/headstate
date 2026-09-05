@@ -9,6 +9,9 @@ import type { Transport } from "./transport";
 /// `@tauri-apps/api/event`. Tests that mock those modules keep working
 /// unchanged because the calls still land here.
 export const local: Transport = {
-  call: (name, args) => invoke(name, args),
+  // Arity preserved on purpose: a command without arguments reaches
+  // Tauri as `invoke(name)`, exactly as the wrappers called it before
+  // the seam. Tests assert on that one-argument shape.
+  call: (name, args) => (args === undefined ? invoke(name) : invoke(name, args)),
   listen: (event, cb) => listen(event, cb),
 };
