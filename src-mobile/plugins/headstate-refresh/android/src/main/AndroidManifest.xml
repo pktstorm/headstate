@@ -1,0 +1,5 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- WorkManager needs no permission of its own; the periodic
+         request's NetworkType.CONNECTED constraint is checked by the
+         system. -->
+</manifest>
