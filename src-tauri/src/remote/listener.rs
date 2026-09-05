@@ -358,7 +358,7 @@ impl ClientCertVerifier for PairedVerifier {
 }
 
 /// TLS 1.3 only, the desktop's identity, client certificates required
-/// and checked by [`PairedVerifier`].
+/// and checked by [`PairedVerifier`], and no session resumption.
 fn server_config(
     identity: &Identity,
     paired: Arc<dyn PairedCerts>,
@@ -368,10 +368,23 @@ fn server_config(
         paired,
         algs: provider.signature_verification_algorithms,
     };
-    ServerConfig::builder_with_provider(provider)
+    let mut config = ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_client_cert_verifier(Arc::new(verifier))
-        .with_single_cert(vec![identity.cert()], identity.key())
+        .with_single_cert(vec![identity.cert()], identity.key())?;
+    // No resumption, ever. A resumed TLS 1.3 handshake restores the
+    // client certificate from the ticket instead of asking for it, so
+    // `PairedVerifier` never runs -- and a phone revoked after its
+    // first connection would walk back in on the ticket it kept. The
+    // spec's guarantee is "revoked means refused on the next
+    // handshake", which holds only if every handshake is a full one.
+    // Tickets are what a client offers; the session store is where
+    // rustls keeps what a ticket points at. Zeroing the one and
+    // emptying the other closes both halves, so a future change to
+    // either cannot quietly reopen it.
+    config.send_tls13_tickets = 0;
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    Ok(config)
 }
 
 /// The path-level gate above TLS: an unpaired peer reaches `/v1/pair`
@@ -993,13 +1006,25 @@ pub(crate) mod tests {
         handshake(tcp, phone, server_fp).await
     }
 
-    /// The mTLS handshake over a TCP connection already made.
+    /// The mTLS handshake over a TCP connection already made, on a
+    /// fresh client config -- so it never carries a ticket from an
+    /// earlier connection.
     async fn handshake(
         tcp: TcpStream,
         phone: Option<&Identity>,
         server_fp: &str,
     ) -> Result<TlsStream<TcpStream>, String> {
-        let connector = tokio_rustls::TlsConnector::from(client_config(phone, server_fp));
+        handshake_with(tcp, client_config(phone, server_fp)).await
+    }
+
+    /// The handshake on a config the caller keeps: rustls's client
+    /// resumption is on by default, so a config reused across
+    /// connections offers whatever ticket the previous one earned.
+    async fn handshake_with(
+        tcp: TcpStream,
+        cfg: Arc<ClientConfig>,
+    ) -> Result<TlsStream<TcpStream>, String> {
+        let connector = tokio_rustls::TlsConnector::from(cfg);
         let name = ServerName::try_from("localhost").unwrap();
         connector
             .connect(name, tcp)
@@ -1151,6 +1176,84 @@ pub(crate) mod tests {
                 .unwrap()
                 .status,
             200
+        );
+        server.handle.stop().await;
+    }
+
+    /// One HTTP/1.1 GET of `/v1/hello` on a connection the caller made,
+    /// reading to the close -- which also drains the session tickets a
+    /// TLS 1.3 server sends right after the handshake, so the client's
+    /// store holds them for its next connection.
+    async fn hello_on(tls: &mut TlsStream<TcpStream>) -> Result<u16, String> {
+        tls.write_all(b"GET /v1/hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .map_err(|e| format!("write: {e}"))?;
+        let mut raw = Vec::new();
+        let _ = tls.read_to_end(&mut raw).await;
+        let text = String::from_utf8_lossy(&raw);
+        text.split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| format!("no response (got {} bytes)", raw.len()))
+    }
+
+    /// The desktop never resumes a session: a client that reuses its
+    /// config (and so its ticket store) still gets a full handshake,
+    /// which is the only kind that runs the certificate verifier.
+    #[tokio::test]
+    async fn the_listener_never_resumes_a_session() {
+        let certs = Arc::new(MemoryCerts::default());
+        let server = serve(certs).await;
+        let phone = Identity::generate().unwrap();
+        server.certs.pair(&phone.fingerprint());
+        let addr = server.handle.local_addr();
+        let cfg = client_config(Some(&phone), &server.fp);
+
+        for attempt in 1..=2 {
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let mut tls = handshake_with(tcp, cfg.clone()).await.unwrap();
+            assert_eq!(hello_on(&mut tls).await.unwrap(), 200);
+            assert_eq!(
+                tls.get_ref().1.handshake_kind(),
+                Some(rustls::HandshakeKind::Full),
+                "connection {attempt} must be a full handshake"
+            );
+        }
+        server.handle.stop().await;
+    }
+
+    /// The attack: a phone that was paired keeps the TLS 1.3 ticket its
+    /// first connection earned; after revocation it offers that ticket,
+    /// and a server that accepted it would skip the certificate
+    /// exchange -- and `PairedVerifier` -- entirely. Revocation must
+    /// bite on the next handshake whether or not a ticket is offered.
+    #[tokio::test]
+    async fn a_revoked_phone_cannot_resume_its_earlier_session() {
+        let certs = Arc::new(MemoryCerts::default());
+        let server = serve(certs).await;
+        let phone = Identity::generate().unwrap();
+        server.certs.pair(&phone.fingerprint());
+        let addr = server.handle.local_addr();
+        // One config for both connections: its session store keeps the
+        // ticket from the first, and the second offers it.
+        let cfg = client_config(Some(&phone), &server.fp);
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let mut tls = handshake_with(tcp, cfg.clone()).await.unwrap();
+        assert_eq!(hello_on(&mut tls).await.unwrap(), 200);
+
+        server.certs.revoke(&phone.fingerprint());
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let reply = match handshake_with(tcp, cfg).await {
+            // A refusal surfaces on the first read: the client believes
+            // its half of the TLS 1.3 handshake is complete.
+            Ok(mut tls) => hello_on(&mut tls).await,
+            Err(e) => Err(e),
+        };
+        assert!(
+            reply.is_err(),
+            "a revoked certificate must not reach HTTP by resuming: got {reply:?}"
         );
         server.handle.stop().await;
     }
