@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { invoke } from "@tauri-apps/api/core";
+import { call } from "./transport";
 
 /// What the mobile crate's `connection_state` command answers with.
 ///
@@ -18,6 +18,11 @@ interface ConnectionReport {
   desktop: string | null;
   last_poll: string | null;
   protocol_version?: number | null;
+  /// True unless connected to a desktop the companion can drive: what
+  /// the list's stale marker reads, and when the companion refuses
+  /// write and destructive commands (`remote_call` rejects with a
+  /// message naming the desktop and the reason).
+  stale?: boolean;
 }
 
 /// The connection as the UI sees it.
@@ -54,12 +59,11 @@ export type ConnectionState =
 /// and the call is a local IPC round trip, not a network request.
 const CONNECTION_POLL_MS = 5_000;
 
-/// The mobile crate's answer, or a rejection where the command does
-/// not exist. Routed through `invoke` directly for now; once the
-/// transport seam (#527) is on main this becomes `transport.call`, so
-/// that nothing outside `src/api` ever imports from `@tauri-apps/api`.
+/// The mobile crate's answer. Through the transport, like every other
+/// command: on the mobile build `remote.ts` invokes the companion's own
+/// `connection_state` directly.
 function connectionState(): Promise<ConnectionReport> {
-  return invoke<ConnectionReport>("connection_state");
+  return call<ConnectionReport>("connection_state");
 }
 
 function fromReport(report: ConnectionReport): ConnectionState {

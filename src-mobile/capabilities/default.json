@@ -1,13 +1,14 @@
 {
   "$schema": "../gen/schemas/mobile-schema.json",
   "identifier": "default",
-  "description": "Minimal grants for the companion's single window: subscribe to the events the client re-emits from the desktop's stream. App-defined commands registered via generate_handler! are not ACL-gated and need no entry here. Plugins that need grants (barcode scanner, biometric, stronghold) are added with the code that uses them.",
+  "description": "Minimal grants for the companion's single window: subscribe to the events the client re-emits from the desktop's stream, and scan the pairing QR. App-defined commands registered via generate_handler! are not ACL-gated and need no entry here. The stronghold plugin's JS commands are deliberately NOT granted: the Rust side owns the store (src/store.rs) and the webview never reads a seed.",
   "windows": [
     "main"
   ],
   "permissions": [
     "core:event:allow-listen",
     "core:event:allow-unlisten",
-    "core:app:default"
+    "core:app:default",
+    "barcode-scanner:default"
   ]
 }
