@@ -76,7 +76,7 @@ impl EventSink for AppHandle {
 
 #[tauri::command]
 async fn pair_from_qr(
-    state: State<'_, Companion>,
+    state: State<'_, Arc<Companion>>,
     payload: String,
     device_name: Option<String>,
 ) -> Result<String, String> {
@@ -84,18 +84,18 @@ async fn pair_from_qr(
 }
 
 #[tauri::command]
-fn unpair(state: State<'_, Companion>) -> Result<(), String> {
+fn unpair(state: State<'_, Arc<Companion>>) -> Result<(), String> {
     state.unpair()
 }
 
 #[tauri::command]
-fn connection_state(state: State<'_, Companion>) -> connection::Report {
+fn connection_state(state: State<'_, Arc<Companion>>) -> connection::Report {
     state.connection_state()
 }
 
 #[tauri::command]
 async fn remote_call(
-    state: State<'_, Companion>,
+    state: State<'_, Arc<Companion>>,
     command: String,
     args: Option<Value>,
 ) -> Result<Value, String> {
@@ -108,7 +108,7 @@ async fn remote_call(
 }
 
 #[tauri::command]
-fn subscribe_events(state: State<'_, Companion>) -> Result<(), String> {
+fn subscribe_events(state: State<'_, Arc<Companion>>) -> Result<(), String> {
     state.subscribe()
 }
 
@@ -170,7 +170,9 @@ fn setup(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         }),
     );
     companion.load()?;
-    app.manage(companion);
+    // In an `Arc` so the background window (`background::install`) can
+    // hold the same companion the commands drive.
+    app.manage(Arc::new(companion));
     Ok(())
 }
 
@@ -187,8 +189,9 @@ pub fn run() {
                 .build(),
         )
         // Opportunistic background refresh (#516): the OS-granted window
-        // on each platform, running whatever `background::install` put
-        // in state. On a desktop host it registers an inert scheduler.
+        // on each platform, running the refresher `background::install`
+        // puts in state. On a desktop host it registers an inert
+        // scheduler.
         .plugin(tauri_plugin_headstate_refresh::init());
     // The scanner is UI the frontend drives (`scan()` from
     // `@tauri-apps/plugin-barcode-scanner`, then `pair_from_qr` with the
@@ -197,8 +200,11 @@ pub fn run() {
     let builder = builder.plugin(tauri_plugin_barcode_scanner::init());
     builder
         .setup(|app| {
+            setup(app)?;
+            // After `setup`: the refresher is built over the managed
+            // companion.
             background::install(app.handle());
-            setup(app)
+            Ok(())
         })
         // Hardware-backed step-up keys and the session identity (#513).
         // On a desktop host it registers a stub whose every call is
