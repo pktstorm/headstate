@@ -227,6 +227,18 @@ struct AppState {
 /// additionally waits for the accept loop to finish and every open
 /// connection to be torn down, which is what "Allow phone connections:
 /// off" should mean.
+///
+/// What `stop` cannot promise is that the kernel stops completing TCP
+/// handshakes on the port the instant it returns. macOS has no
+/// `SOCK_CLOEXEC`, so there is a window between `socket(2)` and the
+/// `fcntl(2)` that marks the fd close-on-exec in which a child spawned
+/// from another thread (this app shells out to git and gh constantly)
+/// inherits the listening socket and keeps it open until it exits;
+/// `shutdown(2)` on a listening socket is `ENOTCONN` there, so nothing
+/// on this side can take it back. Such a connection is never served:
+/// the accept loop is gone, so no handshake completes and the phone
+/// sees a dead port rather than a desktop. The test
+/// `stop_closes_the_port` asserts exactly that boundary.
 pub struct Handle {
     addr: SocketAddr,
     shutdown: Option<oneshot::Sender<()>>,
@@ -977,8 +989,17 @@ pub(crate) mod tests {
         phone: Option<&Identity>,
         server_fp: &str,
     ) -> Result<TlsStream<TcpStream>, String> {
-        let connector = tokio_rustls::TlsConnector::from(client_config(phone, server_fp));
         let tcp = TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
+        handshake(tcp, phone, server_fp).await
+    }
+
+    /// The mTLS handshake over a TCP connection already made.
+    async fn handshake(
+        tcp: TcpStream,
+        phone: Option<&Identity>,
+        server_fp: &str,
+    ) -> Result<TlsStream<TcpStream>, String> {
+        let connector = tokio_rustls::TlsConnector::from(client_config(phone, server_fp));
         let name = ServerName::try_from("localhost").unwrap();
         connector
             .connect(name, tcp)
@@ -1251,17 +1272,51 @@ pub(crate) mod tests {
         handle.stop().await;
     }
 
+    /// Off means off: once `stop()` has returned, nothing answers on
+    /// the port.
+    ///
+    /// A refused TCP connect is the usual outcome and the strong form
+    /// of the check. It is not the only acceptable one. macOS has no
+    /// `SOCK_CLOEXEC`, so between `socket(2)` and the `fcntl(2)` that
+    /// sets `FD_CLOEXEC` a child spawned by another test thread (the
+    /// packages and worktrees tests shell out) inherits the listening
+    /// socket and the kernel keeps completing handshakes on it until
+    /// that child exits -- `shutdown(2)` on a listening socket is
+    /// `ENOTCONN` there, so `stop()` cannot take it back. Measured with
+    /// four threads spawning `sleep 0.01` beside 3000 stop-then-connect
+    /// rounds: 1, 5 and 0 leaked ports per run, and 0 of 3000 twice
+    /// without the spawning. CI runs the suite with `--test-threads=8`
+    /// and saw exactly this once in three runs (#537). What `stop()`
+    /// does guarantee is that the accept loop is gone and this process
+    /// holds no reference, and that is what the second half asserts: an
+    /// orphaned socket has nobody to answer a ClientHello, whereas a
+    /// listener `stop()` failed to shut down answers it in milliseconds.
     #[tokio::test]
     async fn stop_closes_the_port() {
         let certs = Arc::new(MemoryCerts::default());
+        let phone = Identity::generate().unwrap();
+        certs.pair(&phone.fingerprint());
         let server = serve(certs).await;
         let addr = server.handle.local_addr();
-        assert!(TcpStream::connect(addr).await.is_ok());
+        connect(addr, Some(&phone), &server.fp)
+            .await
+            .expect("reachable before stop");
 
         server.handle.stop().await;
+        let Ok(tcp) = TcpStream::connect(addr).await else {
+            return; // closed: the port refuses outright
+        };
+        // The kernel completed the handshake, so something still holds
+        // the socket. Only an inherited copy is allowed to: that one
+        // never talks TLS back.
+        let served = tokio::time::timeout(
+            Duration::from_secs(2),
+            handshake(tcp, Some(&phone), &server.fp),
+        )
+        .await;
         assert!(
-            TcpStream::connect(addr).await.is_err(),
-            "the port must be closed once the toggle is off"
+            !matches!(served, Ok(Ok(_))),
+            "the listener must be gone once the toggle is off, but it completed a handshake"
         );
     }
 
@@ -1292,25 +1347,44 @@ pub(crate) mod tests {
     /// addresses: a phone on IPv4 must reach it. On a runner with IPv6
     /// off the fallback to `0.0.0.0` makes the same test pass, which is
     /// the property wanted either way.
+    ///
+    /// The port is retried when it turns out to be shared. With
+    /// `SO_REUSEADDR` set, a BSD kernel hands a wildcard `bind(0)` any
+    /// port no other *wildcard* socket holds, so `[::]:0` can land on a
+    /// port some other process is listening on at `127.0.0.1` -- and
+    /// that process, being the more specific match, gets the IPv4
+    /// connect. It answers the ClientHello with whatever it speaks,
+    /// which the pinned handshake reports as a corrupt message (seen
+    /// once in 30 local runs of the suite, this desktop having seven
+    /// such listeners). A refused connect is not retried: that is the
+    /// bug this test exists to catch.
     #[tokio::test]
     async fn the_ipv6_wildcard_answers_on_ipv4_too() {
-        let certs = Arc::new(MemoryCerts::default());
-        let server = serve_at(
-            "[::]:0".parse().unwrap(),
-            certs,
-            Arc::new(Hub::new(no_snapshot())),
-        )
-        .await;
         let phone = Identity::generate().unwrap();
-        server.certs.pair(&phone.fingerprint());
-        let port = server.handle.local_addr().port();
-
-        let v4 = SocketAddr::from(([127, 0, 0, 1], port));
-        let reply = get(v4, "/v1/hello", Some(&phone), &server.fp)
-            .await
-            .expect("reachable over IPv4 loopback");
-        assert_eq!(reply.status, 200);
-        server.handle.stop().await;
+        let mut last = String::new();
+        for _ in 0..5 {
+            let certs = Arc::new(MemoryCerts::default());
+            certs.pair(&phone.fingerprint());
+            let server = serve_at(
+                "[::]:0".parse().unwrap(),
+                certs,
+                Arc::new(Hub::new(no_snapshot())),
+            )
+            .await;
+            let port = server.handle.local_addr().port();
+            let v4 = SocketAddr::from(([127, 0, 0, 1], port));
+            let reply = get(v4, "/v1/hello", Some(&phone), &server.fp).await;
+            server.handle.stop().await;
+            match reply {
+                Ok(reply) => {
+                    assert_eq!(reply.status, 200);
+                    return;
+                }
+                Err(e) if e.starts_with("handshake:") => last = e,
+                Err(e) => panic!("reachable over IPv4 loopback: {e}"),
+            }
+        }
+        panic!("five wildcard ports in a row answered as somebody else: {last}");
     }
 
     /// Revocation closes what the device already has open, not only
