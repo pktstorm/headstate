@@ -80,6 +80,23 @@ tauri-plugin-autostart = "2.5.1"
 # to open a tab in -- so every external link in the app was inert. It
 # works in `tauri dev`, which is why nobody noticed.
 tauri-plugin-opener = "2"
+# Mobile pairing (remote/pairing.rs). The phone proves it holds the pairing
+# token with an HMAC-SHA256 over both certificate fingerprints. 0.12 rather
+# than 0.13 because it shares `digest` 0.10 with the `sha2` already above;
+# 0.13 would drag a second digest stack into the tree. Verification goes
+# through the crate's constant-time `verify_slice`, never a `==` on bytes.
+hmac = "0.12"
+# Constant-time comparison of the presented pairing token against the
+# issued one. Already in the tree (hmac and rustls both use it).
+subtle = "2"
+# 32 random bytes for the pairing token. Already in the tree at this
+# version; `rand::rng()` is OS-seeded ChaCha, which is what a bearer token
+# needs.
+rand = "0.9"
+# Every non-loopback address of this machine, for the pairing QR payload
+# -- std has no interface enumeration. One crate over `getifaddrs` with
+# only `libc` beneath it, which is already in the tree.
+if-addrs = "0.15"
 
 [dev-dependencies]
 temp-env = "0.3"
