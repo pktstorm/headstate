@@ -5,7 +5,10 @@
 //! keys and forwards every command to a paired desktop; it never holds a
 //! GitHub token and never talks to GitHub. The modules the spec names --
 //! `keys`, `client`, `pairing`, `events` -- arrive with #514; what is here
-//! is the shell those plug into.
+//! is the shell those plug into, plus `discovery`, which finds the paired
+//! desktop on the LAN when its stored address has gone stale.
+
+pub mod discovery;
 
 /// The shared frontend in `src/` is built with `VITE_TARGET=mobile`; its
 /// `transport.ts` picks the remote transport on that value. Until #514

@@ -15,8 +15,14 @@
 //! its `CommandHost` is `surface::dispatch` on the live `AppHandle`,
 //! and pairing's `IdentityInfo` is the identity the listener loaded
 //! plus this machine's name.
+//!
+//! While the listener is up the desktop also advertises itself on the
+//! LAN (`remote/discovery.rs`) under that same machine name. That is
+//! best effort: it starts after the listener and its failure is a
+//! warning, never a failed toggle.
 
 use crate::commands::db_path;
+use crate::remote::discovery::Advertisement;
 use crate::remote::events::{Hub, SnapshotSource};
 use crate::remote::identity::{self, Identity, PlatformStore};
 use crate::remote::listener::{
@@ -30,7 +36,7 @@ use serde_json::Value;
 use std::future::Future;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{AppHandle, Manager, State};
 
 /// The verifier's view of `paired_devices`: the pairing state's
@@ -144,6 +150,10 @@ fn display_name_from(computer: Option<String>, host: Option<String>) -> String {
 /// The remote feature's live state.
 pub struct Remote {
     listener: tokio::sync::Mutex<Option<Handle>>,
+    /// The mDNS record, while the listener is up and the platform let
+    /// us advertise. A std mutex: it is only ever touched under the
+    /// listener lock and never held across an await.
+    advertisement: Mutex<Option<Advertisement>>,
     paired: Arc<dyn PairedCerts>,
     /// Loaded once per process; the keychain may prompt on macOS, and
     /// asking on every enable would prompt on every enable.
@@ -157,10 +167,16 @@ impl Remote {
     pub fn new(paired: Arc<dyn PairedCerts>, events: Arc<Hub>) -> Self {
         Self {
             listener: tokio::sync::Mutex::new(None),
+            advertisement: Mutex::new(None),
             paired,
             identity: OnceLock::new(),
             events,
         }
+    }
+
+    #[cfg(test)]
+    fn is_advertising(&self) -> bool {
+        self.advertisement.lock().unwrap().is_some()
     }
 
     /// The desktop certificate's fingerprint, once the identity has been
@@ -316,6 +332,7 @@ pub async fn start(app: &AppHandle) -> Result<SocketAddr, String> {
     let identity = load_identity(app).await?;
     // Managed in `lib.rs` before this module is set up.
     let pairing = app.state::<Arc<PairingState>>().inner().clone();
+    let fingerprint = identity.fingerprint();
     let handle = listener::start(ListenerConfig {
         // The IPv6 wildcard, dual-stack: see `ListenerConfig::bind`.
         bind: SocketAddr::from((Ipv6Addr::UNSPECIFIED, PORT)),
@@ -332,15 +349,34 @@ pub async fn start(app: &AppHandle) -> Result<SocketAddr, String> {
     .map_err(|e| e.to_string())?;
     let addr = handle.local_addr();
     *guard = Some(handle);
+    advertise(&remote, addr.port(), &fingerprint);
     Ok(addr)
+}
+
+/// Put the mDNS record up for a listener that just started, named as
+/// the pairing QR names this desktop (`desktop_name`), so a Bonjour
+/// browser and the phone agree on what it is. Best effort by design
+/// (see `remote/discovery.rs`): a platform that cannot multicast logs a
+/// warning and the phone falls back to the addresses it stored at
+/// pairing.
+fn advertise(remote: &Remote, port: u16, fingerprint: &str) {
+    match Advertisement::start(&desktop_name(), port, fingerprint) {
+        Ok(a) => *remote.advertisement.lock().unwrap() = Some(a),
+        Err(e) => log::warn!("phone connections: on, but not advertised on the LAN: {e}"),
+    }
 }
 
 /// Stop the listener, dropping every open connection. A no-op when it
 /// is not running.
 pub async fn stop(app: &AppHandle) {
     let remote = app.state::<Remote>();
-    let handle = remote.listener.lock().await.take();
-    if let Some(h) = handle {
+    let mut guard = remote.listener.lock().await;
+    let advertisement = remote.advertisement.lock().unwrap().take();
+    if let Some(a) = advertisement {
+        // Sends the goodbye and waits for it, briefly; off the workers.
+        let _ = tokio::task::spawn_blocking(move || a.stop()).await;
+    }
+    if let Some(h) = guard.take() {
         h.stop().await;
     }
 }
@@ -394,6 +430,7 @@ mod tests {
             Arc::new(Hub::new(Arc::new(|| Box::pin(async { None })))),
         );
         assert!(!remote.is_running().await);
+        assert!(!remote.is_advertising());
         assert_eq!(remote.fingerprint(), None);
     }
 
