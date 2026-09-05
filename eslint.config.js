@@ -5,7 +5,19 @@ import reactHooks from "eslint-plugin-react-hooks";
 import reactRefresh from "eslint-plugin-react-refresh";
 
 export default tseslint.config(
-  { ignores: ["dist", "src-tauri/target", "coverage", ".remember"] },
+  // Both crates' build directories: an iOS build leaves tauri-codegen's
+  // compressed `.js` assets under src-mobile/target, which eslint
+  // otherwise tries to parse.
+  {
+    ignores: [
+      "dist",
+      "src-tauri/target",
+      "src-mobile/target",
+      "src-mobile/gen/apple/build",
+      "coverage",
+      ".remember",
+    ],
+  },
   {
     extends: [js.configs.recommended, ...tseslint.configs.recommended],
     files: ["**/*.{ts,tsx}"],
