@@ -31,6 +31,7 @@ vi.mock("../api/hooks", () => ({
   }),
   useCleanupPrefs: () => ({ prefs: undefined, set: () => Promise.resolve() }),
   useAutostart: () => ({ enabled: false, set: () => Promise.resolve() }),
+  useRemoteEnabled: () => ({ enabled: false, set: () => Promise.resolve() }),
   usePollState: () => state.current,
   useRemovalProgress: () => state.removal,
   usePollError: () => state.error,

@@ -40,6 +40,7 @@ vi.mock("../api/hooks", () => ({
   }),
   useCleanupPrefs: () => ({ prefs: cleanupPrefs.current, set: setCleanup }),
   useAutostart: () => ({ enabled: false, set: () => Promise.resolve() }),
+  useRemoteEnabled: () => ({ enabled: false, set: () => Promise.resolve() }),
   usePollInterval: () => ({ seconds: 120, set: setInterval_ }),
   useWorktreeDirs: () => ({ dirs: dirs.current, set: setDirs }),
   // Defaults, matching the Rust side: absent prefs mean everything on.

@@ -44,6 +44,11 @@ fn mark_focus(focused: &AtomicBool, is_focused: bool) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Before anything builds a TLS config. Two rustls providers are
+    // compiled in (see Cargo.toml), and without an installed default the
+    // first `ClientConfig::builder()` in any dependency panics.
+    remote::gate::install_crypto_provider();
+
     tauri::Builder::default()
         // A GUI-launched .app has no stderr, so every eprintln! in this
         // codebase went nowhere a user could reach. "It stopped updating"
@@ -179,6 +184,8 @@ pub fn run() {
             remote::pairing::respond_to_pairing,
             remote::pairing::list_paired_devices,
             remote::pairing::revoke_paired_device,
+            remote::gate::get_remote_enabled,
+            remote::gate::set_remote_enabled,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -310,6 +317,11 @@ pub fn run() {
             }
 
             tray::setup_tray(&app.handle().clone())?;
+
+            // After the GitHub client is managed: `/v1/hello` reports
+            // the signed-in login through it. Off by default; this only
+            // binds a port when the setting says so.
+            remote::gate::setup(&app.handle().clone());
 
             Ok(())
         })

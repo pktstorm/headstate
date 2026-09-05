@@ -60,6 +60,10 @@ pub mod keys {
 
     /// Automatic cleanup preferences (#382).
     pub const CLEANUP_PREFS: &str = "cleanup_prefs";
+    /// Whether the phone listener starts with the app, as a JSON bool.
+    /// Absent means off: the listener opens a port on every interface,
+    /// and that is never something an upgrade should switch on.
+    pub const ALLOW_PHONE_CONNECTIONS: &str = "allow_phone_connections";
 }
 
 #[cfg(test)]

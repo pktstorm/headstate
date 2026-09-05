@@ -12,6 +12,7 @@ vi.mock("../api/hooks", () => ({
   }),
   useCleanupPrefs: () => ({ prefs: undefined, set: () => Promise.resolve() }),
   useAutostart: () => ({ enabled: false, set: () => Promise.resolve() }),
+  useRemoteEnabled: () => ({ enabled: false, set: () => Promise.resolve() }),
   usePollInterval: () => ({ seconds: 120, set: vi.fn() }),
   useWorktreeDirs: () => ({ dirs: [], set: vi.fn(() => Promise.resolve()) }),
   useNotifyPrefs: () => ({ prefs: prefsState.prefs, set: setPrefs }),

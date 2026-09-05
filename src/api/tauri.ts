@@ -78,6 +78,14 @@ export const setUiPrefs = (prefs: UiPrefs) => invoke<void>("set_ui_prefs", { pre
 export const getAutostart = () => invoke<boolean>("get_autostart");
 export const setAutostart = (enabled: boolean) =>
   invoke<void>("set_autostart", { enabled });
+/// Whether phones can connect to this desktop right now.
+///
+/// The live state rather than the stored setting, for the same reason
+/// as autostart: the two differ when the port could not be bound at
+/// startup, and the checkbox should say what is true.
+export const getRemoteEnabled = () => invoke<boolean>("get_remote_enabled");
+export const setRemoteEnabled = (enabled: boolean) =>
+  invoke<void>("set_remote_enabled", { enabled });
 /// What the app already knows about a worktree's unmerged work.
 ///
 /// Per row rather than per scan: several git calls each, so this is

@@ -25,6 +25,8 @@ import {
   getCycleTrend,
   getPeriods,
   getPollInterval,
+  getRemoteEnabled,
+  setRemoteEnabled,
   actOnPr,
   getPrDetail,
   getWorktreeDirs,
@@ -1382,6 +1384,27 @@ export function useAutostart() {
   const set = (enabled: boolean) =>
     setAutostart(enabled).then(() =>
       qc.invalidateQueries({ queryKey: ["autostart"] }),
+    );
+  return { enabled: query.data ?? false, set };
+}
+
+/// Whether phones can connect right now.
+///
+/// Asked of the listener rather than stored, like autostart: the two
+/// differ when the port could not be bound at startup, and the box
+/// should say what is true. Refetched after EVERY attempt, failed or
+/// not -- a start that bound the port but could not save the setting
+/// is still a running listener, and the box must show it.
+export function useRemoteEnabled() {
+  const qc = useQueryClient();
+  const query = useQuery({
+    queryKey: ["remote-enabled"],
+    queryFn: getRemoteEnabled,
+    staleTime: Infinity,
+  });
+  const set = (enabled: boolean) =>
+    setRemoteEnabled(enabled).finally(() =>
+      qc.invalidateQueries({ queryKey: ["remote-enabled"] }),
     );
   return { enabled: query.data ?? false, set };
 }

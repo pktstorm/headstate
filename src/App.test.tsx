@@ -20,6 +20,7 @@ vi.mock("./api/hooks", () => ({
   }),
   useCleanupPrefs: () => ({ prefs: undefined, set: () => Promise.resolve() }),
   useAutostart: () => ({ enabled: false, set: () => Promise.resolve() }),
+  useRemoteEnabled: () => ({ enabled: false, set: () => Promise.resolve() }),
   useActOnPr: () => () => Promise.resolve(),
   useUpdatePrBranch: () => () => Promise.resolve(),
   useActOnPrs: () => () => Promise.resolve([]),
