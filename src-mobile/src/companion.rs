@@ -250,6 +250,30 @@ impl Companion {
             l.events.stop();
         }
     }
+
+    /// The live client, for the background window (`background.rs`),
+    /// which talks to the desktop directly rather than through
+    /// [`Companion::call`]: that path moves the connection state and
+    /// wakes the subscriber, and a window in the background does
+    /// neither.
+    pub(crate) fn client(&self) -> Result<Arc<Client>, String> {
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|l| l.client.clone())
+            .ok_or_else(|| "not paired with a desktop".to_string())
+    }
+
+    /// Keep a list the background window fetched, exactly as the
+    /// subscriber keeps a `prs-updated` frame: the snapshot, and the
+    /// poll time the banner shows.
+    pub(crate) fn record_snapshot(&self, prs_json: &str) -> Result<(), String> {
+        let now = Utc::now();
+        events::save_snapshot(self.store.as_ref(), prs_json, now).map_err(|e| e.to_string())?;
+        self.conn.mark_poll(now);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

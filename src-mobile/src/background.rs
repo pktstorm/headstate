@@ -4,8 +4,8 @@
 //! The spec's decision ("What the phone does when it is in the
 //! background") is that the phone does nothing while suspended and
 //! catches up on resume, which is the event subscriber's reconnect
-//! (`subscribe_events`, #514) and is not duplicated here. The one cheap
-//! improvement it allows is [`BackgroundRefresh`]: when
+//! (`subscribe_events`, `companion.rs`) and is not duplicated here. The
+//! one cheap improvement it allows is [`BackgroundRefresh`]: when
 //! `tauri-plugin-headstate-refresh` is granted a window, `GET /v1/hello`
 //! and then the cached list, exactly what a connect does before the
 //! stream, store the list as the snapshot, and return. On any error give
@@ -16,20 +16,25 @@
 //! so it asks for the same list through `get_cached` instead (the
 //! desktop's `remote/events.rs` documents them as the same data). The
 //! [`Desktop`] seam has no way to open the stream at all, and the tests
-//! pin the request sequence to those two.
+//! pin the request sequence to those two -- against the fake, and
+//! against the loopback server with the real client.
 //!
-//! [`Desktop`] and [`SnapshotSink`] are the seam to the client (#514):
-//! the wiring is `hello` -> `Client::hello`, `get_cached` ->
-//! `Client::call("get_cached", {}, None)`, `save` ->
-//! `events::save_snapshot`. Until that lands [`install`] manages the
-//! plugin's [`NoopRefresher`].
+//! [`Desktop`] and [`SnapshotSink`] are implemented by [`Companion`]:
+//! `hello` is `Client::hello`, `get_cached` is
+//! `Client::call("get_cached", {}, None)` on the live client, `save` is
+//! `events::save_snapshot` plus `Connection::mark_poll`. A window does
+//! not move the connection state: the subscriber owns that, and a
+//! desktop that is away is the expected case for a phone in a pocket.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use serde_json::json;
 use tauri::{AppHandle, Manager, Runtime};
-use tauri_plugin_headstate_refresh::{NoopRefresher, RefreshFuture, Refresher};
+use tauri_plugin_headstate_refresh::{RefreshFuture, Refresher};
+
+use crate::companion::Companion;
 
 /// A boxed request to the desktop.
 pub type DesktopFuture<T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send>>;
@@ -46,6 +51,30 @@ pub trait Desktop: Send + Sync {
 /// Where the list goes: the snapshot store, so the app opens fresh.
 pub trait SnapshotSink: Send + Sync {
     fn save(&self, prs_json: &str) -> Result<(), String>;
+}
+
+impl Desktop for Companion {
+    fn hello(&self) -> DesktopFuture<()> {
+        let client = self.client();
+        Box::pin(async move { client?.hello().await.map(|_| ()).map_err(|e| e.to_string()) })
+    }
+
+    fn get_cached(&self) -> DesktopFuture<String> {
+        let client = self.client();
+        Box::pin(async move {
+            let list = client?
+                .call("get_cached", &json!({}), None)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_string(&list).map_err(|e| e.to_string())
+        })
+    }
+}
+
+impl SnapshotSink for Companion {
+    fn save(&self, prs_json: &str) -> Result<(), String> {
+        self.record_snapshot(prs_json)
+    }
 }
 
 /// The [`Refresher`] the plugin runs in a window.
@@ -72,19 +101,29 @@ impl Refresher for BackgroundRefresh {
     }
 }
 
-/// Put the app's refresher in Tauri state for the plugin to find.
-///
-/// TODO(#514): once the client is on main, build a [`BackgroundRefresh`]
-/// over `Companion`'s client and store here instead of the no-op.
+/// Put the app's refresher in Tauri state for the plugin to find: a
+/// [`BackgroundRefresh`] over the managed [`Companion`], so it must run
+/// after `setup` has managed one.
 pub fn install<R: Runtime>(app: &AppHandle<R>) {
-    let refresher: Arc<dyn Refresher> = Arc::new(NoopRefresher);
+    let companion = app.state::<Arc<Companion>>().inner().clone();
+    let refresher: Arc<dyn Refresher> =
+        Arc::new(BackgroundRefresh::new(companion.clone(), companion));
     app.manage(refresher);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::tests::Recorder;
+    use crate::connection::State;
+    use crate::events;
+    use crate::keys::SoftwareKeys;
+    use crate::store::MemoryStore;
+    use crate::testing::{Reply, TestServer};
+    use base64::Engine;
+    use chrono::Utc;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     /// Every request the fake desktop saw, by kind. The enum has two
     /// variants because the seam has two methods; a third request kind
@@ -196,5 +235,141 @@ mod tests {
             .collect();
         assert_eq!(methods, vec!["hello", "get_cached"]);
         assert!(!body.contains("events"), "no stream on the seam");
+    }
+
+    // ---- The real client, against the loopback server ---------------
+
+    async fn until(mut cond: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !cond() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("condition within 10s");
+    }
+
+    /// A companion paired with the loopback server, its subscriber
+    /// connected and holding the stream open, as on a phone.
+    async fn paired() -> (TestServer, Arc<MemoryStore>, Arc<Recorder>, Arc<Companion>) {
+        let store = Arc::new(MemoryStore::default());
+        let rec = Arc::new(Recorder::default());
+        let c = Arc::new(Companion::new(
+            store.clone(),
+            Arc::new(SoftwareKeys::new(store.clone())),
+            rec.clone(),
+            Arc::new(|f| {
+                tokio::spawn(f);
+            }),
+        ));
+        let server = TestServer::start().await;
+        server.open_window(true);
+        server.reply(
+            "/v1/events",
+            Reply::sse(&[("prs-updated", r#"[{"number":1}]"#)], true),
+        );
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([9u8; 32]);
+        let qr = server.qr(&token, Utc::now().timestamp() + 120);
+        c.pair(&qr, None).await.unwrap();
+        let fp = server.requests()[0].peer_fp.clone();
+        server.pair(&fp);
+        server.open_window(false);
+        until(|| {
+            let r = c.connection_state();
+            r.state == State::Connected && r.last_poll.is_some()
+        })
+        .await;
+        (server, store, rec, c)
+    }
+
+    /// The wired refresher, end to end: one window against the loopback
+    /// server makes exactly `GET /v1/hello` and `POST /v1/call/get_cached`
+    /// on the real client, stores what came back as the snapshot with a
+    /// fresh poll time, and opens no second stream.
+    #[tokio::test]
+    async fn the_wired_refresher_goes_through_the_seam_and_never_opens_the_stream() {
+        let (server, store, _rec, c) = paired().await;
+        server.reply(
+            "/v1/call/get_cached",
+            Reply::json(200, serde_json::from_str(LIST).unwrap()),
+        );
+        let before = server.requests().len();
+        let streams = |s: &TestServer| {
+            s.requests()
+                .iter()
+                .filter(|r| r.path == "/v1/events")
+                .count()
+        };
+        assert_eq!(streams(&server), 1, "the subscriber's stream, held open");
+        let stale = c.connection_state().last_poll.unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        let refresh = BackgroundRefresh::new(c.clone(), c.clone());
+        refresh.refresh().await.unwrap();
+
+        let made: Vec<(String, String)> = server.requests()[before..]
+            .iter()
+            .map(|r| (r.method.clone(), r.path.clone()))
+            .collect();
+        assert_eq!(
+            made,
+            vec![
+                ("GET".to_string(), "/v1/hello".to_string()),
+                ("POST".to_string(), "/v1/call/get_cached".to_string()),
+            ]
+        );
+        assert_eq!(streams(&server), 1, "no stream opened by the window");
+        let snap = events::cached_snapshot(store.as_ref()).unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(snap.prs.get()).unwrap(),
+            serde_json::from_str::<serde_json::Value>(LIST).unwrap()
+        );
+        let fresh = c.connection_state().last_poll.unwrap();
+        assert!(fresh > stale, "mark_poll: {stale} -> {fresh}");
+        assert_eq!(c.connection_state().state, State::Connected);
+    }
+
+    /// A window while the desktop is away: hello fails, nothing else is
+    /// tried, the snapshot and the connection state are left alone.
+    #[tokio::test]
+    async fn a_window_while_the_desktop_is_away_touches_nothing() {
+        let (server, store, _rec, c) = paired().await;
+        let snapshot_before = events::cached_snapshot(store.as_ref())
+            .unwrap()
+            .unwrap()
+            .received_at;
+        drop(server);
+        // The subscriber notices the dead stream on its own; the window
+        // must not be what tells it.
+        until(|| c.connection_state().state == State::Unreachable).await;
+
+        let refresh = BackgroundRefresh::new(c.clone(), c.clone());
+        let err = refresh.refresh().await.unwrap_err();
+        assert!(err.contains("unreachable"), "{err}");
+        assert_eq!(
+            events::cached_snapshot(store.as_ref())
+                .unwrap()
+                .unwrap()
+                .received_at,
+            snapshot_before
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unpaired_companion_has_nothing_to_refresh() {
+        let store = Arc::new(MemoryStore::default());
+        let c = Arc::new(Companion::new(
+            store.clone(),
+            Arc::new(SoftwareKeys::new(store)),
+            Arc::new(Recorder::default()),
+            Arc::new(|f| {
+                tokio::spawn(f);
+            }),
+        ));
+        let refresh = BackgroundRefresh::new(c.clone(), c);
+        assert_eq!(
+            refresh.refresh().await.unwrap_err(),
+            "not paired with a desktop"
+        );
     }
 }
