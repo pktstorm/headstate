@@ -56,5 +56,7 @@
 	</array>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Headstate Companion confirms it is you before deleting anything on your desktop.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Headstate Companion uses the camera to scan the pairing code shown on your desktop.</string>
 </dict>
 </plist>

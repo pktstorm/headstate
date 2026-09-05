@@ -199,7 +199,7 @@ is a matter of regenerating and re-pairing.
 | Attacker impersonates the desktop to the phone | Phone pins the desktop's certificate fingerprint, delivered out of band by QR code at pairing |
 | Attacker scans the pairing QR over your shoulder | Pairing token is single use, expires in two minutes, and the desktop shows a confirmation dialog naming the device before the pairing is stored |
 | Phone is stolen, unlocked | Destructive commands require a per-request signature from a biometric-gated key; the desktop can revoke the device |
-| Phone is stolen, locked | Device keys live in the Secure Enclave or Android Keystore and are not exportable |
+| Phone is stolen, locked | The step-up signing keys live in the Secure Enclave or Android Keystore and are not exportable; the TLS session key is software-backed, kept in the phone's keychain, and is worthless once the desktop revokes the pairing |
 | Desktop listener is reachable from the internet | Listener is off by default and binds only when the user enables it; even when on, unpaired clients are refused at the handshake |
 | A paired phone issues a command the desktop UI could not | The remote surface is an explicit allowlist, enumerated in one Rust file, with local-only commands excluded |
 | Request replay | Every write carries a nonce and timestamp; the desktop rejects duplicates and clock skew beyond sixty seconds |

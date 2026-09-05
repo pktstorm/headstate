@@ -699,6 +699,16 @@ settled, the settlement is here.
 - **Revocation closes open connections, not only streams** (#543). Every
   connection task watches the revocation broadcast and shuts itself down
   gracefully on its own fingerprint, with a five-second deadline.
+- **The listener never resumes a TLS session** (#547). A resumed TLS 1.3
+  handshake restores the client certificate from the ticket instead of
+  asking for it, so `PairedVerifier` only runs on a full handshake and a
+  revoked phone could have reached HTTP by resuming. The desktop's
+  `ServerConfig` now sets `send_tls13_tickets = 0` and
+  `NoServerSessionStorage`, closing both the ticket and the cache halves;
+  `the_listener_never_resumes_a_session` and
+  `a_revoked_phone_cannot_resume_its_earlier_session` pin it. The phone
+  disables resumption too (#542), but the desktop no longer depends on
+  that.
 - **On macOS, toggling off can leave the port open but never served**
   (#545). macOS has no `SOCK_CLOEXEC`, so a listening socket is briefly
   inheritable between `socket(2)` and `fcntl(FD_CLOEXEC)`; a child
