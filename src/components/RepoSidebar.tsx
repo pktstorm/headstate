@@ -3,6 +3,7 @@ import type { PullRequest } from "@/types/pr";
 import { type View, useActiveFilters, useFilters } from "@/store/filters";
 import { ViewSwitcher } from "@/components/ViewSwitcher";
 import { repoCounts } from "@/lib/repos";
+import { useIsMobile } from "@/lib/useIsMobile";
 
 /// Repos where the user currently has open PRs, busiest first, plus an
 /// always-first "All repositories" entry that is the default (no `repo`
@@ -25,6 +26,9 @@ export function RepoSidebar({
   const filters = useActiveFilters();
   const { setFilter, view, panel, setPanel } = useFilters();
   const counts = repoCounts(prs);
+  // Stats is desktop-only in the companion's first release, so the
+  // phone gets no entry that leads to it.
+  const isMobile = useIsMobile();
 
   const rowClass = (active: boolean) =>
     `flex w-full items-center justify-between rounded px-3 py-2 text-sm ${
@@ -66,6 +70,7 @@ export function RepoSidebar({
         ))}
       </div>
 
+      {isMobile ? null : (
       <div className="mt-2 shrink-0 border-t border-[#30363d] pt-2">
         <button
           type="button"
@@ -79,6 +84,7 @@ export function RepoSidebar({
           </span>
         </button>
       </div>
+      )}
     </nav>
   );
 }

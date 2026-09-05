@@ -1,5 +1,6 @@
 import { render, screen } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { stubViewport } from "@/test-utils";
 
 const repos = vi.hoisted(() => vi.fn<() => unknown>(() => []));
 
@@ -8,6 +9,26 @@ vi.mock("./ViewSwitcher", () => ({ ViewSwitcher: () => null }));
 
 import { WorktreeSidebar } from "./WorktreeSidebar";
 import { useFilters } from "../store/filters";
+
+afterEach(() => stubViewport(null));
+
+describe("WorktreeSidebar on a phone", () => {
+  it("drops the Stats entry but keeps the repositories", () => {
+    stubViewport(390);
+    repos.mockReturnValue([repo("busy", 3)]);
+    render(<WorktreeSidebar />);
+    expect(screen.queryByRole("button", { name: /stats/i })).toBeNull();
+    expect(screen.getByText("busy")).toBeTruthy();
+    expect(screen.getByText("All repositories")).toBeTruthy();
+  });
+
+  it("keeps Stats at the desktop width", () => {
+    stubViewport(1400);
+    repos.mockReturnValue([repo("busy", 3)]);
+    render(<WorktreeSidebar />);
+    expect(screen.getByRole("button", { name: /stats/i })).toBeTruthy();
+  });
+});
 
 /// `worktrees` includes the MAIN checkout, so a repo with only main has
 /// nothing anyone would remove.

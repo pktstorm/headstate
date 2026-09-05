@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PrDetail } from "@/types/pr";
+import { stubViewport } from "@/test-utils";
 
 const state = vi.hoisted(() => ({
   data: undefined as PrDetail | undefined,
@@ -77,6 +78,75 @@ function view(over: Partial<PrDetail> = {}) {
   state.data = detail(over);
   return render(<PrDetailView repo="octocat/hello-world" number={42} onBack={() => {}} />);
 }
+
+describe("PrDetailView layout", () => {
+  afterEach(() => {
+    cleanup();
+    stubViewport(null);
+    viewer.current = undefined;
+  });
+
+  /// Every action the desktop pins stays pinned on the phone; only the
+  /// arrangement changes. Asserting each by role is what proves that a
+  /// stacked header did not quietly drop one.
+  it("keeps back, approve, merge and GitHub in the sticky header on a phone", () => {
+    stubViewport(390);
+    viewer.current = "hubot";
+    const { container } = view();
+    const bar = container.querySelector(".sticky") as HTMLElement;
+    expect(bar).toBeTruthy();
+    expect(within(bar).getByRole("button", { name: /back to list/i })).toBeTruthy();
+    expect(within(bar).getByRole("button", { name: "Approve" })).toBeTruthy();
+    expect(within(bar).getByRole("button", { name: /^merge$/i })).toBeTruthy();
+    expect(within(bar).getByText(/github/i)).toBeTruthy();
+    // The actions moved to a second, full-width line under the back
+    // link so four controls are not squeezed into 390 pixels.
+    const merge = within(bar).getByRole("button", { name: /^merge$/i });
+    expect(merge.closest(".basis-full")).toBeTruthy();
+  });
+
+  it("keeps the desktop header on one line", () => {
+    stubViewport(1400);
+    viewer.current = "hubot";
+    const { container } = view();
+    const bar = container.querySelector(".sticky") as HTMLElement;
+    expect(bar.querySelector(".basis-full")).toBeNull();
+    expect(bar.className).not.toContain("flex-wrap");
+    // Back, then the action cluster: exactly two direct children.
+    expect(bar.children).toHaveLength(2);
+    expect(within(bar).getByRole("button", { name: "Approve" })).toBeTruthy();
+    expect(within(bar).getByRole("button", { name: /^merge$/i })).toBeTruthy();
+  });
+
+  it("still offers review, comment, threads and the footer actions on a phone", () => {
+    stubViewport(390);
+    viewer.current = "hubot";
+    view({
+      state: "MERGED",
+      head_ref_id: "REF_1",
+      review_threads: [
+        {
+          id: "T1",
+          path: "src/a.ts",
+          line: 3,
+          is_resolved: false,
+          is_outdated: false,
+          viewer_can_reply: true,
+          viewer_can_resolve: true,
+          viewer_can_unresolve: true,
+          comments: [{ author: "octocat", body: "Why?", created_at: "2026-01-01T00:00:00Z" }],
+          comment_count: 1,
+        },
+      ],
+    });
+    expect(screen.getByText(/view on github/i)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /copy for agent/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /delete branch/i })).toBeTruthy();
+    expect(screen.getByText("Why?")).toBeTruthy();
+    // The review box and the thread reply box: both still there.
+    expect(screen.getAllByRole("textbox").length).toBeGreaterThan(0);
+  });
+});
 
 describe("PrDetailView", () => {
   beforeEach(() => {

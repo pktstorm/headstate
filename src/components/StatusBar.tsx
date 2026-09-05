@@ -7,6 +7,7 @@ import { Settings } from "lucide-react";
 import { useEffect, useState } from "react";
 import { usePollError, usePollInterval, usePollState, useRemovalProgress } from "../api/hooks";
 import { relativeTime } from "../lib/time";
+import { useIsMobile } from "../lib/useIsMobile";
 import { SettingsDialog } from "./SettingsDialog";
 
 const CHOICES = [60, 120, 300, 900];
@@ -74,6 +75,11 @@ export function StatusBar({ updatedAt }: { updatedAt: number }) {
   } as const;
   const { seconds, set } = usePollInterval();
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // The poll cadence is the desktop's setting, and Settings > General
+  // carries it too. On a phone-width bar it is the one thing that can
+  // go: with it, "Up to date" and the timestamp each broke onto two
+  // lines.
+  const isMobile = useIsMobile();
 
   // From the built binary, not package.json: the release workflow stamps
   // the version from the git tag at build time and never commits it, so
@@ -186,6 +192,9 @@ export function StatusBar({ updatedAt }: { updatedAt: number }) {
         {removal ? `Removing worktrees — ${removal.done} of ${removal.total}` : ""}
       </span>
 
+      {isMobile ? (
+        <span className="ml-auto" />
+      ) : (
       <label className="ml-auto flex items-center gap-1.5">
         <span>Check every</span>
         <select
@@ -201,6 +210,7 @@ export function StatusBar({ updatedAt }: { updatedAt: number }) {
           ))}
         </select>
       </label>
+      )}
 
       {/* Beside the settings button rather than next to the poll state:
           this is an identity, not a status, and it is what a user quotes
