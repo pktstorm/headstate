@@ -1,0 +1,53 @@
+# The mobile crate's supply-chain gate. A separate file from
+# src-tauri/deny.toml because the two crates have separate graphs and
+# separate targets: the desktop scopes its scan to macOS, and this one
+# scopes to the two phone targets so a finding in an iOS- or
+# Android-only crate is reported and a GTK/Windows one is not.
+[graph]
+targets = [
+  { triple = "aarch64-apple-ios" },
+  { triple = "aarch64-linux-android" },
+]
+
+[advisories]
+version = 2
+
+# Same deliberate acceptances as the desktop, for the same reason: the
+# unic-* crates reach us only through tauri-utils -> urlpattern, are
+# "unmaintained" notices rather than vulnerabilities, and have no safe
+# upgrade. Revisit when Tauri moves urlpattern off unic.
+ignore = [
+  "RUSTSEC-2025-0075",  # unic-char-range unmaintained
+  "RUSTSEC-2025-0080",  # unic-common unmaintained
+  "RUSTSEC-2025-0081",  # unic-char-property unmaintained
+  "RUSTSEC-2025-0098",  # unic-ucd-version unmaintained
+  "RUSTSEC-2025-0100",  # unic-ucd-ident unmaintained
+]
+
+[licenses]
+version = 2
+# The desktop's list plus OpenSSL: aws-lc-sys, the C library beneath the
+# aws-lc-rs provider, is dual "ISC AND (Apache-2.0 OR OpenSSL)". The
+# OpenSSL licence is permissive with an attribution clause, the same
+# class as BSD-3-Clause already here; it is the price of the only rustls
+# provider with X25519MLKEM768.
+allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause",
+         "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib", "MPL-2.0", "CC0-1.0",
+         "CDLA-Permissive-2.0", "OpenSSL"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# The reason this crate exists apart from the desktop. `cargo deny`
+# checks the resolved graph, so a path dependency on the desktop crate
+# or a copy-pasted dependency block fails here as well as in the
+# lockfile test in src/lib.rs.
+deny = [
+  { crate = "octocrab", reason = "the phone never holds the GitHub token" },
+  { crate = "rusqlite", reason = "the cleanup ledger lives on the desktop" },
+  { crate = "ring", reason = "one crypto provider only: aws-lc-rs" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { call } from "./transport";
 import { useEffect } from "react";
 
 /// Diagnostic timing log, off unless the user turns it on in Settings.
@@ -23,7 +23,7 @@ import { useEffect } from "react";
 /// Never awaited by callers and never throws: diagnostics must not
 /// change the behaviour they are measuring, so a failed log is dropped.
 function diag(line: string): void {
-  void invoke("diag_log", { line }).catch(() => {});
+  void call("diag_log", { line }).catch(() => {});
 }
 
 /// Wraps a query function with start/end lines and an elapsed time.

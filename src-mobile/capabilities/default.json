@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/mobile-schema.json",
+  "identifier": "default",
+  "description": "Minimal grants for the companion's single window: subscribe to the events the client re-emits from the desktop's stream. App-defined commands registered via generate_handler! are not ACL-gated and need no entry here. Plugins that need grants (barcode scanner, biometric, stronghold) are added with the code that uses them.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:app:default"
+  ]
+}

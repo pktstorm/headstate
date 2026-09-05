@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Merged into the generated Xcode project's Info.plist by the Tauri
+       CLI. LAN discovery of the paired desktop (#511): without this key
+       iOS silently drops every multicast and every connection to a
+       private address, so mDNS finds nothing and pairing "just fails". -->
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Headstate Companion looks for your desktop Headstate on the local network to pair with it and send it commands.</string>
+  <!-- The Bonjour service the desktop advertises (remote/discovery.rs).
+       iOS refuses to browse a service type not declared here. -->
+  <key>NSBonjourServiceTypes</key>
+  <array>
+    <string>_headstate._tcp</string>
+  </array>
+</dict>
+</plist>

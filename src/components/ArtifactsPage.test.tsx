@@ -1,6 +1,7 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Artifact } from "@/types/pr";
+import { stubViewport } from "@/test-utils";
 
 const state = vi.hoisted(() => ({
   artifacts: [] as Artifact[],
@@ -51,6 +52,47 @@ const art = (over: Partial<Artifact> = {}): Artifact => ({
   size_bytes: null,
   modified_secs_ago: null,
   ...over,
+});
+
+describe("ArtifactsPage on a phone", () => {
+  afterEach(() => stubViewport(null));
+
+  const rowFor = (path: string) =>
+    screen.getByLabelText(`Select ${path}`).closest("li") as HTMLElement;
+
+  /// Every fact the desktop row states -- kind, path, age, size, how to
+  /// rebuild -- is still stated, on two lines instead of one. A row
+  /// that dropped the size to fit would hide the number the view
+  /// exists to show.
+  it("stacks each row so nothing is pushed off the edge", () => {
+    stubViewport(390);
+    state.artifacts = [art({ path: "/code/repo/target" })];
+    state.sizes = new Map([["/code/repo/target", 1024]]);
+    state.ages = new Map([["/code/repo/target", 86_400 * 3]]);
+    render(<ArtifactsPage />);
+    const row = rowFor("/code/repo/target");
+    expect(row.className).toContain("flex-col");
+    expect(within(row).getByText("/code/repo/target")).toBeTruthy();
+    expect(within(row).getByText("1.0 KB")).toBeTruthy();
+    expect(within(row).getByText("3 days ago")).toBeTruthy();
+    expect(within(row).getByText("cargo build")).toBeTruthy();
+    expect(within(row).getByText("target")).toBeTruthy();
+    // The checkbox still selects, so the remove flow is unchanged.
+    fireEvent.click(within(row).getByRole("checkbox"));
+    expect(screen.getByRole("button", { name: /remove 1 /i })).toBeTruthy();
+  });
+
+  it("keeps the desktop row on one line", () => {
+    stubViewport(1400);
+    state.artifacts = [art({ path: "/code/repo/target" })];
+    state.sizes = new Map([["/code/repo/target", 1024]]);
+    render(<ArtifactsPage />);
+    const row = rowFor("/code/repo/target");
+    expect(row.className).not.toContain("flex-col");
+    // Checkbox, kind, path, rebuild hint, age, size: siblings of one row.
+    expect(within(row).getByText("1.0 KB").parentElement).toBe(row);
+    expect(within(row).getByText("/code/repo/target").parentElement).toBe(row);
+  });
 });
 
 describe("ArtifactsPage", () => {
