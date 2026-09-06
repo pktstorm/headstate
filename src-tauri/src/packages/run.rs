@@ -157,15 +157,21 @@ pub fn check(repo: &Path, eco: Ecosystem) -> EcosystemReport {
         Ecosystem::Cargo => &["--version"],
     };
 
-    let out = match std::process::Command::new(&bin)
+    let mut command = std::process::Command::new(&bin);
+    command
         .args(args)
         // The tool's own directory goes on the child's PATH: `npm` and
         // `yarn` are `#!/usr/bin/env node` scripts, so finding them is
         // not enough -- the child has to find `node` too.
         .env("PATH", tools::child_path(&bin))
-        .current_dir(repo)
-        .output()
-    {
+        .current_dir(repo);
+    // And a locale, for the one tool that cannot run without one. Both
+    // variables, because `LANG` alone loses to an inherited `LC_ALL`.
+    if let Some(locale) = child_locale(eco) {
+        command.env("LC_ALL", locale).env("LANG", locale);
+    }
+
+    let out = match command.output() {
         Ok(o) => o,
         Err(e) => {
             return EcosystemReport {
@@ -185,12 +191,16 @@ pub fn check(repo: &Path, eco: Ecosystem) -> EcosystemReport {
     let parsed = parse(&stdout, eco, repo);
 
     if is_real_failure(parsed.is_empty(), out.status.success(), &stdout) {
+        // STDERR FIRST, then stdout. Most of these tools put a failure on
+        // stderr, but the two whose refusals reach `is_usage_error` --
+        // Yarn Berry and CocoaPods -- write theirs to STDOUT, and reading
+        // only stderr would show an empty banner for exactly the cases
+        // that function was added to catch.
         let stderr = String::from_utf8_lossy(&out.stderr);
-        let msg = stderr.lines().next().unwrap_or("the command failed");
         return EcosystemReport {
             ecosystem: eco,
             outdated: Vec::new(),
-            error: Some(msg.to_string()),
+            error: Some(failure_message(&stderr, &stdout)),
         };
     }
 
@@ -245,21 +255,134 @@ fn is_real_failure(nothing_parsed: bool, status_ok: bool, stdout: &str) -> bool 
 /// Deliberately narrow: it must not match a legitimate empty result, so
 /// this looks for the shape of a CLI's own refusal at the very start of
 /// the output, never anywhere within it.
+///
+/// `[!] ` is CocoaPods' own error marker, and it arrives here for the
+/// same reason Yarn Berry's does: `pod outdated` writes
+/// `[!] No 'Podfile.lock' found in the project directory` to STDOUT and
+/// exits 1, so the "empty stdout" half of `is_real_failure` never fired
+/// and a project that cannot be checked at all reported "no updates" --
+/// the inversion this module exists to refuse, arriving by the third
+/// route it did not cover.
 fn is_usage_error(stdout: &str) -> bool {
     // First line only. `starts_with` on the whole string would behave
     // the same for every input seen here -- both reject a match on a
     // later line -- but taking the line explicitly says what is meant
     // and does not depend on that coincidence holding.
     let head = stdout.lines().next().unwrap_or_default().trim_start();
-    // Strip the ANSI colour codes Yarn writes even when redirected.
-    let plain: String = head
-        .split('\u{1b}')
-        .map(|part| part.split_once('m').map_or(part, |(_, rest)| rest))
-        .collect();
+    let plain = strip_ansi(head);
     let lowered = plain.to_ascii_lowercase();
     lowered.starts_with("usage error")
         || lowered.starts_with("unknown syntax error")
         || lowered.starts_with("error: unknown command")
+        // CocoaPods. Case-sensitive and including the space, so it is
+        // the marker rather than any line that opens with a bracket.
+        || plain.starts_with("[!] ")
+}
+
+/// Text with its ANSI escape sequences removed.
+///
+/// These tools colour their output EVEN WHEN REDIRECTED -- Yarn writes
+/// `\x1b[31m\x1b[1mUsage Error`, CocoaPods writes `\x1b[33mWARNING` --
+/// so a pipe is not enough to be rid of them and neither is `--no-color`,
+/// which not all of them have.
+///
+/// Splits on the escape byte and drops the SGR sequence that opens each
+/// fragment AFTER one -- `[`, the numeric parameters, then the `m`. That
+/// covers colour sequences, which is all any of these tools emit.
+///
+/// The TEXT BEFORE the first escape is never touched, which is the whole
+/// reason this is not a one-line `split_once('m')`: doing that uniformly
+/// turns `bash: pod: command not found` into `mand not found`, because
+/// the first `m` it finds is the one in "command". Only a fragment that
+/// genuinely begins `\x1b[…m` loses anything, and a malformed one is
+/// kept whole rather than swallowed.
+fn strip_ansi(text: &str) -> String {
+    let mut parts = text.split('\u{1b}');
+    // Everything before the first escape is literal text.
+    let mut out = parts.next().unwrap_or_default().to_string();
+    for part in parts {
+        let rest = part.strip_prefix('[').and_then(|p| {
+            let end = p.find(|c: char| !c.is_ascii_digit() && c != ';')?;
+            // Only `m` terminates a colour sequence. Anything else is
+            // some other escape this does not claim to understand, so
+            // the fragment is left alone rather than half-eaten.
+            (p.as_bytes()[end] == b'm').then(|| &p[end + 1..])
+        });
+        out.push_str(rest.unwrap_or(part));
+    }
+    out
+}
+
+/// The one line of stderr worth showing when a check failed.
+///
+/// Not simply the first line, which is what this used to be, because
+/// CocoaPods WARNS BEFORE IT FAILS. With no UTF-8 locale it writes four
+/// lines about the terminal encoding and then dies in
+/// `unicode_normalize`, so the first line told the user to edit their
+/// `~/.profile` while the actual failure sat five lines below it -- and
+/// it arrived wearing a raw `\x1b[33m`, which the UI printed as text.
+///
+/// So: skip blank lines and lines that are a tool's own advisory noise,
+/// take the first line that remains, and strip the colour codes off it.
+/// If every line is noise the first one is shown anyway -- a warning in
+/// the banner beats an empty banner, since the check really did fail.
+///
+/// Narrow on purpose. Only a line that OPENS with `warning:` or `note:`
+/// is skipped, never one that merely contains the word: `[!] No
+/// 'Podfile.lock' found` and `bash: pod: command not found` are the
+/// messages that matter and neither is touched.
+///
+/// Both streams are considered, stderr first. Yarn Berry and CocoaPods
+/// write their refusals to STDOUT, so stderr alone would leave the
+/// banner empty for the two cases most likely to reach here.
+fn failure_message(stderr: &str, stdout: &str) -> String {
+    let lines: Vec<String> = stderr
+        .lines()
+        .chain(stdout.lines())
+        .map(|l| strip_ansi(l).trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    let is_advisory = |l: &String| {
+        let lowered = l.to_ascii_lowercase();
+        lowered.starts_with("warning:")
+            || lowered.starts_with("warning ")
+            || lowered.starts_with("note:")
+            // The continuation lines of CocoaPods' own warning. Anchored
+            // to the whole phrase, not to "consider", so ordinary advice
+            // in a real error message is not thrown away.
+            || lowered.starts_with("consider adding the following")
+            || lowered.starts_with("export lang=")
+    };
+
+    lines
+        .iter()
+        .find(|l| !is_advisory(l))
+        .or(lines.first())
+        .cloned()
+        .unwrap_or_else(|| "the command failed".to_string())
+}
+
+/// The locale to hand this ecosystem's child process, if it needs one.
+///
+/// COCOAPODS ONLY, and it is not cosmetic. A macOS GUI app inherits no
+/// `LANG` or `LC_ALL` -- the same missing-environment class as the PATH
+/// problem `tools::child_path` exists for -- and CocoaPods does not
+/// merely warn about that: `Pod::Config#installation_root` calls
+/// `String#unicode_normalize`, which raises
+/// `Encoding::CompatibilityError` on an ASCII-8BIT string, so `pod`
+/// exits 1 having produced nothing. Measured on this machine with
+/// CocoaPods 1.17 and Ruby 4.0.
+///
+/// `en_US.UTF-8` is what the warning itself asks for. Scoped to the
+/// child process: the app's own environment is not touched, and no other
+/// tool here is affected, because none of the others reads the locale to
+/// decide whether it can normalise a path.
+fn child_locale(eco: Ecosystem) -> Option<&'static str> {
+    match eco {
+        Ecosystem::Cocoapods => Some("en_US.UTF-8"),
+        _ => None,
+    }
 }
 
 /// Every project in a repository, with its ecosystems checked.
@@ -962,6 +1085,218 @@ mod berry {
     }
 }
 
+/// CocoaPods, which fails in a way none of the other tools do.
+#[cfg(test)]
+mod cocoapods {
+    use super::*;
+
+    /// The REAL bytes CocoaPods 1.17 writes to stderr when the child
+    /// process has no UTF-8 locale, captured from `pod outdated` run with
+    /// `LANG`, `LC_ALL` and `LC_CTYPE` unset -- which is exactly a macOS
+    /// GUI app's environment.
+    ///
+    /// Two facts about it, and both matter. It is INDENTED four spaces
+    /// and coloured, so it does not look like the first line of an error
+    /// message. And it is a WARNING followed by three more lines of
+    /// advice, after which CocoaPods crashes for real with an
+    /// `Encoding::CompatibilityError` -- so the useful line is the fifth,
+    /// not the first.
+    const POD_UTF8_WARNING: &str = concat!(
+        "    \u{1b}[33mWARNING: CocoaPods requires your terminal to be using UTF-8 encoding.\n",
+        "    Consider adding the following to ~/.profile:\n\n",
+        "    export LANG=en_US.UTF-8\n",
+        "    \u{1b}[0m\n",
+        "/opt/homebrew/Cellar/ruby/4.0.5/lib/ruby/4.0.0/unicode_normalize/normalize.rb:153:in ",
+        "'UnicodeNormalize.normalize': Unicode Normalization not appropriate for ASCII-8BIT ",
+        "(Encoding::CompatibilityError)\n",
+    );
+
+    /// No raw escape sequence ever reaches the UI.
+    ///
+    /// `[33m` rendered as literal text in the error banner. Yarn's
+    /// output is already stripped on the `is_usage_error` path, so the
+    /// stripper existed -- it was just not on the path that builds the
+    /// message a user reads.
+    #[test]
+    fn the_error_message_carries_no_ansi_escape() {
+        let msg = failure_message(POD_UTF8_WARNING, "");
+        assert!(
+            !msg.contains('\u{1b}') && !msg.contains("[33m") && !msg.contains("[0m"),
+            "an escape code leaked into the UI: {msg:?}"
+        );
+    }
+
+    /// The message names what actually went wrong.
+    ///
+    /// The first stderr line is a WARNING about the terminal, and
+    /// reporting it as the error told the user to fix their `~/.profile`
+    /// when the real failure was four lines further down. Taking the
+    /// first line is right for every other tool here and wrong for this
+    /// one, because this one warns before it fails.
+    #[test]
+    fn the_error_message_is_the_failure_not_the_warning_above_it() {
+        let msg = failure_message(POD_UTF8_WARNING, "");
+        assert!(
+            !msg.contains("WARNING"),
+            "a warning was reported as the error: {msg:?}"
+        );
+        assert!(
+            msg.contains("Encoding::CompatibilityError"),
+            "the real failure must be named: {msg:?}"
+        );
+    }
+
+    /// A tool whose first stderr line IS the error keeps reporting it.
+    ///
+    /// The warning skip must be narrow enough that it does not eat a
+    /// legitimate first line, and blank and indented lines are skipped
+    /// only in service of finding one.
+    #[test]
+    fn an_ordinary_first_line_is_still_the_message() {
+        assert_eq!(
+            failure_message("bash: pod: command not found\n", ""),
+            "bash: pod: command not found"
+        );
+        assert_eq!(
+            failure_message(
+                "",
+                "[!] No `Podfile.lock' found in the project directory.\n"
+            ),
+            "[!] No `Podfile.lock' found in the project directory."
+        );
+    }
+
+    /// Nothing on stderr at all still says something.
+    #[test]
+    fn empty_stderr_falls_back_to_a_sentence() {
+        assert_eq!(failure_message("", ""), "the command failed");
+        assert_eq!(failure_message("   \n\n", ""), "the command failed");
+        // Warnings and nothing else: there is no better line to show, so
+        // the warning is better than an empty banner.
+        assert_eq!(
+            failure_message("    \u{1b}[33mWARNING: something\n", ""),
+            "WARNING: something"
+        );
+    }
+
+    /// CocoaPods' own refusal, on STDOUT with a non-zero exit, is a
+    /// failure -- not zero updates.
+    ///
+    /// The exact shape Yarn Berry's was: `pod outdated` in a directory
+    /// with a `Podfile` but no `Podfile.lock` prints
+    /// `[!] No 'Podfile.lock' found in the project directory` to stdout
+    /// and exits 1. `is_real_failure` required stdout to be EMPTY or a
+    /// recognised usage error, and this was neither -- so a project that
+    /// could not be checked at all rendered as a clean, empty list.
+    ///
+    /// Measured on this repository: `src-mobile/gen/apple` has a Podfile
+    /// and no installed Pods, and reported "no updates" with no error.
+    #[test]
+    fn a_cocoapods_refusal_on_stdout_is_a_failure_not_zero_updates() {
+        const NO_LOCK: &str = "[!] No `Podfile.lock' found in the project directory, \
+                               run `pod install'.\n";
+        assert!(is_usage_error(NO_LOCK));
+        assert!(is_real_failure(true, false, NO_LOCK));
+        // And the banner names it, reading the stream it was written to.
+        assert_eq!(
+            failure_message("", NO_LOCK),
+            "[!] No `Podfile.lock' found in the project directory, run `pod install'."
+        );
+    }
+
+    /// The marker must not swallow a real result.
+    ///
+    /// It is anchored to the first line, requires the trailing space, and
+    /// a zero exit is never a failure whatever was printed -- so an
+    /// ordinary `pod outdated` listing stays a listing.
+    #[test]
+    fn a_real_cocoapods_listing_is_not_mistaken_for_a_refusal() {
+        let listing = "The following pod updates are available:\n\
+                       - Alamofire 5.8.0 -> 5.8.0 (latest version 5.9.1)\n";
+        assert!(!is_usage_error(listing));
+        assert!(!is_real_failure(false, false, listing));
+        // A bracket that is not the marker.
+        assert!(!is_usage_error("[info] nothing to do"));
+        assert!(!is_usage_error("[!]nospace"));
+        // Anchored to the FIRST line, like every other rule here.
+        assert!(!is_usage_error("a real first line\n[!] later\n"));
+        // Exit 0 is never a failure, whatever it printed.
+        assert!(!is_real_failure(true, true, "[!] something"));
+    }
+
+    /// Text with no escapes at all comes back unchanged.
+    ///
+    /// The bug this pins was in the stripper the Yarn path already had:
+    /// it split every fragment at its first `m`, INCLUDING the text
+    /// before any escape, so `bash: pod: command not found` came out as
+    /// `mand not found`. It was invisible there because that path only
+    /// ever asked whether the result STARTS WITH "usage error", and a
+    /// mangled line answers no just as a clean one does. Putting the
+    /// same helper on the path that builds a message a user reads is
+    /// what made it visible.
+    #[test]
+    fn stripping_leaves_plain_text_alone() {
+        assert_eq!(
+            strip_ansi("bash: pod: command not found"),
+            "bash: pod: command not found"
+        );
+        assert_eq!(
+            strip_ansi("no escapes, many m's here"),
+            "no escapes, many m's here"
+        );
+        // And it still does its job on the real coloured bytes.
+        assert_eq!(
+            strip_ansi("\u{1b}[31m\u{1b}[1mUsage Error\u{1b}[22m\u{1b}[39m: nope"),
+            "Usage Error: nope"
+        );
+        // A sequence that is not a colour is left whole rather than
+        // half-eaten.
+        assert_eq!(strip_ansi("a\u{1b}[2Kb"), "a[2Kb");
+    }
+
+    /// Non-ASCII text does not panic and is not mangled.
+    ///
+    /// `find` returns a BYTE index and the byte at it is then compared
+    /// against `m`, so a multi-byte character right after the escape is
+    /// the case where those two could disagree. It lands on a character
+    /// boundary either way -- so the read is in range, the lead byte is
+    /// never `m`, and the fragment is correctly left whole. Worth a test
+    /// rather than a comment: a package name or a path in a tool's error
+    /// message is not guaranteed to be ASCII.
+    #[test]
+    fn stripping_is_safe_on_non_ascii() {
+        assert_eq!(strip_ansi("é\u{1b}[31mrouge\u{1b}[0m"), "érouge");
+        assert_eq!(strip_ansi("\u{1b}[é"), "[é");
+        assert_eq!(strip_ansi("\u{1b}[31mné"), "né");
+        assert_eq!(strip_ansi("路径: not found"), "路径: not found");
+    }
+
+    /// The child process is given a UTF-8 locale.
+    ///
+    /// A GUI app inherits neither `LANG` nor `LC_ALL` -- the same class
+    /// of missing-environment bug as the PATH one `tools::child_path`
+    /// exists for -- and without one CocoaPods does not merely warn, it
+    /// dies in `unicode_normalize`. Measured on this machine: with the
+    /// locale unset `pod outdated` exits 1 having printed nothing usable;
+    /// with `LC_ALL=en_US.UTF-8` it runs and reports its real answer.
+    ///
+    /// Setting it is what the warning itself asks for, and it is scoped
+    /// to the child: nothing about the app's own environment changes.
+    #[test]
+    fn cocoapods_gets_a_utf8_locale_and_other_tools_do_not() {
+        assert_eq!(child_locale(Ecosystem::Cocoapods), Some("en_US.UTF-8"));
+        for eco in [
+            Ecosystem::Npm,
+            Ecosystem::Yarn,
+            Ecosystem::Poetry,
+            Ecosystem::Uv,
+            Ecosystem::Dotnet,
+        ] {
+            assert_eq!(child_locale(eco), None, "{eco:?}");
+        }
+    }
+}
+
 /// End-to-end against a REAL Yarn Berry project. Ignored by default: it
 /// needs npm, a project on this machine, and the network.
 ///
@@ -984,6 +1319,55 @@ mod yarn_e2e {
         assert!(
             !report.outdated.is_empty(),
             "a Berry project with outdated packages must report them"
+        );
+    }
+}
+
+/// End-to-end against the REAL `pod` binary, in the environment a GUI
+/// app actually has. Ignored by default: it needs CocoaPods installed.
+///
+/// `HEADSTATE_PODFILE_DIR=/path cargo test -- --ignored pod_e2e --nocapture`
+#[cfg(test)]
+mod pod_e2e {
+    use super::*;
+
+    /// The locale fix, measured rather than asserted from a fixture.
+    ///
+    /// The test CLEARS `LANG`, `LC_ALL` and `LC_CTYPE` from its own
+    /// process first, because that -- not a terminal -- is the
+    /// environment a launched `.app` runs in, and it is the only way to
+    /// reproduce the failure at all. With the variables cleared and no
+    /// fix, `pod outdated` exits 1 having written a coloured warning and
+    /// a Ruby backtrace; with the fix it runs and reports whatever it
+    /// really has to say.
+    ///
+    /// `temp_env` restores the variables afterwards, so this does not
+    /// leak into the rest of the suite.
+    #[test]
+    #[ignore = "needs CocoaPods installed and a directory holding a Podfile"]
+    fn a_gui_environment_no_longer_breaks_cocoapods() {
+        let Ok(dir) = std::env::var("HEADSTATE_PODFILE_DIR") else {
+            eprintln!("set HEADSTATE_PODFILE_DIR to run this");
+            return;
+        };
+        temp_env::with_vars(
+            [
+                ("LANG", None::<&str>),
+                ("LC_ALL", None::<&str>),
+                ("LC_CTYPE", None::<&str>),
+            ],
+            || {
+                let report = check(Path::new(&dir), Ecosystem::Cocoapods);
+                eprintln!("error: {:?}", report.error);
+                eprintln!("outdated: {}", report.outdated.len());
+                if let Some(e) = &report.error {
+                    assert!(!e.contains('\u{1b}'), "a raw escape reached the UI: {e:?}");
+                    assert!(
+                        !e.contains("UTF-8 encoding"),
+                        "the encoding warning is still reported as the error: {e:?}"
+                    );
+                }
+            },
         );
     }
 }
