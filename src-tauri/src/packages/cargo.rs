@@ -547,13 +547,27 @@ pub fn is_registry_row(o: &Outdated) -> bool {
 /// broken, which is why it is unit-tested against all four buckets.
 pub fn index_path(name: &str) -> Option<String> {
     let lower = name.to_ascii_lowercase();
-    // A name with a slash would escape the index path entirely. Crate
-    // names cannot contain one, so this is a guard on input that did not
-    // come from a real manifest rather than a case to handle.
-    if lower.is_empty() || lower.contains(['/', '\\', '.']) {
+    // Cargo permits only ASCII alphanumerics, `-` and `_` in a crate
+    // name, and this REJECTS anything else rather than encoding it.
+    //
+    // Two distinct reasons, and both matter. A `/`, `\` or `.` would
+    // escape the index path and turn a lookup into a request for some
+    // other URL entirely. And a multi-byte character would make the
+    // byte slices below split mid-character and PANIC -- `chars().count()`
+    // measures characters while `&lower[..2]` takes bytes, so any
+    // agreement between them holds only for ASCII. Neither can arise
+    // from a real manifest; this guards input that did not come from
+    // one.
+    if lower.is_empty()
+        || !lower
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
         return None;
     }
-    let n = lower.chars().count();
+    // ASCII by the check above, so bytes and characters agree and the
+    // slices below cannot split a character.
+    let n = lower.len();
     Some(match n {
         1 => format!("1/{lower}"),
         2 => format!("2/{lower}"),
@@ -674,6 +688,21 @@ mod tests {
         assert_eq!(index_path(""), None);
         assert_eq!(index_path("../../etc/passwd"), None);
         assert_eq!(index_path("a/b"), None);
+        assert_eq!(index_path("a\\b"), None);
+    }
+
+    /// A multi-byte name must be REFUSED, not sliced. The 4+ bucket
+    /// takes `&lower[..2]` and `&lower[2..4]`, which are BYTE indices --
+    /// on a non-ASCII name they land mid-character and panic. Cargo
+    /// permits only ASCII in a crate name, so this cannot come from a
+    /// real manifest, but the function takes a `&str` and a panic here
+    /// would take down the whole check.
+    #[test]
+    fn a_non_ascii_name_is_refused_rather_than_split_mid_character() {
+        assert_eq!(index_path("café-au-lait"), None);
+        assert_eq!(index_path("日本語クレート"), None);
+        // Two bytes in, one character: the exact shape that panics.
+        assert_eq!(index_path("ée"), None);
     }
 
     /// A YANKED version must never be offered. It stays in the index
