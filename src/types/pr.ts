@@ -558,6 +558,16 @@ export interface Outdated {
   ecosystem: Ecosystem;
   /// The manifest to edit, so an agent does not have to find it.
   manifest: string;
+  /// Which PROJECT in the repository this row came from, relative to
+  /// the repository root. Empty at the root.
+  ///
+  /// Attached by `PackagesPage` rather than sent by the backend: the
+  /// grouping already knows it (`ProjectReport.label`) and flattening
+  /// the groups for the wizard is what threw it away. An apply needs it
+  /// -- in THIS repository every Rust row lives under `src-tauri` or
+  /// `src-mobile` and there is no `Cargo.toml` at the root at all, so a
+  /// request without it has nothing to edit.
+  project?: string;
 }
 
 /// One package the user asked to update.
@@ -565,6 +575,10 @@ export interface UpdateRequest {
   name: string;
   version: string;
   ecosystem: Ecosystem;
+  /// The project directory, relative to the repository root. Omitted or
+  /// empty means the root itself, which is what every caller meant
+  /// before this field existed.
+  project?: string;
 }
 
 /// What happened to one requested update.

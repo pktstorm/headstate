@@ -123,7 +123,14 @@ export function PackagesPage() {
   // been filtered to (#494). The filter is the user saying which
   // updates they are willing to take; carrying it through is the point
   // of setting it.
-  const offered = projects.flatMap((p) => p.reports.flatMap((r) => shown(r)));
+  // The project label is attached HERE, on the way out. Flattening the
+  // groups is what lost it, and an apply cannot find the manifest
+  // without it: every Rust row in this repository lives under
+  // `src-tauri` or `src-mobile`, and there is no `Cargo.toml` at the
+  // repository root to fall back to.
+  const offered = projects.flatMap((p) =>
+    p.reports.flatMap((r) => shown(r).map((o) => ({ ...o, project: p.label }))),
+  );
   // ONE derivation. These were computed separately from the same
   // filter, which is how the button could say 122 while the modal
   // listed 153 without anything looking wrong.

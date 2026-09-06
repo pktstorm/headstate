@@ -19,14 +19,18 @@ use super::model::Ecosystem;
 
 /// Whether a pull request may be opened for this ecosystem.
 ///
-/// npm and yarn only, because those are the two whose manifest is read
-/// back and CONFIRMED. Poetry, uv, .NET and CocoaPods report
+/// npm, yarn and Cargo, because those are the ones whose manifest is
+/// read back and CONFIRMED. Poetry, uv, .NET and CocoaPods report
 /// `resolved_constraint` as `None` -- reading those manifests safely
 /// needs a real TOML/XML parser -- so a body could not describe what
 /// landed, and the whole point of this description is that it is
 /// accurate about that.
+///
+/// Cargo qualifies since #559 for a stronger reason than the other two:
+/// it is not merely read back afterwards, it is the code that WROTE it,
+/// with `toml_edit`, and it re-reads the file from disk to confirm.
 pub fn can_describe(eco: Ecosystem) -> bool {
-    matches!(eco, Ecosystem::Npm | Ecosystem::Yarn)
+    matches!(eco, Ecosystem::Npm | Ecosystem::Yarn | Ecosystem::Cargo)
 }
 
 /// The pull request title.
@@ -121,6 +125,23 @@ pub fn body(report: &RunReport) -> String {
         }
     }
 
+    // STATED, not left to be discovered in review. A Cargo apply edits
+    // `Cargo.toml` and deliberately does not touch `Cargo.lock` -- see
+    // `cargo_apply::LOCKFILE` for why -- so the two disagree until the
+    // next build. A reviewer who notices that themselves has been
+    // surprised by the tool that opened the pull request, which is the
+    // failure mode this whole body exists to avoid.
+    if report.ecosystems.contains(&Ecosystem::Cargo) {
+        out.push(String::new());
+        out.push(format!(
+            "**Rust:** {} The manifest is edited directly rather than by \
+             `cargo add`, which on a workspace severs `workspace = true` \
+             inheritance and rewrites version constraints it was not asked \
+             to change.",
+            super::cargo_apply::LOCKFILE
+        ));
+    }
+
     let changed: Vec<&str> = ok
         .iter()
         .flat_map(|r| r.changed_files.iter().map(String::as_str))
@@ -159,6 +180,36 @@ mod tests {
             ecosystems: vec![Ecosystem::Npm],
             results,
         }
+    }
+
+    /// A Cargo run says the lockfile is stale, in the body, rather
+    /// than leaving a reviewer to notice `Cargo.toml` moved and
+    /// `Cargo.lock` did not.
+    #[test]
+    fn a_cargo_run_states_that_the_lockfile_is_untouched() {
+        let mut r = report(vec![outcome("serde", "1.0.229", Some("1.0.229"))]);
+        r.ecosystems = vec![Ecosystem::Cargo];
+        let b = body(&r);
+        assert!(b.contains("Cargo.lock is not updated"), "{b}");
+    }
+
+    /// And a run with no Rust in it does NOT carry the note.
+    #[test]
+    fn a_run_without_cargo_does_not_mention_the_lockfile() {
+        let b = body(&report(vec![outcome(
+            "lodash",
+            "4.17.21",
+            Some("^4.17.21"),
+        )]));
+        assert!(!b.contains("Cargo.lock"), "{b}");
+    }
+
+    /// Cargo can be described, because the code that wrote the
+    /// manifest reads it back from disk.
+    #[test]
+    fn cargo_can_be_described() {
+        assert!(can_describe(Ecosystem::Cargo));
+        assert!(!can_describe(Ecosystem::Poetry));
     }
 
     /// THE case phase 1 was built to discover: npm rewrites a pinned

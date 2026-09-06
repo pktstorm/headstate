@@ -10,13 +10,12 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 
-/// Ecosystems whose updates this can apply.
+/// Ecosystems the backend refuses, with the reason shown to the user.
 ///
 /// Swift is excluded for the same reason the CHECK excludes it: nothing
 /// reports what is outdated for Xcode-managed dependencies, so there is
 /// no version to move to. Stated in the UI rather than silently omitted,
 /// because a package that quietly cannot be selected reads as a bug.
-/// Ecosystems the backend refuses, with the reason shown to the user.
 ///
 /// Must match `packages::apply::supported`. Terraform was missing here
 /// while the backend refused it -- so every Terraform row was
@@ -26,8 +25,10 @@ const CANNOT_APPLY: Partial<Record<Ecosystem, string>> = {
   swift: "Swift packages must be updated in Xcode or Package.swift.",
   terraform:
     "Terraform provider versions are a constraint in your .tf source, not something a lockfile edit can change.",
-  cargo:
-    "Rust crates cannot be updated here yet: `cargo add` cannot target a workspace member, so on a workspace it would edit the wrong manifest. Run `cargo add <pkg>@<version>` in the crate's own directory.",
+  // Cargo was here until #559. It is applicable now because the backend
+  // stopped trying to use `cargo add` -- which on a workspace severs
+  // `workspace = true` inheritance, edits the wrong crate, and rewrites
+  // constraint styles -- and edits the declaring manifest directly.
 };
 
 /// Applies dependency updates in a fresh worktree.
@@ -62,7 +63,14 @@ export function UpdateWizard({
   /// for that name shared one checkbox -- ticking one ticked them all,
   /// and React saw duplicate keys. `manifest` is what actually
   /// distinguishes them.
-  const key = (p: Outdated) => `${p.ecosystem}:${p.manifest}:${p.name}`;
+  ///
+  /// `project` is part of it too: a monorepo declares the same crate in
+  /// two projects under the same manifest NAME (`Cargo.toml
+  /// [dependencies]` in both `src-tauri` and `src-mobile`), which
+  /// without it is one key for two rows -- the same collision `manifest`
+  /// was added to fix, one level up.
+  const key = (p: Outdated) =>
+    `${p.ecosystem}:${p.project ?? ""}:${p.manifest}:${p.name}`;
 
   const { applicable, blocked } = useMemo(() => {
     const applicable: Outdated[] = [];
@@ -96,7 +104,14 @@ export function UpdateWizard({
   const run = () => {
     const requests = applicable
       .filter((p) => selected.has(key(p)))
-      .map((p) => ({ name: p.name, version: p.latest, ecosystem: p.ecosystem }));
+      .map((p) => ({
+        name: p.name,
+        version: p.latest,
+        ecosystem: p.ecosystem,
+        // Carried through so the backend edits the manifest in THIS
+        // project rather than at the worktree root.
+        project: p.project ?? "",
+      }));
     // Unreachable through the UI -- the button is disabled with an
     // empty selection -- and kept as a guard for any other caller.
     if (requests.length === 0) return;

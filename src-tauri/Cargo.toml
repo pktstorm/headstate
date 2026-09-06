@@ -46,8 +46,19 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # and `Cargo.lock`. Both are TOML with quoted keys, dotted keys, inline
 # tables and arrays of tables; hand-scanning them the way `swift.rs`
 # scans JSON would get the awkward shapes wrong in exactly the quiet
-# ways that module refuses. `parse` only -- nothing here writes TOML.
+# ways that module refuses. Reading only; the WRITE side is `toml_edit`.
 toml = "1.1"
+# ALREADY in the tree at this version, underneath `toml` itself -- so
+# declaring it adds no new code to the supply chain.
+#
+# The write half of the Cargo ecosystem (`packages/cargo_apply.rs`).
+# `toml` round-trips through a value model and would reformat the whole
+# file; `toml_edit` keeps a format-preserving document, which is the
+# only reason an apply can leave the why-comment above a dependency
+# alone. That is not a nicety here: nearly every dependency in this
+# repository carries one, and losing them is precisely why #560 refused
+# to ship an apply button.
+toml_edit = "0.25"
 tokio = { version = "1.53", features = ["full"] }
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }

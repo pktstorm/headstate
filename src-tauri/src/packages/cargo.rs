@@ -80,6 +80,28 @@ pub struct Declared {
     /// Where the version comes from, which decides whether it can be
     /// compared at all.
     pub source: Source,
+    /// Whether the entry is `foo.workspace = true`.
+    ///
+    /// Decides WHICH FILE an update must edit, and it is not the file
+    /// the entry was read from. An inherited entry carries no version
+    /// of its own -- the number lives in the root's
+    /// `[workspace.dependencies]` -- so writing a version onto the
+    /// member's line does not update anything, it SEVERS the
+    /// inheritance. Measured: that is exactly what `cargo add` does,
+    /// even when correctly aimed with `--package` (#559).
+    pub inherited: bool,
+    /// The manifest this entry was read from, absolute.
+    ///
+    /// Carried rather than re-derived at apply time. `declared` already
+    /// walks the workspace and knows which member each entry came from;
+    /// a second walk that answered differently would edit a file the
+    /// report never named.
+    ///
+    /// For an INHERITED entry this is still the member's manifest --
+    /// where the entry is written -- not the root that holds its
+    /// version. `apply` needs both and resolves the root from the
+    /// project path.
+    pub manifest: PathBuf,
 }
 
 /// Where a dependency's code comes from.
@@ -126,7 +148,12 @@ pub fn declared(project: &Path) -> Vec<Declared> {
         let Some(doc) = read_manifest(&manifest) else {
             continue;
         };
-        for d in from_document(&doc, &inherited) {
+        for mut d in from_document(&doc, &inherited) {
+            // Recorded HERE, where the file is known. `from_document`
+            // sees a parsed document and cannot name its own source, so
+            // stamping it in the loop is what keeps one answer to
+            // "which file declares this" rather than two.
+            d.manifest = manifest.clone();
             // De-duplicated across a workspace. Every member of
             // `src-mobile` declares `serde`; three identical rows saying
             // the same thing about the same resolved version is noise,
@@ -333,6 +360,10 @@ fn declared_from(
             table,
             target,
             source: Source::Registry,
+            inherited: false,
+            // Filled by `declared`, which knows which file this came
+            // from; `from_document` sees only a parsed document.
+            manifest: PathBuf::new(),
         });
     }
 
@@ -356,6 +387,8 @@ fn declared_from(
             table,
             target,
             source: classify(root_spec),
+            inherited: true,
+            manifest: PathBuf::new(),
         });
     }
 
@@ -365,6 +398,8 @@ fn declared_from(
         table,
         target,
         source: classify(spec),
+        inherited: false,
+        manifest: PathBuf::new(),
     })
 }
 

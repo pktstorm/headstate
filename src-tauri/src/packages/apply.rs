@@ -59,31 +59,21 @@ pub fn supported(eco: Ecosystem) -> Result<(), Unsupported> {
              constraint in your .tf source, not something a lockfile edit \
              can change.",
         )),
-        // Refused on MEASURED evidence, not on principle. `cargo add`
-        // itself is well behaved -- it is built on `toml_edit`, so it
-        // preserves comments and existing features, both verified. What
-        // it cannot do is act on a WORKSPACE, and a workspace root is
-        // one row on this page:
+        // Allowed since #559, and NOT by running `cargo add`. All three
+        // of that tool's wrong edits were re-measured against cargo
+        // 1.98.1 and all three still happen -- including one `--package`
+        // does not fix (it severs `workspace = true` inheritance either
+        // way) and one #560 never found (it flattens the constraint
+        // style, turning `serde = "1"` into `"1.0.229"` and `log =
+        // "=0.4.20"` into `"0.4.30"`).
         //
-        // - Run at a virtual workspace root, `cargo add serde@x`
-        //   redirects into a member and REWRITES `serde.workspace = true`
-        //   into a hardcoded version -- silently severing the
-        //   inheritance and deleting the comment above it. Measured.
-        // - Run at a non-virtual root (a package that is also a
-        //   workspace root, which is exactly `src-mobile`), asking for a
-        //   MEMBER's crate ADDS A NEW DEPENDENCY to the root package
-        //   instead of updating the member's. Measured.
-        //
-        // Either outcome is a wrong edit the user did not ask for, which
-        // is worse than no button. Reporting works; applying waits for a
-        // path that edits the right manifest -- see #559.
-        Ecosystem::Cargo => Err(Unsupported::NoCommand(
-            "Rust crates cannot be updated here yet: `cargo add` cannot target a \
-             workspace member, so on a workspace it would edit the wrong manifest \
-             -- severing `workspace = true` inheritance, or adding the crate to the \
-             root package instead. Run `cargo add <pkg>@<version>` in the crate's \
-             own directory.",
-        )),
+        // So `packages::cargo_apply` edits the manifest with `toml_edit`
+        // directly, resolving WHICH manifest through `cargo::declared` --
+        // the same walk that produced the row -- and preserving both the
+        // why-comments and the constraint style. It is routed in
+        // `apply_one` rather than through `update_args`, because it
+        // spawns nothing.
+        Ecosystem::Cargo => Ok(()),
         Ecosystem::Swift => Err(Unsupported::NoCommand(
             "Swift packages cannot be updated here: nothing reports what is \
              outdated, so there is no version to move to. Update the version \
@@ -192,7 +182,10 @@ pub fn update_args(dir: &Path, eco: Ecosystem, name: &str, version: &str) -> Vec
         // take down the whole command for a case the caller already
         // guarded.
         Ecosystem::Swift => vec![s("--version")],
-        // Unreachable: `supported` refuses Cargo before this is called.
+        // Unreachable: `apply_one_in` handles Cargo before this is
+        // called, by editing the manifest rather than spawning
+        // anything. Kept total rather than panicking, for the same
+        // reason as Swift above.
         Ecosystem::Cargo => vec![s("--version")],
     }
 }
@@ -234,23 +227,76 @@ pub struct Applied {
 /// `dir` must be a worktree created for this purpose. Nothing here
 /// checks that, because the caller creates it; this function's contract
 /// is only that it does not reach outside `dir`.
+///
+/// `project` is the subdirectory the manifest lives in, and is where
+/// the tool runs; `dir` stays the worktree, because that is what `git
+/// status` must be asked about -- a resolver routinely rewrites a
+/// lockfile ABOVE the project directory, and asking git only about the
+/// project would drop it from the report.
 pub fn apply_one(dir: &Path, eco: Ecosystem, name: &str, version: &str) -> Result<Applied, String> {
+    apply_one_in(dir, dir, eco, name, version)
+}
+
+pub fn apply_one_in(
+    dir: &Path,
+    project: &Path,
+    eco: Ecosystem,
+    name: &str,
+    version: &str,
+) -> Result<Applied, String> {
     supported(eco).map_err(|Unsupported::NoCommand(m)| m.to_string())?;
     reject_flaglike("package name", name)?;
     reject_flaglike("version", version)?;
+
+    // Cargo spawns NOTHING. See `supported`: its tool makes three
+    // separate wrong edits on a workspace, so the manifest is edited
+    // directly and the version that lands is read back off disk the
+    // same way every other path reads its manifest back.
+    if eco == Ecosystem::Cargo {
+        let edited = super::cargo_apply::apply(project, name, version)?;
+        return Ok(Applied {
+            name: name.to_string(),
+            requested: version.to_string(),
+            changed_files: changed_files(dir),
+            // Not a tool's stderr -- there is no tool. Says which file
+            // was edited and which table, because on a workspace that
+            // is the whole question, and adds the lockfile caveat so it
+            // is stated rather than discovered.
+            output: if edited.written {
+                format!(
+                    "{} [{}]: {} -> {}. {}",
+                    edited.manifest,
+                    edited.table,
+                    edited.before,
+                    edited.after,
+                    super::cargo_apply::LOCKFILE
+                )
+            } else {
+                format!(
+                    "{} [{}]: left at {:?}, which already admits {version}. \
+                     Narrowing it would rewrite a version policy that was not \
+                     asked about.",
+                    edited.manifest, edited.table, edited.before
+                )
+            },
+            resolved_constraint: Some(edited.after),
+        });
+    }
 
     let fallbacks = tools::fallback_dirs();
     let refs: Vec<&str> = fallbacks.iter().map(String::as_str).collect();
     let bin = tools::find(eco.program(), &refs)
         .ok_or_else(|| format!("{} is not installed", eco.program()))?;
 
-    let args = update_args(dir, eco, name, version);
+    // Read from and run in the PROJECT: the manifest whose style
+    // `was_pinned` inspects is that project's, not the worktree root's.
+    let args = update_args(project, eco, name, version);
     let out = std::process::Command::new(&bin)
         .args(&args)
         // Same reason as the update check: an interpreted tool starts a
         // second lookup for its interpreter inside the child.
         .env("PATH", tools::child_path(&bin))
-        .current_dir(dir)
+        .current_dir(project)
         .output()
         .map_err(|e| format!("could not run {}: {e}", eco.program()))?;
 
@@ -272,7 +318,7 @@ pub fn apply_one(dir: &Path, eco: Ecosystem, name: &str, version: &str) -> Resul
         changed_files: changed_files(dir),
         output: stderr,
         // Read back, never assumed. See `resolved_constraint`.
-        resolved_constraint: read_constraint(dir, eco, name),
+        resolved_constraint: read_constraint(project, eco, name),
     })
 }
 
@@ -537,6 +583,50 @@ pub struct UpdateRequest {
     pub name: String,
     pub version: String,
     pub ecosystem: Ecosystem,
+    /// Which PROJECT within the repository declares it, relative to the
+    /// repository root. Empty, or absent, means the root itself.
+    ///
+    /// Every apply before Cargo ran at the worktree root and ignored
+    /// this, which worked only because those runs happened to be
+    /// single-project repositories -- a `package.json` in a subdirectory
+    /// was already being updated in the wrong place, silently.
+    ///
+    /// Cargo made it unavoidable rather than merely latent: in THIS
+    /// repository every Cargo row comes from `src-tauri` or
+    /// `src-mobile` and there is no `Cargo.toml` at the root at all, so
+    /// a root-relative apply has nothing to edit.
+    ///
+    /// `#[serde(default)]` because the field is new and an older
+    /// caller's payload omits it; absent then means the root, which is
+    /// exactly the behaviour those callers already had.
+    #[serde(default)]
+    pub project: String,
+}
+
+impl UpdateRequest {
+    /// The directory this request's manifest lives in, inside `dir`.
+    ///
+    /// Joined rather than trusted: `project` arrives over IPC, and a
+    /// `..` component would reach outside the throwaway worktree that
+    /// is the entire safety boundary of an apply. Refused rather than
+    /// normalised, on the same reasoning as `reject_flaglike` -- a
+    /// refusal the user can see beats a path quietly rewritten.
+    fn dir(&self, worktree: &Path) -> Result<std::path::PathBuf, String> {
+        if self.project.is_empty() {
+            return Ok(worktree.to_path_buf());
+        }
+        let p = Path::new(&self.project);
+        if p.is_absolute()
+            || p.components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!(
+                "project path {:?} must be relative to the repository and may not contain '..'",
+                self.project
+            ));
+        }
+        Ok(worktree.join(p))
+    }
 }
 
 /// The result of a whole run: where the work landed and what each
@@ -655,12 +745,15 @@ pub fn run_on_branch(
 
     let results = requests
         .iter()
-        .map(
-            |r| match apply_one(&dir, r.ecosystem, &r.name, &r.version) {
+        .map(|r| {
+            match r
+                .dir(&dir)
+                .and_then(|p| apply_one_in(&dir, &p, r.ecosystem, &r.name, &r.version))
+            {
                 Ok(a) => UpdateOutcome::from_applied(a),
                 Err(e) => UpdateOutcome::failed(r, e),
-            },
-        )
+            }
+        })
         .collect();
 
     let mut ecosystems: Vec<Ecosystem> = requests.iter().map(|r| r.ecosystem).collect();
@@ -705,9 +798,81 @@ mod tests {
             Ecosystem::Uv,
             Ecosystem::Dotnet,
             Ecosystem::Cocoapods,
+            // Since #559. Applied by editing the manifest rather than
+            // by running `cargo add`, whose three wrong edits on a
+            // workspace are what kept it out until now.
+            Ecosystem::Cargo,
         ] {
             assert!(supported(eco).is_ok(), "{eco:?} should be supported");
         }
+    }
+
+    /// A Cargo apply must spawn NOTHING.
+    ///
+    /// The whole design rests on this: `cargo` is deliberately one of
+    /// the ecosystems that needs no tool installed, and an apply that
+    /// quietly reintroduced the dependency would make a missing binary
+    /// break half the ecosystem. Proved by pointing it at a directory
+    /// with no manifest and checking the error is about the MANIFEST,
+    /// never about a missing program.
+    #[test]
+    fn a_cargo_apply_never_looks_for_a_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = apply_one(dir.path(), Ecosystem::Cargo, "serde", "1.0.229")
+            .expect_err("no manifest, so it must fail");
+        assert!(
+            !e.contains("not installed"),
+            "must not blame a missing binary: {e}"
+        );
+        assert!(e.contains("not declared"), "{e}");
+    }
+
+    /// A project path that tries to escape the worktree is refused.
+    ///
+    /// `project` arrives over IPC, and the throwaway worktree is the
+    /// entire safety boundary of an apply.
+    #[test]
+    fn a_project_path_may_not_escape_the_worktree() {
+        let req = |p: &str| UpdateRequest {
+            name: "serde".into(),
+            version: "1.0.0".into(),
+            ecosystem: Ecosystem::Cargo,
+            project: p.into(),
+        };
+        assert!(req("../elsewhere").dir(Path::new("/wt")).is_err());
+        assert!(req("a/../../b").dir(Path::new("/wt")).is_err());
+        assert!(req("/etc").dir(Path::new("/wt")).is_err());
+        // The ordinary shapes still work.
+        assert_eq!(
+            req("src-tauri").dir(Path::new("/wt")).unwrap(),
+            Path::new("/wt/src-tauri")
+        );
+        assert_eq!(req("").dir(Path::new("/wt")).unwrap(), Path::new("/wt"));
+    }
+
+    /// The nested-project route, end to end through `apply_one_in`.
+    ///
+    /// In THIS repository there is no `Cargo.toml` at the repo root at
+    /// all -- every crate is under `src-tauri` or `src-mobile` -- so an
+    /// apply that ignored the project path would have nothing to edit.
+    #[test]
+    fn a_cargo_apply_edits_a_manifest_in_a_nested_project() {
+        let wt = tempfile::tempdir().unwrap();
+        let project = wt.path().join("src-tauri");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"p\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\n# WHY: needed for the config types.\nserde = \"1.0.200\"\n",
+        )
+        .unwrap();
+
+        let a = apply_one_in(wt.path(), &project, Ecosystem::Cargo, "serde", "1.0.229").unwrap();
+        assert_eq!(a.resolved_constraint.as_deref(), Some("1.0.229"));
+
+        let text = std::fs::read_to_string(project.join("Cargo.toml")).unwrap();
+        assert!(text.contains("serde = \"1.0.229\""), "{text}");
+        assert!(text.contains("# WHY: needed for the config types."));
     }
 
     /// `apply_one` must refuse Swift BEFORE looking for a binary --
@@ -1106,6 +1271,7 @@ mod tests {
             name: "--registry=http://elsewhere".into(),
             version: "1.0".into(),
             ecosystem: Ecosystem::Npm,
+            project: String::new(),
         }];
         assert!(run(tmp.path(), &reqs).is_err());
         assert!(
@@ -1185,6 +1351,7 @@ mod tests {
             name: "lodash".into(),
             version: "2.0.0".into(),
             ecosystem: Ecosystem::Npm,
+            project: String::new(),
         }];
         // Asserted on OUR message, not merely that it failed.
         //
@@ -1217,6 +1384,7 @@ mod tests {
             name: "Alamofire".into(),
             version: "5.0".into(),
             ecosystem: Ecosystem::Swift,
+            project: String::new(),
         }];
         assert!(run(tmp.path(), &reqs).is_err());
         assert!(
@@ -1244,11 +1412,13 @@ mod tests {
                 name: "definitely-not-a-real-package-xyz".into(),
                 version: "9.9.9".into(),
                 ecosystem: Ecosystem::Dotnet,
+                project: String::new(),
             },
             UpdateRequest {
                 name: "another-fake-package-abc".into(),
                 version: "9.9.9".into(),
                 ecosystem: Ecosystem::Dotnet,
+                project: String::new(),
             },
         ];
         let Ok(report) = run(tmp.path(), &reqs) else {
@@ -1327,6 +1497,7 @@ mod real {
             name: "lodash".into(),
             version: "4.17.21".into(),
             ecosystem: Ecosystem::Npm,
+            project: String::new(),
         }];
         let report = run(dir, &reqs).expect("run should succeed");
         let r = &report.results[0];
