@@ -2832,14 +2832,24 @@ mod live {
         }
     }
 
-    /// #343, against the REAL worktree that produced the report: a
-    /// branch merged as PR #164 through a squash-merge queue, which
-    /// both ancestry and `git cherry` call unmerged.
+    /// #343, against a REAL worktree rather than a fixture: a branch
+    /// merged through a squash-merge queue, which both ancestry and
+    /// `git cherry` call unmerged.
+    ///
+    /// Takes the path from `HEADSTATE_SQUASHED_WORKTREE` rather than
+    /// hardcoding one, for the reason `a_yarn_berry_project_reports_updates`
+    /// takes `HEADSTATE_YARN_REPO`: the worktree that produced the
+    /// original report is on one machine, and this is a public
+    /// repository where a real checkout path is exactly what
+    /// CONTRIBUTING.md's privacy rule keeps out.
     #[test]
     #[ignore]
     fn live_squash_merged_worktree_is_detected() {
-        let wt = std::path::Path::new(&std::env::var("HOME").unwrap())
-            .join("code/enclave/stohic-admin/.claude/worktrees/stohic-mcp-pr2-transport");
+        let Ok(path) = std::env::var("HEADSTATE_SQUASHED_WORKTREE") else {
+            println!("set HEADSTATE_SQUASHED_WORKTREE to a squash-merged worktree to run this");
+            return;
+        };
+        let wt = std::path::PathBuf::from(path);
         if !wt.is_dir() {
             println!("worktree absent; nothing to check");
             return;
