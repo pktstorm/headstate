@@ -59,6 +59,31 @@ pub fn supported(eco: Ecosystem) -> Result<(), Unsupported> {
              constraint in your .tf source, not something a lockfile edit \
              can change.",
         )),
+        // Refused on MEASURED evidence, not on principle. `cargo add`
+        // itself is well behaved -- it is built on `toml_edit`, so it
+        // preserves comments and existing features, both verified. What
+        // it cannot do is act on a WORKSPACE, and a workspace root is
+        // one row on this page:
+        //
+        // - Run at a virtual workspace root, `cargo add serde@x`
+        //   redirects into a member and REWRITES `serde.workspace = true`
+        //   into a hardcoded version -- silently severing the
+        //   inheritance and deleting the comment above it. Measured.
+        // - Run at a non-virtual root (a package that is also a
+        //   workspace root, which is exactly `src-mobile`), asking for a
+        //   MEMBER's crate ADDS A NEW DEPENDENCY to the root package
+        //   instead of updating the member's. Measured.
+        //
+        // Either outcome is a wrong edit the user did not ask for, which
+        // is worse than no button. Reporting works; applying waits for a
+        // path that edits the right manifest -- see #559.
+        Ecosystem::Cargo => Err(Unsupported::NoCommand(
+            "Rust crates cannot be updated here yet: `cargo add` cannot target a \
+             workspace member, so on a workspace it would edit the wrong manifest \
+             -- severing `workspace = true` inheritance, or adding the crate to the \
+             root package instead. Run `cargo add <pkg>@<version>` in the crate's \
+             own directory.",
+        )),
         Ecosystem::Swift => Err(Unsupported::NoCommand(
             "Swift packages cannot be updated here: nothing reports what is \
              outdated, so there is no version to move to. Update the version \
@@ -167,6 +192,8 @@ pub fn update_args(dir: &Path, eco: Ecosystem, name: &str, version: &str) -> Vec
         // take down the whole command for a case the caller already
         // guarded.
         Ecosystem::Swift => vec![s("--version")],
+        // Unreachable: `supported` refuses Cargo before this is called.
+        Ecosystem::Cargo => vec![s("--version")],
     }
 }
 

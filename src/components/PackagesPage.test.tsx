@@ -212,6 +212,39 @@ describe("PackagesPage grouping, sorting, and Claudify", () => {
     expect(prompt).toMatch(/ACTUALLY chose/);
     expect(prompt).toMatch(/Do not update anything that is not listed/i);
   });
+  /// A new ecosystem needs a label or the group header renders blank.
+  /// `ECOSYSTEM_LABEL` is a total `Record<Ecosystem, string>`, so the
+  /// compiler catches a MISSING one -- this pins that the label reads
+  /// as a person would name it, and that a Cargo row reaches the page
+  /// at all.
+  it("names the Cargo ecosystem and shows its rows", () => {
+    state.reports = [
+      {
+        path: "/code/app",
+        label: "src-tauri",
+        reports: [
+          {
+            ecosystem: "cargo",
+            outdated: [
+              {
+                name: "tauri-plugin-log",
+                current: "2.9.0",
+                latest: "2.9.1",
+                bump: "patch",
+                ecosystem: "cargo",
+                manifest: "Cargo.toml [dependencies]",
+              },
+            ],
+            error: null,
+          },
+        ],
+      },
+    ];
+    render(<PackagesPage />);
+    expect(screen.getByText("Cargo")).toBeTruthy();
+    expect(screen.getByText("tauri-plugin-log")).toBeTruthy();
+    expect(screen.getByText(/2\.9\.0\s*→\s*2\.9\.1/)).toBeTruthy();
+  });
 });
 
 /// #494: the wizard was handed every outdated package regardless of the
@@ -257,4 +290,5 @@ describe("the update wizard's contents", () => {
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getAllByRole("checkbox")).toHaveLength(2);
   });
+
 });
