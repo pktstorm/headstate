@@ -469,12 +469,21 @@ fn set_requirement(item: &mut Item, version: &str) -> Result<(), String> {
 }
 
 /// A path relative to the project, for the report.
+///
+/// Separators are normalised to `/` on every platform. This string is
+/// not a path the code opens -- it is shown to the user, put in a pull
+/// request body, and compared against manifest labels that Cargo itself
+/// writes with forward slashes. On Windows `join` produces
+/// `plugins\thing\Cargo.toml`, which would render as an escape sequence
+/// to a reader and match nothing. Caught by CI on windows-latest.
 fn relative(project: &Path, manifest: &Path) -> String {
     manifest
         .strip_prefix(project)
         .unwrap_or(manifest)
-        .to_string_lossy()
-        .into_owned()
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 #[cfg(test)]
@@ -886,6 +895,21 @@ mod tests {
         assert!(changed[0].1.contains("1.99.0"), "{:?}", changed[0]);
         assert_eq!(before.lines().count(), after.lines().count());
         assert!(e.written);
+    }
+
+    /// The reported path uses `/` on every platform.
+    ///
+    /// It is shown to the user and goes into a pull request body, where
+    /// a Windows `plugins\thing\Cargo.toml` reads as an escape
+    /// sequence. CI on windows-latest caught this; a macOS-only run
+    /// never would.
+    #[test]
+    fn the_reported_manifest_path_uses_forward_slashes() {
+        let dir = tempfile::tempdir().unwrap();
+        non_virtual_workspace(dir.path());
+        let e = apply(dir.path(), "thiserror", "2.0.18").unwrap();
+        assert_eq!(e.manifest, "plugins/thing/Cargo.toml");
+        assert!(!e.manifest.contains('\\'), "{}", e.manifest);
     }
 
     /// The quoted middle component of a target table must survive

@@ -611,12 +611,23 @@ impl UpdateRequest {
     /// is the entire safety boundary of an apply. Refused rather than
     /// normalised, on the same reasoning as `reject_flaglike` -- a
     /// refusal the user can see beats a path quietly rewritten.
+    ///
+    /// The leading-separator check is deliberately NOT `is_absolute`
+    /// alone. `Path::is_absolute` is platform-dependent: on Windows
+    /// `/etc` is *relative* (it has no drive letter), so `is_absolute`
+    /// returns false and `join` then discards the worktree's own root
+    /// and resolves it against the current drive. A path this app
+    /// refuses on macOS must not be accepted on Windows, so the leading
+    /// separator is rejected on every platform. Caught by CI on
+    /// windows-latest, not by reasoning.
     fn dir(&self, worktree: &Path) -> Result<std::path::PathBuf, String> {
         if self.project.is_empty() {
             return Ok(worktree.to_path_buf());
         }
         let p = Path::new(&self.project);
         if p.is_absolute()
+            || self.project.starts_with('/')
+            || self.project.starts_with('\\')
             || p.components()
                 .any(|c| matches!(c, std::path::Component::ParentDir))
         {
@@ -841,7 +852,14 @@ mod tests {
         };
         assert!(req("../elsewhere").dir(Path::new("/wt")).is_err());
         assert!(req("a/../../b").dir(Path::new("/wt")).is_err());
+        // A leading separator is refused on EVERY platform. On Windows
+        // `/etc` is not `is_absolute` -- it has no drive letter -- so
+        // `join` would drop the worktree root and resolve it against
+        // the current drive. CI caught this; the rule is "refused
+        // everywhere", not "refused where the platform calls it
+        // absolute".
         assert!(req("/etc").dir(Path::new("/wt")).is_err());
+        assert!(req("\\windows").dir(Path::new("/wt")).is_err());
         // The ordinary shapes still work.
         assert_eq!(
             req("src-tauri").dir(Path::new("/wt")).unwrap(),
