@@ -163,13 +163,16 @@ jobs:
       #
       # The Tauri CLI ALSO reads the certificate and profile from the
       # IOS_CERTIFICATE / IOS_MOBILE_PROVISION environment (set on the
-      # build step): that is what makes it switch the Xcode project to
-      # manual signing, set the identity, team and profile on it, and
-      # write signingCertificate/teamID/provisioningProfiles into
-      # ExportOptions.plist. It imports into a temporary keychain of its
-      # own that it deletes on exit. This keychain is the one that
-      # survives a killed job long enough for the cleanup step to name
-      # it, and the one `security find-identity` below proves works.
+      # build step), importing them into a temporary keychain of its own
+      # that it deletes on exit. This keychain is the one that survives a
+      # killed job long enough for the cleanup step to name it, and the
+      # one `security find-identity` below proves works.
+      #
+      # What the CLI does NOT do is edit the Xcode project: it runs
+      # `xcodebuild` against the committed .xcodeproj as-is, and that
+      # project carries `CODE_SIGN_IDENTITY = "iPhone Developer"` with no
+      # team and no profile. Setting those is the build step's job -- see
+      # the `--` arguments there.
       - name: Import signing material
         if: env.DRY_RUN != 'true'
         env:
@@ -178,6 +181,8 @@ jobs:
           IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
           APPSTORE_API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
           APPSTORE_API_PRIVATE_KEY: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          BUNDLE_ID: com.pktstorm.headstate.companion
         run: |
           set -euo pipefail
           KEYCHAIN="$RUNNER_TEMP/mobile-release.keychain-db"
@@ -207,7 +212,40 @@ jobs:
           echo "PROFILE_UUID=$UUID" >> "$GITHUB_ENV"
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
           cp "$RUNNER_TEMP/dist.mobileprovision" "$HOME/Library/MobileDevice/Provisioning Profiles/$UUID.mobileprovision"
-          echo "Installed provisioning profile $(plutil -extract Name raw -o - "$RUNNER_TEMP/profile.plist")"
+          PROFILE_NAME=$(plutil -extract Name raw -o - "$RUNNER_TEMP/profile.plist")
+          echo "PROFILE_NAME=$PROFILE_NAME" >> "$GITHUB_ENV"
+          echo "Installed provisioning profile $PROFILE_NAME"
+
+          # The profile must actually be for THIS app. `application-identifier`
+          # is "<team>.<bundle id>", and a mismatch here is the same
+          # "requires a provisioning profile" error at build time with no
+          # hint that the wrong profile was uploaded -- so compare now,
+          # where the message can name both sides.
+          APP_ID=$(plutil -extract Entitlements.application-identifier raw -o - "$RUNNER_TEMP/profile.plist")
+          WANT="$APPLE_TEAM_ID.$BUNDLE_ID"
+          if [ "$APP_ID" != "$WANT" ]; then
+            echo "Provisioning profile is for '$APP_ID', but this app is '$WANT'." >&2
+            echo "Regenerate the App Store profile for $BUNDLE_ID; see docs/mobile-release-process.md." >&2
+            exit 1
+          fi
+
+          # The signing identity xcodebuild must use, by full name. Taken
+          # from the keychain rather than hardcoded so it follows the
+          # certificate that was actually imported.
+          # Both spellings, matching the find-identity check above:
+          # "Apple Distribution" is current, "iPhone Distribution" is what
+          # older certificates are named. `sed -E` because alternation as
+          # `\|` is a GNU extension that the BSD sed on macOS runners
+          # matches literally -- it prints nothing rather than failing,
+          # which would leave IDENTITY empty and trip the check below.
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | sed -n -E 's/.*"((Apple|iPhone) Distribution:[^"]*)".*/\1/p' | head -1)
+          if [ -z "$IDENTITY" ]; then
+            echo "No Apple Distribution identity in the build keychain." >&2
+            exit 1
+          fi
+          echo "SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "Signing identity: $IDENTITY"
 
           # altool searches $API_PRIVATE_KEYS_DIR for AuthKey_<KEY_ID>.p8
           # (xcrun altool --help, Xcode 26).
@@ -234,25 +272,45 @@ jobs:
       # exports an empty string (Tauri treats a present IOS_CERTIFICATE
       # as "sign this").
       #
-      # APPLE_DEVELOPMENT_TEAM is the one that is NOT optional, and it is
-      # the reason mobile-v0.1.1 failed. Tauri REGENERATES the Xcode
-      # project from tauri.conf.json on every `ios build`, and the
-      # generated target gets a DEVELOPMENT_TEAM only if the team is
-      # known -- so with none set, the project it writes has no team and
-      # `CODE_SIGN_IDENTITY = "iPhone Developer"`, and xcodebuild stops
-      # with `"headstate-companion_iOS" requires a provisioning profile`
-      # before compiling anything. Importing the certificate does not
-      # rescue it: the CLI resolves the team FIRST (its "No code signing
-      # certificates found ... set APPLE_DEVELOPMENT_TEAM" warning is
-      # printed two seconds BEFORE it imports the p12), so by the time an
-      # identity exists the project has already been written without one.
+      # Signing is set on the xcodebuild command line, after `--`, and
+      # NOT in the project. This is what mobile-v0.1.1 and v0.1.2 got
+      # wrong, both failing at
+      # `"headstate-companion_iOS" requires a provisioning profile`
+      # before a line was compiled.
       #
-      # It reuses APPLE_TEAM_ID, the secret release.yml already notarizes
-      # with -- one team, one secret, and Preflight fails early if it is
-      # unset. A team ID is not really sensitive (it ships inside every
-      # signed app), but it is an account identifier and this repository
-      # is public, so it stays a secret rather than being written into
-      # the committed config.
+      # The committed src-mobile/gen/apple project (checked in on purpose,
+      # see its .gitignore) carries `CODE_SIGN_IDENTITY = "iPhone
+      # Developer"`, no DEVELOPMENT_TEAM, no CODE_SIGN_STYLE and no
+      # profile -- the defaults `tauri ios init` writes. Nothing rewrites
+      # them at build time: the CLI runs `xcodebuild` against that project
+      # as-is, so a target with no team and no profile cannot resolve an
+      # App Store identity no matter what is in the keychain. Setting
+      # APPLE_DEVELOPMENT_TEAM alone (v0.1.2) silenced the CLI's warning
+      # and changed nothing about the failure, which is the evidence that
+      # the project, not the CLI, is what needs the settings.
+      #
+      # `xcodebuild` build settings given as arguments override the
+      # project's, so the four below make the build manually signed
+      # against exactly the certificate and profile this job installed,
+      # leaving the generated project untouched and regenerable. Manual
+      # and not automatic: automatic signing wants an Xcode account to
+      # talk to the Developer portal, which a CI runner holding only a
+      # p12 and a .mobileprovision does not have.
+      #
+      # PROVISIONING_PROFILE_SPECIFIER takes the profile NAME (the UUID
+      # form is deprecated and ignored by recent Xcode), and both it and
+      # SIGNING_IDENTITY were read off the installed profile and keychain
+      # in the import step rather than hardcoded, so they cannot drift
+      # from what is actually there.
+      #
+      # APPLE_DEVELOPMENT_TEAM stays as well: it is what stops the CLI
+      # emitting a "No code signing certificates found" warning, and it
+      # reuses APPLE_TEAM_ID, the secret release.yml already notarizes
+      # with -- one team, one secret, with Preflight failing early if it
+      # is unset. A team ID is not really sensitive (it ships inside
+      # every signed app), but it is an account identifier and this
+      # repository is public, so it stays a secret rather than being
+      # written into the committed config.
       - name: Build the IPA
         env:
           IOS_CERTIFICATE: ${{ env.DRY_RUN != 'true' && secrets.IOS_DIST_CERT_P12_BASE64 || '' }}
@@ -268,7 +326,11 @@ jobs:
             echo "Dry run: building an unsigned IPA."
             yarn tauri ios build --ci --no-sign --config "$CONFIG"
           else
-            yarn tauri ios build --ci --export-method app-store-connect --config "$CONFIG"
+            yarn tauri ios build --ci --export-method app-store-connect --config "$CONFIG" -- \
+              CODE_SIGN_STYLE=Manual \
+              DEVELOPMENT_TEAM="$APPLE_DEVELOPMENT_TEAM" \
+              CODE_SIGN_IDENTITY="$SIGNING_IDENTITY" \
+              PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME"
           fi
 
       - name: Collect the IPA
