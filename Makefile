@@ -92,6 +92,7 @@ lint: lint-rust lint-ui lint-deps
 lint-deps:
 	python3 scripts/check-tauri-versions.test.py
 	python3 scripts/check-tauri-versions.py
+	python3 scripts/android-release-signing.test.py
 
 lint-rust:
 	cd src-tauri && cargo fmt --check

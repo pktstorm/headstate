@@ -9,7 +9,7 @@ UNSIGNED bundle -- which Google Play refuses. Tauri's Android signing guide
 script adds that block so the release workflow does not depend on a hand
 edit that `tauri android init` would silently drop on regeneration.
 
-Two deliberate departures from the guide's snippet:
+Three deliberate departures from the guide's snippet:
 
 1. Everything is guarded on `keystore.properties` existing. The guide's
    version does `keystoreProperties["keyAlias"] as String`, which throws
@@ -19,6 +19,19 @@ Two deliberate departures from the guide's snippet:
    the guide's single `password` key, so a file written by hand from the
    guide still works. (A PKCS12 keystore, the `keytool` default, requires
    the two to be equal anyway.)
+3. The file is parsed into a `Map<String, String>` rather than with
+   `java.util.Properties`, which the guide uses. A Gradle Kotlin DSL
+   script is compiled against a FIXED implicit-import set that does not
+   include `java.util`, so even the fully-qualified `java.util.Properties()`
+   does not resolve -- `Unresolved reference: util`, and the build dies
+   before it compiles a line of the app (#564). An `import` would work,
+   but it would have to go at the top of a GENERATED file this script
+   patches by string replacement, above blocks whose shape is Tauri's to
+   change; a self-contained expression has no such ordering constraint.
+   The parser handles what this file actually holds -- four unquoted
+   values written by the release workflow, or by hand from the guide --
+   and deliberately not the whole `.properties` grammar (escapes,
+   continuations, `:` as a separator), which nothing here emits.
 
 Idempotent: a marker comment records that the block is present, so
 running this on an already-patched file is a no-op. That is what lets the
@@ -36,23 +49,27 @@ MARKER = "// headstate: release signing (scripts/android-release-signing.py)"
 
 PROPERTIES = f"""{MARKER}
 val keystorePropertiesFile = rootProject.file("keystore.properties")
-val keystoreProperties = java.util.Properties().apply {{
+val keystoreProperties: Map<String, String> =
     if (keystorePropertiesFile.exists()) {{
-        keystorePropertiesFile.inputStream().use {{ load(it) }}
+        keystorePropertiesFile.readLines()
+            .map {{ it.trim() }}
+            .filter {{ it.isNotEmpty() && !it.startsWith("#") && !it.startsWith("!") && it.contains("=") }}
+            .associate {{ it.substringBefore("=").trim() to it.substringAfter("=").trim() }}
+    }} else {{
+        emptyMap()
     }}
-}}
 
 """
 
 SIGNING_CONFIGS = """    signingConfigs {
         if (keystorePropertiesFile.exists()) {
             create("release") {
-                storeFile = file(keystoreProperties.getProperty("storeFile"))
-                storePassword = keystoreProperties.getProperty("storePassword")
-                    ?: keystoreProperties.getProperty("password")
-                keyAlias = keystoreProperties.getProperty("keyAlias")
-                keyPassword = keystoreProperties.getProperty("keyPassword")
-                    ?: keystoreProperties.getProperty("password")
+                storeFile = file(keystoreProperties["storeFile"]!!)
+                storePassword = keystoreProperties["storePassword"]
+                    ?: keystoreProperties["password"]
+                keyAlias = keystoreProperties["keyAlias"]
+                keyPassword = keystoreProperties["keyPassword"]
+                    ?: keystoreProperties["password"]
             }
         }
     }
