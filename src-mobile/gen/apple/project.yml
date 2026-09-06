@@ -72,7 +72,22 @@ targets:
         # the CLI's own xcodebuild still reported only
         # `Build settings from command line: SDKROOT`, so the four
         # settings never reached the build (#573, mobile-v0.1.4).
-        CODE_SIGN_STYLE: $(HEADSTATE_CODE_SIGN_STYLE)
+        # NOT a $(...) reference, unlike the three below. The Tauri CLI
+        # reads CODE_SIGN_STYLE out of the project as a literal string to
+        # build ExportOptions.plist, without asking Xcode to expand it,
+        # and lowercases it -- so a reference here reaches exportArchive
+        # verbatim and it rejects the build AFTER a successful compile:
+        #
+        #   error: exportArchive Unknown "signingStyle" specified
+        #   "$(headstate_code_sign_style)". Must be either automatic or
+        #   manual.
+        #
+        # (mobile-v0.1.5, where the archive itself built and signed.)
+        # A literal is safe because manual signing is what this project
+        # always wants: with no identity, team or profile set, Xcode
+        # falls back to its own behaviour anyway, so a local unsigned
+        # build is unaffected.
+        CODE_SIGN_STYLE: Manual
         DEVELOPMENT_TEAM: $(HEADSTATE_DEVELOPMENT_TEAM)
         CODE_SIGN_IDENTITY: $(HEADSTATE_CODE_SIGN_IDENTITY)
         PROVISIONING_PROFILE_SPECIFIER: $(HEADSTATE_PROVISIONING_PROFILE)
