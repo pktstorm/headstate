@@ -279,6 +279,55 @@ pub fn parse(stdout: &str, eco: Ecosystem, repo: &Path) -> Vec<Outdated> {
     }
 }
 
+/// Whether a parsed row is an update at all, rather than a DOWNGRADE
+/// the tool mislabelled `latest`.
+///
+/// The `latest` column is not always newer than what is installed.
+/// `npm outdated --json` reported `jsdom` as `current 30.0.1,
+/// latest 29.1.1` in a repository where the registry's own `latest`
+/// dist-tag was 30.0.1 -- npm appears to report the newest release
+/// satisfying an engine constraint it computed, and still labels the
+/// column `latest`. Passed straight through, that offered a downgrade
+/// as an available update, and Apply would have run
+/// `yarn up jsdom@29.1.1`.
+///
+/// `version::bump` already refused to CLASSIFY that jump, answering
+/// `Unknown`, but nothing ever dropped the row -- so it reached the list
+/// looking like a package nobody could compare.
+///
+/// THE LINE, and it is the whole point of this function: only a
+/// CONFIDENTLY backwards jump is dropped. A pair that cannot be compared
+/// -- a pre-release suffix, a bare revision, an empty string -- keeps
+/// its row and shows as `Bump::Unknown`, because "we cannot tell" is a
+/// fact the user should see rather than a row to hide. `is_newer`
+/// answers `None` for exactly those, and `Some(false)` only when the
+/// numeric comparison is confident, so this reads that distinction
+/// rather than reconstructing it.
+///
+/// Applies to the five parsers that read a tool's output. Terraform and
+/// Swift rows are not filtered here: both are built with
+/// `latest == current` and are filled in later by `registry::enrich`,
+/// whose `newest` already sorts semantically. Swift additionally
+/// reports revision pins on purpose, and those must keep showing.
+fn keep(name: &str, current: &str, latest: &str, eco: Ecosystem) -> bool {
+    if version::is_newer(current, latest) != Some(false) {
+        return true;
+    }
+    // Worth noticing: a tool systematically reporting a wrong `latest`
+    // is a bug in that tool, and once the row is gone this line is the
+    // only trace of it.
+    //
+    // A package name and two versions only. No repository path and no
+    // manifest -- those identify the checkout, and this is a public
+    // repository's log.
+    log::warn!(
+        "{} reported {name} {current} -> {latest} as an update, which is a downgrade; \
+         the row was dropped",
+        eco.program()
+    );
+    false
+}
+
 /// `{"pkg": {"current": "1.0.0", "latest": "2.0.0", ...}}`
 fn parse_npm(stdout: &str, eco: Ecosystem) -> Vec<Outdated> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout) else {
@@ -294,6 +343,9 @@ fn parse_npm(stdout: &str, eco: Ecosystem) -> Vec<Outdated> {
             // of a list the user is about to hand to an agent.
             let current = info.get("current")?.as_str()?;
             let latest = info.get("latest")?.as_str()?;
+            if !keep(name, current, latest, eco) {
+                return None;
+            }
             Some(Outdated {
                 name: name.clone(),
                 current: current.to_string(),
@@ -316,6 +368,9 @@ fn parse_uv(stdout: &str) -> Vec<Outdated> {
             let name = r.get("name")?.as_str()?;
             let current = r.get("version")?.as_str()?;
             let latest = r.get("latest_version")?.as_str()?;
+            if !keep(name, current, latest, Ecosystem::Uv) {
+                return None;
+            }
             Some(Outdated {
                 name: name.to_string(),
                 current: current.to_string(),
@@ -348,6 +403,9 @@ fn parse_poetry(stdout: &str) -> Vec<Outdated> {
             {
                 return None;
             }
+            if !keep(name, current, latest, Ecosystem::Poetry) {
+                return None;
+            }
             Some(Outdated {
                 name: name.to_string(),
                 current: current.to_string(),
@@ -376,6 +434,9 @@ fn parse_cocoapods(stdout: &str) -> Vec<Outdated> {
             // The arrow, then the target version.
             let latest = parts.find(|p| p.starts_with(|c: char| c.is_ascii_digit()))?;
             if !current.starts_with(|c: char| c.is_ascii_digit()) {
+                return None;
+            }
+            if !keep(name, current, latest, Ecosystem::Cocoapods) {
                 return None;
             }
             Some(Outdated {
@@ -419,6 +480,9 @@ fn parse_dotnet(stdout: &str, repo: &Path) -> Vec<Outdated> {
                 return None;
             }
             let (name, current, latest) = (cols[0], cols[2], cols[3]);
+            if !keep(name, current, latest, Ecosystem::Dotnet) {
+                return None;
+            }
             Some(Outdated {
                 name: name.to_string(),
                 current: current.to_string(),
@@ -650,6 +714,133 @@ The following pod updates are available:
             msg.contains("PATH"),
             "and say why, since that is actionable"
         );
+    }
+
+    // ---- downgrades ---------------------------------------------------
+    //
+    // A tool's `latest` column is not always newer than what is
+    // installed. `npm outdated --json` reported `jsdom` as
+    // `current 30.0.1, latest 29.1.1` while the registry's own `latest`
+    // dist-tag was 30.0.1. Passed through, the Packages page offers a
+    // DOWNGRADE as an update, and Apply runs `yarn up jsdom@29.1.1`.
+    //
+    // The two tests that matter are the two SIDES of the line: a
+    // confidently backwards jump disappears, and a pair that cannot be
+    // compared still shows as `Unknown`. Collapsing those would either
+    // reintroduce the bug or hide rows the design deliberately surfaces.
+
+    /// The real jsdom shape, from `npm outdated --json` in this
+    /// repository. No row: applying it would be a downgrade.
+    #[test]
+    fn an_npm_downgrade_produces_no_row() {
+        let out = r#"{"jsdom": {"current": "30.0.1", "wanted": "30.0.1", "latest": "29.1.1"}}"#;
+        let rows = parse(out, Ecosystem::Npm, nowhere());
+        assert!(
+            rows.is_empty(),
+            "29.1.1 is older than 30.0.1, so it is not an update: {rows:?}"
+        );
+    }
+
+    /// And the row beside it survives. Dropping the downgrade must not
+    /// take the rest of the report with it.
+    #[test]
+    fn a_downgrade_does_not_take_the_real_updates_with_it() {
+        let out = r#"{
+          "jsdom": {"current": "30.0.1", "wanted": "30.0.1", "latest": "29.1.1"},
+          "react": {"current": "18.2.0", "wanted": "18.3.0", "latest": "19.0.0"}
+        }"#;
+        let rows = parse(out, Ecosystem::Npm, nowhere());
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].name, "react");
+        assert_eq!(rows[0].bump, Bump::Major);
+    }
+
+    /// THE OTHER SIDE OF THE LINE. A pair that cannot be compared is
+    /// NOT dropped: it is reported as `Unknown`, because "we cannot
+    /// tell" is the honest answer this design keeps rather than a row to
+    /// hide. Only a CONFIDENTLY backwards jump disappears.
+    #[test]
+    fn an_uncomparable_npm_pair_is_still_reported_as_unknown() {
+        let out = r#"{
+          "alpha": {"current": "1.0rc1", "latest": "1.0"},
+          "beta":  {"current": "main",   "latest": "2.0.0"},
+          "gamma": {"current": "1.2.3",  "latest": "not-a-version"}
+        }"#;
+        let rows = parse(out, Ecosystem::Npm, nowhere());
+        assert_eq!(rows.len(), 3, "none of these may be dropped: {rows:?}");
+        for r in &rows {
+            assert_eq!(r.bump, Bump::Unknown, "{}", r.name);
+        }
+    }
+
+    /// The same rule in every parser that builds a row, not just npm's.
+    /// Each fixture is that tool's real output shape with the `latest`
+    /// column made older than the installed version.
+    #[test]
+    fn every_parser_drops_a_backwards_row() {
+        let uv = r#"[{"name": "requests", "version": "2.31.0", "latest_version": "2.28.0"}]"#;
+        assert!(
+            parse(uv, Ecosystem::Uv, nowhere()).is_empty(),
+            "uv: 2.28.0 is older than 2.31.0"
+        );
+
+        let poetry = "requests 2.31.0 2.28.0 Python HTTP for Humans\n";
+        assert!(
+            parse(poetry, Ecosystem::Poetry, nowhere()).is_empty(),
+            "poetry: 2.28.0 is older than 2.31.0"
+        );
+
+        let dotnet = "   > Newtonsoft.Json      13.0.3      13.0.3     13.0.1\n";
+        assert!(
+            parse(dotnet, Ecosystem::Dotnet, nowhere()).is_empty(),
+            "dotnet: 13.0.1 is older than 13.0.3"
+        );
+
+        let pods = "- Alamofire 5.8.0 -> 5.6.1 (latest version 5.6.1)\n";
+        assert!(
+            parse(pods, Ecosystem::Cocoapods, nowhere()).is_empty(),
+            "cocoapods: 5.6.1 is older than 5.8.0"
+        );
+    }
+
+    /// And the other side of the line in every parser too. An
+    /// uncomparable pair keeps its row, in all four.
+    #[test]
+    fn every_parser_still_reports_an_uncomparable_row() {
+        let uv = r#"[{"name": "requests", "version": "1.0rc1", "latest_version": "1.0"}]"#;
+        let rows = parse(uv, Ecosystem::Uv, nowhere());
+        assert_eq!(rows.len(), 1, "uv: {rows:?}");
+        assert_eq!(rows[0].bump, Bump::Unknown);
+
+        // Poetry and CocoaPods both require their version columns to
+        // START with a digit, so a pre-release suffix is the shape of
+        // uncomparable pair those parsers can actually see.
+        let poetry = "requests 1.0rc1 1.0 Python HTTP for Humans\n";
+        let rows = parse(poetry, Ecosystem::Poetry, nowhere());
+        assert_eq!(rows.len(), 1, "poetry: {rows:?}");
+        assert_eq!(rows[0].bump, Bump::Unknown);
+
+        let dotnet = "   > Newtonsoft.Json      13.0.1      13.0.1     not-a-version\n";
+        let rows = parse(dotnet, Ecosystem::Dotnet, nowhere());
+        assert_eq!(rows.len(), 1, "dotnet: {rows:?}");
+        assert_eq!(rows[0].bump, Bump::Unknown);
+
+        let pods = "- Alamofire 5.6.1 -> 5.6.1rc1 (latest version 5.6.1rc1)\n";
+        let rows = parse(pods, Ecosystem::Cocoapods, nowhere());
+        assert_eq!(rows.len(), 1, "cocoapods: {rows:?}");
+        assert_eq!(rows[0].bump, Bump::Unknown);
+    }
+
+    /// A package already at the newest version is not a downgrade, and
+    /// the parsers must keep behaving as they did: npm lists such a
+    /// package when `wanted` differs from `current`, and that row is a
+    /// real one.
+    #[test]
+    fn an_equal_pair_is_not_treated_as_a_downgrade() {
+        let out = r#"{"vite": {"current": "5.0.2", "wanted": "5.0.2", "latest": "5.0.2"}}"#;
+        let rows = parse(out, Ecosystem::Npm, nowhere());
+        assert_eq!(rows.len(), 1, "an equal pair is not backwards: {rows:?}");
+        assert_eq!(rows[0].bump, Bump::Unknown);
     }
 }
 
