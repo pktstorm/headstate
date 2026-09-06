@@ -143,15 +143,13 @@ remotely (`git tag -d v0.2.0 && git push origin :v0.2.0`) and delete the
 GitHub Release. Re-tagging the same version works, but only if the release
 and tag are both gone first.
 
-## Code signing (not active yet — #23 stays open)
+## Code signing
 
-Releases ship **unsigned** today. `.github/workflows/release.yml` has the
-signing and notarization steps wired in, guarded on the relevant secrets
-existing, but this repository has none of those secrets set, so every
-release build currently takes the unsigned path exactly as before —
-nothing changed for users. Signing switches on automatically, with no
-further workflow edits, the moment these repo secrets are added
-(Settings → Secrets and variables → Actions):
+macOS releases are **signed and notarized** as of v5.3.0. The steps live
+in `.github/workflows/release.yml`, guarded on the secrets below, so a
+fork without them still builds unsigned rather than failing. These are
+the secrets the signing path reads (Settings → Secrets and variables →
+Actions):
 
 | Secret | What it is |
 |---|---|
@@ -166,13 +164,21 @@ further workflow edits, the moment these repo secrets are added
 Tauri infers it from the imported `APPLE_CERTIFICATE` at build time, so
 there's nothing to hardcode ahead of having a real certificate.
 
-This project doesn't have a Developer ID cert yet: this machine only has
-Apple Distribution (App Store submission) and Apple Development (local
-testing) certificates, and the one Developer ID-equivalent certificate
-available belongs to an employer, not appropriate for a personal public
-repo. Getting a Developer ID Application certificate requires its own
-paid Apple Developer account. Until that exists, don't close #23 — the
-plumbing is ready, but nothing is actually signed.
+Verify a release actually got signed rather than trusting a green build —
+the workflow takes the unsigned path silently when a secret is missing:
+
+```
+spctl -a -vvv -t install /Volumes/Headstate/Headstate.app
+```
+
+`accepted` with `source=Notarized Developer ID` is the answer you want.
+`xcrun stapler validate` on the same path confirms the ticket is stapled,
+which is what lets the app launch on a machine with no network.
+
+Notarization adds real time to the macOS job: it waits on Apple's
+service, and the first submission from a new signing identity took about
+an hour where the build alone takes twelve minutes. Later ones are
+usually far quicker.
 
 Headstate started strictly read-only. Since the write path landed it can
 also act on a pull request — merge, close, mark as draft, enqueue,

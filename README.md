@@ -99,20 +99,17 @@ Download the latest `.dmg` or `.app.tar.gz` from the
 [releases page](https://github.com/pktstorm/headstate/releases) and drag
 `Headstate.app` into `/Applications`.
 
-**v1 ships unsigned.** macOS Gatekeeper will refuse to open it with an
-"unidentified developer" or "damaged" message. This isn't a bug — Headstate
-just isn't code-signed or notarized yet (tracked in
-[#23](https://github.com/pktstorm/headstate/issues/23)). Before first
-launch, clear the quarantine flag:
+macOS builds are signed with a Developer ID certificate and notarized by
+Apple, so they open normally — no quarantine workaround, no "unidentified
+developer" dialog. Releases are universal binaries: one download works on
+both Apple Silicon and Intel.
+
+Signing landed in v5.3.0. An earlier release needs the quarantine flag
+cleared once before it will launch:
 
 ```
 xattr -dr com.apple.quarantine /Applications/Headstate.app
 ```
-
-Once per install, not once per launch. The flag is set by the browser on
-download, so a copy you build yourself with `make build` never has it and
-runs without this step. Releases are universal binaries — one download
-works on both Apple Silicon and Intel.
 
 ### If Headstate says it cannot find `gh`
 
