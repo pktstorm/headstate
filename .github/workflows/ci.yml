@@ -36,6 +36,13 @@ jobs:
         run: ./scripts/check-privacy.sh
       - name: Workflow shells
         run: python3 scripts/check-workflow-shells.py
+      # The same check `tauri build` makes at bundle time, asked here in
+      # a second. Without it a JS/Rust Tauri mismatch passes every fast
+      # job and fails from the slowest one (#555).
+      - name: Tauri package versions
+        run: |
+          python3 scripts/check-tauri-versions.test.py
+          python3 scripts/check-tauri-versions.py
       - name: Rust formatting
         working-directory: src-tauri
         run: cargo fmt --check
