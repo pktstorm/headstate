@@ -37,11 +37,36 @@ pub fn projects(repo: &Path) -> Vec<Project> {
         ".worktrees",
     ];
 
-    let mut out = Vec::new();
-    let mut stack = vec![(repo.to_path_buf(), 0usize)];
+    let mut out: Vec<Project> = Vec::new();
 
-    while let Some((dir, depth)) = stack.pop() {
-        let ecos = ecosystems(&dir);
+    // Breadth-first, so a parent is always recorded before its children
+    // and `claimed_by_ancestor` can see it.
+    let mut queue = std::collections::VecDeque::from([(repo.to_path_buf(), 0usize)]);
+
+    while let Some((dir, depth)) = queue.pop_front() {
+        // Only the ecosystems no ANCESTOR project already covers.
+        //
+        // A project's subdirectories are not separate projects for the
+        // toolchain it OWNS: a yarn workspace member is the workspace's
+        // business, and the tool reports it from the root. That was
+        // implemented by ending the descent entirely, which is a claim
+        // about the directory rather than about one toolchain -- and it
+        // is wrong for any polyglot layout.
+        //
+        // A Tauri repository is exactly that: `package.json` at the root
+        // with `src-tauri/Cargo.toml` beneath it. Stopping at the root
+        // meant the Rust half was never looked at. Measured on THIS
+        // repository -- four Cargo manifests, zero rows.
+        //
+        // So the descent continues and the filter is per ecosystem: a
+        // yarn member under a yarn root still adds nothing, a crate
+        // under a yarn root becomes its own project.
+        let claimed = claimed_by_ancestor(&out, &dir);
+        let ecos: Vec<Ecosystem> = ecosystems(&dir)
+            .into_iter()
+            .filter(|e| !claimed.contains(e))
+            .collect();
+
         if !ecos.is_empty() {
             let label = dir
                 .strip_prefix(repo)
@@ -52,17 +77,16 @@ pub fn projects(repo: &Path) -> Vec<Project> {
                 label,
                 ecosystems: ecos,
             });
-            // A project's own subdirectories are not separate projects
-            // for this purpose -- a workspace member is the workspace's
-            // business, and the tool reports it from the root.
-            continue;
         }
+
         if depth >= MAX_DEPTH {
             continue;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
+        // Sorted, so the traversal does not depend on directory order.
+        let mut children: Vec<std::path::PathBuf> = Vec::new();
         for e in entries.flatten() {
             let Ok(meta) = e.metadata() else { continue };
             if !meta.is_dir() {
@@ -72,7 +96,11 @@ pub fn projects(repo: &Path) -> Vec<Project> {
             if SKIP.contains(&name.as_str()) || name.starts_with('.') {
                 continue;
             }
-            stack.push((e.path(), depth + 1));
+            children.push(e.path());
+        }
+        children.sort();
+        for c in children {
+            queue.push_back((c, depth + 1));
         }
     }
 
@@ -85,6 +113,22 @@ pub fn projects(repo: &Path) -> Vec<Project> {
             .then(a.label.cmp(&b.label))
     });
     out
+}
+
+/// The ecosystems an already-recorded project ABOVE this directory
+/// covers.
+///
+/// A path-prefix test, not a string one: `frontend-tools` is not inside
+/// `frontend`, and comparing the strings would say it was.
+fn claimed_by_ancestor(found: &[Project], dir: &Path) -> Vec<Ecosystem> {
+    found
+        .iter()
+        .filter(|p| {
+            let parent = Path::new(&p.path);
+            parent != dir && dir.starts_with(parent)
+        })
+        .flat_map(|p| p.ecosystems.iter().copied())
+        .collect()
 }
 
 /// Which ecosystems a repository actually uses.
@@ -152,6 +196,19 @@ pub fn ecosystems(repo: &Path) -> Vec<Ecosystem> {
     // nothing on a real iOS repo that plainly uses SPM.
     if repo.join("Package.swift").is_file() || has_xcode_spm(repo) {
         out.push(Ecosystem::Swift);
+    }
+
+    // Cargo, from the manifest alone.
+    //
+    // No lockfile tiebreak is needed -- unlike `package.json` and
+    // `pyproject.toml`, nothing else owns `Cargo.toml`. A workspace root
+    // and a standalone crate both match, which is correct: a workspace
+    // root is ONE project, and `projects` already stops descending once
+    // a directory has an ecosystem, so its members never become separate
+    // rows with their own update commands. `packages::cargo` reads the
+    // members from the root and reports them under it.
+    if repo.join("Cargo.toml").is_file() {
+        out.push(Ecosystem::Cargo);
     }
 
     out
@@ -344,6 +401,117 @@ mod tests {
         let t = repo();
         fs::create_dir(t.path().join("App.xcodeproj")).unwrap();
         assert!(ecosystems(t.path()).is_empty());
+    }
+
+    /// The Tauri shape, and the bug this found. A `package.json` at the
+    /// root used to END the descent, so `src-tauri/Cargo.toml` beneath
+    /// it was never even looked at. Measured on THIS repository: four
+    /// Cargo manifests, zero rows.
+    #[test]
+    fn a_crate_under_a_javascript_root_is_still_found() {
+        let t = repo();
+        fs::write(t.path().join("package.json"), "{}").unwrap();
+        fs::write(t.path().join("yarn.lock"), "").unwrap();
+        fs::create_dir(t.path().join("src-tauri")).unwrap();
+        fs::write(
+            t.path().join("src-tauri/Cargo.toml"),
+            "[package]\nname=\"app\"",
+        )
+        .unwrap();
+
+        let found = projects(t.path());
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].ecosystems, vec![Ecosystem::Yarn]);
+        assert_eq!(found[1].label, "src-tauri");
+        assert_eq!(found[1].ecosystems, vec![Ecosystem::Cargo]);
+    }
+
+    /// The other half of that rule, and what keeps the fix narrow: a
+    /// nested project in the SAME ecosystem still adds nothing, because
+    /// it is the parent tool's business.
+    #[test]
+    fn a_nested_project_in_the_same_ecosystem_is_still_subsumed() {
+        let t = repo();
+        fs::write(t.path().join("Cargo.toml"), "[package]\nname=\"root\"").unwrap();
+        fs::create_dir_all(t.path().join("crates/inner")).unwrap();
+        fs::write(
+            t.path().join("crates/inner/Cargo.toml"),
+            "[package]\nname=\"inner\"",
+        )
+        .unwrap();
+
+        let found = projects(t.path());
+        assert_eq!(found.len(), 1, "the root subsumes it: {found:?}");
+    }
+
+    /// A sibling whose NAME starts with the parent's is not inside it.
+    /// A string-prefix test would say it was, and silently drop its
+    /// ecosystems as already covered.
+    #[test]
+    fn a_sibling_with_a_prefix_name_is_not_treated_as_nested() {
+        let t = repo();
+        for (dir, file, body) in [
+            ("frontend", "package.json", "{}"),
+            ("frontend-tools", "package.json", "{}"),
+        ] {
+            fs::create_dir(t.path().join(dir)).unwrap();
+            fs::write(t.path().join(dir).join(file), body).unwrap();
+        }
+        let found = projects(t.path());
+        assert_eq!(found.len(), 2, "{found:?}");
+    }
+
+    /// Nothing but Cargo owns `Cargo.toml`, so no lockfile tiebreak is
+    /// needed the way npm/yarn and poetry/uv need one.
+    #[test]
+    fn cargo_is_detected_from_a_manifest() {
+        let t = repo();
+        fs::write(t.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
+        assert_eq!(ecosystems(t.path()), vec![Ecosystem::Cargo]);
+    }
+
+    /// A Cargo WORKSPACE ROOT is one project, and its members must not
+    /// appear as separate rows -- each would carry its own update
+    /// command against a manifest that inherits its versions from the
+    /// root. This repo is the case: `src-mobile` is a workspace whose
+    /// members are the two plugins under `plugins/`.
+    #[test]
+    fn a_cargo_workspace_root_is_one_project_not_one_per_member() {
+        let t = repo();
+        fs::write(
+            t.path().join("Cargo.toml"),
+            "[package]\nname=\"root\"\n[workspace]\nmembers = [\"plugins/one\", \"plugins/two\"]",
+        )
+        .unwrap();
+        for m in ["plugins/one", "plugins/two"] {
+            fs::create_dir_all(t.path().join(m)).unwrap();
+            fs::write(t.path().join(m).join("Cargo.toml"), "[package]\nname=\"m\"").unwrap();
+        }
+
+        let found = projects(t.path());
+        assert_eq!(found.len(), 1, "the root subsumes its members: {found:?}");
+        assert_eq!(found[0].label, "");
+        assert_eq!(found[0].ecosystems, vec![Ecosystem::Cargo]);
+    }
+
+    /// Two STANDALONE crates side by side are two projects, which is the
+    /// other half of the repo's own shape: `src-tauri` is standalone and
+    /// `src-mobile` is a workspace root.
+    #[test]
+    fn sibling_cargo_crates_are_separate_projects() {
+        let t = repo();
+        for (dir, body) in [
+            ("desktop", "[package]\nname=\"desktop\""),
+            (
+                "mobile",
+                "[package]\nname=\"mobile\"\n[workspace]\nmembers = []",
+            ),
+        ] {
+            fs::create_dir(t.path().join(dir)).unwrap();
+            fs::write(t.path().join(dir).join("Cargo.toml"), body).unwrap();
+        }
+        let found = projects(t.path());
+        assert_eq!(found.len(), 2, "{found:?}");
     }
 
     #[test]

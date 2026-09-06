@@ -539,7 +539,8 @@ export type Ecosystem =
   | "dotnet"
   | "cocoapods"
   | "terraform"
-  | "swift";
+  | "swift"
+  | "cargo";
 
 /// How large a version jump is.
 ///
