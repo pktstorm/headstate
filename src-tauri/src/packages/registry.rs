@@ -99,13 +99,50 @@ pub async fn enrich(reports: &mut [super::model::ProjectReport]) {
         }
     }
 
+    apply_found(reports, &found);
+}
+
+/// Write the looked-up versions onto the rows they belong to.
+///
+/// Split out of `enrich` so the decision below can be tested without a
+/// network call -- `enrich` itself is entirely I/O.
+///
+/// A registry answer OLDER than the pin is not written. `newest` sorts
+/// semantically, so what comes back is genuinely the newest release the
+/// registry has; it can still be older than what the repository pins,
+/// when a release has been yanked or the dependency came from somewhere
+/// else. Writing it would offer a downgrade -- the same bug the parsers
+/// filter, arriving by the other route.
+///
+/// The row is KEPT rather than dropped, which is the opposite of what
+/// `run::keep` does and deliberately so. These rows come from a lock
+/// file and represent a pinned dependency, not a claimed update, so
+/// removing one would make a provider disappear from the list. Left
+/// untouched, it stays at `latest == current` with `Bump::Unknown` --
+/// exactly how a failed lookup already renders, which the UI shows as
+/// "cannot compare" and the wizard refuses to select.
+fn apply_found(
+    reports: &mut [super::model::ProjectReport],
+    found: &std::collections::BTreeMap<String, String>,
+) {
     for p in reports.iter_mut() {
         for r in &mut p.reports {
             for o in &mut r.outdated {
-                if let Some(latest) = found.get(&lookup_key(o)) {
-                    o.bump = super::version::bump(&o.current, latest);
-                    o.latest = latest.clone();
+                let Some(latest) = found.get(&lookup_key(o)) else {
+                    continue;
+                };
+                if super::version::is_newer(&o.current, latest) == Some(false) {
+                    log::warn!(
+                        "the {} registry's newest release for {} is {latest}, older than the \
+                         pinned {}; left uncompared rather than offered as an update",
+                        o.ecosystem.program(),
+                        o.name,
+                        o.current
+                    );
+                    continue;
                 }
+                o.bump = super::version::bump(&o.current, latest);
+                o.latest = latest.clone();
             }
         }
     }
@@ -278,6 +315,117 @@ mod tests {
     #[test]
     fn only_prereleases_yields_none() {
         assert_eq!(newest(["1.0.0-rc.1".to_string()]), None);
+    }
+
+    /// A pin NEWER than anything published is not an update.
+    ///
+    /// `newest` sorts semantically, so the answer it returns is the
+    /// newest release the registry has -- but that can still be older
+    /// than what the repository pins: a yanked release, or a version
+    /// installed from somewhere other than this registry. Writing it
+    /// into `latest` would offer a downgrade, which is the same bug the
+    /// parsers filter, arriving by the other route.
+    ///
+    /// The Terraform and Swift rows are NOT dropped for it, unlike a
+    /// parser row. They are built from a lock file and represent a
+    /// pinned dependency rather than a claimed update, so removing one
+    /// would make a provider vanish from the list entirely. Left at
+    /// `latest == current` with `Bump::Unknown`, they render exactly as
+    /// a failed lookup does: "cannot compare", never "up to date".
+    #[test]
+    fn a_registry_answer_older_than_the_pin_is_not_applied() {
+        use super::super::model::{Bump, Ecosystem, EcosystemReport, Outdated, ProjectReport};
+        let row = |current: &str| Outdated {
+            name: "registry.terraform.io/hashicorp/archive".into(),
+            current: current.into(),
+            latest: current.into(),
+            bump: Bump::Unknown,
+            ecosystem: Ecosystem::Terraform,
+            manifest: ".terraform.lock.hcl".into(),
+        };
+        let mut reports = vec![ProjectReport {
+            path: "/tmp/example".into(),
+            label: String::new(),
+            reports: vec![EcosystemReport {
+                ecosystem: Ecosystem::Terraform,
+                // Pinned ahead of the registry, and pinned behind it.
+                outdated: vec![row("9.9.9"), row("2.0.0")],
+                error: None,
+            }],
+        }];
+
+        apply_found(
+            &mut reports,
+            &[(
+                "registry.terraform.io/hashicorp/archive".to_string(),
+                "2.8.0".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        let rows = &reports[0].reports[0].outdated;
+        assert_eq!(rows.len(), 2, "neither row is dropped");
+        assert_eq!(
+            rows[0].latest, "9.9.9",
+            "the backwards answer is not written"
+        );
+        assert_eq!(rows[0].bump, Bump::Unknown, "and it reads as uncomparable");
+        assert_eq!(rows[1].latest, "2.8.0", "the real update still lands");
+        assert_eq!(rows[1].bump, Bump::Minor);
+    }
+
+    /// A Swift package pinned to a REVISION keeps its row whichever way
+    /// the comparison happens to fall.
+    ///
+    /// `swift::pinned` reports a branch or bare-commit pin with its
+    /// seven-character revision and `Bump::Unknown`, on purpose: there
+    /// is no version to compare, and calling it current would be a lie.
+    /// A revision beginning with a digit (`9f2a1c4`) is the one that
+    /// `numeric_parts` mistakes for a version, so it takes the
+    /// suppression path above -- and lands in the right place anyway,
+    /// because that path leaves the row exactly as `swift::pinned`
+    /// built it. Neither revision is dropped, and neither is claimed to
+    /// be an update.
+    #[test]
+    fn a_swift_revision_pin_survives_enrichment_either_way() {
+        use super::super::model::{Bump, Ecosystem, EcosystemReport, Outdated, ProjectReport};
+        let url = "https://github.com/octocat/hello-world.git";
+        let row = |revision: &str| Outdated {
+            name: "octocat/hello-world".into(),
+            current: revision.into(),
+            latest: revision.into(),
+            bump: Bump::Unknown,
+            ecosystem: Ecosystem::Swift,
+            manifest: format!("{url} <- Package.resolved"),
+        };
+        let mut reports = vec![ProjectReport {
+            path: "/tmp/example".into(),
+            label: String::new(),
+            // One revision that reads as a big number, one that does
+            // not read as a version at all.
+            reports: vec![EcosystemReport {
+                ecosystem: Ecosystem::Swift,
+                outdated: vec![row("9f2a1c4"), row("f2a1c4d")],
+                error: None,
+            }],
+        }];
+
+        apply_found(
+            &mut reports,
+            &[(url.to_string(), "2.0.0".to_string())]
+                .into_iter()
+                .collect(),
+        );
+
+        let rows = &reports[0].reports[0].outdated;
+        assert_eq!(rows.len(), 2, "a revision pin is reported, never dropped");
+        assert_eq!(rows[0].latest, "9f2a1c4", "no update claimed against it");
+        assert_eq!(rows[0].bump, Bump::Unknown);
+        // The other revision is not comparable at all, so enrichment
+        // writes the tag -- and `bump` still answers Unknown, which is
+        // what the row must show.
+        assert_eq!(rows[1].bump, Bump::Unknown, "still uncomparable");
     }
 }
 
