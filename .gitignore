@@ -45,3 +45,9 @@ src-tauri/icons/64x64.png
 # one build. gen/android carries its own .gitignore for this once it is
 # committed; this is the backstop for the window before that.
 src-mobile/gen/android/keystore.properties
+
+# Python bytecode. `scripts/check-tauri-versions.test.py` imports the
+# guard by path, so running the tests locally creates this next to the
+# scripts; #556 committed one by accident.
+__pycache__/
+*.pyc
