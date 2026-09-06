@@ -159,11 +159,11 @@ describe("imageName", () => {
     expect(
       imageName(
         img({
-          repository: "469164977587.dkr.ecr.us-east-1.amazonaws.com/enclave-api",
+          repository: "469164977587.dkr.ecr.us-east-1.amazonaws.com/octocat-api",
           tags: ["latest"],
         }),
       ),
-    ).toBe("enclave-api:latest");
+    ).toBe("octocat-api:latest");
   });
 
   /// A bare `postgres` or an org path has no host to drop.

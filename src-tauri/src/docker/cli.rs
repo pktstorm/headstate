@@ -322,11 +322,17 @@ mod live {
         // The REPO LIST matters: origin resolution needs it, and
         // `is_stale` requires an origin whose branch merged. Passing the
         // real scanned directories is what makes this reflect the page.
-        let repos: Vec<std::path::PathBuf> = std::fs::read_dir(
-            std::path::Path::new(&std::env::var("HOME").unwrap()).join("code/enclave"),
-        )
-        .map(|d| d.filter_map(|e| e.ok()).map(|e| e.path()).collect())
-        .unwrap_or_default();
+        //
+        // The directory comes from `HEADSTATE_REPO_DIR` rather than a
+        // literal: this is a public repository, and a checkout path
+        // names the projects on the machine that ran it.
+        let Ok(dir) = std::env::var("HEADSTATE_REPO_DIR") else {
+            println!("set HEADSTATE_REPO_DIR to a directory of repositories to run this");
+            return;
+        };
+        let repos: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .map(|d| d.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+            .unwrap_or_default();
         let imgs = crate::docker::classify(&repos).expect("docker must be running");
         let superseded = imgs
             .iter()
