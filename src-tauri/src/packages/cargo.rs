@@ -754,6 +754,23 @@ not json at all
         assert_eq!(newest_stable(body), Some("1.0.0".into()));
     }
 
+    /// Cargo versions carry BUILD METADATA, and it is not ordering
+    /// information. Observed live: `toml` publishes `1.1.4+spec-1.1.0`
+    /// and `1.1.5+spec-1.1.0`, and comparing the whole string rather
+    /// than the release segment would find nothing to compare.
+    /// `numeric_parts` already strips `+...`, so this pins the
+    /// behaviour rather than adding it.
+    #[test]
+    fn build_metadata_does_not_defeat_the_comparison() {
+        let body = r#"{"name":"toml","vers":"1.1.4+spec-1.1.0","yanked":false}
+{"name":"toml","vers":"1.1.5+spec-1.1.0","yanked":false}"#;
+        assert_eq!(newest_stable(body), Some("1.1.5+spec-1.1.0".into()));
+        assert_eq!(
+            super::super::version::bump("1.1.4+spec-1.1.0", "1.1.5+spec-1.1.0"),
+            Bump::Patch
+        );
+    }
+
     /// The index is in publication order, not version order: a patch to
     /// an old series is published after a new major.
     #[test]
