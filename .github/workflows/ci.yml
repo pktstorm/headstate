@@ -43,6 +43,7 @@ jobs:
         run: |
           python3 scripts/check-tauri-versions.test.py
           python3 scripts/check-tauri-versions.py
+          python3 scripts/android-release-signing.test.py
       - name: Rust formatting
         working-directory: src-tauri
         run: cargo fmt --check
