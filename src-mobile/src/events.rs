@@ -482,14 +482,33 @@ mod tests {
         }
     }
 
+    /// Poll until `cond` holds, or give up.
+    ///
+    /// The budget is deliberately far larger than the ~10ms these
+    /// conditions take when the machine is healthy. It is not a
+    /// measurement of how long the work should take -- it is the point
+    /// at which "still false" stops meaning "not yet" and starts
+    /// meaning "never", and only a hang produces the latter.
+    ///
+    /// It was 10s, and that failed a release build (`mobile-v0.1.0`):
+    /// the runner was slow enough that this suite took 302s against the
+    /// 2s it takes locally, and one condition did not land inside its
+    /// window. A polling loop costs nothing while it waits, so a budget
+    /// tight enough to lose that race buys nothing and blocks a
+    /// release. `HEADSTATE_TEST_TIMEOUT_SECS` overrides it for anyone
+    /// debugging a genuine hang who wants to fail sooner.
     async fn until(mut cond: impl FnMut() -> bool) {
-        tokio::time::timeout(Duration::from_secs(10), async {
+        let secs = std::env::var("HEADSTATE_TEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120);
+        tokio::time::timeout(Duration::from_secs(secs), async {
             while !cond() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("condition within 10s");
+        .unwrap_or_else(|_| panic!("condition within {secs}s"));
     }
 
     #[tokio::test]
