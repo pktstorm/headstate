@@ -1,4 +1,4 @@
-.PHONY: dev build test test-rust test-ui lint lint-rust lint-ui fmt icons \
+.PHONY: dev build test test-rust test-ui lint lint-rust lint-ui lint-deps fmt icons \
 	mobile-frontend lint-mobile test-mobile check-mobile-ios check-mobile-android \
 	deny-mobile ios-init android-init icons-mobile
 
@@ -81,7 +81,17 @@ test-rust:
 test-ui:
 	yarn vitest run
 
-lint: lint-rust lint-ui
+lint: lint-rust lint-ui lint-deps
+
+# Guards that answer a question in a second which would otherwise be
+# answered by a job that takes minutes. `tauri build` refuses to bundle
+# when an @tauri-apps/* package and its Rust crate disagree on
+# major/minor, and that check lives inside the bundle -- so before this
+# target existed, the mismatch passed lint and both test jobs and failed
+# from the slowest one in CI (#555).
+lint-deps:
+	python3 scripts/check-tauri-versions.test.py
+	python3 scripts/check-tauri-versions.py
 
 lint-rust:
 	cd src-tauri && cargo fmt --check
