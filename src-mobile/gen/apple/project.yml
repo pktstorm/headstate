@@ -61,6 +61,21 @@ targets:
         RUST_LOG: info
     settings:
       base:
+        # Signing is driven by the environment so this generated project
+        # stays generic and secret-free: a local `tauri ios build` sets
+        # none of these and keeps Xcode's automatic behaviour, while the
+        # release workflow exports all four (see mobile-release.yml).
+        #
+        # They live HERE, in the project, because nothing else survives.
+        # `tauri ios build -- ARGS` sends trailing arguments to Cargo, and
+        # XCODE_XCCONFIG_FILE is not honoured either -- with it exported,
+        # the CLI's own xcodebuild still reported only
+        # `Build settings from command line: SDKROOT`, so the four
+        # settings never reached the build (#573, mobile-v0.1.4).
+        CODE_SIGN_STYLE: $(HEADSTATE_CODE_SIGN_STYLE)
+        DEVELOPMENT_TEAM: $(HEADSTATE_DEVELOPMENT_TEAM)
+        CODE_SIGN_IDENTITY: $(HEADSTATE_CODE_SIGN_IDENTITY)
+        PROVISIONING_PROFILE_SPECIFIER: $(HEADSTATE_PROVISIONING_PROFILE)
         ENABLE_BITCODE: false
         ARCHS: [arm64]
         VALID_ARCHS: arm64 

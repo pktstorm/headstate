@@ -289,23 +289,22 @@ jobs:
       # and changed nothing about the failure, which is the evidence that
       # the project, not the CLI, is what needs the settings.
       #
-      # v0.1.3 tried passing the settings as `tauri ios build -- ARGS`.
-      # They never arrived: the CLI's trailing args go to CARGO, and the
-      # xcodebuild line it logged carried no signing settings at all --
+      # Three earlier attempts failed here, each dropping the settings
+      # somewhere between this script and xcodebuild:
       #
-      #   xcodebuild -allowProvisioningUpdates -scheme ... -sdk iphoneos
-      #     -configuration release build
+      #   v0.1.2  APPLE_DEVELOPMENT_TEAM alone. Silenced the CLI's "no
+      #           certificates" warning; the project still had no team.
+      #   v0.1.3  `tauri ios build -- ARGS`. Trailing args go to CARGO.
+      #   v0.1.4  XCODE_XCCONFIG_FILE. Not honoured through the CLI: with
+      #           it exported, xcodebuild still logged only
+      #           `Build settings from command line: SDKROOT`.
       #
-      # -- which is also why that attempt failed identically despite the
-      # values resolving correctly in the shell.
-      #
-      # XCODE_XCCONFIG_FILE needs no cooperation from the CLI: Xcode
-      # applies that file to every target it builds, and it beats the
-      # target's own settings. Verified by `xcodebuild -showBuildSettings`
-      # against this very project, where all four below come back
-      # overridden -- including CODE_SIGN_IDENTITY, which the project
-      # pins to "iPhone Developer" and which a plain `xcconfig` in the
-      # project would have lost to.
+      # So the settings now live in the PROJECT (src-mobile/gen/apple,
+      # committed), which is the one place nothing can strip them, and
+      # they read `$(HEADSTATE_*)` -- build settings expand from the
+      # environment, so exporting the four variables here is what fills
+      # them in. Unset, as in a local build, they expand to empty, which
+      # is the same as an unset setting and leaves Xcode's own defaults.
       #
       # Manual and not automatic signing: automatic wants an Xcode account
       # to talk to the Developer portal, which a CI runner holding only a
@@ -344,14 +343,10 @@ jobs:
             echo "Dry run: building an unsigned IPA."
             yarn tauri ios build --ci --no-sign --config "$CONFIG"
           else
-            XC="$RUNNER_TEMP/signing.xcconfig"
-            {
-              echo "CODE_SIGN_STYLE = Manual"
-              echo "DEVELOPMENT_TEAM = $APPLE_DEVELOPMENT_TEAM"
-              echo "CODE_SIGN_IDENTITY = $SIGNING_IDENTITY"
-              echo "PROVISIONING_PROFILE_SPECIFIER = $PROFILE_NAME"
-            } > "$XC"
-            export XCODE_XCCONFIG_FILE="$XC"
+            export HEADSTATE_CODE_SIGN_STYLE=Manual
+            export HEADSTATE_DEVELOPMENT_TEAM="$APPLE_DEVELOPMENT_TEAM"
+            export HEADSTATE_CODE_SIGN_IDENTITY="$SIGNING_IDENTITY"
+            export HEADSTATE_PROVISIONING_PROFILE="$PROFILE_NAME"
             yarn tauri ios build --ci --export-method app-store-connect --config "$CONFIG"
           fi
 
@@ -430,7 +425,6 @@ jobs:
           if [ -n "${PROFILE_UUID:-}" ]; then
             rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
           fi
-          rm -f "$RUNNER_TEMP/signing.xcconfig"
           rm -rf "$RUNNER_TEMP/private_keys" "$RUNNER_TEMP/profile.plist" \
             "$RUNNER_TEMP/dist.p12" "$RUNNER_TEMP/dist.mobileprovision" "$RUNNER_TEMP/altool.json"
 
