@@ -291,6 +291,80 @@ jobs:
           cp "$SRC" "Headstate-${GITHUB_REF_NAME}.app.tar.gz"
           cp "$SRC.sig" "Headstate-${GITHUB_REF_NAME}.app.tar.gz.sig"
 
+      # Tauri notarizes the .app and stops there; the DMG it wraps it in
+      # afterwards is signed but never submitted. v5.4.1 shipped exactly
+      # that: the .app inside passed `spctl` as "Notarized Developer ID",
+      # while the DMG a user actually downloads was rejected as
+      # "Unnotarized Developer ID".
+      #
+      # That distinction is the one that matters, because the quarantine
+      # bit lands on the DOWNLOADED file. Gatekeeper checks the DMG on
+      # open, so an unnotarized wrapper warns the user before they ever
+      # reach the notarized app inside -- which is the warning README
+      # says releases no longer have.
+      #
+      # `notarytool` uploads the DMG, waits, and `stapler` attaches the
+      # ticket so it verifies offline. Both are Xcode tools already on
+      # the runner. This is a no-op for the .app itself, which Tauri has
+      # already stapled.
+      - name: Notarize the DMG
+        if: matrix.os == 'macos-latest' && env.HAS_SIGNING_CERT == 'true'
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          BUNDLE=src-tauri/target/universal-apple-darwin/release/bundle
+          DMG=$(find "$BUNDLE/dmg" -maxdepth 1 -name '*.dmg' | head -1)
+          if [ -z "$DMG" ]; then
+            echo "No DMG under $BUNDLE/dmg to notarize." >&2
+            exit 1
+          fi
+          echo "Notarizing $DMG"
+          xcrun notarytool submit "$DMG" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 30m
+          xcrun stapler staple "$DMG"
+
+      # Proof, not assumption. The release notes claim the macOS build is
+      # notarized off the presence of a SECRET, which says nothing about
+      # what the bundler actually did -- v5.4.1 made that claim about a
+      # DMG Gatekeeper rejected. This asks the same question a user's Mac
+      # asks, and fails the build if the answer is wrong, so the claim
+      # can never again outrun the artifact.
+      #
+      # `spctl -t install` is the DMG's own assessment type; `-t exec` is
+      # the app's. Both must come back accepted and notarized.
+      - name: Verify the macOS artifacts are notarized
+        if: matrix.os == 'macos-latest' && env.HAS_SIGNING_CERT == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUNDLE=src-tauri/target/universal-apple-darwin/release/bundle
+          DMG=$(find "$BUNDLE/dmg" -maxdepth 1 -name '*.dmg' | head -1)
+          APP="$BUNDLE/macos/Headstate.app"
+
+          fail=0
+          echo "== DMG =="
+          if ! spctl -a -vvv -t install "$DMG" 2>&1 | tee /tmp/dmg.txt; then fail=1; fi
+          grep -q 'source=Notarized Developer ID' /tmp/dmg.txt || fail=1
+          xcrun stapler validate "$DMG" || fail=1
+
+          echo "== app =="
+          if ! spctl -a -vvv -t exec "$APP" 2>&1 | tee /tmp/app.txt; then fail=1; fi
+          grep -q 'source=Notarized Developer ID' /tmp/app.txt || fail=1
+          xcrun stapler validate "$APP" || fail=1
+
+          if [ "$fail" -ne 0 ]; then
+            echo "macOS artifacts are not both notarized and stapled; refusing to publish." >&2
+            exit 1
+          fi
+          echo "Both the DMG and the app are notarized and stapled."
+
       # Collected into one directory so the upload glob does not have to
       # know each platform's bundle layout.
       - name: Collect artifacts
@@ -361,6 +435,14 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          # Both mean "a secret was present", which is a statement about
+          # this repository's configuration and not about the artifacts.
+          # That is only safe to print because the macOS build now REFUSES
+          # to finish unless `spctl` calls the DMG and the app notarized
+          # (see "Verify the macOS artifacts are notarized"), so a build
+          # that reaches this job has already proven the claim. Before
+          # that check existed, v5.4.1 published "signed and notarized"
+          # over a DMG Gatekeeper rejected.
           SIGNED: ${{ secrets.APPLE_CERTIFICATE != '' && 'true' || 'false' }}
           NOTARIZED: ${{ secrets.APPLE_ID != '' && 'true' || 'false' }}
         run: |
