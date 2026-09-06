@@ -127,6 +127,9 @@ pub async fn enrich(reports: &mut [super::model::ProjectReport]) {
 /// untouched, it stays at `latest == current` with `Bump::Unknown` --
 /// exactly how a failed lookup already renders, which the UI shows as
 /// "cannot compare" and the wizard refuses to select.
+///
+/// Afterwards, and for CARGO ONLY, a crate the index confirmed is
+/// already current is dropped -- see `drop_current_cargo_rows`.
 fn apply_found(
     reports: &mut [super::model::ProjectReport],
     found: &std::collections::BTreeMap<(super::model::Ecosystem, String), String>,
@@ -154,6 +157,76 @@ fn apply_found(
                 o.bump = super::version::bump(&o.current, latest);
                 o.latest = latest.clone();
             }
+        }
+    }
+
+    drop_current_cargo_rows(reports, found);
+}
+
+/// Remove the Cargo rows the index confirmed are ALREADY CURRENT.
+///
+/// CARGO ONLY, and that asymmetry is the whole point. Terraform and
+/// Swift share this pass but render PINNED-DEPENDENCY views: every entry
+/// in `.terraform.lock.hcl` or `Package.resolved` is a dependency the
+/// repository has, and one disappearing because it happens to be current
+/// would understate the lock file -- which is precisely why
+/// `apply_found` keeps rows. Cargo's page is an UPDATE list, the same
+/// list the five parser ecosystems fill, whose rows are things to do.
+/// A crate with nothing to do on it is not a row: measured on this
+/// repository, 75 rows of which 9 were updates, and the 66 that read
+/// `serde 1.0.229 -> 1.0.229` buried them.
+///
+/// It runs AFTER the writes above rather than inside `cargo::pinned`,
+/// because before enrichment every Cargo row looks current -- `pinned`
+/// builds them all at `latest == current` on purpose, so the page can
+/// render before the network answers.
+///
+/// ONLY a row whose lookup SUCCEEDED and answered with what is already
+/// locked is dropped, and that is the distinction that makes this safe.
+/// Three other rows look identical on screen and none is dropped:
+///
+/// - A lookup that FAILED -- a 404, a timeout, a crate published only to
+///   a private registry. `enrich` inserts into `found` only when
+///   `latest_for` answered, so the key is ABSENT and nothing has been
+///   learned about the row. Hiding a crate because the network blipped
+///   would render a failure as good news, the inversion this module
+///   refuses everywhere else.
+/// - A PATH, GIT or alternative-registry dependency, which `needs_lookup`
+///   never asks about. `src-mobile` depends on two in-repo plugins
+///   exactly this way and they must stay listed, as `swift.rs` keeps a
+///   revision pin.
+/// - An answer the index gave BACKWARDS, refused as a downgrade above.
+///   The row was never compared against anything, and "the index is
+///   behind the lockfile" is an anomaly worth seeing.
+///
+/// Hence the key is `found` plus a fresh comparison, never `latest ==
+/// current` -- which all four cases satisfy.
+///
+/// Per ROW, never per crate name. The same crate declared in
+/// `[dependencies]` and `[dev-dependencies]`, or under a target table,
+/// is two entries and two places to edit, and it can legitimately be
+/// current in one and behind in the other.
+fn drop_current_cargo_rows(
+    reports: &mut [super::model::ProjectReport],
+    found: &std::collections::BTreeMap<(super::model::Ecosystem, String), String>,
+) {
+    for p in reports.iter_mut() {
+        for r in &mut p.reports {
+            if r.ecosystem != super::model::Ecosystem::Cargo {
+                continue;
+            }
+            r.outdated.retain(|o| {
+                let Some(latest) = found.get(&(o.ecosystem, lookup_key(o))) else {
+                    // Never asked, or asked and not answered.
+                    return true;
+                };
+                // `is_newer` answers None when the two are equal, and
+                // also when neither is comparable -- and an uncomparable
+                // pair has not been shown to be current either, so both
+                // fall to the same test. Only an answer EQUAL to what is
+                // locked, string for string, is proof of currency.
+                o.current != *latest
+            });
         }
     }
 }
@@ -594,6 +667,310 @@ mod tests {
             assert_eq!(o.latest, o.current, "{}: no update claimed", o.name);
             assert_eq!(o.bump, Bump::Unknown, "{}", o.name);
         }
+    }
+
+    /// A crate the index says is ALREADY CURRENT is dropped.
+    ///
+    /// This is the Cargo-only half of `apply_found`, and it is what
+    /// separates Cargo from the two ecosystems it shares this pass with.
+    /// Terraform and Swift render PINNED-DEPENDENCY views: a provider
+    /// that vanished from the list when it happened to be current would
+    /// be reporting a shorter dependency list than the lock file holds.
+    /// Cargo's page is an UPDATE list -- the same list npm, yarn,
+    /// poetry, uv and dotnet fill, whose rows are things to do -- so a
+    /// crate with nothing to do on it is not a row.
+    ///
+    /// Measured on this repository before the drop: 75 rows of which 9
+    /// were updates. Sixty-six rows reading `serde 1.0.229 -> 1.0.229`
+    /// is not a report, and it buried the nine that were.
+    #[test]
+    fn a_cargo_crate_the_index_says_is_current_is_dropped() {
+        use super::super::model::{Bump, Ecosystem, EcosystemReport, Outdated, ProjectReport};
+        let row = |name: &str, current: &str| Outdated {
+            name: name.into(),
+            current: current.into(),
+            latest: current.into(),
+            bump: Bump::Unknown,
+            ecosystem: Ecosystem::Cargo,
+            manifest: "Cargo.toml [dependencies]".into(),
+        };
+        let mut reports = vec![ProjectReport {
+            path: "/tmp/example".into(),
+            label: String::new(),
+            reports: vec![EcosystemReport {
+                ecosystem: Ecosystem::Cargo,
+                outdated: vec![row("serde", "1.0.229"), row("p256", "0.13.2")],
+                error: None,
+            }],
+        }];
+
+        apply_found(
+            &mut reports,
+            &[
+                // Answered with exactly what is locked.
+                (
+                    (Ecosystem::Cargo, "serde".to_string()),
+                    "1.0.229".to_string(),
+                ),
+                // A real update.
+                ((Ecosystem::Cargo, "p256".to_string()), "0.14.0".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let out = &reports[0].reports[0].outdated;
+        assert_eq!(out.len(), 1, "the current crate is gone");
+        assert_eq!(out[0].name, "p256", "the update survives");
+        assert_eq!(out[0].latest, "0.14.0");
+        assert_eq!(out[0].bump, Bump::Minor);
+    }
+
+    /// Two rows for the SAME crate, both current, both dropped -- and
+    /// two rows for the same crate that has an update, both kept.
+    ///
+    /// The duplicate is not a bug to be de-duplicated. A crate declared
+    /// in `[dependencies]` and again in `[dev-dependencies]`, or under a
+    /// target table, is two entries and TWO PLACES TO EDIT; the manifest
+    /// label is what tells them apart. `src-mobile` declares `sha2`,
+    /// `p256`, `tokio` and `rustls` exactly this way, and `tauri` once
+    /// plainly and once under an iOS target.
+    ///
+    /// So the drop is per ROW against that row's own current version,
+    /// never per crate name: a crate current in one table and stale in
+    /// another must lose one row and keep the other.
+    #[test]
+    fn duplicate_cargo_rows_are_dropped_and_kept_per_row() {
+        use super::super::model::{Bump, Ecosystem, EcosystemReport, Outdated, ProjectReport};
+        let row = |name: &str, current: &str, table: &str| Outdated {
+            name: name.into(),
+            current: current.into(),
+            latest: current.into(),
+            bump: Bump::Unknown,
+            ecosystem: Ecosystem::Cargo,
+            manifest: format!("Cargo.toml [{table}]"),
+        };
+        let mut reports = vec![ProjectReport {
+            path: "/tmp/example".into(),
+            label: String::new(),
+            reports: vec![EcosystemReport {
+                ecosystem: Ecosystem::Cargo,
+                outdated: vec![
+                    // Current in both tables.
+                    row("tokio", "1.53.1", "dependencies"),
+                    row("tokio", "1.53.1", "dev-dependencies"),
+                    // Stale in both tables.
+                    row("sha2", "0.10.9", "dependencies"),
+                    row("sha2", "0.10.9", "dev-dependencies"),
+                    // The SAME crate, current in one table and behind in
+                    // the other -- the case a per-name decision gets
+                    // wrong in both directions.
+                    row("rustls", "0.23.43", "dependencies"),
+                    row("rustls", "0.23.40", "dev-dependencies"),
+                ],
+                error: None,
+            }],
+        }];
+
+        apply_found(
+            &mut reports,
+            &[
+                (
+                    (Ecosystem::Cargo, "tokio".to_string()),
+                    "1.53.1".to_string(),
+                ),
+                ((Ecosystem::Cargo, "sha2".to_string()), "0.11.0".to_string()),
+                (
+                    (Ecosystem::Cargo, "rustls".to_string()),
+                    "0.23.43".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let out = &reports[0].reports[0].outdated;
+        let names: Vec<&str> = out.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["sha2", "sha2", "rustls"],
+            "both stale sha2 rows survive, both current tokio rows go, \
+             and rustls keeps only the table that is behind"
+        );
+        assert_eq!(
+            out[0].manifest, "Cargo.toml [dependencies]",
+            "the two sha2 rows stay distinguishable"
+        );
+        assert_eq!(out[1].manifest, "Cargo.toml [dev-dependencies]");
+        assert_eq!(
+            out[2].manifest, "Cargo.toml [dev-dependencies]",
+            "the surviving rustls row is the one that is behind"
+        );
+    }
+
+    /// A crate whose LOOKUP FAILED keeps its row.
+    ///
+    /// This is the distinction that makes the drop safe, and the data
+    /// carries it: `enrich` inserts into `found` only when `latest_for`
+    /// answered, so a 404, a timeout, a DNS failure or a yanked-only
+    /// crate leaves the key ABSENT. A row whose key is absent has not
+    /// been shown to be current -- nothing has been shown about it at
+    /// all -- so it stays, uncomparable.
+    ///
+    /// Dropping it instead would hide a crate because a network blip
+    /// happened, rendering a failure as good news. That is the exact
+    /// inversion this module refuses everywhere else, and it is why the
+    /// drop is keyed on `found` rather than on `latest == current` --
+    /// which a failed lookup leaves looking identical.
+    #[test]
+    fn a_cargo_crate_whose_lookup_failed_is_never_dropped() {
+        use super::super::model::{Bump, Ecosystem, EcosystemReport, Outdated, ProjectReport};
+        let row = |name: &str| Outdated {
+            name: name.into(),
+            current: "1.0.0".into(),
+            latest: "1.0.0".into(),
+            bump: Bump::Unknown,
+            ecosystem: Ecosystem::Cargo,
+            manifest: "Cargo.toml [dependencies]".into(),
+        };
+        let mut reports = vec![ProjectReport {
+            path: "/tmp/example".into(),
+            label: String::new(),
+            reports: vec![EcosystemReport {
+                ecosystem: Ecosystem::Cargo,
+                outdated: vec![row("unreachable-crate"), row("private-crate")],
+                error: None,
+            }],
+        }];
+
+        // Both needed a lookup, and neither answered.
+        for o in &reports[0].reports[0].outdated {
+            assert!(needs_lookup(o), "{}", o.name);
+        }
+        apply_found(&mut reports, &Default::default());
+
+        let out = &reports[0].reports[0].outdated;
+        assert_eq!(out.len(), 2, "a failed lookup is not evidence of currency");
+        for o in out {
+            assert_eq!(o.bump, Bump::Unknown, "{}", o.name);
+        }
+    }
+
+    /// A registry answer OLDER than the lock keeps its row too.
+    ///
+    /// The lookup succeeded, so the key IS in `found` -- but the write
+    /// was refused as a downgrade, and the row was therefore never
+    /// compared against anything. "The index is behind the lockfile" is
+    /// an anomaly worth seeing, not a crate that is up to date, so it
+    /// takes the same uncomparable path a failed lookup does. The
+    /// existing backwards-write test asserts the row survives; this
+    /// asserts the new drop did not quietly take it away.
+    #[test]
+    fn a_cargo_row_the_index_answered_backwards_is_not_dropped() {
+        use super::super::model::{Bump, Ecosystem, EcosystemReport, Outdated, ProjectReport};
+        let mut reports = vec![ProjectReport {
+            path: "/tmp/example".into(),
+            label: String::new(),
+            reports: vec![EcosystemReport {
+                ecosystem: Ecosystem::Cargo,
+                outdated: vec![Outdated {
+                    name: "serde".into(),
+                    current: "9.9.9".into(),
+                    latest: "9.9.9".into(),
+                    bump: Bump::Unknown,
+                    ecosystem: Ecosystem::Cargo,
+                    manifest: "Cargo.toml [dependencies]".into(),
+                }],
+                error: None,
+            }],
+        }];
+
+        apply_found(
+            &mut reports,
+            &[(
+                (Ecosystem::Cargo, "serde".to_string()),
+                "1.0.228".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        let out = &reports[0].reports[0].outdated;
+        assert_eq!(out.len(), 1, "the anomaly stays visible");
+        assert_eq!(out[0].latest, "9.9.9", "and uncompared");
+        assert_eq!(out[0].bump, Bump::Unknown);
+    }
+
+    /// Terraform and Swift keep their current rows. UNCHANGED BEHAVIOUR,
+    /// pinned here because the Cargo drop runs in the same function.
+    ///
+    /// Both pages are pinned-dependency views, not update lists. A
+    /// Terraform provider that is current is still a provider this
+    /// repository pins, and a `Package.resolved` entry that is current is
+    /// still a package the app depends on. Dropping either would make
+    /// the list understate what the lock file holds -- which is exactly
+    /// the reason `apply_found`'s comment gives for keeping rows.
+    #[test]
+    fn terraform_and_swift_rows_that_are_current_are_still_kept() {
+        use super::super::model::{Bump, Ecosystem, EcosystemReport, Outdated, ProjectReport};
+        let url = "https://github.com/octocat/hello-world.git";
+        let mut reports = vec![ProjectReport {
+            path: "/tmp/example".into(),
+            label: String::new(),
+            reports: vec![
+                EcosystemReport {
+                    ecosystem: Ecosystem::Terraform,
+                    outdated: vec![Outdated {
+                        name: "registry.terraform.io/hashicorp/archive".into(),
+                        current: "2.8.0".into(),
+                        latest: "2.8.0".into(),
+                        bump: Bump::Unknown,
+                        ecosystem: Ecosystem::Terraform,
+                        manifest: ".terraform.lock.hcl".into(),
+                    }],
+                    error: None,
+                },
+                EcosystemReport {
+                    ecosystem: Ecosystem::Swift,
+                    outdated: vec![Outdated {
+                        name: "octocat/hello-world".into(),
+                        current: "2.0.0".into(),
+                        latest: "2.0.0".into(),
+                        bump: Bump::Unknown,
+                        ecosystem: Ecosystem::Swift,
+                        manifest: format!("{url} <- Package.resolved"),
+                    }],
+                    error: None,
+                },
+            ],
+        }];
+
+        apply_found(
+            &mut reports,
+            &[
+                (
+                    (
+                        Ecosystem::Terraform,
+                        "registry.terraform.io/hashicorp/archive".to_string(),
+                    ),
+                    "2.8.0".to_string(),
+                ),
+                ((Ecosystem::Swift, url.to_string()), "2.0.0".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        assert_eq!(
+            reports[0].reports[0].outdated.len(),
+            1,
+            "a current Terraform provider is still pinned, so still listed"
+        );
+        assert_eq!(
+            reports[0].reports[1].outdated.len(),
+            1,
+            "and so is a current Swift package"
+        );
     }
 }
 
