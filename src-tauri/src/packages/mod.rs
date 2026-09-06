@@ -7,6 +7,7 @@
 //! Nothing here talks to GitHub.
 
 pub mod apply;
+pub mod cargo;
 pub mod detect;
 pub mod markdown;
 pub mod model;

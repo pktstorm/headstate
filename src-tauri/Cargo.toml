@@ -39,6 +39,15 @@ octocrab = { version = "0.54", default-features = false, features = [
   "default-client", "rustls-ring", "rustls-webpki-tokio", "jwt-aws-lc-rs",
 ] }
 rusqlite = { version = "0.40", features = ["bundled"] }
+# ALREADY in the tree at this version, pulled in by tauri's build stack --
+# declaring it adds no new code to the supply chain.
+#
+# For the Cargo ecosystem (`packages/cargo.rs`), which reads `Cargo.toml`
+# and `Cargo.lock`. Both are TOML with quoted keys, dotted keys, inline
+# tables and arrays of tables; hand-scanning them the way `swift.rs`
+# scans JSON would get the awkward shapes wrong in exactly the quiet
+# ways that module refuses. `parse` only -- nothing here writes TOML.
+toml = "1.1"
 tokio = { version = "1.53", features = ["full"] }
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }

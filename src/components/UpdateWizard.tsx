@@ -26,6 +26,8 @@ const CANNOT_APPLY: Partial<Record<Ecosystem, string>> = {
   swift: "Swift packages must be updated in Xcode or Package.swift.",
   terraform:
     "Terraform provider versions are a constraint in your .tf source, not something a lockfile edit can change.",
+  cargo:
+    "Rust crates cannot be updated here yet: `cargo add` cannot target a workspace member, so on a workspace it would edit the wrong manifest. Run `cargo add <pkg>@<version>` in the crate's own directory.",
 };
 
 /// Applies dependency updates in a fresh worktree.
