@@ -524,7 +524,7 @@ mod tests {
         );
         let report = r.conn.report();
         assert_eq!(report.state, State::Connected);
-        assert_eq!(report.protocol_version, Some(1));
+        assert_eq!(report.protocol_version, Some(PROTOCOL_VERSION));
         assert!(report.last_poll.is_some());
         // The hello was filed with the desktop record it belongs to.
         pairing::save_desktops(

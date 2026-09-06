@@ -1,10 +1,15 @@
 //! The HTTPS client for the paired desktop: reqwest on rustls with the
-//! aws-lc-rs provider, the session certificate as the client identity,
-//! and a server verifier that accepts one certificate -- the one whose
-//! SHA256 fingerprint was pinned at pairing.
+//! `rustls-post-quantum` provider (aws-lc-rs plus ML-DSA), the ML-DSA-65
+//! session certificate as the client identity, and a server verifier
+//! that accepts one certificate -- the one whose SHA256 fingerprint was
+//! pinned at pairing -- signed with ML-DSA-65 and nothing else.
 //!
 //! - TLS 1.3 only, X25519MLKEM768 offered first (the same provider and
-//!   order as the desktop's listener).
+//!   order as the desktop's listener). The provider is the one that can
+//!   sign CertificateVerify with the ML-DSA-65 session key and verify
+//!   the desktop's; the plain aws-lc-rs provider cannot load the key
+//!   at all. See Cargo.toml for what its `aws-lc-rs-unstable` feature
+//!   does and does not mean.
 //! - No hostname check and no chain: the desktop's certificate is
 //!   self-signed and names no host, because a laptop's address changes
 //!   with every network. The fingerprint IS the identity; the handshake
@@ -28,7 +33,8 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::{aws_lc_rs, CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{
-    CertificateError, ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme,
+    CertificateError, ClientConfig, DigitallySignedStruct, Error as TlsError, PeerMisbehaved,
+    SignatureScheme,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -39,8 +45,16 @@ use std::time::Duration;
 use crate::keys::{fingerprint_of, SessionIdentity};
 use crate::stepup;
 
-/// The protocol this client speaks; `/v1/hello` reports the desktop's.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// The protocol this client speaks; `/v1/hello` reports the desktop's,
+/// and `connection.rs` calls a desktop below this too old to drive.
+///
+/// 2 (#521): both TLS certificates are ML-DSA-65. A 5.0 desktop
+/// (protocol 1) presents a P-256 certificate this client refuses at
+/// the handshake anyway, and its verifier would refuse ours.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// The one signature scheme the desktop may sign the handshake with.
+const SERVER_SIGNATURE_SCHEME: SignatureScheme = SignatureScheme::ML_DSA_65;
 
 /// Per address. A LAN address that has gone away fails fast; an overlay
 /// address on a slow link still connects within this.
@@ -86,8 +100,10 @@ impl ClientError {
     }
 }
 
-/// aws-lc-rs with X25519MLKEM768 first, spelled out rather than left to
-/// rustls's `prefer-post-quantum` feature, exactly as the desktop does.
+/// `rustls-post-quantum`'s provider -- aws-lc-rs plus the ML-DSA signing
+/// keys and verifiers rustls 0.23 only names -- with X25519MLKEM768
+/// first, spelled out rather than left to rustls's `prefer-post-quantum`
+/// feature, exactly as the desktop does.
 pub(crate) fn provider() -> CryptoProvider {
     CryptoProvider {
         kx_groups: vec![
@@ -95,13 +111,15 @@ pub(crate) fn provider() -> CryptoProvider {
             aws_lc_rs::kx_group::X25519,
             aws_lc_rs::kx_group::SECP256R1,
         ],
-        ..aws_lc_rs::default_provider()
+        ..rustls_post_quantum::provider()
     }
 }
 
 /// Accepts the one certificate whose fingerprint matches; verifies the
 /// handshake signature so the fingerprint cannot be replayed by someone
-/// without the key.
+/// without the key -- and accepts ML-DSA-65 as that signature's scheme
+/// and nothing else, so a desktop from before protocol 2 (P-256) is
+/// refused at the handshake rather than reasoned about afterwards.
 #[derive(Debug)]
 struct PinnedServer {
     fp: String,
@@ -137,17 +155,24 @@ impl ServerCertVerifier for PinnedServer {
         Err(TlsError::General("TLS 1.2 is not offered".into()))
     }
 
+    /// ML-DSA-65 only. The provider's table maps the scheme to webpki's
+    /// ML-DSA-65 verifier, which also checks that the certificate's
+    /// public key is an ML-DSA-65 key.
     fn verify_tls13_signature(
         &self,
         message: &[u8],
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
+        if dss.scheme != SERVER_SIGNATURE_SCHEME {
+            return Err(PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme.into());
+        }
         rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algs)
     }
 
+    /// What ClientHello's signature_algorithms offers the desktop.
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.algs.supported_schemes()
+        vec![SERVER_SIGNATURE_SCHEME]
     }
 }
 
@@ -497,6 +522,48 @@ mod tests {
         assert_eq!(hello.protocol_version, PROTOCOL_VERSION);
         assert_eq!(hello.viewer_login.as_deref(), Some("octocat"));
         assert_eq!(server.last_kx(), Some(rustls::NamedGroup::X25519MLKEM768));
+        // The phone signed CertificateVerify with ML-DSA-65 -- what the
+        // desktop's verifier saw -- and verified the desktop's ML-DSA-65
+        // certificate, the only kind `PinnedServer` accepts.
+        assert_eq!(server.last_sig(), Some(SignatureScheme::ML_DSA_65));
+        assert!(server.cert_is_ml_dsa_65());
+    }
+
+    /// What ClientHello offers, and what the verifier will check.
+    #[test]
+    fn the_verifier_accepts_ml_dsa_65_and_nothing_else() {
+        let provider = provider();
+        let verifier = PinnedServer {
+            fp: "ab".repeat(32),
+            algs: provider.signature_verification_algorithms,
+        };
+        assert_eq!(
+            verifier.supported_verify_schemes(),
+            vec![SignatureScheme::ML_DSA_65]
+        );
+        assert!(provider
+            .signature_verification_algorithms
+            .supported_schemes()
+            .contains(&SignatureScheme::ML_DSA_65));
+        assert!(!aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+            .contains(&SignatureScheme::ML_DSA_65));
+    }
+
+    /// A 5.0 desktop presents a P-256 certificate. Even with its
+    /// fingerprint pinned, the handshake fails: this client offers no
+    /// scheme it can sign with. That is what a phone on protocol 2 sees
+    /// of a desktop on protocol 1, before `/v1/hello` can say so.
+    #[tokio::test]
+    async fn a_desktop_with_a_p256_certificate_is_a_handshake_failure() {
+        let id = identity();
+        let server = TestServer::start_with_p256_certificate().await;
+        server.pair(&id.fingerprint());
+        let client = Client::new(&id, &server.fp, vec![server.addr()], server.port()).unwrap();
+        let err = client.hello().await.unwrap_err();
+        assert!(err.is_handshake(), "{err:?}");
+        assert!(server.requests().is_empty(), "nothing reached HTTP");
     }
 
     #[tokio::test]

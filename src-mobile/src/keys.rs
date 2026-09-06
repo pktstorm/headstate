@@ -31,8 +31,11 @@
 //! - ECDSA signature: raw `r || s`, 64 bytes (IEEE P1363), over the
 //!   SHA256 of the message, either `s` accepted.
 //! - ML-DSA-65 signature: 3309 bytes, pure mode, EMPTY context string.
-//! - Session identity: the certificate as DER and the private key as
-//!   PKCS#8 DER, the shapes rustls takes for a client identity.
+//! - Session identity: the ML-DSA-65 certificate as DER and the private
+//!   key as PKCS#8 DER (the 54-byte seed form), the shapes rustls takes
+//!   for a client identity on the post-quantum provider. What is
+//!   STORED is the certificate and the key's 32-byte seed, as the
+//!   desktop stores its own; the plugin derives one from the other.
 //!
 //! A hardware implementation must return exactly these. On iOS,
 //! `P256.Signing.ECDSASignature.rawRepresentation` and
@@ -44,16 +47,20 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use rcgen::{
-    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair,
-    KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
+    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyUsagePurpose,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::sync::Arc;
 // The plugin's trait, under another name: it shares its spelling with
-// this crate's, and only [`HardwareKeys`] calls it.
+// this crate's, and only [`HardwareKeys`] calls it. The session-key
+// helpers are the plugin's too, so the software keys mint and reload
+// exactly the kind of identity the hardware path does.
 use tauri_plugin_headstate_keys::DeviceKeys as PluginDeviceKeys;
+use tauri_plugin_headstate_keys::{
+    generate_session_key, session_from_seed, SessionSeed, SESSION_SEED_LEN,
+};
 
 use crate::store::{get_json, put_json, Store, StoreError};
 
@@ -165,14 +172,20 @@ pub fn random_bytes<const N: usize>() -> Result<[u8; N], KeyError> {
 // The software implementation
 // ---------------------------------------------------------------------
 
-/// What [`SoftwareKeys`] persists at `keys/session`.
+/// What [`SoftwareKeys`] persists at `keys/session`. Version 2: the
+/// certificate and the ML-DSA-65 key's seed; version 1 held a P-256
+/// key's PKCS#8 and is simply not readable by this build -- a phone
+/// upgrading from protocol 1 re-pairs, which `generate`s afresh.
 #[derive(Serialize, Deserialize)]
 pub struct StoredSession {
     pub v: u32,
     /// Standard base64.
     pub cert_der: String,
-    /// Standard base64, PKCS#8 DER.
-    pub key_pkcs8: String,
+    /// Standard base64, 32 bytes: the FIPS 204 seed. Defaulted so a
+    /// version-1 record (which has `key_pkcs8` instead) still parses
+    /// far enough for the version check to name it.
+    #[serde(default)]
+    pub key_seed: String,
 }
 
 /// What [`SoftwareKeys`] persists at `keys/stepup`.
@@ -189,6 +202,7 @@ pub struct StoredStepUp {
 }
 
 const STORED_VERSION: u32 = 1;
+const STORED_SESSION_VERSION: u32 = 2;
 
 /// Keys derived from seeds in the settings store.
 pub struct SoftwareKeys {
@@ -263,9 +277,11 @@ fn validity_window(today: chrono::NaiveDate) -> ((i32, u8, u8), (i32, u8, u8)) {
     )
 }
 
-fn generate_session() -> Result<SessionIdentity, KeyError> {
+/// A fresh ML-DSA-65 session identity and the seed it derives from.
+fn generate_session() -> Result<(SessionIdentity, SessionSeed), KeyError> {
     let crypto = |e: rcgen::Error| KeyError::Crypto(format!("session certificate: {e}"));
-    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(crypto)?;
+    let (key, seed) =
+        generate_session_key().map_err(|e| KeyError::Crypto(format!("session key: {e}")))?;
     let (from, to) = validity_window(chrono::Utc::now().date_naive());
     let mut params = CertificateParams::default();
     params.not_before = rcgen::date_time_ymd(from.0, from.1, from.2);
@@ -276,15 +292,18 @@ fn generate_session() -> Result<SessionIdentity, KeyError> {
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
     let cert = params.self_signed(&key).map_err(crypto)?;
-    Ok(SessionIdentity {
-        cert_der: cert.der().to_vec(),
-        key_pkcs8: key.serialize_der(),
-    })
+    Ok((
+        SessionIdentity {
+            cert_der: cert.der().to_vec(),
+            key_pkcs8: key.serialize_der(),
+        },
+        seed,
+    ))
 }
 
 impl DeviceKeys for SoftwareKeys {
     fn generate(&self) -> Result<PublicKeys, KeyError> {
-        let session = generate_session()?;
+        let (session, session_seed) = generate_session()?;
         // A random 32-byte scalar is a valid P-256 key unless it is zero
         // or at least the group order, odds around 2^-128 per draw; the
         // loop is correctness, not an expected path.
@@ -299,9 +318,9 @@ impl DeviceKeys for SoftwareKeys {
             self.store.as_ref(),
             SESSION_KEY,
             &StoredSession {
-                v: STORED_VERSION,
+                v: STORED_SESSION_VERSION,
                 cert_der: BASE64.encode(&session.cert_der),
-                key_pkcs8: BASE64.encode(&session.key_pkcs8),
+                key_seed: BASE64.encode(session_seed),
             },
         )?;
         put_json(
@@ -348,9 +367,26 @@ impl DeviceKeys for SoftwareKeys {
     fn session_identity(&self) -> Result<SessionIdentity, KeyError> {
         let stored: StoredSession =
             get_json(self.store.as_ref(), SESSION_KEY)?.ok_or(KeyError::NoKeys)?;
+        if stored.v != STORED_SESSION_VERSION {
+            return Err(KeyError::Crypto(format!(
+                "stored session is version {} (this build reads {STORED_SESSION_VERSION}); pair again",
+                stored.v
+            )));
+        }
+        let seed: SessionSeed = decode(&stored.key_seed, "session seed")?
+            .try_into()
+            .map_err(|v: Vec<u8>| {
+                KeyError::Crypto(format!(
+                    "stored session seed is {} bytes, not {SESSION_SEED_LEN}",
+                    v.len()
+                ))
+            })?;
+        let cert_der = decode(&stored.cert_der, "session certificate")?;
+        let plugin = session_from_seed(&seed, cert_der)
+            .map_err(|e| KeyError::Crypto(format!("stored session: {e}")))?;
         Ok(SessionIdentity {
-            cert_der: decode(&stored.cert_der, "session certificate")?,
-            key_pkcs8: decode(&stored.key_pkcs8, "session key")?,
+            cert_der: plugin.cert_der,
+            key_pkcs8: plugin.key_pkcs8,
         })
     }
 }
@@ -651,10 +687,69 @@ mod tests {
         assert_eq!(id.fingerprint().len(), 64);
         assert!(id.fingerprint().chars().all(|c| c.is_ascii_hexdigit()));
         assert!(!format!("{id:?}").contains("key_pkcs8"));
-        // rustls accepts the pair as a client identity.
-        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(id.key_pkcs8.clone().into());
-        let provider = rustls::crypto::aws_lc_rs::default_provider();
-        provider.key_provider.load_private_key(key).unwrap();
+        // rustls accepts the pair as a client identity -- on the
+        // post-quantum provider, which is the one the client uses; the
+        // plain one cannot load an ML-DSA key.
+        let key = || rustls::pki_types::PrivateKeyDer::Pkcs8(id.key_pkcs8.clone().into());
+        rustls::sign::CertifiedKey::from_der(
+            vec![rustls::pki_types::CertificateDer::from(id.cert_der.clone())],
+            key(),
+            &rustls_post_quantum::provider(),
+        )
+        .unwrap();
+        assert!(rustls::crypto::aws_lc_rs::default_provider()
+            .key_provider
+            .load_private_key(key())
+            .is_err());
+    }
+
+    /// The session identity is ML-DSA-65 and what the store holds is
+    /// the certificate plus the key's seed, from which the same key --
+    /// and so the same fingerprint -- comes back on every load.
+    #[test]
+    fn the_session_is_ml_dsa_65_and_reloads_from_its_seed() {
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::default());
+        let keys = SoftwareKeys::new(store.clone());
+        keys.generate().unwrap();
+        let id = keys.session_identity().unwrap();
+        // id-ml-dsa-65 in the subject public key, the TBS signature
+        // field and the outer signature algorithm.
+        let oid = [
+            0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12,
+        ];
+        assert_eq!(
+            id.cert_der.windows(oid.len()).filter(|w| *w == oid).count(),
+            3
+        );
+        assert_eq!(
+            id.key_pkcs8.len(),
+            54,
+            "the seed form, not the expanded key"
+        );
+
+        let stored: StoredSession = get_json(store.as_ref(), SESSION_KEY).unwrap().unwrap();
+        assert_eq!(stored.v, 2);
+        assert_eq!(
+            BASE64.decode(&stored.key_seed).unwrap().len(),
+            SESSION_SEED_LEN
+        );
+        assert_eq!(
+            SoftwareKeys::new(store.clone()).session_identity().unwrap(),
+            id
+        );
+
+        // A pre-protocol-2 record (a P-256 PKCS#8) is refused, not
+        // misread: the phone pairs again.
+        put_json(
+            store.as_ref(),
+            SESSION_KEY,
+            &serde_json::json!({"v": 1, "cert_der": "MAA=", "key_pkcs8": "MAA="}),
+        )
+        .unwrap();
+        assert!(matches!(
+            keys.session_identity(),
+            Err(KeyError::Crypto(m)) if m.contains("version 1")
+        ));
     }
 
     /// The signatures verify the way the desktop's `stepup.rs` verifies

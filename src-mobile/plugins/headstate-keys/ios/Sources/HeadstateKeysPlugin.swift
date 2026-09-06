@@ -36,7 +36,11 @@
 // Keychain, never restored onto another device from a backup. The
 // session identity gets the same protection; it is the one key whose
 // bytes do leave the Keychain (into rustls), so it is not in the
-// enclave -- src/lib.rs explains why.
+// enclave -- src/lib.rs explains why. What is kept for it is the
+// ML-DSA-65 key's 32-byte seed and the certificate DER (about 5 KB),
+// both opaque here; the iOS Keychain has no small-item limit the way
+// Windows Credential Manager does, but the two ends store the same
+// things so the desktop's `remote/identity.rs` and this file agree.
 //
 // # One prompt for two keys
 //
@@ -66,7 +70,7 @@ struct SignArgs: Decodable {
 
 struct StoreSessionArgs: Decodable {
   let certDer: String
-  let keyPkcs8: String
+  let keySeed: String
 }
 
 struct PublicKeysResponse: Encodable {
@@ -81,7 +85,7 @@ struct SignaturesResponse: Encodable {
 
 struct SessionResponse: Encodable {
   let certDer: String
-  let keyPkcs8: String
+  let keySeed: String
 }
 
 /// Rejection codes the Rust side maps to `Error` variants.
@@ -102,7 +106,9 @@ enum Item: String, CaseIterable {
   case stepUpEcdsa = "stepup-ecdsa-p256"
   case stepUpMldsa = "stepup-mldsa-65"
   case sessionCert = "session-cert-der"
-  case sessionKey = "session-key-pkcs8"
+  /// The 32-byte seed of the ML-DSA-65 session key, opaque to this
+  /// side; the Rust side derives the key from it.
+  case sessionKey = "session-key-seed"
 
   static let service = "com.pktstorm.headstate.companion.keys"
 
@@ -248,7 +254,7 @@ class HeadstateKeysPlugin: Plugin {
   @objc public func storeSession(_ invoke: Invoke) throws {
     let args = try invoke.parseArgs(StoreSessionArgs.self)
     guard let cert = Data(base64Encoded: args.certDer),
-      let key = Data(base64Encoded: args.keyPkcs8)
+      let key = Data(base64Encoded: args.keySeed)
     else {
       invoke.reject("session identity is not base64", code: Code.malformed)
       return
@@ -264,7 +270,7 @@ class HeadstateKeysPlugin: Plugin {
       return
     }
     invoke.resolve(
-      SessionResponse(certDer: cert.base64EncodedString(), keyPkcs8: key.base64EncodedString()))
+      SessionResponse(certDer: cert.base64EncodedString(), keySeed: key.base64EncodedString()))
   }
 
   // MARK: Helpers

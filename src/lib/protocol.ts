@@ -7,7 +7,11 @@
 /// pairing payload, recorded in the design spec, never a side effect of
 /// a release: the desktop accepts any phone at or below its own version,
 /// so raising this number is what turns an older desktop away.
-export const REQUIRED_PROTOCOL_VERSION = 1;
+///
+/// 2: both TLS certificates are ML-DSA-65 (#521). A 5.0 desktop
+/// (protocol 1) is refused at the TLS handshake before `/v1/hello` can
+/// say so; this is what makes the banner name the version it needs.
+export const REQUIRED_PROTOCOL_VERSION = 2;
 
 /// Whether the paired desktop is too old for this phone.
 ///

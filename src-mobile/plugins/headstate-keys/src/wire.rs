@@ -11,7 +11,10 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, PublicKeys, Result, SessionIdentity, Signatures};
+use crate::{
+    session_from_seed, Error, PublicKeys, Result, SessionIdentity, SessionSeed, Signatures,
+    SESSION_SEED_LEN,
+};
 
 /// ECDSA P-256 public key: SEC1 uncompressed, `0x04 || x || y`.
 pub const ECDSA_P256_LEN: usize = 65;
@@ -52,11 +55,13 @@ pub struct WireSignatures {
 }
 
 /// Both directions: `storeSession` sends it, `loadSession` returns it.
+/// The certificate DER and the 32-byte seed of the ML-DSA-65 session
+/// key -- never a PKCS#8; the native sides keep both as opaque bytes.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WireSession {
     pub cert_der: String,
-    pub key_pkcs8: String,
+    pub key_seed: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -136,27 +141,31 @@ impl WireSignatures {
     }
 }
 
+/// The session seed out of its base64, exactly [`SESSION_SEED_LEN`]
+/// bytes.
+pub fn decode_seed(b64: &str) -> Result<SessionSeed> {
+    let bytes = decode_exact("session seed", b64, SESSION_SEED_LEN)?;
+    let mut seed = [0u8; SESSION_SEED_LEN];
+    seed.copy_from_slice(&bytes);
+    Ok(seed)
+}
+
 impl WireSession {
-    pub fn from_identity(id: &SessionIdentity) -> Self {
+    pub fn from_parts(cert_der: &[u8], seed: &SessionSeed) -> Self {
         Self {
-            cert_der: encode(&id.cert_der),
-            key_pkcs8: encode(&id.key_pkcs8),
+            cert_der: encode(cert_der),
+            key_seed: encode(seed),
         }
     }
 
     pub fn into_identity(self) -> Result<SessionIdentity> {
         let cert_der = decode("session certificate", &self.cert_der)?;
-        let key_pkcs8 = decode("session key", &self.key_pkcs8)?;
-        // DER SEQUENCE, the outermost tag of both a Certificate and a
-        // PrivateKeyInfo. Cheap, and it catches a swapped or empty field.
-        for (what, bytes) in [("certificate", &cert_der), ("key", &key_pkcs8)] {
-            if bytes.first() != Some(&0x30) {
-                return Err(Error::Malformed(format!("session {what} is not DER")));
-            }
+        // DER SEQUENCE, the outermost tag of a Certificate. Cheap, and
+        // it catches a swapped or empty field.
+        if cert_der.first() != Some(&0x30) {
+            return Err(Error::Malformed("session certificate is not DER".into()));
         }
-        Ok(SessionIdentity {
-            cert_der,
-            key_pkcs8,
-        })
+        let seed = decode_seed(&self.key_seed)?;
+        session_from_seed(&seed, cert_der)
     }
 }

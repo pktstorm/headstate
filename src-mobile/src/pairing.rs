@@ -3,7 +3,8 @@
 //!
 //! The wire is the desktop's `remote/pairing.rs`:
 //!
-//! - QR payload `{v, name, addrs, port, fp, token, exp}`; `v` is 1; `fp`
+//! - QR payload `{v, name, addrs, port, fp, token, exp}`; `v` is 2 (the
+//!   wire protocol version; a 1, from a 5.0 desktop, is refused); `fp`
 //!   is `sha256:<64 lowercase hex>`; `token` is 32 bytes base64url
 //!   unpadded; `exp` is Unix seconds.
 //! - `POST /v1/pair` body `{token, device_name, signing_keys:
@@ -36,7 +37,11 @@ use crate::store::{get_json, put_json, Store, StoreError};
 pub const DESKTOPS_KEY: &str = "desktops";
 
 const TOKEN_LEN: usize = 32;
-const QR_VERSION: u8 = 1;
+/// The one `v` this build pairs with: the desktop's `PROTOCOL_VERSION`,
+/// as the spec says ("the same integer is the QR's `v`"). Exactly, not
+/// at-least: a QR from a newer desktop describes a pairing this phone
+/// does not know how to complete.
+const QR_VERSION: u8 = 2;
 
 /// One paired desktop, as persisted. Newest first in the list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,7 +326,7 @@ mod tests {
 
     fn qr(overrides: Value) -> String {
         let mut v = json!({
-            "v": 1,
+            "v": 2,
             "name": "octocat's laptop",
             "addrs": ["192.0.2.10", "100.64.0.7"],
             "port": 41919,
@@ -338,6 +343,12 @@ mod tests {
     }
 
     use serde_json::Value;
+
+    /// One integer on the wire, two constants in the code.
+    #[test]
+    fn the_qr_version_is_the_protocol_version() {
+        assert_eq!(u32::from(QR_VERSION), crate::client::PROTOCOL_VERSION);
+    }
 
     #[test]
     fn the_spec_qr_parses() {
@@ -361,7 +372,10 @@ mod tests {
             Err(PairingError::BadQr(m)) => m,
             other => panic!("expected BadQr for {over}, got {other:?}"),
         };
-        assert!(bad(json!({"v": 2})).contains("version 2"));
+        // A 5.0 desktop's QR (P-256 certificates, protocol 1) and a
+        // future one alike: only this build's version pairs.
+        assert!(bad(json!({"v": 1})).contains("version 1"));
+        assert!(bad(json!({"v": 3})).contains("version 3"));
         assert!(bad(json!({"name": "  "})).contains("name"));
         assert!(bad(json!({"addrs": []})).contains("addresses"));
         assert!(bad(json!({"port": 0})).contains("port"));
@@ -542,7 +556,7 @@ mod tests {
 
         let hello = Hello {
             desktop_version: "9.9.9".into(),
-            protocol_version: 1,
+            protocol_version: 2,
             viewer_login: Some("octocat".into()),
         };
         record_hello(store.as_ref(), &server.fp, &hello).unwrap();

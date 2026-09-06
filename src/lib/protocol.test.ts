@@ -2,11 +2,12 @@ import { describe, expect, it } from "vitest";
 import { REQUIRED_PROTOCOL_VERSION, desktopTooOld } from "./protocol";
 
 describe("desktopTooOld", () => {
-  it("requires protocol 1, the version the desktop listener ships", () => {
+  it("requires protocol 2, the version the desktop listener ships", () => {
     // Pinned on purpose: a bump is a spec change (design spec,
     // "Versioning and compatibility"), so this test should be edited
-    // alongside it, not by accident.
-    expect(REQUIRED_PROTOCOL_VERSION).toBe(1);
+    // alongside it, not by accident. 2 is the ML-DSA-65 certificates
+    // (#521): a 5.0 desktop on protocol 1 must trip the banner.
+    expect(REQUIRED_PROTOCOL_VERSION).toBe(2);
   });
 
   it("is false for a desktop at exactly the required version", () => {

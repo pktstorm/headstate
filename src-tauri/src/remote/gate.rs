@@ -24,7 +24,7 @@
 use crate::commands::db_path;
 use crate::remote::discovery::Advertisement;
 use crate::remote::events::{Hub, SnapshotSource};
-use crate::remote::identity::{self, Identity, PlatformStore};
+use crate::remote::identity::{self, FileStore, Identity, PlatformStore};
 use crate::remote::listener::{
     self, CommandHost, Handle, ListenerConfig, PairedCerts, ViewerLookup, PORT,
 };
@@ -299,9 +299,15 @@ fn snapshot_source(app: &AppHandle) -> SnapshotSource {
     })
 }
 
-/// Where the Linux fallback file goes; see `PlatformStore`.
+/// Where the Linux fallback file for the seed goes; see `PlatformStore`.
 fn fallback_path(app: &AppHandle) -> std::path::PathBuf {
     db_path(app).with_file_name("remote-identity.json")
+}
+
+/// Where the certificate goes, on every platform: it is public, and too
+/// large for a Windows credential. See `remote/identity.rs`.
+fn certificate_path(app: &AppHandle) -> std::path::PathBuf {
+    db_path(app).with_file_name("remote-identity.crt")
 }
 
 async fn load_identity(app: &AppHandle) -> Result<Identity, String> {
@@ -310,12 +316,15 @@ async fn load_identity(app: &AppHandle) -> Result<Identity, String> {
         return Ok(id.clone());
     }
     let store = PlatformStore::new(fallback_path(app));
+    let certificate = FileStore::new(certificate_path(app));
     // Keychain access is synchronous and may wait on a user prompt;
     // keep it off the async workers.
-    let id = tauri::async_runtime::spawn_blocking(move || identity::load_or_create(&store))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
+    let id = tauri::async_runtime::spawn_blocking(move || {
+        identity::load_or_create(&store, &certificate)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
     // A concurrent load may have won; either copy is the same identity.
     Ok(remote.identity.get_or_init(|| id).clone())
 }

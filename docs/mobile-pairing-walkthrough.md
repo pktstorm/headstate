@@ -68,6 +68,15 @@ committed run record.
       and **Paired devices** reading *No phones paired yet.* If a device
       from an earlier run is listed, revoke it first so the run starts
       from nothing.
+- [ ] If the desktop was upgraded from 5.0 (protocol 1) rather than
+      installed fresh: this version moves both TLS certificates to
+      ML-DSA-65 (protocol 2, #521). The upgrade clears **Paired devices**
+      on its own and the desktop makes a new identity -- a new
+      fingerprint -- the first time phone connections are enabled, so
+      **every phone must pair again**; a 5.0 companion sees the new
+      desktop as unreachable, and a 5.0 desktop shows this companion the
+      *Update Headstate on your desktop* banner. Expect the desktop log
+      to say the pre-5.1 identity was replaced, once.
 - [ ] A throwaway git worktree exists on the desktop for the destructive
       step, for example a worktree of `octocat/hello-world` on a branch named
       `walkthrough-scratch`. It must contain nothing you want to keep.
