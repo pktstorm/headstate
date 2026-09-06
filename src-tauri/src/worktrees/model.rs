@@ -11,7 +11,7 @@ pub struct Repo {
     /// request; None means no pairing rather than a fuzzy one.
     #[serde(default)]
     pub identity: Option<String>,
-    /// Directory name, e.g. `enc-api`.
+    /// Directory name, e.g. `octo-api`.
     pub name: String,
     /// Absolute path to the main checkout.
     pub path: String,

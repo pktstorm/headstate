@@ -978,15 +978,15 @@ mod tests {
     use super::*;
 
     const SAMPLE: &str = "\
-worktree /home/u/code/enc-api
+worktree /home/u/code/octo-api
 HEAD 3d2216e643c827fb1dfad5c3fa58d9a14421e236
 branch refs/heads/main
 
-worktree /home/u/code/enc-api-35b
+worktree /home/u/code/octo-api-35b
 HEAD 48fa2124c6fd90bc07881e32037db99ce5b194c4
 branch refs/heads/chore-remove-dead
 
-worktree /home/u/code/enc-api-detached
+worktree /home/u/code/octo-api-detached
 HEAD 8ed50a741e1696d1a0c9506f2e033cf2887bb144
 ";
 
@@ -994,7 +994,7 @@ HEAD 8ed50a741e1696d1a0c9506f2e033cf2887bb144
     fn parses_every_record() {
         let w = parse_porcelain(SAMPLE);
         assert_eq!(w.len(), 3);
-        assert_eq!(w[1].path, "/home/u/code/enc-api-35b");
+        assert_eq!(w[1].path, "/home/u/code/octo-api-35b");
         assert_eq!(w[1].branch, "chore-remove-dead");
         assert_eq!(w[1].head, "48fa2124c6fd90bc07881e32037db99ce5b194c4");
     }
@@ -2614,10 +2614,17 @@ mod live {
         }
 
         /// Against the REAL directories that prompted #356.
+        ///
+        /// Takes `HEADSTATE_REPO_DIR` rather than a literal path: this
+        /// is a public repository, and a checkout path names the
+        /// projects on the machine that ran it.
         #[test]
         #[ignore]
         fn live_orphans_in_the_code_directory() {
-            let base = format!("{}/code/enclave", std::env::var("HOME").unwrap());
+            let Ok(base) = std::env::var("HEADSTATE_REPO_DIR") else {
+                println!("set HEADSTATE_REPO_DIR to a directory of repositories to run this");
+                return;
+            };
             if !Path::new(&base).is_dir() {
                 println!("no such directory; nothing to check");
                 return;
@@ -2832,14 +2839,24 @@ mod live {
         }
     }
 
-    /// #343, against the REAL worktree that produced the report: a
-    /// branch merged as PR #164 through a squash-merge queue, which
-    /// both ancestry and `git cherry` call unmerged.
+    /// #343, against a REAL worktree rather than a fixture: a branch
+    /// merged through a squash-merge queue, which both ancestry and
+    /// `git cherry` call unmerged.
+    ///
+    /// Takes the path from `HEADSTATE_SQUASHED_WORKTREE` rather than
+    /// hardcoding one, for the reason `a_yarn_berry_project_reports_updates`
+    /// takes `HEADSTATE_YARN_REPO`: the worktree that produced the
+    /// original report is on one machine, and this is a public
+    /// repository where a real checkout path is exactly what
+    /// CONTRIBUTING.md's privacy rule keeps out.
     #[test]
     #[ignore]
     fn live_squash_merged_worktree_is_detected() {
-        let wt = std::path::Path::new(&std::env::var("HOME").unwrap())
-            .join("code/enclave/stohic-admin/.claude/worktrees/stohic-mcp-pr2-transport");
+        let Ok(path) = std::env::var("HEADSTATE_SQUASHED_WORKTREE") else {
+            println!("set HEADSTATE_SQUASHED_WORKTREE to a squash-merged worktree to run this");
+            return;
+        };
+        let wt = std::path::PathBuf::from(path);
         if !wt.is_dir() {
             println!("worktree absent; nothing to check");
             return;
