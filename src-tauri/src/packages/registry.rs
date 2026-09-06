@@ -542,6 +542,10 @@ mod tests {
     /// the wizard refuses to select. Dropping it instead would tell the
     /// user their dependency list is shorter than it is: `src-mobile`
     /// depends on two in-repo plugins exactly this way.
+    ///
+    /// The alternative-registry row is here for a sharper reason: that
+    /// lookup would not merely fail, it would send a private crate name
+    /// to a public host.
     #[test]
     fn a_cargo_path_dependency_is_never_looked_up_and_never_dropped() {
         use super::super::model::{Bump, Ecosystem, EcosystemReport, Outdated, ProjectReport};
@@ -559,6 +563,10 @@ mod tests {
                 "Cargo.toml [dependencies] (path dependency)",
             ),
             row("forked-thing", "Cargo.toml [dependencies] (git dependency)"),
+            row(
+                "internal-thing",
+                "Cargo.toml [dependencies] (alternative registry)",
+            ),
         ];
         // None of them is a row enrichment would ask about.
         for o in &rows {
@@ -581,7 +589,7 @@ mod tests {
         apply_found(&mut reports, &Default::default());
 
         let out = &reports[0].reports[0].outdated;
-        assert_eq!(out.len(), 2, "none is dropped");
+        assert_eq!(out.len(), 3, "none is dropped");
         for o in out {
             assert_eq!(o.latest, o.current, "{}: no update claimed", o.name);
             assert_eq!(o.bump, Bump::Unknown, "{}", o.name);

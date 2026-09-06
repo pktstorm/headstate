@@ -84,17 +84,22 @@ pub struct Declared {
 
 /// Where a dependency's code comes from.
 ///
-/// The distinction that decides comparability. A registry crate has a
-/// published version list; a path or git dependency has none, and there
-/// is no honest answer to "is there a newer one".
+/// The distinction that decides comparability. A crates.io crate has a
+/// published version list this can ask for; a path or git dependency
+/// has none, and an alternative registry has one this cannot reach. In
+/// all three of the latter cases there is no honest answer to "is there
+/// a newer one".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
-    /// From a registry -- crates.io unless `registry` says otherwise.
+    /// From crates.io, the only registry this can ask.
     Registry,
     /// A sibling crate in this repository.
     Path,
     /// A git dependency, by branch, tag or revision.
     Git,
+    /// A registry that is not crates.io. Has a published version list,
+    /// but not one this knows how to ask for.
+    Other,
 }
 
 /// Every crate this project declares, across every dependency table.
@@ -387,6 +392,21 @@ fn classify(spec: &toml::Value) -> Source {
     if t.contains_key("git") {
         return Source::Git;
     }
+    // An ALTERNATIVE registry is not crates.io, and this only knows how
+    // to ask crates.io.
+    //
+    // The lookup would 404 harmlessly in the ordinary case, but the
+    // request itself is the problem: a company's private crate names
+    // are not something to send to a public host in order to find out
+    // it has never heard of them. `swift.rs` refuses non-GitHub hosts
+    // for the same reason rather than guessing an API shape for them.
+    //
+    // Reported as `Other` and shown as uncomparable, not dropped -- it
+    // is a real dependency, and the honest answer is "this exists and
+    // is not checked here".
+    if t.contains_key("registry") || t.contains_key("registry-index") {
+        return Source::Other;
+    }
     Source::Registry
 }
 
@@ -509,6 +529,7 @@ fn manifest_label(d: &Declared) -> String {
         Source::Registry => String::new(),
         Source::Path => " (path dependency)".to_string(),
         Source::Git => " (git dependency)".to_string(),
+        Source::Other => " (alternative registry)".to_string(),
     };
     format!("Cargo.toml [{table}]{source}")
 }
@@ -523,6 +544,7 @@ pub fn is_registry_row(o: &Outdated) -> bool {
     o.ecosystem == Ecosystem::Cargo
         && !o.manifest.contains("(path dependency)")
         && !o.manifest.contains("(git dependency)")
+        && !o.manifest.contains("(alternative registry)")
 }
 
 /// The sparse-index path for a crate name.
@@ -964,6 +986,41 @@ not json at all
         assert_eq!(src("forked"), Source::Git);
         // Same reasoning for git.
         assert_eq!(src("tagged"), Source::Git);
+    }
+
+    /// A crate from an ALTERNATIVE registry is not sent to crates.io.
+    ///
+    /// The lookup would 404 harmlessly, but the request itself is the
+    /// problem: a company's private crate names are not something to
+    /// send to a public host in order to learn it has never heard of
+    /// them. `swift.rs` refuses non-GitHub hosts for the same reason.
+    #[test]
+    fn an_alternative_registry_crate_is_not_sent_to_crates_io() {
+        let t = project(&[
+            (
+                "Cargo.toml",
+                r#"
+                [package]
+                name = "app"
+                [dependencies]
+                internal-thing = { version = "1.0", registry = "company-internal" }
+                serde = "1"
+                "#,
+            ),
+            (
+                "Cargo.lock",
+                "[[package]]\nname = \"internal-thing\"\nversion = \"1.0.3\"\n[[package]]\nname = \"serde\"\nversion = \"1.0.228\"",
+            ),
+        ]);
+        let rows = pinned(t.path());
+        let row = |n: &str| rows.iter().find(|r| r.name == n).unwrap();
+        // Reported -- it is a real dependency -- but never looked up.
+        assert!(row("internal-thing")
+            .manifest
+            .contains("(alternative registry)"));
+        assert!(!is_registry_row(row("internal-thing")));
+        // And the ordinary crate beside it is unaffected.
+        assert!(is_registry_row(row("serde")));
     }
 
     /// `foo = { package = "bar" }` renames a crate locally. The REGISTRY
