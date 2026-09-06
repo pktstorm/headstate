@@ -53,6 +53,52 @@ pub fn bump(current: &str, latest: &str) -> Bump {
     Bump::Unknown
 }
 
+/// Whether `latest` is strictly newer than `current`.
+///
+/// `None` means the two are NOT COMPARABLE, and that is a distinct
+/// answer from `Some(false)` rather than a failure to produce one. A
+/// caller may act on `Some(false)`; it must never act on `None`.
+///
+/// This exists because a tool's `latest` column is not always newer.
+/// `npm outdated --json` reported `jsdom` as `current 30.0.1,
+/// latest 29.1.1` while the registry's own `latest` dist-tag was
+/// 30.0.1 -- npm appears to report the newest release satisfying an
+/// engine constraint it computed, but the column is still labelled
+/// `latest`. Passed through, that offers a DOWNGRADE as an update.
+///
+/// Built on `numeric_parts`, the same function `bump` uses, so the two
+/// agree BY CONSTRUCTION rather than by two parsers happening to match.
+/// The guarantee callers rely on: `is_newer` answers `Some(false)`
+/// exactly where `bump` answers `Unknown` for a backwards jump, and
+/// `None` everywhere else `bump` answers `Unknown`. So dropping the
+/// `Some(false)` rows can never remove a row `bump` classified as a
+/// real upgrade, and never removes an uncomparable one.
+///
+/// EQUAL numeric parts are `None`, not `Some(false)`. That is the
+/// pre-release case: `1.0rc1` and `1.0` have the same numeric parts and
+/// the suffix decides an ordering this cannot see, so "we cannot tell"
+/// is the honest answer -- the same one `bump` gives. An identical pair
+/// (`1.2.3` to `1.2.3`) lands there too, which is right: it is not an
+/// update, but it is also not a tool reporting a downgrade, and the
+/// rows that legitimately carry `latest == current` (a Terraform
+/// provider whose registry lookup failed) must keep showing.
+pub fn is_newer(current: &str, latest: &str) -> Option<bool> {
+    let (a, b) = (numeric_parts(current)?, numeric_parts(latest)?);
+    // Missing components are zero, exactly as in `bump`, so `1.2` and
+    // `1.2.0` compare equal rather than as a backwards jump.
+    let len = a.len().max(b.len());
+    for i in 0..len {
+        let (x, y) = (
+            a.get(i).copied().unwrap_or(0),
+            b.get(i).copied().unwrap_or(0),
+        );
+        if x != y {
+            return Some(y > x);
+        }
+    }
+    None
+}
+
 /// The leading dotted numeric components of a version string.
 ///
 /// Returns None when there is nothing comparable, which is what produces
@@ -167,5 +213,146 @@ mod tests {
     #[test]
     fn a_prerelease_suffix_does_not_produce_a_confident_answer() {
         assert_eq!(bump("1.0rc1", "1.0"), Bump::Unknown);
+    }
+
+    // ---- is_newer -------------------------------------------------
+    //
+    // The filter `bump` never had. `bump` classifies the SIZE of a jump
+    // and answers `Unknown` for anything it cannot place; `is_newer`
+    // answers the narrower question of DIRECTION, and its `None` is the
+    // line between a row that gets dropped and one that keeps showing.
+
+    #[test]
+    fn is_newer_reads_the_ordinary_direction() {
+        assert_eq!(is_newer("1.2.3", "2.0.0"), Some(true));
+        assert_eq!(is_newer("1.2.3", "1.3.0"), Some(true));
+        assert_eq!(is_newer("1.2.3", "1.2.4"), Some(true));
+    }
+
+    /// The jsdom case, in its real shape: npm's `latest` column was
+    /// OLDER than the version installed.
+    #[test]
+    fn is_newer_catches_the_backwards_jump_npm_reported() {
+        assert_eq!(is_newer("30.0.1", "29.1.1"), Some(false));
+        assert_eq!(is_newer("2.0.0", "1.9.9"), Some(false));
+        assert_eq!(is_newer("1.2.3", "1.2.2"), Some(false));
+    }
+
+    /// The same prefixes `bump` strips, stripped the same way -- they
+    /// share `numeric_parts`, and this pins that they agree.
+    #[test]
+    fn is_newer_strips_range_and_v_prefixes() {
+        assert_eq!(is_newer("v1.2.4", "v1.2.3"), Some(false));
+        assert_eq!(is_newer("^1.2.3", "1.3.0"), Some(true));
+        assert_eq!(is_newer("~2.0.0", "1.0.0"), Some(false));
+    }
+
+    /// PEP 440 epochs and local versions, as `bump` handles them: the
+    /// epoch drops to the release segment, and the local version is not
+    /// ordering information.
+    #[test]
+    fn is_newer_handles_pep440_shapes() {
+        assert_eq!(is_newer("1!2.0", "1!1.0"), Some(false));
+        assert_eq!(is_newer("1!1.0", "1!2.0"), Some(true));
+        assert_eq!(is_newer("1.1+other", "1.0+local"), Some(false));
+    }
+
+    /// .NET's fourth component takes part in the comparison rather than
+    /// being ignored, so a revision downgrade is still backwards.
+    #[test]
+    fn is_newer_compares_four_part_dotnet_versions() {
+        assert_eq!(is_newer("1.2.3.5", "1.2.3.4"), Some(false));
+        assert_eq!(is_newer("1.2.3.4", "1.2.3.5"), Some(true));
+    }
+
+    /// Missing components are zero, so `1.2.0` to `1.2` is not a
+    /// backwards jump -- it is the same version.
+    #[test]
+    fn is_newer_treats_a_missing_component_as_zero() {
+        assert_eq!(is_newer("1.2.0", "1.2"), None, "the same version");
+        assert_eq!(is_newer("1.2", "1.2.1"), Some(true));
+        assert_eq!(is_newer("2", "1"), Some(false));
+    }
+
+    /// THE LINE. Nothing comparable means `None`, never `Some(false)`:
+    /// a caller that drops backwards rows must not drop these, because
+    /// "we cannot tell" is the answer this design deliberately keeps.
+    #[test]
+    fn an_uncomparable_pair_is_none_not_a_confident_backwards_answer() {
+        assert_eq!(is_newer("", "1.0.0"), None, "an empty current");
+        assert_eq!(is_newer("1.0.0", ""), None, "an empty latest");
+        assert_eq!(is_newer("latest", "1.0.0"), None);
+        assert_eq!(is_newer("1.0.0", "not-a-version"), None);
+        assert_eq!(is_newer("*", "2.0.0"), None);
+        // A bare git revision, which is how a branch-pinned Swift
+        // package reports its version.
+        assert_eq!(is_newer("f2a1c4d", "1.0.0"), None);
+    }
+
+    /// A revision that HAPPENS to start with a digit is the one input
+    /// this cannot see through: `numeric_parts` reads `9f2a1c4` as `9`,
+    /// so both `is_newer` and `bump` treat it as a version. That is a
+    /// property of `numeric_parts` rather than of these two functions,
+    /// and it is pinned here so a caller knows not to rely on the
+    /// version comparison to recognise a revision.
+    ///
+    /// Nothing acts on it: Swift is the only ecosystem that reports
+    /// revisions, and `run::keep` never filters Swift rows, precisely
+    /// because a revision is not a version to compare.
+    #[test]
+    fn a_revision_starting_with_a_digit_is_not_recognised_as_one() {
+        assert_eq!(is_newer("9f2a1c4", "1.0.0"), Some(false));
+        assert_eq!(bump("9f2a1c4", "1.0.0"), Bump::Unknown);
+    }
+
+    /// A pre-release suffix orders BEFORE the release, which numeric
+    /// comparison cannot see -- so it is `None`, not `Some(false)`.
+    /// Dropping it as a downgrade would hide a row the user should see.
+    #[test]
+    fn a_prerelease_suffix_is_uncomparable_not_backwards() {
+        assert_eq!(is_newer("1.0rc1", "1.0"), None);
+        assert_eq!(is_newer("1.0", "1.0rc1"), None);
+    }
+
+    /// An identical pair is not an update, and it is not a downgrade
+    /// either. `registry::enrich` deliberately leaves a row at
+    /// `latest == current` when a lookup fails, and that row must
+    /// survive the filter.
+    #[test]
+    fn an_equal_pair_is_none_so_a_failed_lookup_still_shows() {
+        assert_eq!(is_newer("1.2.3", "1.2.3"), None);
+    }
+
+    /// `is_newer` and `bump` share `numeric_parts`, and this pins the
+    /// contract the parsers rely on: every pair `is_newer` calls
+    /// `Some(false)` is one `bump` calls `Unknown`, and every pair
+    /// `bump` places as a real jump is one `is_newer` calls
+    /// `Some(true)`.
+    #[test]
+    fn is_newer_and_bump_never_disagree() {
+        let pairs = [
+            ("1.2.3", "2.0.0"),
+            ("1.2.3", "1.2.2"),
+            ("30.0.1", "29.1.1"),
+            ("1.0rc1", "1.0"),
+            ("1.2.3", "1.2.3"),
+            ("latest", "1.0.0"),
+            ("1.2.3.4", "1.2.3.5"),
+            ("1!2.0", "1!1.0"),
+        ];
+        for (current, latest) in pairs {
+            match is_newer(current, latest) {
+                Some(true) => assert_ne!(
+                    bump(current, latest),
+                    Bump::Unknown,
+                    "{current} -> {latest} is newer, so bump must place it"
+                ),
+                Some(false) | None => assert_eq!(
+                    bump(current, latest),
+                    Bump::Unknown,
+                    "{current} -> {latest} is not an upgrade, so bump must say Unknown"
+                ),
+            }
+        }
     }
 }
