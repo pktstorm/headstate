@@ -147,7 +147,7 @@ function ImageRow({
   // `repository:tag`, not the tag alone.
   //
   // Docker reports Repository and Tag separately and `tags` holds only
-  // the TAG, so a row for `<registry>/enclave-api:latest` used to render
+  // the TAG, so a row for `<registry>/octocat-api:latest` used to render
   // as `latest`. On a machine with 31 images that is 31 rows saying
   // `latest` with nothing to tell them apart -- and the repository, the
   // one part that says what the image IS, was on the type the whole

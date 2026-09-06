@@ -978,15 +978,15 @@ mod tests {
     use super::*;
 
     const SAMPLE: &str = "\
-worktree /home/u/code/enc-api
+worktree /home/u/code/octo-api
 HEAD 3d2216e643c827fb1dfad5c3fa58d9a14421e236
 branch refs/heads/main
 
-worktree /home/u/code/enc-api-35b
+worktree /home/u/code/octo-api-35b
 HEAD 48fa2124c6fd90bc07881e32037db99ce5b194c4
 branch refs/heads/chore-remove-dead
 
-worktree /home/u/code/enc-api-detached
+worktree /home/u/code/octo-api-detached
 HEAD 8ed50a741e1696d1a0c9506f2e033cf2887bb144
 ";
 
@@ -994,7 +994,7 @@ HEAD 8ed50a741e1696d1a0c9506f2e033cf2887bb144
     fn parses_every_record() {
         let w = parse_porcelain(SAMPLE);
         assert_eq!(w.len(), 3);
-        assert_eq!(w[1].path, "/home/u/code/enc-api-35b");
+        assert_eq!(w[1].path, "/home/u/code/octo-api-35b");
         assert_eq!(w[1].branch, "chore-remove-dead");
         assert_eq!(w[1].head, "48fa2124c6fd90bc07881e32037db99ce5b194c4");
     }
@@ -2614,10 +2614,17 @@ mod live {
         }
 
         /// Against the REAL directories that prompted #356.
+        ///
+        /// Takes `HEADSTATE_REPO_DIR` rather than a literal path: this
+        /// is a public repository, and a checkout path names the
+        /// projects on the machine that ran it.
         #[test]
         #[ignore]
         fn live_orphans_in_the_code_directory() {
-            let base = format!("{}/code/enclave", std::env::var("HOME").unwrap());
+            let Ok(base) = std::env::var("HEADSTATE_REPO_DIR") else {
+                println!("set HEADSTATE_REPO_DIR to a directory of repositories to run this");
+                return;
+            };
             if !Path::new(&base).is_dir() {
                 println!("no such directory; nothing to check");
                 return;

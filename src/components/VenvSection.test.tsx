@@ -36,8 +36,8 @@ vi.mock("../api/hooks", () => ({
 import { VenvSection } from "./VenvSection";
 
 const venv = (over: Partial<Venv> = {}): Venv => ({
-  path: "/cache/mls-delivery-service-AAAAAAAA-py3.13",
-  project: "mls-delivery-service",
+  path: "/cache/hello-world-delivery-AAAAAAAA-py3.13",
+  project: "hello-world-delivery",
   state: "orphaned",
   source: null,
   size_bytes: null,
@@ -59,16 +59,16 @@ describe("VenvSection on a phone", () => {
 
   it("stacks each row, keeping project, state, source, age and size", () => {
     stubViewport(390);
-    const v = venv({ source: "/code/mls-delivery-service", state: "stale" });
+    const v = venv({ source: "/code/hello-world-delivery", state: "stale" });
     state.venvs = [v];
     state.sizes = new Map([[v.path, 1024]]);
     state.idle = new Map([[v.path, 86_400 * 3]]);
     render(<VenvSection />);
     const row = screen.getByRole("checkbox").closest("li") as HTMLElement;
     expect(row.className).toContain("flex-col");
-    expect(within(row).getByText("mls-delivery-service")).toBeTruthy();
+    expect(within(row).getByText("hello-world-delivery")).toBeTruthy();
     expect(within(row).getByText("stale")).toBeTruthy();
-    expect(within(row).getByText("/code/mls-delivery-service")).toBeTruthy();
+    expect(within(row).getByText("/code/hello-world-delivery")).toBeTruthy();
     expect(within(row).getByText("3 days ago")).toBeTruthy();
     expect(within(row).getByText("1.0 KB")).toBeTruthy();
     fireEvent.click(within(row).getByRole("checkbox"));
@@ -84,7 +84,7 @@ describe("VenvSection on a phone", () => {
     const row = screen.getByRole("checkbox").closest("li") as HTMLElement;
     expect(row.className).not.toContain("flex-col");
     expect(within(row).getByText("1.0 KB").parentElement).toBe(row);
-    expect(within(row).getByText("mls-delivery-service").parentElement).toBe(row);
+    expect(within(row).getByText("hello-world-delivery").parentElement).toBe(row);
   });
 });
 
@@ -105,13 +105,13 @@ describe("VenvSection", () => {
     state.venvs = [
       venv(),
       venv({
-        path: "/cache/cm-backend-BBBBBBBB-py3.13",
-        project: "cm-backend",
+        path: "/cache/octo-backend-BBBBBBBB-py3.13",
+        project: "octo-backend",
         state: "live",
-        source: "/code/cm-backend",
+        source: "/code/octo-backend",
       }),
     ];
-    state.idle = new Map([["/cache/cm-backend-BBBBBBBB-py3.13", 416 * 86400]]);
+    state.idle = new Map([["/cache/octo-backend-BBBBBBBB-py3.13", 416 * 86400]]);
     render(<VenvSection />);
 
     const boxes = screen.getAllByRole("checkbox");
@@ -127,13 +127,13 @@ describe("VenvSection", () => {
   it("labels a long-idle venv as stale, not live", () => {
     state.venvs = [
       venv({
-        path: "/cache/cm-backend-BBBBBBBB-py3.13",
-        project: "cm-backend",
+        path: "/cache/octo-backend-BBBBBBBB-py3.13",
+        project: "octo-backend",
         state: "live",
-        source: "/code/cm-backend",
+        source: "/code/octo-backend",
       }),
     ];
-    state.idle = new Map([["/cache/cm-backend-BBBBBBBB-py3.13", 416 * 86400]]);
+    state.idle = new Map([["/cache/octo-backend-BBBBBBBB-py3.13", 416 * 86400]]);
     render(<VenvSection />);
     expect(screen.getByText("stale")).toBeTruthy();
   });
@@ -141,13 +141,13 @@ describe("VenvSection", () => {
   it("keeps a recently used venv live", () => {
     state.venvs = [
       venv({
-        path: "/cache/enclave-mcp-CCCCCCCC-py3.13",
-        project: "enclave-mcp",
+        path: "/cache/octocat-mcp-CCCCCCCC-py3.13",
+        project: "octocat-mcp",
         state: "live",
-        source: "/code/enclave-mcp",
+        source: "/code/octocat-mcp",
       }),
     ];
-    state.idle = new Map([["/cache/enclave-mcp-CCCCCCCC-py3.13", 3 * 3600]]);
+    state.idle = new Map([["/cache/octocat-mcp-CCCCCCCC-py3.13", 3 * 3600]]);
     render(<VenvSection />);
     expect(screen.getByText("live")).toBeTruthy();
   });
@@ -320,7 +320,7 @@ describe("selecting a stale virtualenv", () => {
   it("always offers an orphan", () => {
     state.venvs = [venv()];
     render(<VenvSection />);
-    const box = screen.getByLabelText("Select mls-delivery-service virtualenv");
+    const box = screen.getByLabelText("Select hello-world-delivery virtualenv");
     expect(box.hasAttribute("disabled")).toBe(false);
   });
 });
@@ -387,7 +387,7 @@ describe("age on a virtualenv row", () => {
   it("shows how long ago the virtualenv was last written", () => {
     state.venvs = [venv()];
     state.idle = new Map([
-      ["/cache/mls-delivery-service-AAAAAAAA-py3.13", 60 * 60 * 24 * 270],
+      ["/cache/hello-world-delivery-AAAAAAAA-py3.13", 60 * 60 * 24 * 270],
     ]);
     render(<VenvSection />);
     expect(screen.getByText("9 months ago")).toBeTruthy();
@@ -428,7 +428,7 @@ describe("while the scan is running", () => {
     state.venvs = [venv()];
     state.loading = false;
     render(<VenvSection />);
-    expect(screen.getByText("mls-delivery-service")).toBeTruthy();
+    expect(screen.getByText("hello-world-delivery")).toBeTruthy();
     expect(screen.queryByText(/looking for poetry/i)).toBeNull();
   });
 });

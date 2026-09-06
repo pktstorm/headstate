@@ -466,7 +466,7 @@ export type VenvState = "orphaned" | "stale" | "live";
 /// One Poetry virtualenv.
 export interface Venv {
   path: string;
-  /// The project name Poetry encoded, e.g. `mls-delivery-service`.
+  /// The project name Poetry encoded, e.g. `hello-world-delivery`.
   project: string;
   state: VenvState;
   /// The directory that produced it. Null for an orphan -- that IS the

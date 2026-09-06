@@ -204,7 +204,7 @@ mod tests {
 
     /// The user's own correction, and the reason `Stale` exists at all:
     ///
-    /// > cm-backend is a great example - I stopped working on that a year
+    /// > octo-backend is a great example - I stopped working on that a year
     /// > ago and definitely would want to clean up that cache
     ///
     /// Its directory still exists, so a pure orphan check PROTECTS it.

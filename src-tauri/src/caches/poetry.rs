@@ -45,7 +45,7 @@ pub enum VenvState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Venv {
     pub path: String,
-    /// The project name Poetry encoded, e.g. `mls-delivery-service`.
+    /// The project name Poetry encoded, e.g. `hello-world-delivery`.
     pub project: String,
     pub state: VenvState,
     /// The directory that produced it, when one was found. None for an
@@ -151,8 +151,8 @@ mod tests {
     #[test]
     fn parses_a_plain_name() {
         assert_eq!(
-            parse_venv_name("cm-backend-Ja7MTDN0-py3.13"),
-            Some(("cm-backend".into(), "Ja7MTDN0".into()))
+            parse_venv_name("octo-backend-Ja7MTDN0-py3.13"),
+            Some(("octo-backend".into(), "Ja7MTDN0".into()))
         );
     }
 
@@ -166,8 +166,8 @@ mod tests {
             Some(("regscale-cli".into(), "HIA-2bcd".into()))
         );
         assert_eq!(
-            parse_venv_name("mls-delivery-service--GlU8mQR-py3.13"),
-            Some(("mls-delivery-service".into(), "-GlU8mQR".into()))
+            parse_venv_name("hello-world-delivery--GlU8mQR-py3.13"),
+            Some(("hello-world-delivery".into(), "-GlU8mQR".into()))
         );
     }
 
