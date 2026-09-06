@@ -34,7 +34,12 @@ afterEach(() => {
 describe("ConnectionBanner", () => {
   it("renders nothing on the desktop layout", () => {
     stubViewport(1400);
-    connection.current = { kind: "connected", desktop: "octocat's laptop", lastPoll: null, protocolVersion: 1 };
+    connection.current = {
+      kind: "connected",
+      desktop: "octocat's laptop",
+      lastPoll: null,
+      protocolVersion: REQUIRED_PROTOCOL_VERSION,
+    };
     const { container } = render(<ConnectionBanner />);
     expect(container.innerHTML).toBe("");
   });
@@ -54,7 +59,7 @@ describe("ConnectionBanner", () => {
       kind: "connected",
       desktop: "octocat's laptop",
       lastPoll: tenMinutesAgo,
-      protocolVersion: 1,
+      protocolVersion: REQUIRED_PROTOCOL_VERSION,
     };
     render(<ConnectionBanner />);
     const banner = screen.getByRole("button", { name: /octocat's laptop/ });

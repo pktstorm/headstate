@@ -85,8 +85,8 @@ src-tauri/src (desktop)
 ├── remote/
 │   ├── mod.rs        the module list
 │   ├── gate.rs       Remote state; start/stop the listener from the setting; get/set_remote_enabled
-│   ├── identity.rs   desktop P256 key pair and self-signed cert, generated once; keychain via keyring
-│   ├── listener.rs   axum over rustls/aws-lc-rs on a dual-stack socket; mTLS by fingerprint; the four routes
+│   ├── identity.rs   desktop ML-DSA-65 key pair and self-signed cert, generated once; seed in the keychain via keyring, cert in a file
+│   ├── listener.rs   axum over rustls/rustls-post-quantum on a dual-stack socket; mTLS by fingerprint; the four routes
 │   ├── pairing.rs    QR payload, token, proof, pairing-request event, approve/deny/revoke, the pairing commands
 │   ├── surface.rs    the remote allowlist: command name -> class; dispatch onto commands::*
 │   ├── stepup.rs     X-Headstate-Signature grammar, canonical bytes, hybrid verify, nonce window, notification
@@ -157,15 +157,17 @@ TLS is rustls with:
 
 - TLS 1.3 only.
 - The desktop's own self-signed certificate, generated on first enable
-  with `rcgen`, ten-year validity, private key stored in the platform keychain.
-  Headstate uses no keychain today; this is the first entry. (On Linux,
-  when no Secret Service daemon is running, a mode-0600 file stands in;
-  see *What shipped differently*.) The certificate is not tied to a
+  with `rcgen`, ten-year validity, ML-DSA-65 since protocol 2 (see
+  *Post-quantum posture*), the private key's seed stored in the platform
+  keychain and the certificate in a file beside the database. Headstate
+  used no keychain before this; this is the first entry. (On Linux, when
+  no Secret Service daemon is running, a mode-0600 file stands in; see
+  *What shipped differently*.) The certificate is not tied to a
   hostname; the phone pins the fingerprint, not the name.
 - A client certificate verifier that accepts a connection only when the
-  presented certificate's SHA256 fingerprint matches a row in
-  `paired_devices`. No CA, no chain building. Unpaired certificates fail
-  the handshake, so an attacker never reaches HTTP.
+  presented certificate is ML-DSA-65 and its SHA256 fingerprint matches a
+  row in `paired_devices`. No CA, no chain building. Unpaired
+  certificates fail the handshake, so an attacker never reaches HTTP.
 
 The HTTP surface is deliberately tiny:
 
@@ -219,8 +221,9 @@ presumably sitting in front of.
 The phone holds a session key and a signing key pair, all generated at
 pairing and all non-exportable:
 
-- A **session key**, ECDSA P256, whose certificate is the TLS client
-  identity. Usable whenever the app is open.
+- A **session key**, ML-DSA-65 since protocol 2 (ECDSA P256 in 5.0),
+  whose certificate is the TLS client identity. Usable whenever the app
+  is open.
 - A **signing key pair** used only for step-up: an ECDSA P256 key and,
   where the platform can hold one, an ML-DSA-65 key. Both are generated
   in the platform's secure hardware with biometric or device passcode
@@ -289,14 +292,68 @@ later. This design therefore:
    listings recorded off the wire today stay private.
 2. Makes the step-up signature hybrid now, because the platform keys are
    available and the cost is one extra signature on a rare request.
-3. Leaves the TLS certificates themselves on ECDSA P256 for v1. ML-DSA in
-   TLS 1.3 is still an IETF draft, and rustls is in the middle of turning
-   it on by default for its 0.23 line; the pull request to do so was
-   marked ready for review on 4 September 2026 and was open when this
-   was written. Because both ends pin the peer's fingerprint rather than
-   validating a chain, migrating the certificates later is a matter of
-   regenerating them and re-pairing, and the plan is to do that once
-   rustls ships it.
+3. Left the TLS certificates themselves on ECDSA P256 for 5.0, and moved
+   them to **ML-DSA-65 in protocol 2** (#521), on rustls' unstable path
+   rather than waiting for a release that turns it on by default. What
+   "unstable" means for us:
+
+   - rustls 0.23.43 names the ML-DSA `SignatureScheme`s (0x0904-0x0906)
+     but ships neither a signing key nor a verifier for them on that
+     line. Both come from `rustls-post-quantum` 0.2.4 built with its
+     `aws-lc-rs-unstable` feature (rustls #2579, #2997): its `provider()`
+     is the aws-lc-rs provider plus a key provider that loads ML-DSA
+     PKCS#8 and a signature-algorithm table that includes webpki's
+     ML-DSA verifiers. Both ends build every TLS config on that
+     provider and nothing else, because the plain aws-lc-rs provider
+     cannot load an ML-DSA key at all.
+   - The feature drags in `rustls-webpki/aws-lc-rs-unstable`,
+     `aws-lc-rs/unstable` and `rcgen/aws_lc_rs_unstable`, all already in
+     both lockfiles, and declares rustls with default features, so
+     `tls12` and `prefer-post-quantum` come along. `tls12` was already
+     compiled in on both ends through hyper-rustls, and both still offer
+     TLS 1.3 only; `prefer-post-quantum` only reorders aws-lc-rs's
+     default key-exchange groups, which both ends override explicitly.
+   - "Unstable" is a statement about the crate API, which may move
+     between minor versions (aws-lc-rs 1.18 already moved `PqdsaKeyPair`
+     from `unstable::signature` to `signature`), not about the
+     algorithm: FIPS 204 is final, and the X.509 and TLS codepoints are
+     the ones the IETF drafts and rustls `main` (#3237) use. The cost is
+     that a rustls or aws-lc-rs bump may need the provider code touched;
+     the pins are `rustls-post-quantum = "0.2.4"` on both ends, over the
+     rustls 0.23.43 / aws-lc-rs 1.18.1 / rustls-webpki 0.103.x / rcgen
+     0.14.10 already locked.
+   - Pure ML-DSA-65, not a hybrid: rustls has no hybrid X.509 signature
+     scheme, and the key exchange is already hybrid. ML-DSA-65 rather
+     than 44 or 87 for the reason the step-up key uses it.
+
+   Keys are minted by `rcgen` (`PKCS_ML_DSA_65`) and verified through
+   webpki's `ML_DSA_65`; the desktop's `PairedVerifier` and the phone's
+   `PinnedServer` each advertise and accept `ML_DSA_65` and nothing
+   else, so a 5.0 certificate on either end fails the handshake before
+   any fingerprint is compared. Because both ends pin fingerprints, the
+   migration is regenerate, bump `v`, re-pair: every pairing made under
+   protocol 1 is cleared by migration 7 and every phone pairs again.
+
+   **Storage, and the Windows constraint.** An ML-DSA-65 certificate is
+   5,482 bytes, and Windows Credential Manager caps a credential blob at
+   `CRED_MAX_CREDENTIAL_BLOB_SIZE` (5 * 512 = 2560 bytes, `wincred.h`),
+   so the 5.0 layout -- the whole identity as one keychain item -- would
+   fail on Windows. The private key is not the problem: aws-lc-rs 1.18
+   serialises an ML-DSA key as the seed-form PKCS#8 (54 bytes), not the
+   expanded 4 KB form. So both ends keep the **32-byte FIPS 204 seed**
+   and re-derive the key with `PqdsaKeyPair::from_seed` (rcgen can mint
+   an ML-DSA key but not load one, so the seed is read out of the
+   seed-form PKCS#8 rcgen returns, against a pinned 22-byte prefix), and
+   keep the certificate separately: on the desktop in
+   `remote-identity.crt` beside the database (it is public, and cannot
+   be re-minted from the seed with the same fingerprint because ML-DSA
+   signing is hedged and the serial is random, so a seed without its
+   file is reported as corrupt, never regenerated); on the phone in the
+   same keychain item / encrypted preference as before, as `keySeed`
+   plus `certDer` -- the iOS Keychain has no such cap, but the two ends
+   store the same two things. A 5.0 desktop identity (version 1 in the
+   keychain) is replaced on the first enable after upgrading, since no
+   phone can be paired with it under protocol 2.
 
 **Implementation.**
 
@@ -324,8 +381,8 @@ later. This design therefore:
   `src-tauri/src/remote/stepup.rs`. aws-lc-rs also ships ML-DSA, but its
   API has moved between the unstable and stable modules across recent
   releases, so it was not considered.
-- The desktop's own identity key stays P256 in v1, for the same reason as
-  the certificates.
+- The desktop's own identity key stayed P256 in 5.0, for the same reason
+  as the certificates, and is ML-DSA-65 from protocol 2 (item 3 above).
 
 **Verified during the mobile crate spike** (#512, September 2026). These
 are the claims this section rests on that could not be confirmed from
@@ -430,7 +487,7 @@ intended pairing from an opportunistic one.
 
    ```json
    {
-     "v": 1,
+     "v": 2,
      "name": "octocat's laptop",
      "addrs": ["192.0.2.10", "100.64.0.7"],
      "port": 41919,
@@ -514,14 +571,25 @@ compatibility*).
 
 ### Port, versions, and `/v1/hello`
 
-- Port **41919**, protocol version **1** (`remote/listener.rs`,
-  `PROTOCOL_VERSION`). The same integer is the QR's `v`.
+- Port **41919**, protocol version **2** (`remote/listener.rs`,
+  `PROTOCOL_VERSION`). The same integer is the QR's `v`
+  (`the_qr_version_is_the_protocol_version`, on both ends). Version 1
+  was 5.0's ECDSA P256 certificates; the phone accepts a QR with `v: 2`
+  only and requires `protocol_version >= 2` from `/v1/hello`.
 - `GET /v1/hello` answers
-  `{"desktop_version": "<semver>", "protocol_version": 1, "viewer_login": "<login>" | null}`
+  `{"desktop_version": "<semver>", "protocol_version": 2, "viewer_login": "<login>" | null}`
   (`a_paired_phone_gets_hello`, `hello_reports_no_login_when_not_signed_in`).
 - TLS 1.3 only. Key exchange groups are offered in the order
   X25519MLKEM768, X25519, secp256r1
   (`key_exchange_is_hybrid_post_quantum`).
+- Both certificates are self-signed **ML-DSA-65** (X.509 algorithm
+  2.16.840.1.101.3.4.3.18; TLS `SignatureScheme::ML_DSA_65`, 0x0905),
+  and each verifier advertises and accepts that scheme alone: the
+  desktop's in CertificateRequest, the phone's in ClientHello. A P256
+  certificate on either end fails the handshake
+  (`the_handshake_signs_with_ml_dsa_65_on_both_sides`,
+  `a_p256_client_certificate_is_refused_even_when_paired`,
+  `a_desktop_with_a_p256_certificate_is_a_handshake_failure`).
 - The listener binds `[::]:41919` as one dual-stack socket with
   `IPV6_V6ONLY` cleared, falling back to `0.0.0.0:41919` where the IPv6
   wildcard cannot be bound (`the_ipv6_wildcard_answers_on_ipv4_too`).
@@ -773,7 +841,25 @@ settled, the settlement is here.
   and `make lint-mobile` / `test-mobile` / `deny-mobile`.
 - **aws-lc-rs is a third ML-DSA verifier candidate** (#533): at 1.18 its
   ML-DSA lives in the stable `signature` module. The desktop still
-  verifies with RustCrypto `ml-dsa` (#532).
+  verifies step-up signatures with RustCrypto `ml-dsa` (#532); the TLS
+  certificates (below) go through aws-lc-rs, because that is what rustls
+  can sign and verify a handshake with.
+- **The TLS certificates are ML-DSA-65, on rustls' unstable path**
+  (#521, after 5.0). The design deferred this until a released rustls
+  enabled ML-DSA by default; the maintainer chose to move first, on
+  `rustls-post-quantum` 0.2.4 with `aws-lc-rs-unstable`. Protocol 2, QR
+  `v: 2`, migration 7 clears `paired_devices`, and every phone re-pairs.
+  The desktop keeps the key's 32-byte seed in the keychain and the
+  certificate in `remote-identity.crt` beside the database, because the
+  certificate (5,482 bytes) does not fit a Windows credential (2560
+  bytes); the phone's keys plugin stores `keySeed` plus `certDer`
+  through the same native code, which only ever held opaque bytes. The
+  spike note above about the "4 KB PKCS#8" was wrong for the crate we
+  ship: aws-lc-rs 1.18 writes the 54-byte seed form. Both verifiers
+  accept `ML_DSA_65` only, so a 5.0 desktop and a 5.0 phone are refused
+  at the handshake rather than reasoned about afterwards. The full
+  account, including what "unstable" does and does not mean, is item 3
+  under *Post-quantum posture*.
 - **Secure Enclave generations for ML-DSA remain unconfirmed** (#533).
   iOS 26 needs A13 or later, so that is the floor by OS support alone;
   Android needs `FEATURE_HARDWARE_KEYSTORE >= 500` (KeyMint 5), and the
@@ -1018,9 +1104,14 @@ produces a TestFlight and internal-testing build.
 
 ## Open questions
 
-- **Post-quantum TLS certificates.** Decided as a follow-up rather than
-  v1; see Post-quantum posture. The trigger is rustls enabling ML-DSA
-  signature schemes by default in a released version.
+- **Post-quantum TLS certificates.** Settled (#521): ML-DSA-65 on both
+  ends from protocol 2, on `rustls-post-quantum`'s unstable feature
+  rather than waiting for default enablement; see Post-quantum posture.
+  What remains open is when to drop the unstable feature: once a
+  released rustls 0.23 (or 0.24, #3237) carries ML-DSA in its own
+  aws-lc-rs provider, `rustls-post-quantum` can go and `provider()` on
+  both ends becomes the stock provider with the same key-exchange order.
+  Nothing on the wire changes when that happens.
 - **Multiple desktops.** The phone's settings store is designed as a list
   of desktops even though the UI shows one, so adding a switcher later is
   a frontend change only.

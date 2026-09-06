@@ -73,6 +73,11 @@ use tokio::sync::{broadcast, oneshot};
 /// with a well-known service.
 pub const PORT: u16 = 41919;
 
+/// The QR payload's `v`: the wire protocol version, as the spec says
+/// ("the same integer is the QR's `v`"). 2 since the certificates moved
+/// to ML-DSA-65 (#521); a phone accepts a 2 and nothing else.
+pub const QR_VERSION: u8 = 2;
+
 /// How long a pairing token stays valid after it is issued.
 pub const TOKEN_TTL: Duration = Duration::from_secs(120);
 
@@ -785,7 +790,7 @@ pub async fn issue_pairing_token(
     let issued = state.issue_token();
     log::info!("pairing token issued, {} address(es) offered", addrs.len());
     Ok(QrPayload {
-        v: 1,
+        v: QR_VERSION,
         name: identity.display_name,
         addrs,
         port: PORT,
@@ -1319,10 +1324,20 @@ mod tests {
         );
     }
 
+    /// One integer on the wire, two constants in the code: the QR's `v`
+    /// and `/v1/hello`'s `protocol_version` must never drift apart.
+    #[test]
+    fn the_qr_version_is_the_protocol_version() {
+        assert_eq!(
+            u32::from(QR_VERSION),
+            crate::remote::listener::PROTOCOL_VERSION
+        );
+    }
+
     #[test]
     fn the_qr_payload_matches_the_spec_shape() {
         let payload = QrPayload {
-            v: 1,
+            v: QR_VERSION,
             name: "octocat's laptop".into(),
             addrs: vec!["192.0.2.10".into(), "100.64.0.7".into()],
             port: PORT,
@@ -1334,7 +1349,7 @@ mod tests {
         assert_eq!(
             json,
             serde_json::json!({
-                "v": 1,
+                "v": 2,
                 "name": "octocat's laptop",
                 "addrs": ["192.0.2.10", "100.64.0.7"],
                 "port": 41919,

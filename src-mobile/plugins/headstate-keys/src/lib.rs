@@ -5,7 +5,7 @@
 //! "Post-quantum posture" in docs/superpowers/specs/2026-09-05-mobile-companion-design.md)
 //! holds three keys, all made at pairing:
 //!
-//! - a **session key**, ECDSA P-256, whose self-signed certificate is the
+//! - a **session key**, ML-DSA-65, whose self-signed certificate is the
 //!   TLS client identity the desktop pins;
 //! - a **step-up signing key**, ECDSA P-256, in the Secure Enclave or
 //!   the Android Keystore, usable only after a biometric or device
@@ -40,6 +40,22 @@
 //! CryptoKit on iOS and Rust on Android, keeps one code path and one
 //! PKCS#8 encoder (`rcgen`'s, which rustls is known to load).
 //!
+//! # The session key is ML-DSA-65, kept as its seed
+//!
+//! Since protocol 2 (#521) the session certificate is ML-DSA-65, like
+//! the desktop's, on rustls' unstable path: `rustls-post-quantum` with
+//! `aws-lc-rs-unstable` supplies the signing key and the verifier that
+//! rustls 0.23 itself only names, and `rcgen` mints the key behind
+//! `aws_lc_rs_unstable`. What the native side keeps is the key's
+//! **32-byte FIPS 204 seed** and the certificate DER, not a PKCS#8: the
+//! key derives from the seed deterministically ([`session_key_pkcs8`]),
+//! and the desktop stores its own identity the same way (its keychain
+//! on Windows cannot hold the 5 KB certificate, and the two sides are
+//! kept symmetrical). rcgen can mint an ML-DSA key but not load one, so
+//! the seed is read out of the seed-form PKCS#8 rcgen returns and the
+//! certificate is minted once, at generate. The native sides never
+//! look inside either blob.
+//!
 //! # One prompt per destructive command
 //!
 //! Access control is on the keys themselves, not on a prompt the app
@@ -61,9 +77,10 @@
 
 use std::fmt;
 
+use aws_lc_rs::signature::{KeyPair as _, PqdsaKeyPair, ML_DSA_65_SIGNING};
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair,
-    KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
+    KeyUsagePurpose, PKCS_ML_DSA_65,
 };
 use serde_json::Value;
 use tauri::{
@@ -124,10 +141,83 @@ impl fmt::Debug for Signatures {
 /// The TLS client identity, in the shapes rustls takes.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SessionIdentity {
-    /// The self-signed certificate, DER.
+    /// The self-signed ML-DSA-65 certificate, DER.
     pub cert_der: Vec<u8>,
-    /// The private key, PKCS#8 DER.
+    /// The private key, PKCS#8 DER: the seed form, which only the
+    /// post-quantum provider loads.
     pub key_pkcs8: Vec<u8>,
+}
+
+/// The FIPS 204 seed `xi` the session key derives from -- the whole
+/// secret, and what the native side keeps.
+pub const SESSION_SEED_LEN: usize = 32;
+pub type SessionSeed = [u8; SESSION_SEED_LEN];
+
+/// What aws-lc-rs 1.18 writes before the seed in the seed-form PKCS#8
+/// of an ML-DSA-65 key: `SEQUENCE { version 0, AlgorithmIdentifier
+/// { id-ml-dsa-65 }, OCTET STRING { [0] seed } }`. Pinned byte for
+/// byte so an encoding change in a dependency is caught at generate
+/// time, never stored and misread on the next start. The desktop's
+/// `remote/identity.rs` pins the same bytes.
+const ML_DSA_65_SEED_PKCS8_PREFIX: [u8; 22] = [
+    0x30, 0x34, // SEQUENCE, 52 bytes
+    0x02, 0x01, 0x00, // INTEGER 0 (v1)
+    0x30, 0x0b, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03,
+    0x12, // AlgorithmIdentifier { 2.16.840.1.101.3.4.3.18 }
+    0x04, 0x22, // OCTET STRING, 34 bytes
+    0x80, 0x20, // [0] IMPLICIT, 32 bytes: the seed
+];
+
+/// A fresh ML-DSA-65 session key, as the rcgen key pair a certificate
+/// is minted from and the seed it derives from. Public so the app's
+/// software fallback (`src-mobile/src/keys.rs`) mints its certificate
+/// from the same kind of key and stores the same kind of seed.
+pub fn generate_session_key() -> Result<(KeyPair, SessionSeed)> {
+    let key = KeyPair::generate_for(&PKCS_ML_DSA_65)?;
+    let der = key.serialize_der();
+    let expected = ML_DSA_65_SEED_PKCS8_PREFIX.len() + SESSION_SEED_LEN;
+    if der.len() != expected
+        || der[..ML_DSA_65_SEED_PKCS8_PREFIX.len()] != ML_DSA_65_SEED_PKCS8_PREFIX
+    {
+        return Err(Error::Certificate(format!(
+            "the ML-DSA-65 key is {} bytes, not the {expected}-byte seed form this plugin stores",
+            der.len()
+        )));
+    }
+    let mut seed = [0u8; SESSION_SEED_LEN];
+    seed.copy_from_slice(&der[ML_DSA_65_SEED_PKCS8_PREFIX.len()..]);
+    Ok((key, seed))
+}
+
+/// The seed-form PKCS#8 of the ML-DSA-65 key `seed` derives: byte for
+/// byte what rcgen produced when the seed was generated, so rustls
+/// loads the same key on every start.
+pub fn session_key_pkcs8(seed: &SessionSeed) -> Result<Vec<u8>> {
+    let key = PqdsaKeyPair::from_seed(&ML_DSA_65_SIGNING, seed)
+        .map_err(|e| Error::Malformed(format!("session seed: {e}")))?;
+    key.to_pkcs8v1()
+        .map(|doc| doc.as_ref().to_vec())
+        .map_err(|e| Error::Malformed(format!("session seed: {e}")))
+}
+
+/// The identity `seed` and `cert_der` describe, or [`Error::Malformed`]
+/// when the certificate's public key is not the seed's -- a swapped or
+/// stale blob, caught here with a message rather than as a failed
+/// handshake. (rustls repeats the check, rigorously, when the client
+/// config is built.)
+pub fn session_from_seed(seed: &SessionSeed, cert_der: Vec<u8>) -> Result<SessionIdentity> {
+    let key = PqdsaKeyPair::from_seed(&ML_DSA_65_SIGNING, seed)
+        .map_err(|e| Error::Malformed(format!("session seed: {e}")))?;
+    let public = key.public_key().as_ref();
+    if !cert_der.windows(public.len()).any(|w| w == public) {
+        return Err(Error::Malformed(
+            "session certificate does not carry the session key".into(),
+        ));
+    }
+    Ok(SessionIdentity {
+        cert_der,
+        key_pkcs8: session_key_pkcs8(seed)?,
+    })
 }
 
 /// No key bytes in logs: `Debug` prints lengths.
@@ -179,14 +269,15 @@ impl HeadstateKeys {
     }
 }
 
-/// A fresh P-256 key and a self-signed certificate for it. The same
-/// shape as the desktop's identity (`src-tauri/src/remote/identity.rs`)
-/// with `ClientAuth` in place of `ServerAuth`. Validity is rcgen's
-/// default window (1975 to 4096): the desktop pins the fingerprint and
-/// checks no dates, and the alternative would make the certificate
-/// depend on the phone's clock at pairing time for no gain.
-fn generate_session() -> Result<SessionIdentity> {
-    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
+/// A fresh ML-DSA-65 key and a self-signed certificate for it, plus the
+/// seed the native side keeps. The same shape as the desktop's identity
+/// (`src-tauri/src/remote/identity.rs`) with `ClientAuth` in place of
+/// `ServerAuth`. Validity is rcgen's default window (1975 to 4096): the
+/// desktop pins the fingerprint and checks no dates, and the
+/// alternative would make the certificate depend on the phone's clock
+/// at pairing time for no gain.
+fn generate_session() -> Result<(SessionIdentity, SessionSeed)> {
+    let (key, seed) = generate_session_key()?;
     let mut params = CertificateParams::default();
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, "Headstate Companion");
@@ -194,10 +285,13 @@ fn generate_session() -> Result<SessionIdentity> {
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
     let cert = params.self_signed(&key)?;
-    Ok(SessionIdentity {
-        cert_der: cert.der().to_vec(),
-        key_pkcs8: key.serialize_der(),
-    })
+    Ok((
+        SessionIdentity {
+            cert_der: cert.der().to_vec(),
+            key_pkcs8: key.serialize_der(),
+        },
+        seed,
+    ))
 }
 
 impl DeviceKeys for HeadstateKeys {
@@ -208,8 +302,8 @@ impl DeviceKeys for HeadstateKeys {
         // `generate` starts over. Nothing is ever half-trusted.
         let keys: WirePublicKeys = self.call(cmd::GENERATE, Value::Null)?;
         let keys = keys.into_public()?;
-        let session = generate_session()?;
-        let stored = serde_json::to_value(WireSession::from_identity(&session))
+        let (session, seed) = generate_session()?;
+        let stored = serde_json::to_value(WireSession::from_parts(&session.cert_der, &seed))
             .expect("two strings serialise");
         let _: Value = self.call(cmd::STORE_SESSION, stored)?;
         log::info!(
@@ -382,24 +476,85 @@ mod tests {
         assert_eq!(k.sign(CANONICAL).unwrap_err(), Error::NotGenerated);
     }
 
-    /// rustls accepts the identity: the key loads through the provider
-    /// and its public half matches the certificate's.
+    /// rustls accepts the identity: the key loads through the
+    /// post-quantum provider (and not the plain one) and its public half
+    /// matches the certificate's; the certificate is an ML-DSA-65 one.
     #[test]
-    fn the_session_identity_is_a_rustls_client_identity() {
+    fn the_session_identity_is_an_ml_dsa_65_rustls_client_identity() {
         let k = keys(Fake::new(true));
         k.generate().unwrap();
         let id = k.session_identity().unwrap();
         assert!(!format!("{id:?}").contains("key_pkcs8: ["));
 
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-        let provider = rustls::crypto::aws_lc_rs::default_provider();
-        let key = provider
+        let pq = rustls_post_quantum::provider();
+        let certified = rustls::sign::CertifiedKey::from_der(
+            vec![CertificateDer::from(id.cert_der.clone())],
+            PrivateKeyDer::Pkcs8(id.key_pkcs8.clone().into()),
+            &pq,
+        )
+        .unwrap();
+        assert_eq!(
+            certified
+                .key
+                .choose_scheme(&[rustls::SignatureScheme::ML_DSA_65])
+                .map(|s| s.scheme()),
+            Some(rustls::SignatureScheme::ML_DSA_65)
+        );
+        assert!(rustls::crypto::aws_lc_rs::default_provider()
             .key_provider
             .load_private_key(PrivateKeyDer::Pkcs8(id.key_pkcs8.clone().into()))
-            .unwrap();
-        let certified =
-            rustls::sign::CertifiedKey::new(vec![CertificateDer::from(id.cert_der.clone())], key);
-        certified.keys_match().unwrap();
+            .is_err());
+        // id-ml-dsa-65 in the subject public key, the TBS signature
+        // field and the outer signature algorithm.
+        let oid = [
+            0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12,
+        ];
+        assert_eq!(
+            id.cert_der.windows(oid.len()).filter(|w| *w == oid).count(),
+            3
+        );
+    }
+
+    /// What crosses the bridge is the seed and the certificate; the key
+    /// the app gets back is derived from the seed, byte for byte the
+    /// one rcgen made.
+    #[test]
+    fn the_native_side_holds_the_seed_and_the_certificate_only() {
+        let k = keys(Fake::new(true));
+        k.generate().unwrap();
+        let stored = k.bridge.call(cmd::LOAD_SESSION, Value::Null).unwrap();
+        let seed = wire::decode_seed(stored["keySeed"].as_str().unwrap()).unwrap();
+        assert!(stored.get("keyPkcs8").is_none());
+        let id = k.session_identity().unwrap();
+        assert_eq!(id.key_pkcs8, session_key_pkcs8(&seed).unwrap());
+        assert_eq!(
+            id.key_pkcs8.len(),
+            54,
+            "the seed form, not the expanded key"
+        );
+        assert_eq!(session_from_seed(&seed, id.cert_der.clone()).unwrap(), id);
+
+        // A seed that is not this certificate's is refused.
+        let other = [9u8; SESSION_SEED_LEN];
+        assert!(matches!(
+            session_from_seed(&other, id.cert_der.clone()),
+            Err(Error::Malformed(_))
+        ));
+        // And a seed of the wrong length never gets that far.
+        assert!(matches!(
+            wire::decode_seed("AAAA"),
+            Err(Error::Malformed(m)) if m.contains("3 bytes")
+        ));
+    }
+
+    /// The seed rcgen's PKCS#8 carries derives the same key.
+    #[test]
+    fn the_seed_reproduces_rcgens_key() {
+        let (key, seed) = generate_session_key().unwrap();
+        assert_eq!(session_key_pkcs8(&seed).unwrap(), key.serialize_der());
+        let (_, again) = generate_session_key().unwrap();
+        assert_ne!(seed, again);
     }
 
     #[test]

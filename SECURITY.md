@@ -51,25 +51,29 @@ GitHub client. It is a remote control for the one you already have.
 
 ### The desktop identity key
 
-On first enable, the desktop generates its own ECDSA P-256 key pair and a
-self-signed certificate (ten-year validity, not tied to a hostname). The
-**private key is stored in the platform keychain** — the first and only
-keychain entry Headstate makes. One exception, on Linux only: the
-keychain there is the freedesktop Secret Service, which needs a daemon
-(gnome-keyring, KWallet, KeePassXC) on the session bus, and a headless
-box, a CI runner, or a bare window manager has none. When no Secret
-Service is available, the key is kept instead in a file in Headstate's
-own data directory, readable by the owning user only (mode 0600), and
-the step down is logged at every start. macOS and Windows never fall
-back. Wherever it lives, the key is the TLS server identity for the
-listener, and nothing else: it is not a GitHub credential, it cannot be
-used to talk to GitHub, and it never leaves the machine.
+On first enable, the desktop generates its own ML-DSA-65 key pair (FIPS
+204; ECDSA P-256 in 5.0) and a self-signed certificate (ten-year
+validity, not tied to a hostname). The **private key's 32-byte seed is
+stored in the platform keychain** — the first and only keychain entry
+Headstate makes; the key is re-derived from it at every start. The
+certificate, which is public and too large for a Windows credential,
+lives in `remote-identity.crt` beside the database. One exception, on
+Linux only: the keychain there is the freedesktop Secret Service, which
+needs a daemon (gnome-keyring, KWallet, KeePassXC) on the session bus,
+and a headless box, a CI runner, or a bare window manager has none. When
+no Secret Service is available, the seed is kept instead in a file in
+Headstate's own data directory, readable by the owning user only (mode
+0600), and the step down is logged at every start. macOS and Windows
+never fall back. Wherever it lives, the key is the TLS server identity
+for the listener, and nothing else: it is not a GitHub credential, it
+cannot be used to talk to GitHub, and it never leaves the machine.
 
 A phone does not trust this certificate by name or by any CA. At pairing
 it pins the certificate's SHA256 fingerprint, delivered out of band in the
 QR code, and refuses to connect to anything else. That is why **removing
-the key from the keychain invalidates every pairing**: a new key means a
-new fingerprint, every paired phone will refuse the new one, and each
+the seed from the keychain, or the certificate file, invalidates every
+pairing**: a new key means a new fingerprint, every paired phone will
+refuse the new one, and each
 phone must be paired again. Deleting the key is therefore also the blunt
 way to revoke every phone at once.
 
@@ -151,10 +155,11 @@ and it can act only by asking the desktop to act. A stolen phone whose
 pairing has been revoked has nothing: no credential, no access, and a
 cached PR snapshot it can no longer refresh. The phone's step-up signing
 keys live in the Secure Enclave or Android Keystore and are not
-exportable; its TLS session key is software-backed, because rustls must
-hold the private key bytes to present a client certificate, and is kept
-in the phone's keychain (an iOS Keychain item, or on Android a
-preference encrypted under a Keystore-held AES key).
+exportable; its TLS session key (ML-DSA-65) is software-backed, because
+rustls must hold the private key bytes to present a client certificate,
+and its seed is kept in the phone's keychain (an iOS Keychain item, or
+on Android a preference encrypted under a Keystore-held AES key)
+alongside the certificate.
 
 ### Step-up for destructive commands
 
@@ -186,10 +191,13 @@ the device.
 
 The TLS key exchange between phone and desktop is **hybrid X25519MLKEM768**
 by default, so traffic recorded off the wire today cannot be decrypted by
-a future quantum computer. The TLS certificates themselves remain ECDSA
-P-256 in 5.0 because ML-DSA in TLS 1.3 is still an IETF draft; since both
-ends pin a fingerprint rather than validate a chain, migrating them later
-is a matter of regenerating and re-pairing.
+a future quantum computer. Since protocol 2 the TLS certificates on both
+ends are **ML-DSA-65** as well, and each end accepts that signature
+scheme alone at the handshake. This rides on rustls' unstable ML-DSA
+path (`rustls-post-quantum` with `aws-lc-rs-unstable`): the algorithm is
+final FIPS 204, the crate API is what may move. 5.0 shipped ECDSA P-256
+certificates; upgrading regenerates the desktop's identity and clears
+every pairing, and every phone pairs again.
 
 ### Threat model
 

@@ -13,7 +13,7 @@ use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{
     CertificateError, DigitallySignedStruct, DistinguishedName, Error as TlsError, NamedGroup,
-    ServerConfig, SignatureScheme,
+    PeerMisbehaved, ServerConfig, SignatureScheme,
 };
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -96,12 +96,14 @@ struct Shared {
     replies: Mutex<HashMap<String, Reply>>,
     requests: Mutex<Vec<Request>>,
     last_kx: Mutex<Option<NamedGroup>>,
+    /// The scheme the last client CertificateVerify was checked with.
+    last_sig: Mutex<Option<SignatureScheme>>,
     end_streams: Notify,
 }
 
 /// The desktop's client-cert rule: paired, or the pairing window is
 /// open. The handshake signature is verified so the fingerprint alone
-/// admits nobody.
+/// admits nobody -- and, as on the desktop, with ML-DSA-65 only.
 struct Verifier {
     shared: Arc<Shared>,
     algs: rustls::crypto::WebPkiSupportedAlgorithms,
@@ -148,10 +150,14 @@ impl ClientCertVerifier for Verifier {
         c: &CertificateDer<'_>,
         d: &DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, TlsError> {
+        if d.scheme != SignatureScheme::ML_DSA_65 {
+            return Err(PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme.into());
+        }
+        *self.shared.last_sig.lock().unwrap() = Some(d.scheme);
         rustls::crypto::verify_tls13_signature(m, c, d, &self.algs)
     }
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.algs.supported_schemes()
+        vec![SignatureScheme::ML_DSA_65]
     }
 }
 
@@ -159,6 +165,7 @@ pub(crate) struct TestServer {
     /// The server certificate's fingerprint, lowercase hex: what a QR
     /// would carry.
     pub fp: String,
+    cert_der: Vec<u8>,
     port: u16,
     shared: Arc<Shared>,
     task: tokio::task::JoinHandle<()>,
@@ -174,8 +181,12 @@ impl Drop for TestServer {
     }
 }
 
-fn server_identity() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
-    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+/// A self-signed desktop certificate of the given algorithm: ML-DSA-65
+/// is what a protocol-2 desktop presents, P-256 what a 5.0 one does.
+fn server_identity(
+    alg: &'static rcgen::SignatureAlgorithm,
+) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+    let key = rcgen::KeyPair::generate_for(alg).unwrap();
     let mut params = rcgen::CertificateParams::default();
     let mut dn = rcgen::DistinguishedName::new();
     dn.push(rcgen::DnType::CommonName, "Headstate desktop");
@@ -189,7 +200,18 @@ fn server_identity() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
 
 impl TestServer {
     pub async fn start() -> Self {
-        let (cert, key) = server_identity();
+        Self::start_with(&rcgen::PKCS_ML_DSA_65).await
+    }
+
+    /// A desktop from before protocol 2, for proving the client refuses
+    /// one.
+    pub async fn start_with_p256_certificate() -> Self {
+        Self::start_with(&rcgen::PKCS_ECDSA_P256_SHA256).await
+    }
+
+    async fn start_with(alg: &'static rcgen::SignatureAlgorithm) -> Self {
+        let (cert, key) = server_identity(alg);
+        let cert_der = cert.as_ref().to_vec();
         let fp = fingerprint_of(cert.as_ref());
         let shared = Arc::new(Shared::default());
         let provider = Arc::new(provider());
@@ -213,6 +235,7 @@ impl TestServer {
         let task = tokio::spawn(accept_loop(listener, acceptor, shared.clone()));
         Self {
             fp,
+            cert_der,
             port,
             shared,
             task,
@@ -224,6 +247,21 @@ impl TestServer {
     }
     pub fn port(&self) -> u16 {
         self.port
+    }
+    /// Whether the certificate this server presents names id-ml-dsa-65
+    /// in all three places a self-signed certificate does.
+    pub fn cert_is_ml_dsa_65(&self) -> bool {
+        let oid = [
+            0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12,
+        ];
+        self.cert_der
+            .windows(oid.len())
+            .filter(|w| *w == oid)
+            .count()
+            == 3
+    }
+    pub fn last_sig(&self) -> Option<SignatureScheme> {
+        *self.shared.last_sig.lock().unwrap()
     }
     pub fn pair(&self, fp: &str) {
         self.shared.paired.lock().unwrap().insert(fp.to_string());
@@ -255,7 +293,7 @@ impl TestServer {
     /// The QR a desktop would show for this server.
     pub fn qr(&self, token_b64url: &str, exp: i64) -> String {
         json!({
-            "v": 1,
+            "v": 2,
             "name": "octocat's laptop",
             "addrs": [self.addr()],
             "port": self.port,
@@ -339,7 +377,7 @@ fn default_reply(req: &Request) -> Reply {
     match req.path.as_str() {
         "/v1/hello" => Reply::json(
             200,
-            json!({"desktop_version": "9.9.9", "protocol_version": 1, "viewer_login": "octocat"}),
+            json!({"desktop_version": "9.9.9", "protocol_version": 2, "viewer_login": "octocat"}),
         ),
         "/v1/pair" => {
             let body: Value = serde_json::from_str(&req.body).unwrap_or(Value::Null);

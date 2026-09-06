@@ -1,10 +1,12 @@
 //! The mTLS listener a paired phone talks to.
 //!
 //! axum on a tokio task, port [`PORT`] on every interface (IPv4 and
-//! IPv6 on one dual-stack socket), TLS 1.3 only, rustls on the aws-lc-rs
-//! provider. Client certificates are required at the handshake and
-//! checked by fingerprint against the paired devices -- no CA, no chain
-//! -- so an unpaired client never reaches HTTP.
+//! IPv6 on one dual-stack socket), TLS 1.3 only, rustls on the
+//! `rustls-post-quantum` provider (aws-lc-rs plus ML-DSA; see
+//! [`provider`]). Client certificates are required at the handshake,
+//! must be ML-DSA-65, and are checked by fingerprint against the paired
+//! devices -- no CA, no chain -- so an unpaired client never reaches
+//! HTTP.
 //!
 //! # The seams
 //!
@@ -69,8 +71,8 @@ use rustls::crypto::{aws_lc_rs, CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{
-    CertificateError, DigitallySignedStruct, DistinguishedName, Error as TlsError, ServerConfig,
-    SignatureScheme,
+    CertificateError, DigitallySignedStruct, DistinguishedName, Error as TlsError, PeerMisbehaved,
+    ServerConfig, SignatureScheme,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -91,7 +93,15 @@ pub const PORT: u16 = 41919;
 
 /// Bumped deliberately, in the spec, when the surface or the pairing
 /// payload changes shape. Returned by `/v1/hello` and embedded in the QR.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// 2 (#521): both TLS certificates are ML-DSA-65. The desktop's own
+/// fingerprint changed with its certificate and the verifier admits no
+/// P-256 client certificate, so every phone from protocol 1 re-pairs.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// The one signature scheme a phone may sign the handshake with. Named
+/// here, once, because the verifier both advertises it and enforces it.
+const CLIENT_SIGNATURE_SCHEME: SignatureScheme = SignatureScheme::ML_DSA_65;
 
 /// The one path an unpaired peer may reach.
 pub const PAIR_PATH: &str = "/v1/pair";
@@ -271,14 +281,21 @@ impl Drop for Handle {
 
 /// The provider the listener uses, regardless of the process default.
 ///
-/// aws-lc-rs, because it is the only rustls provider with a
-/// post-quantum key exchange, and X25519MLKEM768 placed FIRST
-/// explicitly. rustls only orders it first under its
-/// `prefer-post-quantum` cargo feature, which this crate does not enable
-/// (rustls is declared with default features off, for the reasons in
-/// Cargo.toml); spelling the order out here means the preference does
-/// not depend on a feature flag anyone can drop by accident, and the
-/// test `key_exchange_is_hybrid_post_quantum` holds it.
+/// `rustls-post-quantum`'s: aws-lc-rs, which is the only rustls
+/// provider with a post-quantum key exchange, plus the ML-DSA signing
+/// keys and verifiers that rustls 0.23 itself only names. That is what
+/// signs the handshake with the desktop's ML-DSA-65 key and verifies
+/// the phone's; the plain aws-lc-rs provider cannot load an ML-DSA key
+/// at all, so this is the one provider every TLS config in this module
+/// is built on. It comes from the crate's `aws-lc-rs-unstable` feature
+/// -- see Cargo.toml for what "unstable" does and does not mean.
+///
+/// X25519MLKEM768 placed FIRST explicitly. rustls orders it first only
+/// under its `prefer-post-quantum` cargo feature (which the
+/// post-quantum crate happens to turn on); spelling the order out here
+/// means the preference does not depend on a feature flag anyone can
+/// drop by accident, and the test `key_exchange_is_hybrid_post_quantum`
+/// holds it.
 fn provider() -> CryptoProvider {
     CryptoProvider {
         kx_groups: vec![
@@ -286,11 +303,12 @@ fn provider() -> CryptoProvider {
             aws_lc_rs::kx_group::X25519,
             aws_lc_rs::kx_group::SECP256R1,
         ],
-        ..aws_lc_rs::default_provider()
+        ..rustls_post_quantum::provider()
     }
 }
 
-/// Accepts a client certificate by fingerprint alone.
+/// Accepts a client certificate by fingerprint alone, and only an
+/// ML-DSA-65 one.
 ///
 /// No chain building: the certificate is self-signed by the phone and
 /// the desktop learned its fingerprint at pairing. The one thing this
@@ -298,6 +316,16 @@ fn provider() -> CryptoProvider {
 /// the peer HOLDS the private key for the certificate it presented --
 /// because without that a fingerprint is a public value anyone could
 /// replay.
+///
+/// ML-DSA-65 and nothing else, in both directions: the scheme list
+/// goes out in CertificateRequest, so a phone with a pre-protocol-2
+/// P-256 session certificate finds nothing it can sign with and the
+/// handshake ends there; and `verify_tls13_signature` refuses any other
+/// scheme should a peer sign with one it was not offered. Refusing
+/// P-256 outright rather than accepting both through a transition is
+/// deliberate: every phone re-pairs for protocol 2 anyway, because the
+/// desktop's own fingerprint changed with its certificate, so there is
+/// no pairing a P-256 certificate could still belong to.
 struct PairedVerifier {
     paired: Arc<dyn PairedCerts>,
     algs: WebPkiSupportedAlgorithms,
@@ -343,17 +371,25 @@ impl ClientCertVerifier for PairedVerifier {
         Err(TlsError::General("TLS 1.2 is not offered".into()))
     }
 
+    /// ML-DSA-65 only. The provider's algorithm table maps that scheme
+    /// to webpki's ML-DSA-65 verifier, which also checks that the
+    /// certificate's public key is an ML-DSA-65 key -- so the scheme,
+    /// the key and the signature all have to agree.
     fn verify_tls13_signature(
         &self,
         message: &[u8],
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, TlsError> {
+        if dss.scheme != CLIENT_SIGNATURE_SCHEME {
+            return Err(PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme.into());
+        }
         rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algs)
     }
 
+    /// What CertificateRequest offers the phone.
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.algs.supported_schemes()
+        vec![CLIENT_SIGNATURE_SCHEME]
     }
 }
 
@@ -863,13 +899,20 @@ pub(crate) mod tests {
         }
     }
 
+    /// The signature scheme the phone-side verifier saw the desktop
+    /// sign CertificateVerify with, recorded so a test can assert the
+    /// handshake used ML-DSA-65 rather than infer it.
+    pub(crate) type SchemeSeen = Arc<Mutex<Option<SignatureScheme>>>;
+
     /// The phone's side of the pin: accept the server certificate whose
-    /// fingerprint matches, verify it holds the key, refuse anything
-    /// else. Mirrors what `src-mobile/client.rs` will do.
+    /// fingerprint matches, verify it holds the key -- with ML-DSA-65
+    /// and nothing else -- refuse anything else. Mirrors what
+    /// `src-mobile/src/client.rs` does.
     #[derive(Debug)]
     struct PinnedServer {
         fp: String,
         algs: WebPkiSupportedAlgorithms,
+        seen: SchemeSeen,
     }
 
     impl ServerCertVerifier for PinnedServer {
@@ -903,10 +946,14 @@ pub(crate) mod tests {
             c: &CertificateDer<'_>,
             d: &DigitallySignedStruct,
         ) -> Result<HandshakeSignatureValid, TlsError> {
+            if d.scheme != SignatureScheme::ML_DSA_65 {
+                return Err(PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme.into());
+            }
+            *self.seen.lock().unwrap() = Some(d.scheme);
             rustls::crypto::verify_tls13_signature(m, c, d, &self.algs)
         }
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            self.algs.supported_schemes()
+            vec![SignatureScheme::ML_DSA_65]
         }
     }
 
@@ -971,10 +1018,21 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn client_config(phone: Option<&Identity>, server_fp: &str) -> Arc<ClientConfig> {
+        pinned_client(phone, server_fp).0
+    }
+
+    /// `client_config`, plus the handle its verifier records the
+    /// desktop's signature scheme into.
+    pub(crate) fn pinned_client(
+        phone: Option<&Identity>,
+        server_fp: &str,
+    ) -> (Arc<ClientConfig>, SchemeSeen) {
         let provider = Arc::new(provider());
+        let seen: SchemeSeen = Arc::default();
         let verifier = PinnedServer {
             fp: server_fp.to_string(),
             algs: provider.signature_verification_algorithms,
+            seen: seen.clone(),
         };
         let builder = ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13])
@@ -987,7 +1045,7 @@ pub(crate) mod tests {
                 .unwrap(),
             None => builder.with_no_client_auth(),
         };
-        Arc::new(cfg)
+        (Arc::new(cfg), seen)
     }
 
     pub(crate) struct Reply {
@@ -1109,7 +1167,7 @@ pub(crate) mod tests {
         assert_eq!(reply.status, 200);
         let v: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
         assert_eq!(v["desktop_version"], "9.9.9");
-        assert_eq!(v["protocol_version"], 1);
+        assert_eq!(v["protocol_version"], 2);
         assert_eq!(v["viewer_login"], "octocat");
         server.handle.stop().await;
     }
@@ -1322,6 +1380,99 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(reply.kx, Some(NamedGroup::X25519MLKEM768));
         server.handle.stop().await;
+    }
+
+    /// ML-DSA-65 on both sides, observed rather than assumed. The
+    /// phone-side verifier records the scheme the desktop signed
+    /// CertificateVerify with and the leaf it signed under; the desktop's
+    /// verifier admits no scheme but ML-DSA-65, so a completed handshake
+    /// is itself the proof that the phone's CertificateVerify was
+    /// ML-DSA-65 under its ML-DSA-65 certificate.
+    #[tokio::test]
+    async fn the_handshake_signs_with_ml_dsa_65_on_both_sides() {
+        use crate::remote::identity::testing::is_ml_dsa_65_certificate;
+        let certs = Arc::new(MemoryCerts::default());
+        let server = serve(certs).await;
+        let phone = Identity::generate().unwrap();
+        server.certs.pair(&phone.fingerprint());
+
+        let (cfg, seen) = pinned_client(Some(&phone), &server.fp);
+        let tcp = TcpStream::connect(server.handle.local_addr())
+            .await
+            .unwrap();
+        let mut tls = handshake_with(tcp, cfg).await.unwrap();
+        assert_eq!(hello_on(&mut tls).await.unwrap(), 200);
+
+        assert_eq!(*seen.lock().unwrap(), Some(SignatureScheme::ML_DSA_65));
+        let leaf = tls.get_ref().1.peer_certificates().unwrap()[0].clone();
+        assert_eq!(fingerprint_of(leaf.as_ref()), server.fp);
+        assert!(is_ml_dsa_65_certificate(leaf.as_ref()));
+        assert!(is_ml_dsa_65_certificate(phone.cert().as_ref()));
+        server.handle.stop().await;
+    }
+
+    /// A phone from before protocol 2 presents an ECDSA P-256 session
+    /// certificate. Even paired by fingerprint, it never reaches HTTP:
+    /// the desktop offers no scheme it can sign with. The listener is
+    /// not broken for anyone else while it tries.
+    #[tokio::test]
+    async fn a_p256_client_certificate_is_refused_even_when_paired() {
+        let certs = Arc::new(MemoryCerts::default());
+        let server = serve(certs).await;
+        let addr = server.handle.local_addr();
+        let old_phone = Identity::p256_for_tests();
+        server.certs.pair(&old_phone.fingerprint());
+        server.certs.open_window(true);
+
+        assert!(
+            get(addr, "/v1/hello", Some(&old_phone), &server.fp)
+                .await
+                .is_err(),
+            "a P-256 client certificate must fail the handshake"
+        );
+        assert!(
+            get(addr, PAIR_PATH, Some(&old_phone), &server.fp)
+                .await
+                .is_err(),
+            "not even to pair: the window does not widen the scheme"
+        );
+
+        let phone = Identity::generate().unwrap();
+        server.certs.pair(&phone.fingerprint());
+        assert_eq!(
+            get(addr, "/v1/hello", Some(&phone), &server.fp)
+                .await
+                .unwrap()
+                .status,
+            200
+        );
+        server.handle.stop().await;
+    }
+
+    /// What CertificateRequest advertises, and what the verifier will
+    /// check: one scheme.
+    #[test]
+    fn the_verifier_offers_ml_dsa_65_and_nothing_else() {
+        let provider = provider();
+        let verifier = PairedVerifier {
+            paired: Arc::new(MemoryCerts::default()),
+            algs: provider.signature_verification_algorithms,
+        };
+        assert_eq!(
+            verifier.supported_verify_schemes(),
+            vec![SignatureScheme::ML_DSA_65]
+        );
+        // And the provider it delegates to can verify that scheme --
+        // the plain aws-lc-rs one cannot, which is the whole reason for
+        // the post-quantum provider.
+        assert!(provider
+            .signature_verification_algorithms
+            .supported_schemes()
+            .contains(&SignatureScheme::ML_DSA_65));
+        assert!(!aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+            .contains(&SignatureScheme::ML_DSA_65));
     }
 
     /// The pin on the phone's side is real: a server presenting some

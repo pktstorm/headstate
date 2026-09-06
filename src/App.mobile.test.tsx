@@ -3,6 +3,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConnectionState } from "./api/connection";
 import { PR_FIXTURES } from "./fixtures/prs";
+import { REQUIRED_PROTOCOL_VERSION } from "./lib/protocol";
 import { useFilters } from "./store/filters";
 import { stubViewport } from "./test-utils";
 
@@ -118,7 +119,12 @@ afterEach(() => {
 describe("App shell on the desktop", () => {
   it("renders the repo sidebar inline, with no menu button and no banner", () => {
     stubViewport(1400);
-    connection.current = { kind: "connected", desktop: "octocat's laptop", lastPoll: null, protocolVersion: 1 };
+    connection.current = {
+      kind: "connected",
+      desktop: "octocat's laptop",
+      lastPoll: null,
+      protocolVersion: REQUIRED_PROTOCOL_VERSION,
+    };
     renderApp();
     const nav = screen.getByRole("navigation");
     expect(within(nav).getByText("All repositories")).toBeTruthy();
@@ -135,7 +141,7 @@ describe("App shell on a phone", () => {
       kind: "connected",
       desktop: "octocat's laptop",
       lastPoll: new Date(Date.now() - 3 * 60_000).toISOString(),
-      protocolVersion: 1,
+      protocolVersion: REQUIRED_PROTOCOL_VERSION,
     };
   });
 

@@ -16,8 +16,8 @@ use serde_json::{json, Value};
 
 use crate::bridge::Bridge;
 use crate::error::{codes, from_rejection};
-use crate::wire::{cmd, SignArgs, WirePublicKeys, WireSession, WireSignatures};
-use crate::{PublicKeys, Result, SessionIdentity, Signatures};
+use crate::wire::{cmd, SignArgs, WirePublicKeys, WireSignatures};
+use crate::{PublicKeys, Result, Signatures};
 
 /// Ways the fake can misbehave, to prove the Rust side refuses them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,7 +32,9 @@ pub enum Tamper {
 struct Held {
     ecdsa: p256::ecdsa::SigningKey,
     mldsa: Option<ml_dsa::SigningKey<MlDsa65>>,
-    session: Option<SessionIdentity>,
+    /// What `storeSession` sent, verbatim: the native sides keep the
+    /// blobs opaque and so does the fake.
+    session: Option<Value>,
 }
 
 pub struct Fake {
@@ -177,17 +179,16 @@ impl Bridge for Fake {
                 Ok(Value::Null)
             }
             cmd::STORE_SESSION => {
-                let session: WireSession = serde_json::from_value(args).unwrap();
                 let mut guard = self.held.lock().unwrap();
                 let held = guard.as_mut().expect("storeSession follows generate");
-                held.session = Some(session.into_identity().unwrap());
+                held.session = Some(args);
                 Ok(Value::Null)
             }
             cmd::LOAD_SESSION => match self.held.lock().unwrap().as_ref() {
                 Some(Held {
                     session: Some(session),
                     ..
-                }) => Ok(serde_json::to_value(WireSession::from_identity(session)).unwrap()),
+                }) => Ok(session.clone()),
                 _ => Self::reject(codes::NOT_GENERATED, "no session"),
             },
             other => Ok(json!({ "unknownCommand": other })),

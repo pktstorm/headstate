@@ -48,9 +48,10 @@
 // # The session identity
 //
 // A Keystore key cannot be exported, and rustls needs the bytes, so the
-// session key is generated in Rust and only STORED here: the PKCS#8 and
-// certificate DER, as a small JSON document, encrypted with 256-bit AES-GCM
-// under a non-exportable Keystore key and written to SharedPreferences.
+// session key is generated in Rust and only STORED here: the 32-byte seed
+// of the ML-DSA-65 key and the certificate DER, both opaque, as a small
+// JSON document, encrypted with 256-bit AES-GCM under a non-exportable
+// Keystore key and written to SharedPreferences.
 // This is the construction androidx's EncryptedSharedPreferences used
 // before it was deprecated, done by hand to avoid the dependency.
 //
@@ -107,7 +108,7 @@ class SignArgs {
 @InvokeArg
 class StoreSessionArgs {
     var certDer: String = ""
-    var keyPkcs8: String = ""
+    var keySeed: String = ""
 }
 
 @TauriPlugin
@@ -240,7 +241,7 @@ class HeadstateKeysPlugin(private val activity: Activity) : Plugin(activity) {
         try {
             val plaintext = JSONObject()
                 .put("certDer", args.certDer)
-                .put("keyPkcs8", args.keyPkcs8)
+                .put("keySeed", args.keySeed)
                 .toString()
                 .toByteArray(Charsets.UTF_8)
             val sealed = Base64.encodeToString(wrap(plaintext), Base64.NO_WRAP)
@@ -263,7 +264,7 @@ class HeadstateKeysPlugin(private val activity: Activity) : Plugin(activity) {
             invoke.resolve(
                 JSObject()
                     .put("certDer", json.getString("certDer"))
-                    .put("keyPkcs8", json.getString("keyPkcs8")) as JSObject
+                    .put("keySeed", json.getString("keySeed")) as JSObject
             )
         } catch (e: Exception) {
             invoke.reject("could not read the session identity: ${e.message}", e)

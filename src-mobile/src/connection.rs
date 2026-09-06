@@ -240,7 +240,7 @@ pub(crate) mod tests {
             })
         );
         c.set_desktop(Some("octocat's laptop".into()), None);
-        c.connected(1);
+        c.connected(PROTOCOL_VERSION);
         c.mark_poll("2026-09-05T12:00:00Z".parse().unwrap());
         assert_eq!(
             serde_json::to_value(c.report()).unwrap(),
@@ -248,7 +248,7 @@ pub(crate) mod tests {
                 "state": "connected",
                 "desktop": "octocat's laptop",
                 "last_poll": "2026-09-05T12:00:00Z",
-                "protocol_version": 1,
+                "protocol_version": PROTOCOL_VERSION,
                 "stale": false
             })
         );

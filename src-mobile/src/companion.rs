@@ -367,7 +367,7 @@ mod tests {
         let (server, store, rec, c) = paired().await;
         let report = c.connection_state();
         assert_eq!(report.desktop.as_deref(), Some("octocat's laptop"));
-        assert_eq!(report.protocol_version, Some(1));
+        assert_eq!(report.protocol_version, Some(2));
         assert!(report.last_poll.is_some());
         assert_eq!(rec.last("prs-updated").unwrap(), r#"[{"number":1347}]"#);
         assert_eq!(
