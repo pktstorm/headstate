@@ -13,6 +13,7 @@
 
 use crate::remote::events::tests::SseClient;
 use crate::remote::events::Hub;
+use crate::remote::identity::testing::is_ml_dsa_65_certificate;
 use crate::remote::identity::Identity;
 use crate::remote::listener::tests::{connect, request, RecordingHost, Reply};
 use crate::remote::listener::{self, ListenerConfig, PairedCerts};
@@ -35,8 +36,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-/// The phone: a self-signed session certificate (what `rcgen` gives
-/// the mobile crate too), a P-256 step-up key, and an ML-DSA-65 one.
+/// The phone: a self-signed ML-DSA-65 session certificate (what `rcgen`
+/// gives the mobile crate too), a P-256 step-up key, and an ML-DSA-65
+/// one.
 struct Phone {
     cert: Identity,
     ecdsa: p256::ecdsa::SigningKey,
@@ -262,6 +264,9 @@ async fn a_phone_pairs_calls_listens_and_is_revoked() {
         .expect("approve inserted the row");
     assert_eq!(row.id, outcome.device_id);
     assert_eq!(row.cert_der, phone.cert.cert().as_ref());
+    // What the desktop stored is the certificate the handshake verified,
+    // and it is an ML-DSA-65 one -- the only kind the verifier admits.
+    assert!(is_ml_dsa_65_certificate(&row.cert_der));
     assert!(desktop.pairing.is_paired(&phone.fingerprint()));
     assert!(!desktop.pairing.pairing_window_open(), "the token is spent");
 
@@ -270,6 +275,7 @@ async fn a_phone_pairs_calls_listens_and_is_revoked() {
     assert_eq!(hello.status, 200);
     let v: Value = serde_json::from_str(&hello.body).unwrap();
     assert_eq!(v["viewer_login"], "octocat");
+    assert_eq!(v["protocol_version"], listener::PROTOCOL_VERSION);
 
     // Read.
     let reply = desktop.call(&phone, "get_cached", &[], None).await;

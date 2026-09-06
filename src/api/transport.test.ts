@@ -22,6 +22,18 @@ const local = vi.hoisted(() => ({
 }));
 vi.mock("./local", () => ({ local }));
 
+/// The remote transport, mocked the same way, so the mobile selection
+/// can be asserted without a companion process.
+const remote = vi.hoisted(() => ({
+  call: vi.fn<(name: string, args?: Record<string, unknown>) => Promise<unknown>>(() =>
+    Promise.resolve("from the phone"),
+  ),
+  listen: vi.fn<(event: string, cb: unknown) => Promise<() => void>>(() =>
+    Promise.resolve(() => {}),
+  ),
+}));
+vi.mock("./remote", () => ({ remote }));
+
 import * as api from "./tauri";
 import * as hooks from "./hooks";
 import { call, listen } from "./transport";
@@ -258,10 +270,16 @@ describe("transport selection", () => {
     expect(import.meta.env.VITE_TARGET).toBe("desktop");
   });
 
-  it("refuses mobile until the remote transport exists", async () => {
+  it("selects the remote transport for mobile", async () => {
     vi.stubEnv("VITE_TARGET", "mobile");
     vi.resetModules();
-    await expect(import("./transport")).rejects.toThrow(/remote transport not built/);
+    const mod = await import("./transport");
+    await expect(mod.call("get_cached")).resolves.toBe("from the phone");
+    expect(remote.call).toHaveBeenCalledWith("get_cached", undefined);
+    expect(local.call).not.toHaveBeenCalled();
+    const cb = () => {};
+    await mod.listen("prs-updated", cb);
+    expect(remote.listen).toHaveBeenCalledWith("prs-updated", cb);
   });
 
   it("refuses a target it does not know", async () => {

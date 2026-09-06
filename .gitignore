@@ -40,3 +40,8 @@ src-tauri/icons/64x64.png
 
 # Git worktrees for parallel branches
 .worktrees/
+
+# The Android upload keystore credentials the release workflow writes for
+# one build. gen/android carries its own .gitignore for this once it is
+# committed; this is the backstop for the window before that.
+src-mobile/gen/android/keystore.properties

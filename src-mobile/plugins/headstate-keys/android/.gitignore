@@ -1,0 +1,3 @@
+/build
+# Copied in by the build script from the tauri crate.
+/.tauri

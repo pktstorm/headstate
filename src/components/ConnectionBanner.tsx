@@ -1,8 +1,17 @@
 import { useState } from "react";
 import { type ConnectionState, useConnectionState } from "@/api/connection";
+import { REQUIRED_PROTOCOL_VERSION, desktopTooOld } from "@/lib/protocol";
 import { useIsMobile } from "@/lib/useIsMobile";
 import { relativeTime } from "@/lib/time";
+import { ExternalLink } from "./ExternalLink";
 import { SettingsDialog } from "./SettingsDialog";
+
+/// Where "update Headstate on your desktop" sends the user: the desktop
+/// is what needs replacing, and the phone cannot do that for it.
+const DESKTOP_RELEASES = "https://github.com/pktstorm/headstate/releases/latest";
+
+const BANNER_CLASS =
+  "flex w-full shrink-0 items-center gap-2 border-b border-[#30363d] bg-[#161b22] px-4 py-2 text-left text-xs text-[#e6edf3] hover:bg-[#21262d]";
 
 /// One line of text per state, and the dot colour beside it.
 ///
@@ -54,6 +63,29 @@ export function ConnectionBanner() {
   const state = useConnectionState();
   const [settingsOpen, setSettingsOpen] = useState(false);
   if (!isMobile || state.kind === "local") return null;
+  if (state.kind === "connected" && desktopTooOld(state.protocolVersion)) {
+    // Reachable, and yet not to be driven: a desktop below the protocol
+    // this build requires would answer commands it does not understand
+    // with 404s, or worse, with a different meaning. Pairing settings
+    // cannot fix that, so the banner is a link to the desktop release
+    // rather than a button into Settings. No action beyond this is
+    // offered from here; the remote transport is what refuses the
+    // commands themselves.
+    return (
+      <ExternalLink
+        href={DESKTOP_RELEASES}
+        title="Download the latest desktop Headstate"
+        className={BANNER_CLASS}
+      >
+        <span className="h-2 w-2 shrink-0 rounded-full bg-[#f85149]" aria-hidden="true" />
+        <span className="min-w-0 flex-1 truncate">
+          Update Headstate on your desktop · this app needs protocol{" "}
+          {REQUIRED_PROTOCOL_VERSION}, {state.desktop} has {state.protocolVersion}
+        </span>
+        <span className="shrink-0 text-[#8b949e]">Update</span>
+      </ExternalLink>
+    );
+  }
   const { text, dot } = describeState(state);
   return (
     <>
@@ -61,7 +93,7 @@ export function ConnectionBanner() {
         type="button"
         onClick={() => setSettingsOpen(true)}
         title="Pairing settings"
-        className="flex w-full shrink-0 items-center gap-2 border-b border-[#30363d] bg-[#161b22] px-4 py-2 text-left text-xs text-[#e6edf3] hover:bg-[#21262d]"
+        className={BANNER_CLASS}
       >
         <span className={`h-2 w-2 shrink-0 rounded-full ${dot}`} aria-hidden="true" />
         <span className="min-w-0 flex-1 truncate">{text}</span>

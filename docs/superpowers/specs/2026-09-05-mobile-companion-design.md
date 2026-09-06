@@ -1,7 +1,16 @@
 # Mobile Companion Design
 
 **Date:** 2026-09-05
-**Status:** Draft
+**Status:** Implemented in Headstate 5.0 (2026-09-05)
+
+Written as a design; kept as the record of what shipped. The sections
+below are the design as agreed. *Wire format* pins the bytes the phone
+must match, and *What shipped differently* lists every place the code on
+`main` departs from the design, with the pull request that made the call.
+Shipped across #525–#545: the desktop side (#527, #528, #529, #530,
+#532, #535, #536, #538, #543, #545), the mobile crate (#533, #534, #537,
+#541, #542, #544), the release workflow and store listings (#539, #540),
+and the policy documents (#525, #526).
 
 ## Problem
 
@@ -71,35 +80,53 @@ the TLS session and the device key; the webview never sees a certificate.
 ## Architecture
 
 ```
-src-tauri/src (desktop, existing)
+src-tauri/src (desktop)
+├── lib.rs            installs ring as the process crypto provider; registers the remote commands
 ├── remote/
-│   ├── mod.rs        feature gate; start/stop the listener from settings
-│   ├── identity.rs   desktop key pair and self-signed cert, generated once
-│   ├── listener.rs   axum over rustls; requires and verifies client certs
-│   ├── pairing.rs    QR payload, pairing token, approve/revoke
-│   ├── surface.rs    the remote allowlist: command name -> handler + class
-│   ├── events.rs     fan-out of Tauri events to SSE subscribers
-│   └── discovery.rs  mDNS advertisement of _headstate._tcp
+│   ├── mod.rs        the module list
+│   ├── gate.rs       Remote state; start/stop the listener from the setting; get/set_remote_enabled
+│   ├── identity.rs   desktop ML-DSA-65 key pair and self-signed cert, generated once; seed in the keychain via keyring, cert in a file
+│   ├── listener.rs   axum over rustls/rustls-post-quantum on a dual-stack socket; mTLS by fingerprint; the four routes
+│   ├── pairing.rs    QR payload, token, proof, pairing-request event, approve/deny/revoke, the pairing commands
+│   ├── surface.rs    the remote allowlist: command name -> class; dispatch onto commands::*
+│   ├── stepup.rs     X-Headstate-Signature grammar, canonical bytes, hybrid verify, nonce window, notification
+│   ├── events.rs     broadcast hub over listen_any; SSE framing for /v1/events
+│   ├── discovery.rs  mDNS advertisement of _headstate._tcp
+│   └── loopback_tests.rs  the in-process loopback test (cfg(test))
 └── store/
-    └── devices.rs    paired_devices table
+    ├── schema.rs     migration 6: paired_devices
+    └── devices.rs    paired_devices rows: insert, list, revoke, find, touch_last_seen
 
-src-mobile/ (new Tauri mobile crate)
+src-mobile/ (Tauri mobile crate; its own Cargo workspace and lockfile)
 ├── src/
-│   ├── lib.rs        mobile_entry_point; registers the client commands
-│   ├── keys.rs       session key + biometric-gated hybrid signing keys
-│   ├── client.rs     reqwest with client identity and server pinning
-│   ├── pairing.rs    scan QR, connect, prove token, store fingerprint
-│   └── events.rs     SSE subscriber; re-emits as Tauri events
+│   ├── lib.rs        mobile_entry_point; registers the plugins and the five client commands
+│   ├── discovery.rs  browse _headstate._tcp for the paired desktop's fingerprint prefix
+│   ├── background.rs the opportunistic background refresh: /v1/hello then get_cached, never the stream
+│   ├── keys.rs       DeviceKeys seam; the hardware implementation is the keys plugin
+│   ├── client.rs     reqwest on rustls/aws-lc-rs; session identity; pinned server fingerprint; no resumption
+│   ├── pairing.rs    parse the QR, prove the token, POST /v1/pair
+│   ├── stepup.rs     the phone side of X-Headstate-Signature
+│   ├── surface.rs    a copy of the desktop's class table, asserted identical at test time
+│   ├── events.rs     /v1/events subscriber; re-emits as Tauri events; caches the snapshot
+│   ├── store.rs      pairing record and snapshot over tauri-plugin-stronghold
+│   ├── connection.rs, companion.rs   the five client commands and the state machine
+│   └── testing.rs    the TLS test server behind the crate's loopback tests
+├── plugins/
+│   ├── headstate-refresh/   Swift and Kotlin sides of the background window; Rust bridge
+│   └── headstate-keys/      hardware-backed step-up keys; the software session identity
+├── Info.ios.plist    the local-network, Bonjour, Face ID, camera, and background-refresh keys
 ├── tauri.conf.json   identifier com.pktstorm.headstate.companion
-└── gen/              Xcode and Android Studio projects (generated)
+└── gen/apple         the Xcode project, committed; gen/android is generated in CI, not yet committed
 
 src (shared frontend)
 ├── api/
-│   ├── transport.ts  the seam: call(name, args) and listen(event, cb)
+│   ├── transport.ts  the seam: call(name, args) and listen(event, cb), chosen by VITE_TARGET
 │   ├── local.ts      transport backed by @tauri-apps/api invoke
 │   ├── remote.ts     transport backed by the mobile crate's client
-│   └── tauri.ts      unchanged signatures; now built on transport.ts
-└── components/       responsive pass; see Layout
+│   ├── connection.ts useConnectionState: polls connection_state on the phone
+│   └── tauri.ts      unchanged signatures; built on transport.ts
+├── lib/protocol.ts   REQUIRED_PROTOCOL_VERSION and desktopTooOld
+└── components/       ConnectionBanner, PairPhonePanel, PairingRequestModal, PairedDevicesList; see Layout
 ```
 
 ### The frontend seam
@@ -130,14 +157,17 @@ TLS is rustls with:
 
 - TLS 1.3 only.
 - The desktop's own self-signed certificate, generated on first enable
-  with `rcgen`, ten-year validity, private key stored in the platform keychain.
-  Headstate uses no keychain today; this is the first entry. The
-  certificate is not tied to a hostname; the phone pins the fingerprint,
-  not the name.
+  with `rcgen`, ten-year validity, ML-DSA-65 since protocol 2 (see
+  *Post-quantum posture*), the private key's seed stored in the platform
+  keychain and the certificate in a file beside the database. Headstate
+  used no keychain before this; this is the first entry. (On Linux, when
+  no Secret Service daemon is running, a mode-0600 file stands in; see
+  *What shipped differently*.) The certificate is not tied to a
+  hostname; the phone pins the fingerprint, not the name.
 - A client certificate verifier that accepts a connection only when the
-  presented certificate's SHA256 fingerprint matches a row in
-  `paired_devices`. No CA, no chain building. Unpaired certificates fail
-  the handshake, so an attacker never reaches HTTP.
+  presented certificate is ML-DSA-65 and its SHA256 fingerprint matches a
+  row in `paired_devices`. No CA, no chain building. Unpaired
+  certificates fail the handshake, so an attacker never reaches HTTP.
 
 The HTTP surface is deliberately tiny:
 
@@ -191,8 +221,9 @@ presumably sitting in front of.
 The phone holds a session key and a signing key pair, all generated at
 pairing and all non-exportable:
 
-- A **session key**, ECDSA P256, whose certificate is the TLS client
-  identity. Usable whenever the app is open.
+- A **session key**, ML-DSA-65 since protocol 2 (ECDSA P256 in 5.0),
+  whose certificate is the TLS client identity. Usable whenever the app
+  is open.
 - A **signing key pair** used only for step-up: an ECDSA P256 key and,
   where the platform can hold one, an ML-DSA-65 key. Both are generated
   in the platform's secure hardware with biometric or device passcode
@@ -242,11 +273,11 @@ record says which keys the phone has, so a device that pairs without
 ML-DSA and later upgrades can re-pair to add it, and the desktop never
 silently accepts a downgrade.
 
-ML-DSA-65 rather than 87 because it is NIST security category 3, a
-3,309-byte public key, and a 3,309-byte signature, which is already
-larger than everything else in a request combined; category 5 buys
-nothing for a signature that only has to hold until the device is
-revoked.
+ML-DSA-65 rather than 87 because it is NIST security category 3, with a
+1,952-byte public key and a 3,309-byte signature (FIPS 204); the
+signature alone is already larger than everything else in a request
+combined, and category 5 buys nothing for a signature that only has to
+hold until the device is revoked.
 
 **Why signatures are the second priority, not the first.** A quantum
 adversary attacks the two halves of this protocol differently. Recorded
@@ -261,14 +292,68 @@ later. This design therefore:
    listings recorded off the wire today stay private.
 2. Makes the step-up signature hybrid now, because the platform keys are
    available and the cost is one extra signature on a rare request.
-3. Leaves the TLS certificates themselves on ECDSA P256 for v1. ML-DSA in
-   TLS 1.3 is still an IETF draft, and rustls is in the middle of turning
-   it on by default for its 0.23 line; the pull request to do so was
-   marked ready for review on 4 September 2026 and was open when this
-   was written. Because both ends pin the peer's fingerprint rather than
-   validating a chain, migrating the certificates later is a matter of
-   regenerating them and re-pairing, and the plan is to do that once
-   rustls ships it.
+3. Left the TLS certificates themselves on ECDSA P256 for 5.0, and moved
+   them to **ML-DSA-65 in protocol 2** (#521), on rustls' unstable path
+   rather than waiting for a release that turns it on by default. What
+   "unstable" means for us:
+
+   - rustls 0.23.43 names the ML-DSA `SignatureScheme`s (0x0904-0x0906)
+     but ships neither a signing key nor a verifier for them on that
+     line. Both come from `rustls-post-quantum` 0.2.4 built with its
+     `aws-lc-rs-unstable` feature (rustls #2579, #2997): its `provider()`
+     is the aws-lc-rs provider plus a key provider that loads ML-DSA
+     PKCS#8 and a signature-algorithm table that includes webpki's
+     ML-DSA verifiers. Both ends build every TLS config on that
+     provider and nothing else, because the plain aws-lc-rs provider
+     cannot load an ML-DSA key at all.
+   - The feature drags in `rustls-webpki/aws-lc-rs-unstable`,
+     `aws-lc-rs/unstable` and `rcgen/aws_lc_rs_unstable`, all already in
+     both lockfiles, and declares rustls with default features, so
+     `tls12` and `prefer-post-quantum` come along. `tls12` was already
+     compiled in on both ends through hyper-rustls, and both still offer
+     TLS 1.3 only; `prefer-post-quantum` only reorders aws-lc-rs's
+     default key-exchange groups, which both ends override explicitly.
+   - "Unstable" is a statement about the crate API, which may move
+     between minor versions (aws-lc-rs 1.18 already moved `PqdsaKeyPair`
+     from `unstable::signature` to `signature`), not about the
+     algorithm: FIPS 204 is final, and the X.509 and TLS codepoints are
+     the ones the IETF drafts and rustls `main` (#3237) use. The cost is
+     that a rustls or aws-lc-rs bump may need the provider code touched;
+     the pins are `rustls-post-quantum = "0.2.4"` on both ends, over the
+     rustls 0.23.43 / aws-lc-rs 1.18.1 / rustls-webpki 0.103.x / rcgen
+     0.14.10 already locked.
+   - Pure ML-DSA-65, not a hybrid: rustls has no hybrid X.509 signature
+     scheme, and the key exchange is already hybrid. ML-DSA-65 rather
+     than 44 or 87 for the reason the step-up key uses it.
+
+   Keys are minted by `rcgen` (`PKCS_ML_DSA_65`) and verified through
+   webpki's `ML_DSA_65`; the desktop's `PairedVerifier` and the phone's
+   `PinnedServer` each advertise and accept `ML_DSA_65` and nothing
+   else, so a 5.0 certificate on either end fails the handshake before
+   any fingerprint is compared. Because both ends pin fingerprints, the
+   migration is regenerate, bump `v`, re-pair: every pairing made under
+   protocol 1 is cleared by migration 7 and every phone pairs again.
+
+   **Storage, and the Windows constraint.** An ML-DSA-65 certificate is
+   5,482 bytes, and Windows Credential Manager caps a credential blob at
+   `CRED_MAX_CREDENTIAL_BLOB_SIZE` (5 * 512 = 2560 bytes, `wincred.h`),
+   so the 5.0 layout -- the whole identity as one keychain item -- would
+   fail on Windows. The private key is not the problem: aws-lc-rs 1.18
+   serialises an ML-DSA key as the seed-form PKCS#8 (54 bytes), not the
+   expanded 4 KB form. So both ends keep the **32-byte FIPS 204 seed**
+   and re-derive the key with `PqdsaKeyPair::from_seed` (rcgen can mint
+   an ML-DSA key but not load one, so the seed is read out of the
+   seed-form PKCS#8 rcgen returns, against a pinned 22-byte prefix), and
+   keep the certificate separately: on the desktop in
+   `remote-identity.crt` beside the database (it is public, and cannot
+   be re-minted from the seed with the same fingerprint because ML-DSA
+   signing is hedged and the serial is random, so a seed without its
+   file is reported as corrupt, never regenerated); on the phone in the
+   same keychain item / encrypted preference as before, as `keySeed`
+   plus `certDer` -- the iOS Keychain has no such cap, but the two ends
+   store the same two things. A 5.0 desktop identity (version 1 in the
+   keychain) is replaced on the first enable after upgrading, since no
+   phone can be paired with it under protocol 2.
 
 **Implementation.**
 
@@ -296,8 +381,8 @@ later. This design therefore:
   `src-tauri/src/remote/stepup.rs`. aws-lc-rs also ships ML-DSA, but its
   API has moved between the unstable and stable modules across recent
   releases, so it was not considered.
-- The desktop's own identity key stays P256 in v1, for the same reason as
-  the certificates.
+- The desktop's own identity key stayed P256 in 5.0, for the same reason
+  as the certificates, and is ML-DSA-65 from protocol 2 (item 3 above).
 
 **Verified during the mobile crate spike** (#512, September 2026). These
 are the claims this section rests on that could not be confirmed from
@@ -402,7 +487,7 @@ intended pairing from an opportunistic one.
 
    ```json
    {
-     "v": 1,
+     "v": 2,
      "name": "octocat's laptop",
      "addrs": ["192.0.2.10", "100.64.0.7"],
      "port": 41919,
@@ -476,6 +561,311 @@ CREATE TABLE paired_devices (
 Added as a versioned migration in `store/schema.rs`. The desktop private
 key is not in SQLite; it lives in the platform keychain, which is a
 Security Policy change and is called out below.
+
+## Wire format
+
+What the phone must match, byte for byte, as the desktop on `main`
+implements it. Each convention is pinned by a Rust test named here; a
+change to any of them is a protocol bump (see *Versioning and
+compatibility*).
+
+### Port, versions, and `/v1/hello`
+
+- Port **41919**, protocol version **2** (`remote/listener.rs`,
+  `PROTOCOL_VERSION`). The same integer is the QR's `v`
+  (`the_qr_version_is_the_protocol_version`, on both ends). Version 1
+  was 5.0's ECDSA P256 certificates; the phone accepts a QR with `v: 2`
+  only and requires `protocol_version >= 2` from `/v1/hello`.
+- `GET /v1/hello` answers
+  `{"desktop_version": "<semver>", "protocol_version": 2, "viewer_login": "<login>" | null}`
+  (`a_paired_phone_gets_hello`, `hello_reports_no_login_when_not_signed_in`).
+- TLS 1.3 only. Key exchange groups are offered in the order
+  X25519MLKEM768, X25519, secp256r1
+  (`key_exchange_is_hybrid_post_quantum`).
+- Both certificates are self-signed **ML-DSA-65** (X.509 algorithm
+  2.16.840.1.101.3.4.3.18; TLS `SignatureScheme::ML_DSA_65`, 0x0905),
+  and each verifier advertises and accepts that scheme alone: the
+  desktop's in CertificateRequest, the phone's in ClientHello. A P256
+  certificate on either end fails the handshake
+  (`the_handshake_signs_with_ml_dsa_65_on_both_sides`,
+  `a_p256_client_certificate_is_refused_even_when_paired`,
+  `a_desktop_with_a_p256_certificate_is_a_handshake_failure`).
+- The listener binds `[::]:41919` as one dual-stack socket with
+  `IPV6_V6ONLY` cleared, falling back to `0.0.0.0:41919` where the IPv6
+  wildcard cannot be bound (`the_ipv6_wildcard_answers_on_ipv4_too`).
+
+### Pairing (`remote/pairing.rs`)
+
+- **Fingerprint**: SHA256 of the certificate DER as 64 lowercase hex
+  characters with no prefix. That is the form in `paired_devices`, in the
+  `pairing-request` event, and in what `handle_pair` compares. Only the
+  QR's `fp` carries it as `sha256:<hex>`.
+- **Token**: 32 random bytes, base64url without padding, 120-second TTL,
+  single use; issuing a new one replaces the previous one
+  (`a_token_is_32_random_bytes_and_replaces_the_previous_one`,
+  `an_expired_token_is_refused`, `a_replayed_token_is_refused`).
+- **Proof**: `HMAC-SHA256(key = the 32 raw token bytes, message =
+  client_fp_hex || server_fp_hex)`, the two hex strings as ASCII with no
+  separator, sent as base64url without padding. The HMAC is the standard
+  one (`the_proof_is_standard_hmac_sha256`, RFC 4231 test case 2).
+- **QR payload**: `{v, name, addrs, port, fp, token, exp}`. `addrs` is
+  every non-loopback IPv4 and IPv6 address, overlay addresses included,
+  IPv6 link-local excluded, IPv4 first
+  (`the_qr_payload_matches_the_spec_shape`,
+  `addrs_drop_loopback_link_local_and_duplicates_and_keep_overlays`).
+- **`POST /v1/pair`** body:
+  `{"token", "device_name", "signing_keys": {"ecdsa_p256", "mldsa_65"?}, "proof"}`.
+  The keys are standard base64 **with** padding: `ecdsa_p256` is the
+  65-byte SEC1 uncompressed point, `mldsa_65` the 1952-byte FIPS 204
+  public key. `200` on approve; `403` on deny, timeout, or a bad token or
+  proof (a wrong proof spends the token); `400` on a malformed body, which
+  keeps the token (`a_wrong_proof_is_refused_and_spends_the_token`,
+  `a_malformed_body_is_400_and_keeps_the_token`).
+- **`pairing-request` event** (desktop webview):
+  `{request_id: u64, device_name, fingerprint, has_mldsa}`. The desktop
+  answers with `respond_to_pairing(request_id, approve, replace_existing)`,
+  where `replace_existing` is `null` until the UI has asked (refused with
+  "a device named … is already paired" while another device has the
+  name), `true` to replace that device, or `false` to keep both. The
+  desktop denies on its own after 120 seconds (`DECISION_TIMEOUT`).
+
+### Step-up (`remote/stepup.rs`)
+
+```
+X-Headstate-Signature: v1;ts=<unix seconds>;nonce=<b64url 16 bytes>;ecdsa=<b64url 64 bytes>[;mldsa=<b64url 3309 bytes>]
+```
+
+- `;`-separated, no whitespace, `v1` first, each key at most once, every
+  value base64url without padding and decoded strictly
+  (`header_parses_and_round_trips`,
+  `header_rejects_every_deviation_from_the_grammar`).
+- ECDSA P256 over the SHA256 of the message, raw `r || s` (IEEE P1363),
+  not DER; no low-S rule. Android: `SHA256withECDSAinP1363Format`. iOS:
+  `P256.Signing.ECDSASignature.rawRepresentation`.
+- ML-DSA-65 pure, over the message itself, with the empty context string.
+- The message is the canonical JSON of
+  `{"args": …, "command": "…", "nonce": "<the header's nonce string>", "timestamp": <int>}`:
+  keys sorted by UTF-8 bytes at every level, including inside `args`, no
+  whitespace, `serde_json` escaping. The byte-exact vector the phone must
+  reproduce is `canonical_bytes_test_vector`: 203 bytes, SHA256
+  `ebd1a4f4f78ff1f55f7bf642cc8d72262b6a77ab14164bbf4f95135a6e0f79ff`.
+- `ts` within 60 seconds of the desktop clock either way; a reused nonce
+  is refused; a nonce is recorded only after every signature verifies. A
+  pairing that recorded an ML-DSA key refuses an ECDSA-only request, and
+  an ECDSA-only pairing refuses a request carrying `mldsa`.
+- Status: `400` for a malformed header, `500` for a stored key the
+  desktop cannot read, `403` for everything else.
+
+### Events (`remote/events.rs`, `GET /v1/events`)
+
+```
+event: <tauri event name>
+data: <the payload on one line, exactly as the webview received it>
+
+```
+
+- A bare `:` comment line after 15 seconds of silence
+  (`keep_alive_is_fifteen_seconds`).
+- The first frame after connecting is always `event: prs-updated` with
+  the cached snapshot, the serialised `Vec<PullRequest>` that
+  `get_cached` returns
+  (`a_phone_gets_the_snapshot_then_each_emit_with_the_webviews_json`).
+- The nine names: `prs-updated`, `poll-state`, `poll-error`,
+  `prs-truncated`, `prs-incomplete`, `store-error`,
+  `worktree-removal-progress`, `reviewing-short`, `update-run-done`.
+- The stream ends on revocation, when the subscriber falls more than 256
+  frames behind, or when the listener stops; the phone reconnects and
+  gets a fresh snapshot (`a_revoked_phones_stream_ends`,
+  `a_lagging_subscriber_is_ended`). `403` if the fingerprint is not
+  paired.
+
+### `connection_state` (phone; `src/api/connection.ts`)
+
+The banner polls the mobile crate's `connection_state` command every
+five seconds and expects
+`{"state": "unpaired" | "connecting" | "connected" | "unreachable" | "revoked", "desktop": string | null, "last_poll": string | null, "protocol_version"?: number | null}`.
+It reports `unknown` while the command is missing or has not answered,
+and treats a missing or null `protocol_version` as "not known", never as
+too old (`src/lib/protocol.ts`, `desktopTooOld`). Tapping the banner opens
+Settings on the Phone topic. The mobile crate's report
+(`src-mobile/src/connection.rs`, #542) also carries `stale: bool`, true
+unless connected to a desktop at this app's protocol or newer, sets
+`protocol_version` only while `connected`, and is emitted as a
+`connection-state` event on every change; `connection.ts` reaches the
+command through `transport.call`.
+
+### mDNS (`remote/discovery.rs`, `src-mobile/src/discovery.rs`)
+
+```
+<instance name>._headstate._tcp.local.   SRV  port=41919
+                                         TXT  fp=<first 16 lowercase hex of the certificate SHA256>
+                                              v=1
+```
+
+The instance name is the display name the QR carries (falling back to
+`Headstate`); the mDNS host name is `headstate-<fp prefix>.local.`. The
+phone's `discovery::browse(fp_prefix, timeout) -> Option<(IpAddr, u16)>`
+blocks for up to `timeout`, matches `fp` exactly, and ignores `v`; the
+client calls it before the addresses stored at pairing
+(`the_record_carries_the_port_the_prefix_and_the_version`,
+`start_registers_and_stop_withdraws_the_record`).
+
+## What shipped differently
+
+Every place the code on `main` departs from the design above, with the
+pull request that made the call. The spike answers under *Post-quantum
+posture* are left as they were written; where one of them has since been
+settled, the settlement is here.
+
+- **Start/stop live in `remote/gate.rs`, not `mod.rs`** (#530). `mod.rs`
+  is the module list. `gate.rs` holds the `Remote` state, `setup`,
+  `start`, `stop`, and the `get_remote_enabled` / `set_remote_enabled`
+  commands.
+- **Two rustls providers, settled** (#530). aws-lc-rs was already
+  compiled in through octocrab's `jwt-aws-lc-rs`, so enabling rustls'
+  `aws_lc_rs` feature added bindings, not a second crypto library.
+  Nothing would have panicked without a default (octocrab falls back to
+  ring), but `remote::gate::install_crypto_provider`, called from
+  `lib.rs` at startup, installs ring as the explicit process default so
+  octocrab and reqwest keep what they used; the listener builds its
+  `ServerConfig` on aws-lc-rs. The lock grew from 587 to 630 packages.
+- **"rustls with aws-lc-rs prefers X25519MLKEM768 by default" holds only
+  under rustls' `prefer-post-quantum` cargo feature** (#530), which this
+  crate does not enable (rustls is declared with default features off).
+  The listener orders the key exchange groups explicitly, and
+  `key_exchange_is_hybrid_post_quantum` asserts the negotiated group.
+- **Linux file fallback for the identity key** (#530). `keyring`'s Secret
+  Service backend needs a daemon at runtime; a headless box or a CI
+  runner has none. On Linux only, that case keeps the identity in a
+  mode-0600 file in the app data directory, logged as a step down at
+  every start. macOS and Windows never fall back. `SECURITY.md` records
+  the exception.
+- **Dual-stack bind** (#543). The design said "all interfaces"; #530
+  bound `0.0.0.0` (IPv4 only) while the QR from #529 lists IPv6
+  addresses too. #543 binds `[::]:41919` with `IPV6_V6ONLY` cleared
+  through `socket2`, falling back to `0.0.0.0` when the IPv6 wildcard
+  cannot be bound at all.
+- **Same-name re-pairing is a three-way answer** (#529, #536).
+  `respond_to_pairing` takes `replace_existing: Option<bool>`: `None` is
+  refused with "a device named … is already paired" and the request
+  stays pending; `Some(true)` replaces, revoking the old row;
+  `Some(false)` keeps both. The desktop never picks one on its own. The
+  `pairing-request` event carries a `request_id` so the answer names the
+  request, and the UI matches the refusal on the words "already paired",
+  so that wording is load-bearing.
+- **`CommandHost` seam on the listener** (#543). `commands::*` are typed
+  against `AppHandle<Wry>`, which no test can construct, so `/v1/call`
+  dispatches through a `CommandHost` trait: `surface::dispatch` plus
+  `notify_destructive` in production, a recording host in the loopback
+  test. The loopback test proves the pipeline up to the `commands::*`
+  call, not through it.
+- **`surface.rs` parses any `path::name` in `generate_handler!`** (#543),
+  and the six `remote::*` commands (`get_remote_enabled`,
+  `set_remote_enabled`, `issue_pairing_token`, `respond_to_pairing`,
+  `list_paired_devices`, `revoke_paired_device`) are classed `local`: a
+  phone must not approve its own pairing or turn the listener off.
+- **Revocation closes open connections, not only streams** (#543). Every
+  connection task watches the revocation broadcast and shuts itself down
+  gracefully on its own fingerprint, with a five-second deadline.
+- **The listener never resumes a TLS session** (#547). A resumed TLS 1.3
+  handshake restores the client certificate from the ticket instead of
+  asking for it, so `PairedVerifier` only runs on a full handshake and a
+  revoked phone could have reached HTTP by resuming. The desktop's
+  `ServerConfig` now sets `send_tls13_tickets = 0` and
+  `NoServerSessionStorage`, closing both the ticket and the cache halves;
+  `the_listener_never_resumes_a_session` and
+  `a_revoked_phone_cannot_resume_its_earlier_session` pin it. The phone
+  disables resumption too (#542), but the desktop no longer depends on
+  that.
+- **On macOS, toggling off can leave the port open but never served**
+  (#545). macOS has no `SOCK_CLOEXEC`, so a listening socket is briefly
+  inheritable between `socket(2)` and `fcntl(FD_CLOEXEC)`; a child
+  process spawned in that window (a `git` or `gh` call, say) forks with
+  the fd and keeps the kernel accepting on 41919 until the child exits,
+  and `shutdown(2)` on a listening socket is `ENOTCONN` on xnu, so the
+  desktop cannot take it back. Nothing answers on such a socket: a
+  connect completes, the TLS handshake never does. `Handle::stop` itself
+  closes the socket in-process; the residual is the child's copy. The
+  squash title reads `fix:`, but the change is the test and the `Handle`
+  docs.
+- **`last_seen` is never written** (#543). `store::devices::touch_last_seen`
+  exists and is tested, but nothing calls it: the verifier's
+  `PairedCerts` contract is read-only on the handshake path, and a write
+  path off it is a follow-up. Settings shows *Never connected* for every
+  device until then.
+- **The session key is software-backed** (#541).
+  rustls needs the private key bytes to present a client identity, so
+  the session key cannot live in the Secure Enclave or the Keystore. It
+  is generated with `rcgen` in Rust and handed to the native side to
+  keep: an iOS Keychain item, or on Android an app-private preference
+  encrypted under a Keystore-wrapped AES key. "All non-exportable" under
+  *Step-up for destructive commands* applies to the signing keys only.
+  The Android ML-DSA key is time-bound (a ten-second window) rather than
+  per-operation, because a `CryptoObject` binds one authentication to
+  one `Signature`.
+- **The Kotlin sides have never been compiled** (#541, #544). No machine
+  on this project has an Android SDK, and the `mobile-android` CI job
+  runs `cargo check` for the Android target, which does not build the
+  Gradle modules. The first `tauri android build` is their first compile.
+- **`gen/android` is not committed** (#537). The `mobile-android` job
+  generates it and uploads it as the `src-mobile-gen-android` artifact.
+  Committing it waits on adding `TAURI_APP_PATH` to the generated
+  `BuildTask.kt` and proving the build on a machine with an SDK, the same
+  defect #533 fixed by hand in the Xcode project (`gen/apple` is
+  committed, with `TAURI_APP_PATH="${SRCROOT:?}/../.."` in its Rust build
+  phase). Every `yarn tauri` call for the mobile crate needs
+  `TAURI_APP_PATH=src-mobile`; the Makefile sets it.
+- **CI is two jobs, not one** (#537): `mobile-android` (Ubuntu, NDK
+  27.3.13750724, lint, test, Android `cargo check`, `cargo deny`) and
+  `mobile-ios` (macOS, iOS `cargo check`). Neither is a required check
+  yet.
+- **The release workflow has never executed** (#540). `mobile-release.yml`
+  is on `main` but has no runs and no `mobile-v*` tag has been pushed. It
+  runs on a tag only once the `MOBILE_RELEASE_ENABLED` repository
+  variable is set, which is how the first-release gate is enforced; a
+  `workflow_dispatch` with `dry_run` builds unsigned and uploads nothing,
+  and is the intended first run. The build number on both stores is
+  `github.run_number`. Whether Xcode 26's `altool --upload-package --type
+  ios` accepts the upload end to end is unconfirmed. The secrets and the
+  promotion steps are in `docs/mobile-release-process.md`.
+- **`Info.ios.plist`** carries `NSLocalNetworkUsageDescription` and
+  `NSBonjourServiceTypes` (#533), the background-refresh keys (#544), and
+  `NSFaceIDUsageDescription` (#541) and `NSCameraUsageDescription`
+  (#542), with the wording settled in `docs/mobile-store-listings.md`.
+- **iPad** (#539). `gen/apple/project.yml` sets no
+  `TARGETED_DEVICE_FAMILY`, so App Store Connect will ask for iPad
+  screenshots; tablets are out of scope, and the choice is made at the
+  first upload.
+- **`src-mobile` is a Cargo workspace** (#541, #544) whose members are
+  the two in-repo plugins under `plugins/`, sharing the crate's lockfile
+  and `make lint-mobile` / `test-mobile` / `deny-mobile`.
+- **aws-lc-rs is a third ML-DSA verifier candidate** (#533): at 1.18 its
+  ML-DSA lives in the stable `signature` module. The desktop still
+  verifies step-up signatures with RustCrypto `ml-dsa` (#532); the TLS
+  certificates (below) go through aws-lc-rs, because that is what rustls
+  can sign and verify a handshake with.
+- **The TLS certificates are ML-DSA-65, on rustls' unstable path**
+  (#521, after 5.0). The design deferred this until a released rustls
+  enabled ML-DSA by default; the maintainer chose to move first, on
+  `rustls-post-quantum` 0.2.4 with `aws-lc-rs-unstable`. Protocol 2, QR
+  `v: 2`, migration 7 clears `paired_devices`, and every phone re-pairs.
+  The desktop keeps the key's 32-byte seed in the keychain and the
+  certificate in `remote-identity.crt` beside the database, because the
+  certificate (5,482 bytes) does not fit a Windows credential (2560
+  bytes); the phone's keys plugin stores `keySeed` plus `certDer`
+  through the same native code, which only ever held opaque bytes. The
+  spike note above about the "4 KB PKCS#8" was wrong for the crate we
+  ship: aws-lc-rs 1.18 writes the 54-byte seed form. Both verifiers
+  accept `ML_DSA_65` only, so a 5.0 desktop and a 5.0 phone are refused
+  at the handshake rather than reasoned about afterwards. The full
+  account, including what "unstable" does and does not mean, is item 3
+  under *Post-quantum posture*.
+- **Secure Enclave generations for ML-DSA remain unconfirmed** (#533).
+  iOS 26 needs A13 or later, so that is the floor by OS support alone;
+  Android needs `FEATURE_HARDWARE_KEYSTORE >= 500` (KeyMint 5), and the
+  exception type on an unsupported device is undocumented. The plugin
+  treats any failure as "no ML-DSA". Record the result per device in the
+  pairing walkthrough.
 
 ## Reachability
 
@@ -714,9 +1104,14 @@ produces a TestFlight and internal-testing build.
 
 ## Open questions
 
-- **Post-quantum TLS certificates.** Decided as a follow-up rather than
-  v1; see Post-quantum posture. The trigger is rustls enabling ML-DSA
-  signature schemes by default in a released version.
+- **Post-quantum TLS certificates.** Settled (#521): ML-DSA-65 on both
+  ends from protocol 2, on `rustls-post-quantum`'s unstable feature
+  rather than waiting for default enablement; see Post-quantum posture.
+  What remains open is when to drop the unstable feature: once a
+  released rustls 0.23 (or 0.24, #3237) carries ML-DSA in its own
+  aws-lc-rs provider, `rustls-post-quantum` can go and `provider()` on
+  both ends becomes the stock provider with the same key-exchange order.
+  Nothing on the wire changes when that happens.
 - **Multiple desktops.** The phone's settings store is designed as a list
   of desktops even though the UI shows one, so adding a switcher later is
   a frontend change only.

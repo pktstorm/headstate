@@ -1,10 +1,12 @@
 //! The mTLS listener a paired phone talks to.
 //!
 //! axum on a tokio task, port [`PORT`] on every interface (IPv4 and
-//! IPv6 on one dual-stack socket), TLS 1.3 only, rustls on the aws-lc-rs
-//! provider. Client certificates are required at the handshake and
-//! checked by fingerprint against the paired devices -- no CA, no chain
-//! -- so an unpaired client never reaches HTTP.
+//! IPv6 on one dual-stack socket), TLS 1.3 only, rustls on the
+//! `rustls-post-quantum` provider (aws-lc-rs plus ML-DSA; see
+//! [`provider`]). Client certificates are required at the handshake,
+//! must be ML-DSA-65, and are checked by fingerprint against the paired
+//! devices -- no CA, no chain -- so an unpaired client never reaches
+//! HTTP.
 //!
 //! # The seams
 //!
@@ -69,8 +71,8 @@ use rustls::crypto::{aws_lc_rs, CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{
-    CertificateError, DigitallySignedStruct, DistinguishedName, Error as TlsError, ServerConfig,
-    SignatureScheme,
+    CertificateError, DigitallySignedStruct, DistinguishedName, Error as TlsError, PeerMisbehaved,
+    ServerConfig, SignatureScheme,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -91,7 +93,15 @@ pub const PORT: u16 = 41919;
 
 /// Bumped deliberately, in the spec, when the surface or the pairing
 /// payload changes shape. Returned by `/v1/hello` and embedded in the QR.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// 2 (#521): both TLS certificates are ML-DSA-65. The desktop's own
+/// fingerprint changed with its certificate and the verifier admits no
+/// P-256 client certificate, so every phone from protocol 1 re-pairs.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// The one signature scheme a phone may sign the handshake with. Named
+/// here, once, because the verifier both advertises it and enforces it.
+const CLIENT_SIGNATURE_SCHEME: SignatureScheme = SignatureScheme::ML_DSA_65;
 
 /// The one path an unpaired peer may reach.
 pub const PAIR_PATH: &str = "/v1/pair";
@@ -227,6 +237,18 @@ struct AppState {
 /// additionally waits for the accept loop to finish and every open
 /// connection to be torn down, which is what "Allow phone connections:
 /// off" should mean.
+///
+/// What `stop` cannot promise is that the kernel stops completing TCP
+/// handshakes on the port the instant it returns. macOS has no
+/// `SOCK_CLOEXEC`, so there is a window between `socket(2)` and the
+/// `fcntl(2)` that marks the fd close-on-exec in which a child spawned
+/// from another thread (this app shells out to git and gh constantly)
+/// inherits the listening socket and keeps it open until it exits;
+/// `shutdown(2)` on a listening socket is `ENOTCONN` there, so nothing
+/// on this side can take it back. Such a connection is never served:
+/// the accept loop is gone, so no handshake completes and the phone
+/// sees a dead port rather than a desktop. The test
+/// `stop_closes_the_port` asserts exactly that boundary.
 pub struct Handle {
     addr: SocketAddr,
     shutdown: Option<oneshot::Sender<()>>,
@@ -259,14 +281,21 @@ impl Drop for Handle {
 
 /// The provider the listener uses, regardless of the process default.
 ///
-/// aws-lc-rs, because it is the only rustls provider with a
-/// post-quantum key exchange, and X25519MLKEM768 placed FIRST
-/// explicitly. rustls only orders it first under its
-/// `prefer-post-quantum` cargo feature, which this crate does not enable
-/// (rustls is declared with default features off, for the reasons in
-/// Cargo.toml); spelling the order out here means the preference does
-/// not depend on a feature flag anyone can drop by accident, and the
-/// test `key_exchange_is_hybrid_post_quantum` holds it.
+/// `rustls-post-quantum`'s: aws-lc-rs, which is the only rustls
+/// provider with a post-quantum key exchange, plus the ML-DSA signing
+/// keys and verifiers that rustls 0.23 itself only names. That is what
+/// signs the handshake with the desktop's ML-DSA-65 key and verifies
+/// the phone's; the plain aws-lc-rs provider cannot load an ML-DSA key
+/// at all, so this is the one provider every TLS config in this module
+/// is built on. It comes from the crate's `aws-lc-rs-unstable` feature
+/// -- see Cargo.toml for what "unstable" does and does not mean.
+///
+/// X25519MLKEM768 placed FIRST explicitly. rustls orders it first only
+/// under its `prefer-post-quantum` cargo feature (which the
+/// post-quantum crate happens to turn on); spelling the order out here
+/// means the preference does not depend on a feature flag anyone can
+/// drop by accident, and the test `key_exchange_is_hybrid_post_quantum`
+/// holds it.
 fn provider() -> CryptoProvider {
     CryptoProvider {
         kx_groups: vec![
@@ -274,11 +303,12 @@ fn provider() -> CryptoProvider {
             aws_lc_rs::kx_group::X25519,
             aws_lc_rs::kx_group::SECP256R1,
         ],
-        ..aws_lc_rs::default_provider()
+        ..rustls_post_quantum::provider()
     }
 }
 
-/// Accepts a client certificate by fingerprint alone.
+/// Accepts a client certificate by fingerprint alone, and only an
+/// ML-DSA-65 one.
 ///
 /// No chain building: the certificate is self-signed by the phone and
 /// the desktop learned its fingerprint at pairing. The one thing this
@@ -286,6 +316,16 @@ fn provider() -> CryptoProvider {
 /// the peer HOLDS the private key for the certificate it presented --
 /// because without that a fingerprint is a public value anyone could
 /// replay.
+///
+/// ML-DSA-65 and nothing else, in both directions: the scheme list
+/// goes out in CertificateRequest, so a phone with a pre-protocol-2
+/// P-256 session certificate finds nothing it can sign with and the
+/// handshake ends there; and `verify_tls13_signature` refuses any other
+/// scheme should a peer sign with one it was not offered. Refusing
+/// P-256 outright rather than accepting both through a transition is
+/// deliberate: every phone re-pairs for protocol 2 anyway, because the
+/// desktop's own fingerprint changed with its certificate, so there is
+/// no pairing a P-256 certificate could still belong to.
 struct PairedVerifier {
     paired: Arc<dyn PairedCerts>,
     algs: WebPkiSupportedAlgorithms,
@@ -331,22 +371,30 @@ impl ClientCertVerifier for PairedVerifier {
         Err(TlsError::General("TLS 1.2 is not offered".into()))
     }
 
+    /// ML-DSA-65 only. The provider's algorithm table maps that scheme
+    /// to webpki's ML-DSA-65 verifier, which also checks that the
+    /// certificate's public key is an ML-DSA-65 key -- so the scheme,
+    /// the key and the signature all have to agree.
     fn verify_tls13_signature(
         &self,
         message: &[u8],
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, TlsError> {
+        if dss.scheme != CLIENT_SIGNATURE_SCHEME {
+            return Err(PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme.into());
+        }
         rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algs)
     }
 
+    /// What CertificateRequest offers the phone.
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.algs.supported_schemes()
+        vec![CLIENT_SIGNATURE_SCHEME]
     }
 }
 
 /// TLS 1.3 only, the desktop's identity, client certificates required
-/// and checked by [`PairedVerifier`].
+/// and checked by [`PairedVerifier`], and no session resumption.
 fn server_config(
     identity: &Identity,
     paired: Arc<dyn PairedCerts>,
@@ -356,10 +404,23 @@ fn server_config(
         paired,
         algs: provider.signature_verification_algorithms,
     };
-    ServerConfig::builder_with_provider(provider)
+    let mut config = ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_client_cert_verifier(Arc::new(verifier))
-        .with_single_cert(vec![identity.cert()], identity.key())
+        .with_single_cert(vec![identity.cert()], identity.key())?;
+    // No resumption, ever. A resumed TLS 1.3 handshake restores the
+    // client certificate from the ticket instead of asking for it, so
+    // `PairedVerifier` never runs -- and a phone revoked after its
+    // first connection would walk back in on the ticket it kept. The
+    // spec's guarantee is "revoked means refused on the next
+    // handshake", which holds only if every handshake is a full one.
+    // Tickets are what a client offers; the session store is where
+    // rustls keeps what a ticket points at. Zeroing the one and
+    // emptying the other closes both halves, so a future change to
+    // either cannot quietly reopen it.
+    config.send_tls13_tickets = 0;
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    Ok(config)
 }
 
 /// The path-level gate above TLS: an unpaired peer reaches `/v1/pair`
@@ -838,13 +899,20 @@ pub(crate) mod tests {
         }
     }
 
+    /// The signature scheme the phone-side verifier saw the desktop
+    /// sign CertificateVerify with, recorded so a test can assert the
+    /// handshake used ML-DSA-65 rather than infer it.
+    pub(crate) type SchemeSeen = Arc<Mutex<Option<SignatureScheme>>>;
+
     /// The phone's side of the pin: accept the server certificate whose
-    /// fingerprint matches, verify it holds the key, refuse anything
-    /// else. Mirrors what `src-mobile/client.rs` will do.
+    /// fingerprint matches, verify it holds the key -- with ML-DSA-65
+    /// and nothing else -- refuse anything else. Mirrors what
+    /// `src-mobile/src/client.rs` does.
     #[derive(Debug)]
     struct PinnedServer {
         fp: String,
         algs: WebPkiSupportedAlgorithms,
+        seen: SchemeSeen,
     }
 
     impl ServerCertVerifier for PinnedServer {
@@ -878,10 +946,14 @@ pub(crate) mod tests {
             c: &CertificateDer<'_>,
             d: &DigitallySignedStruct,
         ) -> Result<HandshakeSignatureValid, TlsError> {
+            if d.scheme != SignatureScheme::ML_DSA_65 {
+                return Err(PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme.into());
+            }
+            *self.seen.lock().unwrap() = Some(d.scheme);
             rustls::crypto::verify_tls13_signature(m, c, d, &self.algs)
         }
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            self.algs.supported_schemes()
+            vec![SignatureScheme::ML_DSA_65]
         }
     }
 
@@ -946,10 +1018,21 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn client_config(phone: Option<&Identity>, server_fp: &str) -> Arc<ClientConfig> {
+        pinned_client(phone, server_fp).0
+    }
+
+    /// `client_config`, plus the handle its verifier records the
+    /// desktop's signature scheme into.
+    pub(crate) fn pinned_client(
+        phone: Option<&Identity>,
+        server_fp: &str,
+    ) -> (Arc<ClientConfig>, SchemeSeen) {
         let provider = Arc::new(provider());
+        let seen: SchemeSeen = Arc::default();
         let verifier = PinnedServer {
             fp: server_fp.to_string(),
             algs: provider.signature_verification_algorithms,
+            seen: seen.clone(),
         };
         let builder = ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13])
@@ -962,7 +1045,7 @@ pub(crate) mod tests {
                 .unwrap(),
             None => builder.with_no_client_auth(),
         };
-        Arc::new(cfg)
+        (Arc::new(cfg), seen)
     }
 
     pub(crate) struct Reply {
@@ -977,8 +1060,29 @@ pub(crate) mod tests {
         phone: Option<&Identity>,
         server_fp: &str,
     ) -> Result<TlsStream<TcpStream>, String> {
-        let connector = tokio_rustls::TlsConnector::from(client_config(phone, server_fp));
         let tcp = TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
+        handshake(tcp, phone, server_fp).await
+    }
+
+    /// The mTLS handshake over a TCP connection already made, on a
+    /// fresh client config -- so it never carries a ticket from an
+    /// earlier connection.
+    async fn handshake(
+        tcp: TcpStream,
+        phone: Option<&Identity>,
+        server_fp: &str,
+    ) -> Result<TlsStream<TcpStream>, String> {
+        handshake_with(tcp, client_config(phone, server_fp)).await
+    }
+
+    /// The handshake on a config the caller keeps: rustls's client
+    /// resumption is on by default, so a config reused across
+    /// connections offers whatever ticket the previous one earned.
+    async fn handshake_with(
+        tcp: TcpStream,
+        cfg: Arc<ClientConfig>,
+    ) -> Result<TlsStream<TcpStream>, String> {
+        let connector = tokio_rustls::TlsConnector::from(cfg);
         let name = ServerName::try_from("localhost").unwrap();
         connector
             .connect(name, tcp)
@@ -1063,7 +1167,7 @@ pub(crate) mod tests {
         assert_eq!(reply.status, 200);
         let v: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
         assert_eq!(v["desktop_version"], "9.9.9");
-        assert_eq!(v["protocol_version"], 1);
+        assert_eq!(v["protocol_version"], 2);
         assert_eq!(v["viewer_login"], "octocat");
         server.handle.stop().await;
     }
@@ -1134,6 +1238,84 @@ pub(crate) mod tests {
         server.handle.stop().await;
     }
 
+    /// One HTTP/1.1 GET of `/v1/hello` on a connection the caller made,
+    /// reading to the close -- which also drains the session tickets a
+    /// TLS 1.3 server sends right after the handshake, so the client's
+    /// store holds them for its next connection.
+    async fn hello_on(tls: &mut TlsStream<TcpStream>) -> Result<u16, String> {
+        tls.write_all(b"GET /v1/hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .map_err(|e| format!("write: {e}"))?;
+        let mut raw = Vec::new();
+        let _ = tls.read_to_end(&mut raw).await;
+        let text = String::from_utf8_lossy(&raw);
+        text.split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| format!("no response (got {} bytes)", raw.len()))
+    }
+
+    /// The desktop never resumes a session: a client that reuses its
+    /// config (and so its ticket store) still gets a full handshake,
+    /// which is the only kind that runs the certificate verifier.
+    #[tokio::test]
+    async fn the_listener_never_resumes_a_session() {
+        let certs = Arc::new(MemoryCerts::default());
+        let server = serve(certs).await;
+        let phone = Identity::generate().unwrap();
+        server.certs.pair(&phone.fingerprint());
+        let addr = server.handle.local_addr();
+        let cfg = client_config(Some(&phone), &server.fp);
+
+        for attempt in 1..=2 {
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let mut tls = handshake_with(tcp, cfg.clone()).await.unwrap();
+            assert_eq!(hello_on(&mut tls).await.unwrap(), 200);
+            assert_eq!(
+                tls.get_ref().1.handshake_kind(),
+                Some(rustls::HandshakeKind::Full),
+                "connection {attempt} must be a full handshake"
+            );
+        }
+        server.handle.stop().await;
+    }
+
+    /// The attack: a phone that was paired keeps the TLS 1.3 ticket its
+    /// first connection earned; after revocation it offers that ticket,
+    /// and a server that accepted it would skip the certificate
+    /// exchange -- and `PairedVerifier` -- entirely. Revocation must
+    /// bite on the next handshake whether or not a ticket is offered.
+    #[tokio::test]
+    async fn a_revoked_phone_cannot_resume_its_earlier_session() {
+        let certs = Arc::new(MemoryCerts::default());
+        let server = serve(certs).await;
+        let phone = Identity::generate().unwrap();
+        server.certs.pair(&phone.fingerprint());
+        let addr = server.handle.local_addr();
+        // One config for both connections: its session store keeps the
+        // ticket from the first, and the second offers it.
+        let cfg = client_config(Some(&phone), &server.fp);
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let mut tls = handshake_with(tcp, cfg.clone()).await.unwrap();
+        assert_eq!(hello_on(&mut tls).await.unwrap(), 200);
+
+        server.certs.revoke(&phone.fingerprint());
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let reply = match handshake_with(tcp, cfg).await {
+            // A refusal surfaces on the first read: the client believes
+            // its half of the TLS 1.3 handshake is complete.
+            Ok(mut tls) => hello_on(&mut tls).await,
+            Err(e) => Err(e),
+        };
+        assert!(
+            reply.is_err(),
+            "a revoked certificate must not reach HTTP by resuming: got {reply:?}"
+        );
+        server.handle.stop().await;
+    }
+
     /// While a pairing window is open the handshake admits an unpaired
     /// certificate -- and the path gate then allows it `/v1/pair` only.
     /// 405 rather than 403 on a GET of the pair path proves it got past
@@ -1200,6 +1382,99 @@ pub(crate) mod tests {
         server.handle.stop().await;
     }
 
+    /// ML-DSA-65 on both sides, observed rather than assumed. The
+    /// phone-side verifier records the scheme the desktop signed
+    /// CertificateVerify with and the leaf it signed under; the desktop's
+    /// verifier admits no scheme but ML-DSA-65, so a completed handshake
+    /// is itself the proof that the phone's CertificateVerify was
+    /// ML-DSA-65 under its ML-DSA-65 certificate.
+    #[tokio::test]
+    async fn the_handshake_signs_with_ml_dsa_65_on_both_sides() {
+        use crate::remote::identity::testing::is_ml_dsa_65_certificate;
+        let certs = Arc::new(MemoryCerts::default());
+        let server = serve(certs).await;
+        let phone = Identity::generate().unwrap();
+        server.certs.pair(&phone.fingerprint());
+
+        let (cfg, seen) = pinned_client(Some(&phone), &server.fp);
+        let tcp = TcpStream::connect(server.handle.local_addr())
+            .await
+            .unwrap();
+        let mut tls = handshake_with(tcp, cfg).await.unwrap();
+        assert_eq!(hello_on(&mut tls).await.unwrap(), 200);
+
+        assert_eq!(*seen.lock().unwrap(), Some(SignatureScheme::ML_DSA_65));
+        let leaf = tls.get_ref().1.peer_certificates().unwrap()[0].clone();
+        assert_eq!(fingerprint_of(leaf.as_ref()), server.fp);
+        assert!(is_ml_dsa_65_certificate(leaf.as_ref()));
+        assert!(is_ml_dsa_65_certificate(phone.cert().as_ref()));
+        server.handle.stop().await;
+    }
+
+    /// A phone from before protocol 2 presents an ECDSA P-256 session
+    /// certificate. Even paired by fingerprint, it never reaches HTTP:
+    /// the desktop offers no scheme it can sign with. The listener is
+    /// not broken for anyone else while it tries.
+    #[tokio::test]
+    async fn a_p256_client_certificate_is_refused_even_when_paired() {
+        let certs = Arc::new(MemoryCerts::default());
+        let server = serve(certs).await;
+        let addr = server.handle.local_addr();
+        let old_phone = Identity::p256_for_tests();
+        server.certs.pair(&old_phone.fingerprint());
+        server.certs.open_window(true);
+
+        assert!(
+            get(addr, "/v1/hello", Some(&old_phone), &server.fp)
+                .await
+                .is_err(),
+            "a P-256 client certificate must fail the handshake"
+        );
+        assert!(
+            get(addr, PAIR_PATH, Some(&old_phone), &server.fp)
+                .await
+                .is_err(),
+            "not even to pair: the window does not widen the scheme"
+        );
+
+        let phone = Identity::generate().unwrap();
+        server.certs.pair(&phone.fingerprint());
+        assert_eq!(
+            get(addr, "/v1/hello", Some(&phone), &server.fp)
+                .await
+                .unwrap()
+                .status,
+            200
+        );
+        server.handle.stop().await;
+    }
+
+    /// What CertificateRequest advertises, and what the verifier will
+    /// check: one scheme.
+    #[test]
+    fn the_verifier_offers_ml_dsa_65_and_nothing_else() {
+        let provider = provider();
+        let verifier = PairedVerifier {
+            paired: Arc::new(MemoryCerts::default()),
+            algs: provider.signature_verification_algorithms,
+        };
+        assert_eq!(
+            verifier.supported_verify_schemes(),
+            vec![SignatureScheme::ML_DSA_65]
+        );
+        // And the provider it delegates to can verify that scheme --
+        // the plain aws-lc-rs one cannot, which is the whole reason for
+        // the post-quantum provider.
+        assert!(provider
+            .signature_verification_algorithms
+            .supported_schemes()
+            .contains(&SignatureScheme::ML_DSA_65));
+        assert!(!aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+            .contains(&SignatureScheme::ML_DSA_65));
+    }
+
     /// The pin on the phone's side is real: a server presenting some
     /// other certificate is refused by the test client. Without this the
     /// tests above could pass against any server at all.
@@ -1251,17 +1526,51 @@ pub(crate) mod tests {
         handle.stop().await;
     }
 
+    /// Off means off: once `stop()` has returned, nothing answers on
+    /// the port.
+    ///
+    /// A refused TCP connect is the usual outcome and the strong form
+    /// of the check. It is not the only acceptable one. macOS has no
+    /// `SOCK_CLOEXEC`, so between `socket(2)` and the `fcntl(2)` that
+    /// sets `FD_CLOEXEC` a child spawned by another test thread (the
+    /// packages and worktrees tests shell out) inherits the listening
+    /// socket and the kernel keeps completing handshakes on it until
+    /// that child exits -- `shutdown(2)` on a listening socket is
+    /// `ENOTCONN` there, so `stop()` cannot take it back. Measured with
+    /// four threads spawning `sleep 0.01` beside 3000 stop-then-connect
+    /// rounds: 1, 5 and 0 leaked ports per run, and 0 of 3000 twice
+    /// without the spawning. CI runs the suite with `--test-threads=8`
+    /// and saw exactly this once in three runs (#537). What `stop()`
+    /// does guarantee is that the accept loop is gone and this process
+    /// holds no reference, and that is what the second half asserts: an
+    /// orphaned socket has nobody to answer a ClientHello, whereas a
+    /// listener `stop()` failed to shut down answers it in milliseconds.
     #[tokio::test]
     async fn stop_closes_the_port() {
         let certs = Arc::new(MemoryCerts::default());
+        let phone = Identity::generate().unwrap();
+        certs.pair(&phone.fingerprint());
         let server = serve(certs).await;
         let addr = server.handle.local_addr();
-        assert!(TcpStream::connect(addr).await.is_ok());
+        connect(addr, Some(&phone), &server.fp)
+            .await
+            .expect("reachable before stop");
 
         server.handle.stop().await;
+        let Ok(tcp) = TcpStream::connect(addr).await else {
+            return; // closed: the port refuses outright
+        };
+        // The kernel completed the handshake, so something still holds
+        // the socket. Only an inherited copy is allowed to: that one
+        // never talks TLS back.
+        let served = tokio::time::timeout(
+            Duration::from_secs(2),
+            handshake(tcp, Some(&phone), &server.fp),
+        )
+        .await;
         assert!(
-            TcpStream::connect(addr).await.is_err(),
-            "the port must be closed once the toggle is off"
+            !matches!(served, Ok(Ok(_))),
+            "the listener must be gone once the toggle is off, but it completed a handshake"
         );
     }
 
@@ -1292,25 +1601,44 @@ pub(crate) mod tests {
     /// addresses: a phone on IPv4 must reach it. On a runner with IPv6
     /// off the fallback to `0.0.0.0` makes the same test pass, which is
     /// the property wanted either way.
+    ///
+    /// The port is retried when it turns out to be shared. With
+    /// `SO_REUSEADDR` set, a BSD kernel hands a wildcard `bind(0)` any
+    /// port no other *wildcard* socket holds, so `[::]:0` can land on a
+    /// port some other process is listening on at `127.0.0.1` -- and
+    /// that process, being the more specific match, gets the IPv4
+    /// connect. It answers the ClientHello with whatever it speaks,
+    /// which the pinned handshake reports as a corrupt message (seen
+    /// once in 30 local runs of the suite, this desktop having seven
+    /// such listeners). A refused connect is not retried: that is the
+    /// bug this test exists to catch.
     #[tokio::test]
     async fn the_ipv6_wildcard_answers_on_ipv4_too() {
-        let certs = Arc::new(MemoryCerts::default());
-        let server = serve_at(
-            "[::]:0".parse().unwrap(),
-            certs,
-            Arc::new(Hub::new(no_snapshot())),
-        )
-        .await;
         let phone = Identity::generate().unwrap();
-        server.certs.pair(&phone.fingerprint());
-        let port = server.handle.local_addr().port();
-
-        let v4 = SocketAddr::from(([127, 0, 0, 1], port));
-        let reply = get(v4, "/v1/hello", Some(&phone), &server.fp)
-            .await
-            .expect("reachable over IPv4 loopback");
-        assert_eq!(reply.status, 200);
-        server.handle.stop().await;
+        let mut last = String::new();
+        for _ in 0..5 {
+            let certs = Arc::new(MemoryCerts::default());
+            certs.pair(&phone.fingerprint());
+            let server = serve_at(
+                "[::]:0".parse().unwrap(),
+                certs,
+                Arc::new(Hub::new(no_snapshot())),
+            )
+            .await;
+            let port = server.handle.local_addr().port();
+            let v4 = SocketAddr::from(([127, 0, 0, 1], port));
+            let reply = get(v4, "/v1/hello", Some(&phone), &server.fp).await;
+            server.handle.stop().await;
+            match reply {
+                Ok(reply) => {
+                    assert_eq!(reply.status, 200);
+                    return;
+                }
+                Err(e) if e.starts_with("handshake:") => last = e,
+                Err(e) => panic!("reachable over IPv4 loopback: {e}"),
+            }
+        }
+        panic!("five wildcard ports in a row answered as somebody else: {last}");
     }
 
     /// Revocation closes what the device already has open, not only

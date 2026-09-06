@@ -1,11 +1,12 @@
 /// The seam between the typed wrappers in `tauri.ts` and whatever
 /// carries them to Rust.
 ///
-/// On the desktop that is the webview's own IPC (`local.ts`). The mobile
-/// companion will instead reach a paired desktop over the network with
-/// the same command names and the same event names, so the wrappers and
-/// the TanStack Query hooks above this line never learn which one they
-/// are on. Nothing else imports `invoke` or `listen` from `@tauri-apps/api`;
+/// On the desktop that is the webview's own IPC (`local.ts`). On the
+/// mobile companion it is the companion's Rust process (`remote.ts`),
+/// which reaches the paired desktop over the network with the same
+/// command names and the same event names, so the wrappers and the
+/// TanStack Query hooks above this line never learn which one they are
+/// on. Nothing else imports `invoke` or `listen` from `@tauri-apps/api`;
 /// every command and every poll-loop event goes through here.
 ///
 /// The build picks the transport with `VITE_TARGET` (see
@@ -14,6 +15,7 @@
 /// it was: one property lookup, no branch, no promise wrapper.
 
 import { local } from "./local";
+import { remote } from "./remote";
 
 /// What `listen` resolves with: call it to stop listening. Shaped
 /// exactly like Tauri's own `UnlistenFn`, and re-declared here so the
@@ -31,12 +33,7 @@ export interface Transport {
 
 function select(target: string): Transport {
   if (target === "desktop") return local;
-  if (target === "mobile") {
-    // Reserved by the mobile companion design. Failing here, at import,
-    // is deliberate: a mobile build that silently fell back to the
-    // desktop transport would talk to a Rust process that is not there.
-    throw new Error("remote transport not built: VITE_TARGET=mobile has no backend yet");
-  }
+  if (target === "mobile") return remote;
   throw new Error(`unknown VITE_TARGET "${target}": expected "desktop" or "mobile"`);
 }
 

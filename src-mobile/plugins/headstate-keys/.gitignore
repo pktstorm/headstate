@@ -1,0 +1,4 @@
+# The Tauri Swift API package, copied here by build.rs on an iOS build
+# (`ios/Package.swift` points at it). The Android copy lands in
+# `android/.tauri` and has its own ignore.
+/.tauri

@@ -123,6 +123,18 @@ const MIGRATIONS: &[&str] = &[
         paired_at       TEXT NOT NULL,
         last_seen       TEXT
      );",
+    // 7: every pairing pinned the desktop's ECDSA P-256 certificate.
+    //
+    // From protocol 2 on (#521) the desktop identity is ML-DSA-65 and is
+    // regenerated on the first enable after the upgrade, so every row
+    // here names a desktop fingerprint that no longer exists -- and a
+    // phone certificate the listener would refuse at the handshake
+    // regardless, since it admits ML-DSA-65 client certificates only.
+    // Cleared rather than kept: a row the verifier can never match is a
+    // device Settings shows as paired that can never connect, and
+    // re-pairing is the migration the design chose for a certificate
+    // change. The table's shape is unchanged.
+    "DELETE FROM paired_devices;",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
@@ -222,7 +234,10 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        // Through 6 and on to the end: 7 only empties the table this
+        // one created, so a v5 database lands at the current version.
+        assert_eq!(version, MIGRATIONS.len() as i64);
+        assert!(version >= 6);
 
         // The fingerprint is the verifier's lookup key; two rows with the
         // same one would make "which device is this" ambiguous.
@@ -234,6 +249,50 @@ mod tests {
             conn.execute(insert, ["b"]).is_err(),
             "cert_fp must be unique"
         );
+    }
+
+    /// Migration 7 empties `paired_devices` on a database that stopped
+    /// at version 6 -- every 5.0 install with a paired phone. Checked
+    /// with a row present, from a real v6 state, so a migration that
+    /// only ran on an empty table would be caught.
+    #[test]
+    fn migration_seven_clears_the_pairings_of_a_v6_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE snapshot (id INTEGER PRIMARY KEY, payload TEXT NOT NULL,
+                fetched_at TEXT NOT NULL);
+             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE cleanup_log (id INTEGER PRIMARY KEY, at TEXT NOT NULL,
+                kind TEXT NOT NULL, target TEXT NOT NULL, detail TEXT, bytes INTEGER,
+                action TEXT NOT NULL, error TEXT);
+             CREATE TABLE paired_devices (id INTEGER PRIMARY KEY, name TEXT NOT NULL,
+                cert_fp TEXT NOT NULL UNIQUE, cert_der BLOB NOT NULL,
+                ecdsa_pubkey BLOB NOT NULL, mldsa_pubkey BLOB, paired_at TEXT NOT NULL,
+                last_seen TEXT);
+             INSERT INTO paired_devices (name, cert_fp, cert_der, ecdsa_pubkey, paired_at)
+                VALUES ('Octocat''s phone', 'ab', x'00', x'04', '2026-09-05T00:00:00Z');",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 6i64).unwrap();
+
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 7);
+        assert!(has_table(&conn, "paired_devices"), "the table stays");
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM paired_devices", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "every P-256-era pairing is gone");
+        // And the table still takes new rows with the same shape.
+        conn.execute(
+            "INSERT INTO paired_devices (name, cert_fp, cert_der, ecdsa_pubkey, paired_at)
+             VALUES ('a', 'cd', x'00', x'04', '2026-09-06T00:00:00Z')",
+            [],
+        )
+        .unwrap();
     }
 
     #[test]
