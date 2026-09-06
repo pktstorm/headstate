@@ -80,6 +80,7 @@ jobs:
           APPSTORE_API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
           APPSTORE_API_ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
           APPSTORE_API_PRIVATE_KEY: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
           if [ "$DRY_RUN" = "true" ]; then
@@ -91,9 +92,14 @@ jobs:
             *) echo "A signed release needs a mobile-v* tag; dispatch with dry_run for a rehearsal." >&2; exit 1 ;;
           esac
           missing=""
+          # APPLE_TEAM_ID is in this list because without it the build
+          # fails at xcodebuild with `requires a provisioning profile`,
+          # which reads as a profile problem rather than a missing
+          # secret. See the Build the IPA step.
           for name in IOS_DIST_CERT_P12_BASE64 IOS_DIST_CERT_PASSWORD \
                       IOS_PROVISIONING_PROFILE_BASE64 APPSTORE_API_KEY_ID \
-                      APPSTORE_API_ISSUER_ID APPSTORE_API_PRIVATE_KEY; do
+                      APPSTORE_API_ISSUER_ID APPSTORE_API_PRIVATE_KEY \
+                      APPLE_TEAM_ID; do
             [ -n "${!name:-}" ] || missing="$missing $name"
           done
           if [ -n "$missing" ]; then
@@ -227,16 +233,38 @@ jobs:
       # it does not matter whether Actions omits an empty value or
       # exports an empty string (Tauri treats a present IOS_CERTIFICATE
       # as "sign this").
+      #
+      # APPLE_DEVELOPMENT_TEAM is the one that is NOT optional, and it is
+      # the reason mobile-v0.1.1 failed. Tauri REGENERATES the Xcode
+      # project from tauri.conf.json on every `ios build`, and the
+      # generated target gets a DEVELOPMENT_TEAM only if the team is
+      # known -- so with none set, the project it writes has no team and
+      # `CODE_SIGN_IDENTITY = "iPhone Developer"`, and xcodebuild stops
+      # with `"headstate-companion_iOS" requires a provisioning profile`
+      # before compiling anything. Importing the certificate does not
+      # rescue it: the CLI resolves the team FIRST (its "No code signing
+      # certificates found ... set APPLE_DEVELOPMENT_TEAM" warning is
+      # printed two seconds BEFORE it imports the p12), so by the time an
+      # identity exists the project has already been written without one.
+      #
+      # It reuses APPLE_TEAM_ID, the secret release.yml already notarizes
+      # with -- one team, one secret, and Preflight fails early if it is
+      # unset. A team ID is not really sensitive (it ships inside every
+      # signed app), but it is an account identifier and this repository
+      # is public, so it stays a secret rather than being written into
+      # the committed config.
       - name: Build the IPA
         env:
           IOS_CERTIFICATE: ${{ env.DRY_RUN != 'true' && secrets.IOS_DIST_CERT_P12_BASE64 || '' }}
           IOS_CERTIFICATE_PASSWORD: ${{ env.DRY_RUN != 'true' && secrets.IOS_DIST_CERT_PASSWORD || '' }}
           IOS_MOBILE_PROVISION: ${{ env.DRY_RUN != 'true' && secrets.IOS_PROVISIONING_PROFILE_BASE64 || '' }}
+          APPLE_DEVELOPMENT_TEAM: ${{ env.DRY_RUN != 'true' && secrets.APPLE_TEAM_ID || '' }}
         run: |
           set -euo pipefail
           CONFIG=$(printf '{"bundle":{"iOS":{"bundleVersion":"%s"}}}' "$BUILD_NUMBER")
           if [ "$DRY_RUN" = "true" ]; then
             unset IOS_CERTIFICATE IOS_CERTIFICATE_PASSWORD IOS_MOBILE_PROVISION
+            unset APPLE_DEVELOPMENT_TEAM
             echo "Dry run: building an unsigned IPA."
             yarn tauri ios build --ci --no-sign --config "$CONFIG"
           else

@@ -17,6 +17,35 @@ jobs:
   # Deliberately a wait rather than duplicating the test steps: one
   # definition of "green" means the release cannot pass a gate that CI
   # would have failed.
+  #
+  # `ignore-checks` excludes the PHONE release's jobs. Without it this
+  # waits on every check run attached to the commit, which is a larger
+  # set than CI: a `mobile-v*` tag pointing at the same commit as a `v*`
+  # tag puts mobile-release.yml's jobs on that commit too, and v5.4.0
+  # failed this gate on `ios-release` -- a job that builds no desktop
+  # artifact and whose failure says nothing about whether the desktop is
+  # releasable. The two pipelines are independent by design (see the
+  # header of mobile-release.yml), so neither may hold the other hostage.
+  #
+  # `ignore-checks` and not `check-name`: the action compares `check-name`
+  # to a check's name with a single `==` (app/services/
+  # github_checks_verifier.rb, `apply_filters`), so it names exactly ONE
+  # check -- a list there matches nothing and fails as "never run".
+  # `ignore-checks` is comma-split, and subtracting is also the safer
+  # direction: a NEW ci.yml job is waited on automatically, where an
+  # allowlist would have silently stopped gating on it.
+  #
+  # `publish` names a job in BOTH release workflows, so ignoring it
+  # covers this file's own `publish` too -- which is what we want. That
+  # job is downstream of this gate and reports `skipped` until the gate
+  # clears, and `skipped` is not an allowed conclusion; on v5.4.0 the
+  # gate's final tally already read `publish: completed (skipped)` and
+  # only escaped failing on it because the mobile run's copy was the one
+  # that survived name deduplication. A gate cannot wait on a job that
+  # waits on the gate.
+  #
+  # Everything not listed here must still conclude `success`, so this
+  # stays as strict as it was for everything CI actually runs.
   gate:
     runs-on: ubuntu-latest
     steps:
@@ -28,6 +57,7 @@ jobs:
           running-workflow-name: gate
           wait-interval: 15
           allowed-conclusions: success
+          ignore-checks: ios-release,android-release,publish
 
   build:
     needs: gate
