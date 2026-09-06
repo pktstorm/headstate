@@ -127,6 +127,27 @@ describe("UpdateWizard", () => {
     expect(screen.getByText(/constraint in your .tf source/i)).toBeTruthy();
   });
 
+  /// Same rule as Terraform, and the same failure it is guarding
+  /// against: `apply::supported` refuses Cargo, so a selectable Cargo
+  /// row would count toward the button and fail at apply time with a
+  /// reason the user could have been given before clicking.
+  ///
+  /// `cargo add` cannot target a workspace member, and a workspace root
+  /// is ONE row here -- measured, it either severs `workspace = true`
+  /// inheritance or adds the crate to the wrong package.
+  it("does not offer Rust crates as applicable", () => {
+    const crate: Outdated = {
+      ...pkg("tauri-plugin-log", "cargo"),
+      current: "2.9.0",
+      latest: "2.9.1",
+      bump: "patch",
+      manifest: "Cargo.toml [dependencies]",
+    };
+    show([crate]);
+    expect(screen.queryAllByRole("checkbox")).toHaveLength(0);
+    expect(screen.getByText(/cargo add/i)).toBeTruthy();
+  });
+
   /// The `2.8.0 → 2.8.0` rows in the report. `registry::enrich` leaves
   /// a provider at `latest == current` with `bump: "unknown"` when its
   /// lookup FAILS -- meaning "cannot compare", not "up to date". The

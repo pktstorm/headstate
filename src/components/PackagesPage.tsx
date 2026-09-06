@@ -24,6 +24,7 @@ const ECOSYSTEM_LABEL: Record<Ecosystem, string> = {
   cocoapods: "CocoaPods",
   terraform: "Terraform",
   swift: "Swift",
+  cargo: "Cargo",
 };
 
 const BUMP_TONE: Record<Bump, string> = {

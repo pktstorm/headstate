@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 
 /// Which toolchain owns a project's dependencies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// `Ord` so an ecosystem can be half of a map key: `registry::enrich`
+// de-duplicates lookups by (ecosystem, name), because `aws` is both a
+// Terraform provider and a crate and one must not answer for the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Ecosystem {
     Npm,
@@ -26,6 +29,16 @@ pub enum Ecosystem {
     /// `Package.resolved` and says plainly that it cannot check them,
     /// rather than rendering an empty list that reads as "up to date".
     Swift,
+    /// Rust crates, from `Cargo.toml` plus `Cargo.lock`.
+    ///
+    /// The THIRD ecosystem needing no tool installed, for the same
+    /// reason as Terraform. Cargo has no `npm outdated`, and the
+    /// subcommands that come close (`cargo outdated`, `cargo upgrade`)
+    /// are third-party installs -- so a missing one would silence the
+    /// whole ecosystem, which is the inversion this module refuses.
+    /// The lockfile carries the resolved version and the crates.io
+    /// SPARSE INDEX answers "what is newest" over plain HTTPS.
+    Cargo,
 }
 
 impl Ecosystem {
@@ -41,6 +54,12 @@ impl Ecosystem {
             // Never spawned; see the variant's comment.
             Ecosystem::Terraform => "terraform",
             Ecosystem::Swift => "swift",
+            // Never spawned; see the variant's comment. `cargo` is on
+            // the machine if there is a Cargo.toml, but it answers a
+            // different question -- `cargo update --dry-run` reports
+            // what the RESOLVER would move to within the existing
+            // constraints, not what the newest published version is.
+            Ecosystem::Cargo => "cargo",
         }
     }
 
@@ -55,6 +74,7 @@ impl Ecosystem {
             Ecosystem::Cocoapods => "pod update <pkg>",
             Ecosystem::Terraform => "raise the version constraint, then terraform init -upgrade",
             Ecosystem::Swift => "update the version rule in Xcode, or Package.swift",
+            Ecosystem::Cargo => "cargo add <pkg>@<version>",
         }
     }
 
@@ -66,6 +86,7 @@ impl Ecosystem {
             Ecosystem::Cocoapods => "Podfile",
             Ecosystem::Terraform => ".terraform.lock.hcl",
             Ecosystem::Swift => "Package.resolved",
+            Ecosystem::Cargo => "Cargo.toml",
             // .NET is a glob, handled by the detector rather than here.
             Ecosystem::Dotnet => "",
         }

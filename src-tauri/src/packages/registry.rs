@@ -77,13 +77,18 @@ pub async fn enrich(reports: &mut [super::model::ProjectReport]) {
     // De-duplicated: a real Terraform repo pins the same seven providers
     // across a dozen modules, which would otherwise be a dozen identical
     // requests.
+    //
+    // Keyed by ECOSYSTEM as well as name, now that three ecosystems
+    // share this pass: `aws` is both a Terraform provider and a crate,
+    // and one lookup answering for the other would report a version from
+    // the wrong registry entirely.
     let mut wanted: Vec<(super::model::Ecosystem, String)> = Vec::new();
     for p in reports.iter() {
         for r in &p.reports {
             for o in &r.outdated {
-                let key = lookup_key(o);
-                if needs_lookup(o.ecosystem) && !wanted.iter().any(|(_, n)| n == &key) {
-                    wanted.push((o.ecosystem, key));
+                let entry = (o.ecosystem, lookup_key(o));
+                if needs_lookup(o) && !wanted.contains(&entry) {
+                    wanted.push(entry);
                 }
             }
         }
@@ -92,10 +97,11 @@ pub async fn enrich(reports: &mut [super::model::ProjectReport]) {
         return;
     }
 
-    let mut found: std::collections::BTreeMap<String, String> = Default::default();
+    let mut found: std::collections::BTreeMap<(super::model::Ecosystem, String), String> =
+        Default::default();
     for (eco, name) in wanted {
         if let Some(v) = latest_for(&client, eco, &name).await {
-            found.insert(name, v);
+            found.insert((eco, name), v);
         }
     }
 
@@ -123,12 +129,16 @@ pub async fn enrich(reports: &mut [super::model::ProjectReport]) {
 /// "cannot compare" and the wizard refuses to select.
 fn apply_found(
     reports: &mut [super::model::ProjectReport],
-    found: &std::collections::BTreeMap<String, String>,
+    found: &std::collections::BTreeMap<(super::model::Ecosystem, String), String>,
 ) {
     for p in reports.iter_mut() {
         for r in &mut p.reports {
             for o in &mut r.outdated {
-                let Some(latest) = found.get(&lookup_key(o)) else {
+                // Keyed by ECOSYSTEM as well as name: `aws` is both a
+                // Terraform provider and a crate, and one lookup
+                // answering for the other would write a version from
+                // the wrong registry entirely.
+                let Some(latest) = found.get(&(o.ecosystem, lookup_key(o))) else {
                     continue;
                 };
                 if super::version::is_newer(&o.current, latest) == Some(false) {
@@ -146,6 +156,35 @@ fn apply_found(
             }
         }
     }
+}
+
+/// The newest published version of a crate, from the crates.io SPARSE
+/// INDEX.
+///
+/// The sparse index is a plain static file per crate over HTTPS -- one
+/// GET, no API, no auth, no rate limit to negotiate -- which is exactly
+/// why this ecosystem needs no tool installed. It returns
+/// newline-delimited JSON, one object per published version, and
+/// `cargo::newest_stable` applies the two filters that matter: yanked
+/// versions are skipped, and pre-releases are not offered as the newest
+/// stable.
+///
+/// A non-200 -- a 404 for a crate published only to a private registry,
+/// say -- yields None, which leaves the row at `latest == current` and
+/// `Bump::Unknown`. That renders as "cannot compare", never as "up to
+/// date": the same per-row silent failure the rest of this module uses,
+/// for the same reason.
+async fn cargo_latest(client: &reqwest::Client, name: &str) -> Option<String> {
+    let path = super::cargo::index_path(name)?;
+    let url = format!("https://index.crates.io/{path}");
+    let response = client.get(&url).send().await.ok()?;
+    // Checked explicitly: an error page's BODY is not index lines, so it
+    // would parse to zero versions and look identical to a crate with no
+    // releases. Both give None here, but only one of them is a fact.
+    if !response.status().is_success() {
+        return None;
+    }
+    super::cargo::newest_stable(&response.text().await.ok()?)
 }
 
 /// The newest release TAG for a Swift package on GitHub.
@@ -217,12 +256,19 @@ fn lookup_key(o: &super::model::Outdated) -> String {
     }
 }
 
-/// Whether this ecosystem's latest version comes from a registry.
-fn needs_lookup(eco: super::model::Ecosystem) -> bool {
-    matches!(
-        eco,
-        super::model::Ecosystem::Terraform | super::model::Ecosystem::Swift
-    )
+/// Whether this ROW's latest version comes from a registry.
+///
+/// Per row rather than per ecosystem, because Cargo has both kinds in
+/// one list: a crates.io dependency has a published version list, and a
+/// path or git dependency has none. Asking crates.io about an in-repo
+/// crate name would 404 -- harmless, but it is a request that can only
+/// fail, and on a workspace it is one per plugin.
+fn needs_lookup(o: &super::model::Outdated) -> bool {
+    match o.ecosystem {
+        super::model::Ecosystem::Terraform | super::model::Ecosystem::Swift => true,
+        super::model::Ecosystem::Cargo => super::cargo::is_registry_row(o),
+        _ => false,
+    }
 }
 
 /// The newest published version for one dependency.
@@ -234,6 +280,7 @@ async fn latest_for(
     match eco {
         super::model::Ecosystem::Terraform => terraform_latest(client, name).await,
         super::model::Ecosystem::Swift => swift_latest(client, name).await,
+        super::model::Ecosystem::Cargo => cargo_latest(client, name).await,
         _ => None,
     }
 }
@@ -357,7 +404,10 @@ mod tests {
         apply_found(
             &mut reports,
             &[(
-                "registry.terraform.io/hashicorp/archive".to_string(),
+                (
+                    Ecosystem::Terraform,
+                    "registry.terraform.io/hashicorp/archive".to_string(),
+                ),
                 "2.8.0".to_string(),
             )]
             .into_iter()
@@ -413,7 +463,7 @@ mod tests {
 
         apply_found(
             &mut reports,
-            &[(url.to_string(), "2.0.0".to_string())]
+            &[((Ecosystem::Swift, url.to_string()), "2.0.0".to_string())]
                 .into_iter()
                 .collect(),
         );
@@ -426,6 +476,124 @@ mod tests {
         // writes the tag -- and `bump` still answers Unknown, which is
         // what the row must show.
         assert_eq!(rows[1].bump, Bump::Unknown, "still uncomparable");
+    }
+
+    /// Cargo is lockfile-based like Terraform and Swift, so it takes the
+    /// same backwards-write path: the write is SKIPPED and the row is
+    /// KEPT, never dropped.
+    ///
+    /// The index should not normally answer with something older than
+    /// the lock -- `newest_stable` sorts semantically and skips yanked
+    /// releases -- but it can: a crate vendored or patched to a version
+    /// ahead of what is published, or every newer release yanked after
+    /// the lock was written. Writing it would offer a downgrade, and
+    /// `cargo add`-ing backwards is exactly the kind of confidently
+    /// wrong number this module exists to refuse.
+    #[test]
+    fn a_crates_io_answer_older_than_the_lockfile_is_not_applied() {
+        use super::super::model::{Bump, Ecosystem, EcosystemReport, Outdated, ProjectReport};
+        let row = |current: &str| Outdated {
+            name: "serde".into(),
+            current: current.into(),
+            latest: current.into(),
+            bump: Bump::Unknown,
+            ecosystem: Ecosystem::Cargo,
+            manifest: "Cargo.toml [dependencies]".into(),
+        };
+        let mut reports = vec![ProjectReport {
+            path: "/tmp/example".into(),
+            label: String::new(),
+            // Locked ahead of the index, and locked behind it.
+            reports: vec![EcosystemReport {
+                ecosystem: Ecosystem::Cargo,
+                outdated: vec![row("9.9.9"), row("1.0.100")],
+                error: None,
+            }],
+        }];
+
+        apply_found(
+            &mut reports,
+            &[(
+                (Ecosystem::Cargo, "serde".to_string()),
+                "1.0.228".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        let rows = &reports[0].reports[0].outdated;
+        assert_eq!(rows.len(), 2, "neither row is dropped");
+        assert_eq!(
+            rows[0].latest, "9.9.9",
+            "the backwards answer is not written"
+        );
+        assert_eq!(rows[0].bump, Bump::Unknown, "and it reads as uncomparable");
+        assert_eq!(rows[1].latest, "1.0.228", "the real update still lands");
+        assert_eq!(rows[1].bump, Bump::Patch);
+    }
+
+    /// A Cargo PATH or GIT dependency keeps its row and stays
+    /// uncomparable.
+    ///
+    /// It never reaches `found` at all -- `needs_lookup` excludes it, so
+    /// no request is made for a crate name crates.io has never heard of.
+    /// The row therefore falls through untouched at `latest == current`
+    /// with `Bump::Unknown`, which the UI shows as "cannot compare" and
+    /// the wizard refuses to select. Dropping it instead would tell the
+    /// user their dependency list is shorter than it is: `src-mobile`
+    /// depends on two in-repo plugins exactly this way.
+    ///
+    /// The alternative-registry row is here for a sharper reason: that
+    /// lookup would not merely fail, it would send a private crate name
+    /// to a public host.
+    #[test]
+    fn a_cargo_path_dependency_is_never_looked_up_and_never_dropped() {
+        use super::super::model::{Bump, Ecosystem, EcosystemReport, Outdated, ProjectReport};
+        let row = |name: &str, manifest: &str| Outdated {
+            name: name.into(),
+            current: "0.1.0".into(),
+            latest: "0.1.0".into(),
+            bump: Bump::Unknown,
+            ecosystem: Ecosystem::Cargo,
+            manifest: manifest.into(),
+        };
+        let rows = vec![
+            row(
+                "tauri-plugin-headstate-keys",
+                "Cargo.toml [dependencies] (path dependency)",
+            ),
+            row("forked-thing", "Cargo.toml [dependencies] (git dependency)"),
+            row(
+                "internal-thing",
+                "Cargo.toml [dependencies] (alternative registry)",
+            ),
+        ];
+        // None of them is a row enrichment would ask about.
+        for o in &rows {
+            assert!(!needs_lookup(o), "{}", o.name);
+        }
+
+        let mut reports = vec![ProjectReport {
+            path: "/tmp/example".into(),
+            label: String::new(),
+            reports: vec![EcosystemReport {
+                ecosystem: Ecosystem::Cargo,
+                outdated: rows,
+                error: None,
+            }],
+        }];
+
+        // So nothing is ever looked up for them, and `apply_found` --
+        // which only ever writes what a lookup returned -- leaves every
+        // row exactly as `cargo::pinned` built it.
+        apply_found(&mut reports, &Default::default());
+
+        let out = &reports[0].reports[0].outdated;
+        assert_eq!(out.len(), 3, "none is dropped");
+        for o in out {
+            assert_eq!(o.latest, o.current, "{}: no update claimed", o.name);
+            assert_eq!(o.bump, Bump::Unknown, "{}", o.name);
+        }
     }
 }
 

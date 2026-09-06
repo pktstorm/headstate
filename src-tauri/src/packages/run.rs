@@ -1,5 +1,5 @@
 use super::model::{Ecosystem, EcosystemReport, Outdated, ProjectReport};
-use super::{detect, swift, terraform, tools, version};
+use super::{cargo, detect, swift, terraform, tools, version};
 use std::path::Path;
 
 /// Whether this project's Yarn is version 1.
@@ -82,6 +82,25 @@ pub fn check(repo: &Path, eco: Ecosystem) -> EcosystemReport {
         };
     }
 
+    // Cargo answers from TWO FILES plus the crates.io index, never a
+    // command.
+    //
+    // `cargo` is certainly installed -- there is a `Cargo.toml` -- but
+    // it has no `outdated`. `cargo update --dry-run` reports what the
+    // resolver would move to WITHIN the existing constraints, which is a
+    // different question from "what is the newest published version",
+    // and the subcommands that do answer it (`cargo outdated`,
+    // `cargo upgrade`) are third-party installs whose absence would
+    // silence the ecosystem. `Cargo.toml` says which crates, `Cargo.lock`
+    // says which versions, and `enrich` asks the sparse index.
+    if eco == Ecosystem::Cargo {
+        return EcosystemReport {
+            ecosystem: eco,
+            outdated: cargo::pinned(repo),
+            error: None,
+        };
+    }
+
     let fallbacks = tools::fallback_dirs();
     let refs: Vec<&str> = fallbacks.iter().map(String::as_str).collect();
     let Some(mut bin) = tools::find(eco.program(), &refs) else {
@@ -133,6 +152,9 @@ pub fn check(repo: &Path, eco: Ecosystem) -> EcosystemReport {
         // Swift never reaches here -- `check` returns early for it,
         // because there is no command that answers the question.
         Ecosystem::Swift => &["--version"],
+        // Nor does Cargo: it returns early too, because `cargo` has no
+        // subcommand that reports outdated dependencies.
+        Ecosystem::Cargo => &["--version"],
     };
 
     let out = match std::process::Command::new(&bin)
@@ -274,8 +296,9 @@ pub fn parse(stdout: &str, eco: Ecosystem, repo: &Path) -> Vec<Outdated> {
         Ecosystem::Poetry => parse_poetry(stdout),
         Ecosystem::Dotnet => parse_dotnet(stdout, repo),
         Ecosystem::Cocoapods => parse_cocoapods(stdout),
-        // Both handled before any command runs: neither has one.
-        Ecosystem::Swift | Ecosystem::Terraform => Vec::new(),
+        // All three handled before any command runs: none has a
+        // command that answers the question.
+        Ecosystem::Swift | Ecosystem::Terraform | Ecosystem::Cargo => Vec::new(),
     }
 }
 
