@@ -127,25 +127,72 @@ describe("UpdateWizard", () => {
     expect(screen.getByText(/constraint in your .tf source/i)).toBeTruthy();
   });
 
-  /// Same rule as Terraform, and the same failure it is guarding
-  /// against: `apply::supported` refuses Cargo, so a selectable Cargo
-  /// row would count toward the button and fail at apply time with a
-  /// reason the user could have been given before clicking.
-  ///
-  /// `cargo add` cannot target a workspace member, and a workspace root
-  /// is ONE row here -- measured, it either severs `workspace = true`
-  /// inheritance or adds the crate to the wrong package.
-  it("does not offer Rust crates as applicable", () => {
+  /// The inverse of the test that stood here until #559. Cargo was
+  /// blocked while `apply::supported` refused it; the backend now edits
+  /// the declaring manifest directly instead of running `cargo add`, so
+  /// the row must be OFFERED. A `CANNOT_APPLY` entry left behind after
+  /// the backend started supporting an ecosystem is the same class of
+  /// bug as one missing while it did not -- the two must agree.
+  it("offers Rust crates as applicable", () => {
     const crate: Outdated = {
       ...pkg("tauri-plugin-log", "cargo"),
       current: "2.9.0",
       latest: "2.9.1",
       bump: "patch",
       manifest: "Cargo.toml [dependencies]",
+      project: "src-tauri",
     };
     show([crate]);
-    expect(screen.queryAllByRole("checkbox")).toHaveLength(0);
-    expect(screen.getByText(/cargo add/i)).toBeTruthy();
+    expect(screen.queryAllByRole("checkbox")).toHaveLength(1);
+    expect(screen.queryByText(/cannot be updated/i)).toBeNull();
+  });
+
+  /// The project path must reach the backend, or the apply runs at the
+  /// worktree root -- where this repository has no `Cargo.toml` at all.
+  it("sends the project a crate came from", async () => {
+    const crate: Outdated = {
+      ...pkg("tauri-plugin-log", "cargo"),
+      current: "2.9.0",
+      latest: "2.9.1",
+      bump: "patch",
+      manifest: "Cargo.toml [dependencies]",
+      project: "src-tauri",
+    };
+    show([crate]);
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: /Apply 1 update/i }));
+
+    await waitFor(() => expect(applyFn).toHaveBeenCalled());
+    expect(applyFn.mock.calls[0][1]).toEqual([
+      {
+        name: "tauri-plugin-log",
+        version: "2.9.1",
+        ecosystem: "cargo",
+        project: "src-tauri",
+      },
+    ]);
+  });
+
+  /// Two projects declaring the same crate under the same manifest
+  /// LABEL are two rows with two checkboxes. Without `project` in the
+  /// key they shared one, which is how ticking `src-tauri`'s `tauri`
+  /// would silently also tick `src-mobile`'s.
+  it("keeps one crate in two projects as two separate rows", () => {
+    const crate = (project: string): Outdated => ({
+      ...pkg("tauri", "cargo"),
+      current: "2.0.0",
+      latest: "2.1.0",
+      bump: "minor",
+      manifest: "Cargo.toml [dependencies]",
+      project,
+    });
+    show([crate("src-tauri"), crate("src-mobile")]);
+    const boxes = screen.queryAllByRole("checkbox");
+    expect(boxes).toHaveLength(2);
+
+    fireEvent.click(boxes[0]);
+    expect((boxes[0] as HTMLInputElement).checked).toBe(true);
+    expect((boxes[1] as HTMLInputElement).checked).toBe(false);
   });
 
   /// The `2.8.0 → 2.8.0` rows in the report. `registry::enrich` leaves
@@ -185,7 +232,10 @@ describe("UpdateWizard", () => {
     // string the user never chose.
     expect(applyFn).toHaveBeenCalledWith(
       "/code/app",
-      [{ name: "lodash", version: "2.0.0", ecosystem: "npm" }],
+      // `project: ""` is the repository root, which is what a row
+      // carrying no project means and what every request meant before
+      // the field existed.
+      [{ name: "lodash", version: "2.0.0", ecosystem: "npm", project: "" }],
       undefined,
     );
     // Closed on click, not on completion.

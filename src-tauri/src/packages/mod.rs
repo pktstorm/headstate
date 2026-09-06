@@ -1,13 +1,18 @@
 //! Which dependencies are out of date, per repository.
 //!
-//! Reports only: nothing here writes to a manifest or a lockfile. The
-//! output is a list and a markdown rendering of it, meant to be handed
-//! to an agent that does the work.
+//! Reporting is the bulk of it: the output is a list and a markdown
+//! rendering of it, meant to be handed to an agent that does the work.
+//!
+//! Two modules write. `apply` runs a package manager in a throwaway
+//! worktree, and `cargo_apply` edits a `Cargo.toml` directly -- the one
+//! ecosystem whose tool makes three separate wrong edits when aimed at
+//! a workspace, so the edit is made here instead.
 //!
 //! Nothing here talks to GitHub.
 
 pub mod apply;
 pub mod cargo;
+pub mod cargo_apply;
 pub mod detect;
 pub mod markdown;
 pub mod model;
