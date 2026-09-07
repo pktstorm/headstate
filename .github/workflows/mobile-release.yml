@@ -298,6 +298,13 @@ jobs:
       #   v0.1.4  XCODE_XCCONFIG_FILE. Not honoured through the CLI: with
       #           it exported, xcodebuild still logged only
       #           `Build settings from command line: SDKROOT`.
+      #   v0.1.5  Settings in the project as $(HEADSTATE_*). This WORKED
+      #           -- `** BUILD SUCCEEDED **`, with the identity expanded
+      #           to a real fingerprint -- and then exportArchive failed
+      #           on CODE_SIGN_STYLE, which the CLI copies into
+      #           ExportOptions.plist as a literal string. That one is
+      #           now hardcoded `Manual` in the project; see the note
+      #           beside it in gen/apple/project.yml.
       #
       # So the settings now live in the PROJECT (src-mobile/gen/apple,
       # committed), which is the one place nothing can strip them, and
@@ -343,7 +350,6 @@ jobs:
             echo "Dry run: building an unsigned IPA."
             yarn tauri ios build --ci --no-sign --config "$CONFIG"
           else
-            export HEADSTATE_CODE_SIGN_STYLE=Manual
             export HEADSTATE_DEVELOPMENT_TEAM="$APPLE_DEVELOPMENT_TEAM"
             export HEADSTATE_CODE_SIGN_IDENTITY="$SIGNING_IDENTITY"
             export HEADSTATE_PROVISIONING_PROFILE="$PROFILE_NAME"
