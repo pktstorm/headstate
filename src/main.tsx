@@ -4,9 +4,11 @@ import { createRoot } from "react-dom/client";
 import App from "./App";
 import { Toaster } from "sonner";
 import { AuthGate } from "./components/AuthGate";
+import { PairingGate } from "./components/PairingGate";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { PairingRequestModal } from "./components/PairingRequestModal";
 import { PERSIST_KEY } from "./store/filters";
+import { IS_DESKTOP_BUILD } from "./lib/target";
 import { initSplash } from "./splash";
 import "./index.css";
 // Sonner 2.x ships its layout in a SEPARATE stylesheet and its runtime
@@ -32,16 +34,31 @@ createRoot(document.getElementById("root") as HTMLElement).render(
         the only thing left to render it. */}
     <ErrorBoundary onReset={() => localStorage.removeItem(PERSIST_KEY)}>
       <QueryClientProvider client={queryClient}>
-        <AuthGate>
-          <App />
-        </AuthGate>
+        {/* Pairing is the OUTER gate, and only on the phone. The
+            companion forwards every desktop command over `remote_call`,
+            which rejects while unpaired -- so `AuthGate`'s check failed
+            on a fresh install and showed the desktop's "install the
+            GitHub CLI" screen to a device that has no shell. On the
+            desktop build `PairingGate` is a pass-through. */}
+        <PairingGate>
+          <AuthGate>
+            <App />
+          </AuthGate>
+        </PairingGate>
         {/* Dark to match the app, and bottom-right so it never covers the
             list the user is acting on. */}
         <Toaster theme="dark" position="bottom-right" richColors />
         {/* Beside the toaster, not inside App: a phone can scan the
             pairing code whether or not GitHub is signed in, and the
-            request must reach a person either way. */}
-        <PairingRequestModal />
+            request must reach a person either way.
+
+            Desktop only. This is the desktop's APPROVAL dialog -- it
+            polls `pairing_request` and answers with
+            `respond_to_pairing`, both `Class::Local`, so on the phone it
+            asks a phone to decide who may pair with it. Deciding that is
+            the desktop user's job at the desktop, which is exactly why
+            those commands are Local. */}
+        {IS_DESKTOP_BUILD ? <PairingRequestModal /> : null}
       </QueryClientProvider>
     </ErrorBoundary>
   </StrictMode>,

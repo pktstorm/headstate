@@ -3,6 +3,8 @@ import { toast } from "sonner";
 import { revealLog } from "@/api/tauri";
 import { HelpButton } from "./HelpButton";
 import { PairPhonePanel } from "./PairPhonePanel";
+import { PairedDesktopPanel } from "./PairedDesktopPanel";
+import { IS_MOBILE_BUILD } from "@/lib/target";
 import { PairedDevicesList } from "./PairedDevicesList";
 import {
   useAutostart,
@@ -552,7 +554,16 @@ export function SettingsDialog({
         {/* The companion app's switch. Off by default and phrased for
             what it does -- opens a port -- rather than as a feature
             name, so nobody turns it on to see what happens. Pairing
-            and the paired-device list follow it below. */}
+            and the paired-device list follow it below.
+
+            Desktop only. Every command behind these three -- the
+            toggle's `get_remote_enabled`/`set_remote_enabled`, the QR's
+            `issue_pairing_token`, the list's `list_paired_devices` and
+            `revoke_paired_device` -- is `Class::Local`, and deliberately
+            so: who may pair with a desktop is a decision made AT that
+            desktop. On the phone they were refused before reaching the
+            wire, so this whole panel rendered inert. */}
+        {IS_MOBILE_BUILD ? <PairedDesktopPanel /> : <>
         <div className="mt-5 flex flex-col gap-2">
           <span className="text-sm font-medium">Phone</span>
           <label className="flex items-center gap-2 text-sm">
@@ -584,6 +595,7 @@ export function SettingsDialog({
         </div>
         <PairPhonePanel />
         <PairedDevicesList />
+        </>}
             </div>
             {/* Rendered always, hidden with CSS -- never unmounted and
                 never the `hidden` ATTRIBUTE.

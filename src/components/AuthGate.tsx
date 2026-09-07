@@ -3,6 +3,7 @@ import { useEffect, type ReactNode } from "react";
 import { clearPollError, usePollError, useStoreError } from "../api/hooks";
 import { ReportLink } from "./ReportLink";
 import { getAuthState } from "../api/tauri";
+import { IS_MOBILE_BUILD } from "@/lib/target";
 import { dismissSplash } from "../splash";
 
 /// Gates the whole app on `get_auth_state`. Rust computes auth once at
@@ -103,6 +104,37 @@ export function AuthGate({ children }: { children: ReactNode }) {
         )}
         {children}
       </>
+    );
+  }
+
+  // On the phone the remediation below is impossible advice: there is
+  // no Homebrew, no shell, and by design no GitHub token -- the DESKTOP
+  // holds it. A failed auth check here means the paired desktop is not
+  // signed in, which is a thing to fix at the desktop.
+  //
+  // `PairingGate` above already sends an unpaired phone to the pairing
+  // screen, so reaching this branch on mobile means paired-but-the-
+  // desktop-cannot-authenticate. Guarded on the build target rather than
+  // `useIsMobile()`: a narrow desktop window still has `gh`, and telling
+  // its user to fix it elsewhere would be the same bug mirrored.
+  if (IS_MOBILE_BUILD) {
+    return (
+      <div className="flex min-h-dvh items-center justify-center bg-[#0d1117] px-6 text-[#e6edf3]">
+        <div className="max-w-md space-y-4">
+          <h1 className="text-xl font-semibold">Your desktop is not signed in to GitHub</h1>
+          <p className="text-sm text-[#8b949e]">
+            Headstate on your computer could not reach GitHub, so there is nothing for
+            this phone to show yet.
+          </p>
+          {data?.message !== undefined ? (
+            <p className="text-sm text-[#8b949e]">{data.message}</p>
+          ) : null}
+          <p className="text-sm text-[#8b949e]">
+            Open Headstate on that computer and follow the instructions it shows, then
+            come back — this screen clears on its own once it can sign in.
+          </p>
+        </div>
+      </div>
     );
   }
 
