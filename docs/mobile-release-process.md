@@ -109,13 +109,9 @@ so none is needed here. What is needed is the declaration:
 
    The build merges it into the app, and uploads stop asking.
 
-Until the secret is set the release still works: the build logs a warning and
-that upload is asked to clear compliance once in App Store Connect.
-
-The key is **merged in only when there is a code**, never carried with an empty
-value. Apple validates `ITSEncryptionExportComplianceCode` whenever it is
-present, and an empty string is a *wrong* code rather than no code, so the
-upload is rejected:
+**Until that secret is set, iOS releases cannot ship.** There is no "declare
+`true` and answer later" state: an upload whose code does not match the
+documentation on file is rejected, and that includes having no code at all.
 
 ```
 Invalid Export Compliance Code. The export compliance key value [] in the
@@ -123,9 +119,14 @@ app's Info.plist doesn't match the key value of the app's export compliance
 documentation.
 ```
 
-That is what happened to build 10. The guard now refuses a build carrying an
-empty or stale code, so the failure shows up before the upload rather than
-after.
+Build 10 hit this with the key present but empty, and build 11 hit the same
+error with the key absent entirely. Preflight now requires the secret, so a
+release without it fails in seconds with the reason named rather than after a
+nine-minute build.
+
+The code is merged in through a second plist rather than living in
+`Info.ios.plist`, because Apple validates the key whenever it is present and an
+empty value is a *wrong* code rather than no code.
 
 ### The BIS report, which nothing here does for you
 
@@ -143,9 +144,9 @@ signatures.
 
 "Collect the IPA" reads both keys back out of the built `.ipa` and fails if:
 
-- the declaration is not `true`,
-- `APPLE_EXPORT_COMPLIANCE_CODE` is set but a different value shipped, or
-- no secret is set yet the app carries a code, empty or stale.
+- the declaration is not `true`, or
+- the code in the built app is not exactly the one in the secret, whether it is
+  missing, empty or stale.
 
 It checks the artifact rather than the source because that is what Apple reads:
 a key that failed to merge, or a reference that expanded to nothing, both look
@@ -203,7 +204,7 @@ and names the missing ones.
 | `APPSTORE_API_KEY_ID` | The App Store Connect API key's Key ID |
 | `APPSTORE_API_ISSUER_ID` | The Issuer ID shown above the keys table |
 | `APPSTORE_API_PRIVATE_KEY` | The contents of the key's `.p8` file, including the BEGIN/END lines |
-| `APPLE_EXPORT_COMPLIANCE_CODE` | **Optional.** Apple's code for the encryption declaration on file; see [Export compliance](#export-compliance). Without it a build still ships, and is asked to clear compliance once per upload |
+| `APPLE_EXPORT_COMPLIANCE_CODE` | Apple's code for the encryption declaration on file; see [Export compliance](#export-compliance). **Required**: the app declares non-exempt encryption, and an upload without a matching code is rejected |
 | `APPLE_TEAM_ID` | The ten-character Apple team ID, used for signing and shared with the desktop release |
 
 How to generate them:

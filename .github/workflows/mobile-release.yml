@@ -81,6 +81,7 @@ jobs:
           APPSTORE_API_ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
           APPSTORE_API_PRIVATE_KEY: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_EXPORT_COMPLIANCE_CODE: ${{ secrets.APPLE_EXPORT_COMPLIANCE_CODE }}
         run: |
           set -euo pipefail
           if [ "$DRY_RUN" = "true" ]; then
@@ -96,15 +97,29 @@ jobs:
           # fails at xcodebuild with `requires a provisioning profile`,
           # which reads as a profile problem rather than a missing
           # secret. See the Build the IPA step.
+          #
+          # APPLE_EXPORT_COMPLIANCE_CODE is here because the app declares
+          # ITSAppUsesNonExemptEncryption=true, and Apple then REQUIRES a
+          # matching code. There is no "declare true, answer later"
+          # state: builds 10 and 11 were both rejected at upload with
+          # `Invalid Export Compliance Code ... key value []`, first with
+          # the key empty and then with it absent entirely. Failing here
+          # costs seconds instead of a nine-minute build.
           for name in IOS_DIST_CERT_P12_BASE64 IOS_DIST_CERT_PASSWORD \
                       IOS_PROVISIONING_PROFILE_BASE64 APPSTORE_API_KEY_ID \
                       APPSTORE_API_ISSUER_ID APPSTORE_API_PRIVATE_KEY \
-                      APPLE_TEAM_ID; do
+                      APPLE_TEAM_ID APPLE_EXPORT_COMPLIANCE_CODE; do
             [ -n "${!name:-}" ] || missing="$missing $name"
           done
           if [ -n "$missing" ]; then
             echo "Missing repository secrets:$missing" >&2
             echo "See docs/mobile-release-process.md for how to generate each." >&2
+            case "$missing" in
+              *APPLE_EXPORT_COMPLIANCE_CODE*)
+                echo "APPLE_EXPORT_COMPLIANCE_CODE comes from App Store Connect > App Information >" >&2
+                echo "App Encryption Documentation, once the declaration is reviewed. Uploads are" >&2
+                echo "rejected without it while the app declares non-exempt encryption." >&2 ;;
+            esac
             exit 1
           fi
 
@@ -341,9 +356,8 @@ jobs:
           IOS_CERTIFICATE_PASSWORD: ${{ env.DRY_RUN != 'true' && secrets.IOS_DIST_CERT_PASSWORD || '' }}
           IOS_MOBILE_PROVISION: ${{ env.DRY_RUN != 'true' && secrets.IOS_PROVISIONING_PROFILE_BASE64 || '' }}
           APPLE_DEVELOPMENT_TEAM: ${{ env.DRY_RUN != 'true' && secrets.APPLE_TEAM_ID || '' }}
-          # Optional, unlike the rest: absent simply means the compliance
-          # question is asked once per upload. Not in Preflight's
-          # required list for that reason.
+          # Required, and checked by Preflight: a `true` declaration
+          # without a matching code is rejected at upload.
           APPLE_EXPORT_COMPLIANCE_CODE: ${{ secrets.APPLE_EXPORT_COMPLIANCE_CODE }}
         run: |
           set -euo pipefail
@@ -364,29 +378,23 @@ jobs:
             # issues. Empty is valid and simply means the question is
             # asked once per build, so a missing code does not fail the
             # release.
-            # ITSEncryptionExportComplianceCode is merged in ONLY when
-            # there is a code, through a second plist handed to
-            # `bundle.iOS.infoPlist`. It cannot live in Info.ios.plist
-            # with an empty value: Apple validates the key whenever it is
-            # present, and an empty string is a WRONG code rather than no
-            # code, so altool rejects the upload outright with
-            # `Invalid Export Compliance Code ... key value []`
-            # (build 10). Absent, the build uploads and is asked the
-            # question once, which is the intended fallback.
-            if [ -n "$APPLE_EXPORT_COMPLIANCE_CODE" ]; then
-              EXTRA="$RUNNER_TEMP/compliance.plist"
-              # Built with plutil rather than a heredoc so the code is
-              # never pasted into markup, and so a value with an
-              # XML-special character cannot produce a broken plist.
-              plutil -create xml1 "$EXTRA"
-              plutil -insert ITSEncryptionExportComplianceCode \
-                -string "$APPLE_EXPORT_COMPLIANCE_CODE" "$EXTRA"
-              plutil -lint "$EXTRA" >/dev/null
-              CONFIG=$(printf '{"bundle":{"iOS":{"bundleVersion":"%s","infoPlist":"%s"}}}' "$BUILD_NUMBER" "$EXTRA")
-              echo "Merging the export compliance code into the app."
-            else
-              echo "::warning::APPLE_EXPORT_COMPLIANCE_CODE is not set; this upload will ask for export compliance once in App Store Connect. See docs/mobile-release-process.md."
-            fi
+            # ITSEncryptionExportComplianceCode is merged in through a
+            # second plist handed to `bundle.iOS.infoPlist`. It is not in
+            # Info.ios.plist because Apple validates the key whenever it
+            # is present, so an empty value is a WRONG code rather than
+            # no code; and it is not optional because a `true`
+            # declaration with no code is rejected just the same
+            # (builds 10 and 11). Preflight guarantees the value is here.
+            #
+            # Built with plutil rather than a heredoc so the code is
+            # never pasted into markup, and so a value containing an
+            # XML-special character cannot produce a broken plist.
+            EXTRA="$RUNNER_TEMP/compliance.plist"
+            plutil -create xml1 "$EXTRA"
+            plutil -insert ITSEncryptionExportComplianceCode \
+              -string "$APPLE_EXPORT_COMPLIANCE_CODE" "$EXTRA"
+            plutil -lint "$EXTRA" >/dev/null
+            CONFIG=$(printf '{"bundle":{"iOS":{"bundleVersion":"%s","infoPlist":"%s"}}}' "$BUILD_NUMBER" "$EXTRA")
             yarn tauri ios build --ci --export-method app-store-connect --config "$CONFIG"
           fi
 
@@ -424,26 +432,18 @@ jobs:
               echo "This app links its own standard crypto, so Apple requires the declaration; see src-mobile/Info.ios.plist." >&2
               exit 1
             fi
-            # The code key must be ABSENT or correct, never present and
-            # empty: Apple validates it whenever it is there, and `[]` is
-            # a wrong code rather than no code, which fails the upload
-            # (build 10).
+            # The code must have reached the app and must match. An
+            # upload with a missing, empty or stale code is rejected by
+            # Apple with `Invalid Export Compliance Code`, so catching it
+            # here is the difference between a clear message and a
+            # nine-minute build ending in altool's.
             BUILT_CODE=$(plutil -extract ITSEncryptionExportComplianceCode raw -o - "$RUNNER_TEMP/built.plist" 2>/dev/null || echo ABSENT)
-            if [ -n "$APPLE_EXPORT_COMPLIANCE_CODE" ]; then
-              if [ "$BUILT_CODE" != "$APPLE_EXPORT_COMPLIANCE_CODE" ]; then
-                echo "APPLE_EXPORT_COMPLIANCE_CODE is set but the built app carries '$BUILT_CODE'." >&2
-                echo "The infoPlist merge in the build step did not take effect." >&2
-                exit 1
-              fi
-              echo "Export compliance declared (non-exempt) with a compliance code."
-            else
-              if [ "$BUILT_CODE" != "ABSENT" ]; then
-                echo "No APPLE_EXPORT_COMPLIANCE_CODE is set, but the app carries '$BUILT_CODE'." >&2
-                echo "An empty or stale code fails the upload; the key must be absent instead." >&2
-                exit 1
-              fi
-              echo "Export compliance declared (non-exempt); no code, so this upload will ask once."
+            if [ "$BUILT_CODE" != "$APPLE_EXPORT_COMPLIANCE_CODE" ]; then
+              echo "The built app carries export compliance code '$BUILT_CODE', not the one in the secret." >&2
+              echo "The infoPlist merge in the build step did not take effect." >&2
+              exit 1
             fi
+            echo "Export compliance declared (non-exempt) with a matching code."
           fi
           (cd release-assets && shasum -a 256 "$NAME" | tee "$NAME.sha256")
           echo "IPA=release-assets/$NAME" >> "$GITHUB_ENV"
