@@ -501,10 +501,8 @@ mod tests {
                 .map(|s| s.scheme()),
             Some(rustls::SignatureScheme::ML_DSA_65)
         );
-        assert!(rustls::crypto::aws_lc_rs::default_provider()
-            .key_provider
-            .load_private_key(PrivateKeyDer::Pkcs8(id.key_pkcs8.clone().into()))
-            .is_err());
+        // NOT asserted: that plain aws-lc-rs cannot load this key.
+        // True when written, false since rustls 0.23.44. See #588.
         // id-ml-dsa-65 in the subject public key, the TBS signature
         // field and the outer signature algorithm.
         let oid = [

@@ -1469,10 +1469,14 @@ pub(crate) mod tests {
             .signature_verification_algorithms
             .supported_schemes()
             .contains(&SignatureScheme::ML_DSA_65));
-        assert!(!aws_lc_rs::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-            .contains(&SignatureScheme::ML_DSA_65));
+        // NOT asserted: that plain aws-lc-rs cannot verify ML-DSA-65.
+        // It could not when this was written, which is why the
+        // post-quantum provider is here at all; as of rustls 0.23.44 it
+        // can. Pinning a third party's LACK of a feature makes its
+        // arrival a red build, which is what happened. What matters is
+        // the line above -- the provider this listener uses does verify
+        // the scheme -- and that is still asserted. Whether the
+        // post-quantum crate is still needed is #588.
     }
 
     /// The pin on the phone's side is real: a server presenting some

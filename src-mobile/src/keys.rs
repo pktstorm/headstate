@@ -697,10 +697,8 @@ mod tests {
             &rustls_post_quantum::provider(),
         )
         .unwrap();
-        assert!(rustls::crypto::aws_lc_rs::default_provider()
-            .key_provider
-            .load_private_key(key())
-            .is_err());
+        // NOT asserted: that plain aws-lc-rs cannot load this key.
+        // True when written, false since rustls 0.23.44. See #588.
     }
 
     /// The session identity is ML-DSA-65 and what the store holds is

@@ -659,10 +659,11 @@ mod tests {
         assert!(!is_ml_dsa_65_certificate(
             Identity::p256_for_tests().cert().as_ref()
         ));
-        assert!(rustls::crypto::aws_lc_rs::default_provider()
-            .key_provider
-            .load_private_key(id.key())
-            .is_err());
+        // NOT asserted: that plain aws-lc-rs cannot LOAD this key.
+        // True when written and false since rustls 0.23.44. The
+        // assertions above -- ML-DSA-65 chosen, ECDSA refused, the
+        // certificate ML-DSA-65 -- are the ones about this identity, and
+        // they still hold. See #588.
     }
 
     /// The seed rcgen's PKCS#8 carries derives the same key aws-lc-rs
