@@ -69,8 +69,12 @@
        ISO), so this is NOT "non-standard cryptography": no CCATS is
        needed, only the declaration in App Store Connect. Apple issues a
        code once that is on file, which
-       ITSEncryptionExportComplianceCode below carries so the question is
-       not asked again.
+       ITSEncryptionExportComplianceCode carries that code, and the
+       release workflow INSERTS that key only when it has one to put
+       there. The key is deliberately absent here: Apple validates it
+       whenever it is present, and an empty string is not "no code" but a
+       wrong one, which altool rejects with `Invalid Export Compliance
+       Code. The export compliance key value []` (build 10).
 
        Separately and not satisfied by anything in this repository: US
        exporters of 5D002 software owe BIS an annual self-classification
@@ -78,13 +82,5 @@
        docs/mobile-release-process.md. -->
   <key>ITSAppUsesNonExemptEncryption</key>
   <true/>
-  <!-- Apple's code for the declaration on file, substituted at build
-       time from APPLE_EXPORT_COMPLIANCE_CODE (mobile-release.yml) so the
-       value is not committed and can be replaced without touching the
-       project. Unset, as in any local build, it expands to empty, which
-       Apple treats as absent; the only cost is being asked the question
-       again on an upload that had no code to give. -->
-  <key>ITSEncryptionExportComplianceCode</key>
-  <string>$(HEADSTATE_EXPORT_COMPLIANCE_CODE)</string>
 </dict>
 </plist>

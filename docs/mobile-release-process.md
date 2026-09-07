@@ -107,11 +107,25 @@ so none is needed here. What is needed is the declaration:
    gh secret set APPLE_EXPORT_COMPLIANCE_CODE
    ```
 
-   The build substitutes it into the app, and uploads stop asking.
+   The build merges it into the app, and uploads stop asking.
 
-Until the secret is set the release still works: the build logs a warning, and
-that upload is asked to clear compliance once in App Store Connect. Nothing
-fails.
+Until the secret is set the release still works: the build logs a warning and
+that upload is asked to clear compliance once in App Store Connect.
+
+The key is **merged in only when there is a code**, never carried with an empty
+value. Apple validates `ITSEncryptionExportComplianceCode` whenever it is
+present, and an empty string is a *wrong* code rather than no code, so the
+upload is rejected:
+
+```
+Invalid Export Compliance Code. The export compliance key value [] in the
+app's Info.plist doesn't match the key value of the app's export compliance
+documentation.
+```
+
+That is what happened to build 10. The guard now refuses a build carrying an
+empty or stale code, so the failure shows up before the upload rather than
+after.
 
 ### The BIS report, which nothing here does for you
 
@@ -130,8 +144,8 @@ signatures.
 "Collect the IPA" reads both keys back out of the built `.ipa` and fails if:
 
 - the declaration is not `true`,
-- the code is still an unexpanded `$(...)` reference, or
-- `APPLE_EXPORT_COMPLIANCE_CODE` is set but a different value shipped.
+- `APPLE_EXPORT_COMPLIANCE_CODE` is set but a different value shipped, or
+- no secret is set yet the app carries a code, empty or stale.
 
 It checks the artifact rather than the source because that is what Apple reads:
 a key that failed to merge, or a reference that expanded to nothing, both look
