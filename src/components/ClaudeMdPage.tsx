@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useIsMobile } from "@/lib/useIsMobile";
 import { FileText } from "lucide-react";
 import type { ClaudeFile, ImportNode } from "@/types/pr";
 import { useClaudeMd, useClaudeMdText } from "@/api/hooks";
@@ -28,10 +29,18 @@ export function ClaudeMdPage() {
   const repo = filters.repo;
   const { data: files = [], isLoading } = useClaudeMd(repo);
   const [selected, setSelected] = useState<string | undefined>(undefined);
+  const isMobile = useIsMobile();
 
   // The selection falls back to the first file so the pane is never
   // empty when there is something to show.
   const active = files.find((f) => f.path === selected) ?? files[0];
+
+  // On a phone the two panes are two screens, so which one is showing
+  // has to key off whether the user has PICKED a file -- not off
+  // `active`, which falls back to the first file and is therefore never
+  // absent. The desktop keeps the fallback: its list is beside the
+  // content, and an empty pane there would just look broken.
+  const showingList = isMobile && selected === undefined;
   const { data: text, isLoading: textLoading } = useClaudeMdText(active?.path);
 
   if (!repo) {
@@ -49,10 +58,25 @@ export function ClaudeMdPage() {
   }
 
   return (
-    <div className="flex h-full min-h-0">
+    <div className={isMobile ? "flex h-full min-h-0 flex-col" : "flex h-full min-h-0"}>
       {/* The browser: every file, its own size, and what its whole tree
-          costs. */}
-      <div className="w-96 shrink-0 overflow-y-auto border-r border-[#30363d] p-3">
+          costs.
+
+          `w-96` is 384px and `shrink-0`, so at 390px it took the whole
+          screen and the content pane -- `flex-1 min-w-0` -- collapsed to
+          about six pixels: the CLAUDE.md text this page exists to show
+          was invisible. On a phone the two become stacked screens, the
+          pattern `PrDetailView` already uses: pick a file, read it, come
+          back. */}
+      <div
+        className={
+          isMobile
+            ? showingList
+              ? "min-h-0 flex-1 overflow-y-auto p-3"
+              : "hidden"
+            : "w-96 shrink-0 overflow-y-auto border-r border-[#30363d] p-3"
+        }
+      >
         {files.map((f) => (
           <FileEntry
             key={f.path}
@@ -64,7 +88,24 @@ export function ClaudeMdPage() {
         ))}
       </div>
 
-      <div className="min-w-0 flex-1 overflow-y-auto p-4">
+      <div
+        className={
+          isMobile
+            ? showingList
+              ? "hidden"
+              : "flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto p-4"
+            : "min-w-0 flex-1 overflow-y-auto p-4"
+        }
+      >
+        {isMobile && !showingList ? (
+          <button
+            type="button"
+            onClick={() => setSelected(undefined)}
+            className="tap-target -ml-1 mb-2 flex items-center self-start rounded px-2 text-sm text-[#58a6ff] hover:bg-[#161b22]"
+          >
+            ← All files
+          </button>
+        ) : null}
         {textLoading ? (
           <p className="text-sm text-[#8b949e]">Reading…</p>
         ) : text !== undefined ? (

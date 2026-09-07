@@ -1,7 +1,10 @@
 import type { PullRequest, ReviewState } from "@/types/pr";
-import type { Filters } from "@/lib/derive";
+import { activeFilterCount, type Filters } from "@/lib/derive";
+import { useState } from "react";
 import { useActiveFilters, useFilters } from "@/store/filters";
 import { Button } from "@/components/ui/button";
+import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
+import { useIsMobile } from "@/lib/useIsMobile";
 import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
@@ -59,22 +62,18 @@ export function FilterBar({ prs }: { prs: PullRequest[] }) {
     );
   };
 
-  return (
-    <div className="flex flex-wrap items-center gap-2 border-b border-[#30363d] bg-[#161b22] px-4 py-2 text-sm">
-      {/* No search existed at all, and a Tauri webview has no Cmd+F
-          fallback. Filtering happens client-side over an already-fetched
-          list, so this costs no API call and needs no debounce. */}
-      <input
-        type="search"
-        value={filters.query ?? ""}
-        onChange={(e) => setFilter("query", e.target.value || undefined)}
-        // The cheapest possible surfacing of a shortcut nobody could
-        // discover: shortcuts.ts implemented "/" from the start and
-        // NOTHING in the UI mentioned it.
-        placeholder="Search title, repo, or #number    /"
-        aria-label="Search pull requests"
-        className="w-64 rounded border border-[#30363d] bg-[#0d1117] px-2 py-1 text-sm text-[#e6edf3] placeholder:text-[#8b949e]"
-      />
+  // Nine controls in one `flex-wrap` row is a single line on a desktop
+  // and five or six on a phone: 358px of usable width, of which the
+  // search alone claimed 256px, so the list this screen exists for
+  // started well below the fold. On a phone the search keeps its place
+  // and the other eight move behind a Filters button.
+  const isMobile = useIsMobile();
+  const [filtersOpen, setFiltersOpen] = useState(false);
+
+  // The eight, verbatim: the same elements in the same order, rendered
+  // inline on a desktop and stacked in a sheet on a phone. One copy,
+  // so the two cannot drift the way a forked component would.
+  const controls = <>
       <DropdownMenu>
         <DropdownMenuTrigger
           render={
@@ -254,6 +253,53 @@ export function FilterBar({ prs }: { prs: PullRequest[] }) {
       <Button variant="ghost" size="sm" onClick={reset}>
         Clear filters
       </Button>
+  </>;
+
+  return (
+    <div className="flex flex-wrap items-center gap-2 border-b border-[#30363d] bg-[#161b22] px-4 py-2 text-sm">
+      {/* No search existed at all, and a Tauri webview has no Cmd+F
+          fallback. Filtering happens client-side over an already-fetched
+          list, so this costs no API call and needs no debounce. */}
+      <input
+        type="search"
+        value={filters.query ?? ""}
+        onChange={(e) => setFilter("query", e.target.value || undefined)}
+        // The cheapest possible surfacing of a shortcut nobody could
+        // discover: shortcuts.ts implemented "/" from the start and
+        // NOTHING in the UI mentioned it.
+        placeholder="Search title, repo, or #number    /"
+        aria-label="Search pull requests"
+        className="min-w-0 flex-1 rounded border border-[#30363d] bg-[#0d1117] px-2 py-1 text-sm text-[#e6edf3] placeholder:text-[#8b949e] md:w-64 md:flex-none"
+      />
+      {isMobile ? (
+        <>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="tap-target"
+            aria-expanded={filtersOpen}
+            onClick={() => setFiltersOpen(true)}
+          >
+            Filters{activeFilterCount(filters) > 0 ? ` (${activeFilterCount(filters)})` : ""}
+          </Button>
+          <Sheet open={filtersOpen} onOpenChange={setFiltersOpen}>
+            <SheetContent
+              side="bottom"
+              className="max-h-[80dvh] gap-0 overflow-y-auto border-[#30363d] bg-[#161b22] pb-safe text-[#e6edf3]"
+            >
+              <SheetTitle className="px-4 pt-4 text-sm font-medium">Filters</SheetTitle>
+              {/* Stacked, and each control full width: the same
+                  elements that sit in a row on a desktop are unusable
+                  side by side at 390px. */}
+              <div className="flex flex-col items-stretch gap-2 p-4 text-sm [&_button]:w-full [&_button]:justify-start">
+                {controls}
+              </div>
+            </SheetContent>
+          </Sheet>
+        </>
+      ) : (
+        controls
+      )}
     </div>
   );
 }

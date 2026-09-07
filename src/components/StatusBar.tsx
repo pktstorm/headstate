@@ -177,7 +177,7 @@ export function StatusBar({ updatedAt }: { updatedAt: number }) {
         onDismiss={() => setDismissed(newer)}
       />
     ) : null}
-    <div className="flex shrink-0 items-center gap-3 border-t border-[#30363d] bg-[#0d1117] px-4 py-1.5 text-xs text-[#8b949e]">
+    <div className="pb-safe flex shrink-0 items-center gap-3 border-t border-[#30363d] bg-[#0d1117] px-4 py-1.5 text-xs text-[#8b949e]">
       <span className="flex items-center gap-1.5">
         <span className={`h-1.5 w-1.5 rounded-full ${DOT[status]}`} aria-hidden="true" />
         <span className={status === "failed" ? "text-[#f85149]" : undefined}>
@@ -253,7 +253,7 @@ export function StatusBar({ updatedAt }: { updatedAt: number }) {
         onClick={() => setSettingsOpen(true)}
         aria-label="Settings"
         title="Settings"
-        className="rounded p-1 hover:bg-[#161b22]"
+        className="tap-target flex items-center justify-center rounded hover:bg-[#161b22]"
       >
         <Settings className="h-3.5 w-3.5" aria-hidden="true" />
       </button>

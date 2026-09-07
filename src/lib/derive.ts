@@ -24,6 +24,25 @@ export interface Filters {
   sort?: "newest" | "oldest" | "recently-updated" | "least-recently-updated";
 }
 
+/// How many filters are narrowing the list.
+///
+/// For the phone's Filters button, which has to say how much is hidden
+/// behind it: the eight controls that sit visibly in a row on a desktop
+/// are collapsed there, so without a count the user cannot tell a bar
+/// that is filtering hard from one that is not filtering at all.
+///
+/// `query` is excluded because the search field stays visible beside the
+/// button and speaks for itself, and `sort` because ordering the list is
+/// not hiding any of it -- counting either would make the badge argue
+/// with what the user can already see.
+export function activeFilterCount(filters: Filters): number {
+  return (Object.entries(filters) as [keyof Filters, unknown][]).filter(([key, value]) => {
+    if (key === "query" || key === "sort") return false;
+    if (Array.isArray(value)) return value.length > 0;
+    return value !== undefined && value !== false;
+  }).length;
+}
+
 /// Blocked on the author and nobody else: a real conflict, or failing CI.
 /// `checking` is deliberately excluded -- GitHub reports UNKNOWN
 /// mergeability while it computes, and treating that as a conflict would
