@@ -59,6 +59,8 @@
 	<key>NSCameraUsageDescription</key>
 	<string>Headstate Companion uses the camera to scan the pairing code shown on your desktop.</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
-	<false/>
+	<true/>
+	<key>ITSEncryptionExportComplianceCode</key>
+	<string>$(HEADSTATE_EXPORT_COMPLIANCE_CODE)</string>
 </dict>
 </plist>

@@ -341,6 +341,10 @@ jobs:
           IOS_CERTIFICATE_PASSWORD: ${{ env.DRY_RUN != 'true' && secrets.IOS_DIST_CERT_PASSWORD || '' }}
           IOS_MOBILE_PROVISION: ${{ env.DRY_RUN != 'true' && secrets.IOS_PROVISIONING_PROFILE_BASE64 || '' }}
           APPLE_DEVELOPMENT_TEAM: ${{ env.DRY_RUN != 'true' && secrets.APPLE_TEAM_ID || '' }}
+          # Optional, unlike the rest: absent simply means the compliance
+          # question is asked once per upload. Not in Preflight's
+          # required list for that reason.
+          APPLE_EXPORT_COMPLIANCE_CODE: ${{ secrets.APPLE_EXPORT_COMPLIANCE_CODE }}
         run: |
           set -euo pipefail
           CONFIG=$(printf '{"bundle":{"iOS":{"bundleVersion":"%s"}}}' "$BUILD_NUMBER")
@@ -353,10 +357,25 @@ jobs:
             export HEADSTATE_DEVELOPMENT_TEAM="$APPLE_DEVELOPMENT_TEAM"
             export HEADSTATE_CODE_SIGN_IDENTITY="$SIGNING_IDENTITY"
             export HEADSTATE_PROVISIONING_PROFILE="$PROFILE_NAME"
+            # Apple's export-compliance code, if there is one yet. The
+            # app declares ITSAppUsesNonExemptEncryption=true, so uploads
+            # are asked to clear compliance until the declaration is on
+            # file in App Store Connect and this carries the code it
+            # issues. Empty is valid and simply means the question is
+            # asked once per build, so a missing code does not fail the
+            # release.
+            export HEADSTATE_EXPORT_COMPLIANCE_CODE="$APPLE_EXPORT_COMPLIANCE_CODE"
+            if [ -z "$APPLE_EXPORT_COMPLIANCE_CODE" ]; then
+              echo "::warning::APPLE_EXPORT_COMPLIANCE_CODE is not set; this build will show Missing Compliance in TestFlight until it is cleared by hand. See docs/mobile-release-process.md."
+            fi
             yarn tauri ios build --ci --export-method app-store-connect --config "$CONFIG"
           fi
 
       - name: Collect the IPA
+        env:
+          # Read back out of the built app below, to prove the code that
+          # was supplied is the one that shipped.
+          APPLE_EXPORT_COMPLIANCE_CODE: ${{ secrets.APPLE_EXPORT_COMPLIANCE_CODE }}
         run: |
           set -euo pipefail
           IPA=$(find src-mobile/gen/apple/build -type f -name '*.ipa' | head -1)
@@ -374,21 +393,38 @@ jobs:
             unzip -l "release-assets/$NAME" | grep -q 'embedded.mobileprovision' \
               || { echo "IPA has no embedded provisioning profile; it is not signed for the App Store." >&2; exit 1; }
 
-            # ITSAppUsesNonExemptEncryption must reach the BUILT app, not
-            # just the source Info.ios.plist, or the upload lands in
-            # TestFlight as "Missing Compliance" and testers cannot
-            # install it until someone answers the question by hand
-            # (build 8). Checked against the IPA because that is the
-            # artifact Apple reads: a merge that silently dropped the key
-            # would look fine in the repository.
+            # The export-compliance answer must reach the BUILT app, not
+            # just the source Info.ios.plist. Checked against the IPA
+            # because that is the artifact Apple reads: a plist key that
+            # failed to merge, or a $(...) reference that expanded to
+            # nothing, both look fine in the repository.
             unzip -p "release-assets/$NAME" 'Payload/*.app/Info.plist' > "$RUNNER_TEMP/built.plist"
             COMPLIANCE=$(plutil -extract ITSAppUsesNonExemptEncryption raw -o - "$RUNNER_TEMP/built.plist" 2>/dev/null || echo MISSING)
-            if [ "$COMPLIANCE" != "false" ]; then
-              echo "The built app declares ITSAppUsesNonExemptEncryption=$COMPLIANCE, expected false." >&2
-              echo "Every TestFlight build will stall on Missing Compliance; see src-mobile/Info.ios.plist." >&2
+            if [ "$COMPLIANCE" != "true" ]; then
+              echo "The built app declares ITSAppUsesNonExemptEncryption=$COMPLIANCE, expected true." >&2
+              echo "This app links its own standard crypto, so Apple requires the declaration; see src-mobile/Info.ios.plist." >&2
               exit 1
             fi
-            echo "Export compliance declared in the built app (exempt)."
+            # The code is optional, but if one was supplied it has to
+            # have survived into the app: an unexpanded or empty value
+            # here is exactly the silent failure that leaves every upload
+            # asking for compliance again.
+            BUILT_CODE=$(plutil -extract ITSEncryptionExportComplianceCode raw -o - "$RUNNER_TEMP/built.plist" 2>/dev/null || echo "")
+            # Literal `$(` on purpose: an unexpanded reference is what
+            # we are looking for, not a command substitution.
+            # shellcheck disable=SC2016
+            case "$BUILT_CODE" in
+              *'$('*) echo "ITSEncryptionExportComplianceCode was not expanded: $BUILT_CODE" >&2; exit 1 ;;
+            esac
+            if [ -n "$APPLE_EXPORT_COMPLIANCE_CODE" ] && [ "$BUILT_CODE" != "$APPLE_EXPORT_COMPLIANCE_CODE" ]; then
+              echo "APPLE_EXPORT_COMPLIANCE_CODE is set but the built app carries '$BUILT_CODE'." >&2
+              exit 1
+            fi
+            if [ -n "$BUILT_CODE" ]; then
+              echo "Export compliance declared (non-exempt) with a compliance code."
+            else
+              echo "Export compliance declared (non-exempt); no code yet, so this upload will ask once."
+            fi
           fi
           (cd release-assets && shasum -a 256 "$NAME" | tee "$NAME.sha256")
           echo "IPA=release-assets/$NAME" >> "$GITHUB_ENV"
