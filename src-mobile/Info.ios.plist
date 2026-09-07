@@ -40,5 +40,30 @@
        without this string. Wording from docs/mobile-store-listings.md. -->
   <key>NSCameraUsageDescription</key>
   <string>Headstate Companion uses the camera to scan the pairing code shown on your desktop.</string>
+  <!-- Export compliance, answered here so it is not asked again. Without
+       this key every upload sits in TestFlight as "Missing Compliance"
+       until someone answers the question by hand in App Store Connect,
+       and testers cannot install it meanwhile (first seen on build 8).
+
+       `false` declares the app's encryption exempt. This is not the
+       narrowest exemption: the app does not use only Apple's crypto, it
+       links aws-lc-rs, p256 and ml-dsa. It rests instead on every use
+       being a supporting one, with no cryptography offered to the user
+       as a feature:
+
+         1. TLS 1.3 with mutual authentication to the paired desktop.
+         2. ECDSA P-256 and ML-DSA-65 signatures authenticating commands
+            (remote/stepup.rs).
+         3. Stronghold, and an AES-GCM key held in the Keystore or
+            Secure Enclave, protecting this app's own secrets on this
+            device.
+
+       Nothing here encrypts third-party data or exposes cryptography to
+       other software. Revisit this key if that changes, whether through
+       a user-facing encryption feature or by carrying someone else's
+       data: `true` then requires a BIS self-classification and an
+       ITSEncryptionExportComplianceCode beside it. -->
+  <key>ITSAppUsesNonExemptEncryption</key>
+  <false/>
 </dict>
 </plist>
