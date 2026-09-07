@@ -364,9 +364,28 @@ jobs:
             # issues. Empty is valid and simply means the question is
             # asked once per build, so a missing code does not fail the
             # release.
-            export HEADSTATE_EXPORT_COMPLIANCE_CODE="$APPLE_EXPORT_COMPLIANCE_CODE"
-            if [ -z "$APPLE_EXPORT_COMPLIANCE_CODE" ]; then
-              echo "::warning::APPLE_EXPORT_COMPLIANCE_CODE is not set; this build will show Missing Compliance in TestFlight until it is cleared by hand. See docs/mobile-release-process.md."
+            # ITSEncryptionExportComplianceCode is merged in ONLY when
+            # there is a code, through a second plist handed to
+            # `bundle.iOS.infoPlist`. It cannot live in Info.ios.plist
+            # with an empty value: Apple validates the key whenever it is
+            # present, and an empty string is a WRONG code rather than no
+            # code, so altool rejects the upload outright with
+            # `Invalid Export Compliance Code ... key value []`
+            # (build 10). Absent, the build uploads and is asked the
+            # question once, which is the intended fallback.
+            if [ -n "$APPLE_EXPORT_COMPLIANCE_CODE" ]; then
+              EXTRA="$RUNNER_TEMP/compliance.plist"
+              # Built with plutil rather than a heredoc so the code is
+              # never pasted into markup, and so a value with an
+              # XML-special character cannot produce a broken plist.
+              plutil -create xml1 "$EXTRA"
+              plutil -insert ITSEncryptionExportComplianceCode \
+                -string "$APPLE_EXPORT_COMPLIANCE_CODE" "$EXTRA"
+              plutil -lint "$EXTRA" >/dev/null
+              CONFIG=$(printf '{"bundle":{"iOS":{"bundleVersion":"%s","infoPlist":"%s"}}}' "$BUILD_NUMBER" "$EXTRA")
+              echo "Merging the export compliance code into the app."
+            else
+              echo "::warning::APPLE_EXPORT_COMPLIANCE_CODE is not set; this upload will ask for export compliance once in App Store Connect. See docs/mobile-release-process.md."
             fi
             yarn tauri ios build --ci --export-method app-store-connect --config "$CONFIG"
           fi
@@ -405,25 +424,25 @@ jobs:
               echo "This app links its own standard crypto, so Apple requires the declaration; see src-mobile/Info.ios.plist." >&2
               exit 1
             fi
-            # The code is optional, but if one was supplied it has to
-            # have survived into the app: an unexpanded or empty value
-            # here is exactly the silent failure that leaves every upload
-            # asking for compliance again.
-            BUILT_CODE=$(plutil -extract ITSEncryptionExportComplianceCode raw -o - "$RUNNER_TEMP/built.plist" 2>/dev/null || echo "")
-            # Literal `$(` on purpose: an unexpanded reference is what
-            # we are looking for, not a command substitution.
-            # shellcheck disable=SC2016
-            case "$BUILT_CODE" in
-              *'$('*) echo "ITSEncryptionExportComplianceCode was not expanded: $BUILT_CODE" >&2; exit 1 ;;
-            esac
-            if [ -n "$APPLE_EXPORT_COMPLIANCE_CODE" ] && [ "$BUILT_CODE" != "$APPLE_EXPORT_COMPLIANCE_CODE" ]; then
-              echo "APPLE_EXPORT_COMPLIANCE_CODE is set but the built app carries '$BUILT_CODE'." >&2
-              exit 1
-            fi
-            if [ -n "$BUILT_CODE" ]; then
+            # The code key must be ABSENT or correct, never present and
+            # empty: Apple validates it whenever it is there, and `[]` is
+            # a wrong code rather than no code, which fails the upload
+            # (build 10).
+            BUILT_CODE=$(plutil -extract ITSEncryptionExportComplianceCode raw -o - "$RUNNER_TEMP/built.plist" 2>/dev/null || echo ABSENT)
+            if [ -n "$APPLE_EXPORT_COMPLIANCE_CODE" ]; then
+              if [ "$BUILT_CODE" != "$APPLE_EXPORT_COMPLIANCE_CODE" ]; then
+                echo "APPLE_EXPORT_COMPLIANCE_CODE is set but the built app carries '$BUILT_CODE'." >&2
+                echo "The infoPlist merge in the build step did not take effect." >&2
+                exit 1
+              fi
               echo "Export compliance declared (non-exempt) with a compliance code."
             else
-              echo "Export compliance declared (non-exempt); no code yet, so this upload will ask once."
+              if [ "$BUILT_CODE" != "ABSENT" ]; then
+                echo "No APPLE_EXPORT_COMPLIANCE_CODE is set, but the app carries '$BUILT_CODE'." >&2
+                echo "An empty or stale code fails the upload; the key must be absent instead." >&2
+                exit 1
+              fi
+              echo "Export compliance declared (non-exempt); no code, so this upload will ask once."
             fi
           fi
           (cd release-assets && shasum -a 256 "$NAME" | tee "$NAME.sha256")

@@ -87,16 +87,6 @@ targets:
         # always wants: with no identity, team or profile set, Xcode
         # falls back to its own behaviour anyway, so a local unsigned
         # build is unaffected.
-        # Carries Apple's export-compliance code into the Info.plist,
-        # which references it as $(HEADSTATE_EXPORT_COMPLIANCE_CODE).
-        # Declared HERE because Xcode expands Info.plist references from
-        # BUILD SETTINGS, not from the environment: an exported variable
-        # with no setting naming it resolves to nothing, which was
-        # confirmed with `xcodebuild -showBuildSettings` before relying
-        # on it. This line is what lets the release workflow supply the
-        # value without committing it. Empty locally, and Apple treats an
-        # empty code as absent.
-        HEADSTATE_EXPORT_COMPLIANCE_CODE: $(HEADSTATE_EXPORT_COMPLIANCE_CODE)
         CODE_SIGN_STYLE: Manual
         DEVELOPMENT_TEAM: $(HEADSTATE_DEVELOPMENT_TEAM)
         CODE_SIGN_IDENTITY: $(HEADSTATE_CODE_SIGN_IDENTITY)
