@@ -11,9 +11,15 @@ Design: [Mobile Companion Design](superpowers/specs/2026-09-05-mobile-companion-
 
 Desktop labels below are the ones Settings ships on its **Phone** topic
 (`PairPhonePanel`, `PairingRequestModal`, `PairedDevicesList`), and the
-banner lines are `src/components/ConnectionBanner.tsx`'s. Phone-side
-labels (*Scan*, *Forget desktop*) are the design's; no shipped screen
-carries them yet.
+banner lines are `src/components/ConnectionBanner.tsx`'s.
+
+Phone-side labels are `PairingScreen` and the Phone topic's mobile half
+(`PairedDesktopPanel`). Both landed in the *Mobile Release 1* epic
+(#590); before it, every phone-side step here described a screen that
+did not exist, so this walkthrough could not be run past step 1.2 -- and
+since two clean runs are what enable store builds, the release gate was
+blocked on it. If a step below names a control you cannot find, that is
+a finding: record it rather than working around it.
 
 ## The release rule
 
