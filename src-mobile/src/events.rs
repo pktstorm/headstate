@@ -200,8 +200,21 @@ impl Handle {
     pub fn new() -> Self {
         Self::default()
     }
-    /// Retry now rather than after the backoff. A no-op while the
-    /// stream is up.
+    /// Reconnect now: drop the stream we have and open a fresh one.
+    ///
+    /// Called when the app returns to the foreground, which is the case
+    /// this whole module exists for -- iOS ends the stream when the app
+    /// suspends, and this is how the phone catches up.
+    ///
+    /// It used to only wake the select, and the wake arm did nothing on
+    /// the reasoning that the stream was still up. It is not: after a
+    /// suspension the `reqwest::Response` handle is alive while the
+    /// socket underneath is dead, and Rust cannot tell. So the loop went
+    /// straight back to awaiting `chunk()` on a corpse, and recovery
+    /// waited out `STREAM_READ_TIMEOUT` (45s) -- longer still on a
+    /// network change, where the old socket black-holes instead of
+    /// resetting. The user saw a stale list under a banner that said
+    /// "connected".
     pub fn resume(&self) {
         self.wake.notify_one();
     }
@@ -290,6 +303,10 @@ pub async fn run(sub: Subscriber, handle: Handle) {
             Ok(mut resp) => {
                 backoff = MIN_BACKOFF;
                 let mut parser = SseParser::default();
+                // Whether we left the read loop because the app came
+                // back, rather than because the desktop went away. The
+                // two deserve different handling below.
+                let mut resumed = false;
                 loop {
                     tokio::select! {
                         chunk = resp.chunk() => match chunk {
@@ -311,9 +328,27 @@ pub async fn run(sub: Subscriber, handle: Handle) {
                             if handle.is_stopped() {
                                 return;
                             }
-                            // A resume while the stream is up: nothing to do.
+                            // Break, which drops `resp` and its socket,
+                            // so the outer loop redoes `hello()` and
+                            // `events()` on a fresh connection. The
+                            // alternative -- carrying on with the
+                            // handle we have -- is what made a resume a
+                            // no-op: the only thing that can prove a
+                            // suspended socket is dead is trying a new
+                            // one.
+                            log::info!("companion: resumed; reconnecting the event stream");
+                            resumed = true;
+                            break;
                         }
                     }
+                }
+                // A resume is not a failure. Reconnect immediately, and
+                // do NOT report the desktop unreachable on the way: the
+                // phone has been asleep, not the desktop, and a banner
+                // that flashes "unreachable" every time the app is
+                // opened teaches people to ignore it.
+                if resumed {
+                    continue;
                 }
                 // Ended streams reconnect after the minimum backoff, not
                 // instantly, so a desktop that keeps ending them is not
@@ -586,6 +621,58 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(r.conn.state(), State::Revoked);
         assert_eq!(streams(&r), 2);
+    }
+
+    /// The suspend/resume case, which had no test at all -- which is
+    /// why `resume` shipped as a no-op while its own module doc said
+    /// "iOS kills the stream when the app suspends, and this is how the
+    /// phone catches up".
+    ///
+    /// The shape that matters is a stream the loop still HOLDS. The
+    /// existing reconnect test ends the stream server-side, so
+    /// `chunk()` returns and the loop notices on its own; that never
+    /// exercised `resume`. Here the stream is left open and idle,
+    /// exactly as it is across an iOS suspension, and the only thing
+    /// that can make the phone reconnect is the resume itself.
+    #[tokio::test]
+    async fn a_resume_reconnects_a_stream_the_loop_is_still_holding() {
+        let r = rig(&[("prs-updated", "[]")]).await;
+        until(|| r.conn.state() == State::Connected).await;
+        let streams = |r: &Rig| {
+            r.server
+                .requests()
+                .iter()
+                .filter(|q| q.path == "/v1/events")
+                .count()
+        };
+        until(|| streams(&r) == 1).await;
+
+        // Nothing has happened to the stream: it is open, idle, and as
+        // far as the loop knows perfectly healthy. Before the fix this
+        // resume did nothing and the count stayed at 1 until
+        // `STREAM_READ_TIMEOUT` expired.
+        //
+        // So the assertion is on the CLOCK, not just the reconnect.
+        // Measured against the unfixed code this test still passed --
+        // in 46s rather than 0.08s -- because `until` waited out that
+        // timeout, and a test that only proves "reconnects eventually"
+        // would not have caught the bug it exists for. What the user
+        // experiences is the delay.
+        let started = std::time::Instant::now();
+        r.handle.resume();
+        until(|| streams(&r) == 2).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a resume took {:?}; it must not wait out STREAM_READ_TIMEOUT",
+            started.elapsed()
+        );
+
+        // And the desktop is never reported unreachable on the way: the
+        // phone was asleep, not the desktop, so a banner flashing
+        // "unreachable" on every app open would be both wrong and
+        // trained-away.
+        assert_eq!(r.conn.state(), State::Connected);
+        r.handle.stop();
     }
 
     #[tokio::test]

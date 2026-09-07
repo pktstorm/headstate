@@ -42,6 +42,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::discovery;
 use crate::keys::{fingerprint_of, SessionIdentity};
 use crate::stepup;
 
@@ -206,6 +207,12 @@ pub fn tls_config(identity: &SessionIdentity, server_fp: &str) -> Result<ClientC
 }
 
 /// One paired desktop, reachable at any of `addrs` on `port`.
+/// How long a rediscovery browse waits. The module doc for
+/// `discovery.rs` names three seconds; a multicast reply from a desktop
+/// on the same LAN arrives in milliseconds, and the rest of the window
+/// is for a busy network rather than for a desktop that is not there.
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
+
 pub struct Client {
     calls: reqwest::Client,
     stream: reqwest::Client,
@@ -214,6 +221,18 @@ pub struct Client {
     /// Index into `addrs` of the last address that answered; tried
     /// first next time.
     preferred: Mutex<Option<usize>>,
+    /// The paired desktop's fingerprint, for matching its mDNS record.
+    /// Only a hint about WHERE to connect; the pinned fingerprint on the
+    /// TLS handshake is what proves the desktop is the right one.
+    server_fp: String,
+    /// An address learned from mDNS, kept until it too stops answering.
+    ///
+    /// The QR's addresses go stale the moment the desktop's DHCP lease
+    /// changes or it moves networks, and nothing else ever updates them
+    /// -- `addrs` is fixed at pairing and re-read verbatim on every
+    /// start. So a laptop that renewed its lease overnight left the
+    /// phone permanently unreachable, recoverable only by re-pairing.
+    discovered: Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for Client {
@@ -254,6 +273,8 @@ impl Client {
             addrs,
             port,
             preferred: Mutex::new(None),
+            server_fp: server_fp.to_string(),
+            discovered: Mutex::new(None),
         })
     }
 
@@ -275,6 +296,49 @@ impl Client {
         order
     }
 
+    /// Every base URL to try, in order: an address mDNS found last time,
+    /// then the stored ones.
+    fn bases(&self) -> Vec<String> {
+        let found = self
+            .discovered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut out: Vec<String> = found.into_iter().collect();
+        out.extend(
+            self.order()
+                .into_iter()
+                .map(|i| Self::base_url(&self.addrs[i], self.port)),
+        );
+        out
+    }
+
+    /// Ask the LAN where the paired desktop is now.
+    ///
+    /// Only after every stored address has failed: while one of them
+    /// answers there is nothing to look up, and a multicast browse on
+    /// each call would be three seconds of latency for a question
+    /// already answered. `None` is not an error -- a different network,
+    /// no multicast, a listener that is off, and an iOS build without
+    /// the local-network entitlement all look identical from here -- so
+    /// the caller reports the same unreachable it would have anyway.
+    ///
+    /// Blocking, on a multicast channel, so it runs on the blocking
+    /// pool rather than parking a tokio worker for the timeout.
+    async fn rediscover(&self) -> Option<String> {
+        let prefix = discovery::fp_prefix(&self.server_fp);
+        let found = tauri::async_runtime::spawn_blocking(move || {
+            discovery::browse(&prefix, DISCOVERY_TIMEOUT)
+        })
+        .await
+        .ok()
+        .flatten()?;
+        let (ip, port) = found;
+        let base = Self::base_url(&ip.to_string(), port);
+        log::info!("companion: found the desktop at {base} over mDNS");
+        Some(base)
+    }
+
     /// Run `f` against each base URL until one answers. An address that
     /// cannot be reached is skipped for the next; any other outcome --
     /// a handshake refusal, a status, a bad reply -- is the desktop's
@@ -286,14 +350,31 @@ impl Client {
         Fut: Future<Output = Result<T, ClientError>>,
     {
         let mut last = None;
-        for i in self.order() {
-            match f(Self::base_url(&self.addrs[i], self.port)).await {
+        for base in self.bases() {
+            match f(base.clone()).await {
                 Ok(v) => {
-                    *self.preferred.lock().unwrap_or_else(|e| e.into_inner()) = Some(i);
+                    self.remember(&base);
                     return Ok(v);
                 }
                 Err(ClientError::Unreachable(m)) => {
-                    log::info!("companion: {} did not answer: {m}", self.addrs[i]);
+                    log::info!("companion: {base} did not answer: {m}");
+                    last = Some(m);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        // Every address we knew about is dead. Before reporting the
+        // desktop unreachable, ask the LAN where it went: this is the
+        // DHCP-renewal case, which otherwise stranded the phone for
+        // good.
+        if let Some(base) = self.rediscover().await {
+            match f(base.clone()).await {
+                Ok(v) => {
+                    *self.discovered.lock().unwrap_or_else(|e| e.into_inner()) = Some(base);
+                    return Ok(v);
+                }
+                Err(ClientError::Unreachable(m)) => {
+                    log::info!("companion: the address from mDNS did not answer: {m}");
                     last = Some(m);
                 }
                 Err(e) => return Err(e),
@@ -302,6 +383,17 @@ impl Client {
         Err(ClientError::Unreachable(
             last.unwrap_or_else(|| "no addresses to try".into()),
         ))
+    }
+
+    /// Record which base URL answered, so it is tried first next time.
+    fn remember(&self, base: &str) {
+        if let Some(i) =
+            (0..self.addrs.len()).find(|i| Self::base_url(&self.addrs[*i], self.port) == base)
+        {
+            *self.preferred.lock().unwrap_or_else(|e| e.into_inner()) = Some(i);
+        }
+        // A discovered address is already at the front of `bases()`, so
+        // there is nothing to reorder when that is what answered.
     }
 
     /// `GET /v1/hello`.
