@@ -175,7 +175,7 @@ pub fn ecosystems(repo: &Path) -> Vec<Ecosystem> {
         out.push(Ecosystem::Dotnet);
     }
 
-    if repo.join("Podfile").is_file() {
+    if declares_pods(repo) {
         out.push(Ecosystem::Cocoapods);
     }
 
@@ -232,6 +232,45 @@ fn has_xcode_spm(dir: &Path) -> bool {
         is_bundle
             && p.join("project.xcworkspace/xcshareddata/swiftpm/Package.resolved")
                 .is_file()
+    })
+}
+
+/// Whether this directory is really a CocoaPods project.
+///
+/// A bare `Podfile.is_file()` was not enough. `tauri ios init` writes a
+/// Podfile with two targets and no pods in either, and this repo carries
+/// one at `src-mobile/gen/apple/`. That stub made every scan run
+/// `pod outdated`, which refused for want of a `Podfile.lock` -- so the
+/// Packages page showed a standing CocoaPods warning for an ecosystem
+/// the project does not use. The warning itself was right (#567 made
+/// refusals visible rather than silently reporting "no updates"); it is
+/// the detection underneath that was wrong.
+///
+/// A `Podfile.lock` is enough on its own: pods existed at some point,
+/// and whatever the Podfile says now, there is a resolved set worth
+/// scanning. Otherwise a `pod` declaration is what makes the ecosystem
+/// real. A Podfile with dependencies and no lockfile still warns --
+/// that is a genuine finding and the case this must not swallow.
+fn declares_pods(dir: &Path) -> bool {
+    if !dir.join("Podfile").is_file() {
+        return false;
+    }
+    if dir.join("Podfile.lock").is_file() {
+        return true;
+    }
+    let Ok(text) = std::fs::read_to_string(dir.join("Podfile")) else {
+        // Unreadable rather than absent: something is there, and
+        // reporting nothing would hide a real project behind a
+        // permissions error. Scanning says so out loud instead.
+        return true;
+    };
+    text.lines().any(|line| {
+        let line = line.trim_start();
+        // `pod` as the statement, not as a prefix: `pod 'Alamofire'`
+        // counts, `pod_target_xcconfig` does not. The stub's own
+        // "# Pods for ..." comment is excluded by the same rule.
+        line.strip_prefix("pod")
+            .is_some_and(|rest| rest.starts_with([' ', '\t', '\'', '"', '(']))
     })
 }
 
@@ -368,10 +407,79 @@ mod tests {
     }
 
     #[test]
-    fn cocoapods_is_detected_from_a_podfile() {
+    fn cocoapods_is_detected_from_a_podfile_that_declares_pods() {
         let t = repo();
-        fs::write(t.path().join("Podfile"), "platform :ios").unwrap();
+        // A `pod` line is what makes the ecosystem real. Note this test
+        // used to write only `platform :ios`, which declares nothing --
+        // it passed against the old bare file check and would have gone
+        // on passing while the bug it now covers was live.
+        fs::write(
+            t.path().join("Podfile"),
+            "target 'App' do\n  platform :ios, '14.0'\n  pod 'Alamofire', '~> 5.0'\nend\n",
+        )
+        .unwrap();
         assert_eq!(ecosystems(t.path()), vec![Ecosystem::Cocoapods]);
+    }
+
+    /// The stub `tauri ios init` writes -- THIS repo's own
+    /// `src-mobile/gen/apple/Podfile`, read from disk rather than
+    /// retyped, so the test cannot drift from the file that caused the
+    /// bug. Both targets are empty, no lockfile has ever been written,
+    /// and nothing in CI runs CocoaPods, yet the Packages page showed a
+    /// standing warning for an ecosystem the project does not use.
+    ///
+    /// Reading the real file also covers the `post_install` block a
+    /// hand-written fixture omitted -- a Ruby hook with no pods in it,
+    /// and exactly the kind of thing a looser match would misread.
+    #[test]
+    fn the_generated_podfile_in_this_repo_is_not_a_cocoapods_project() {
+        let generated =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../src-mobile/gen/apple/Podfile");
+        // Skipped rather than failed when absent: `gen/apple` is
+        // generated, and a checkout that has not run `tauri ios init`
+        // is not broken.
+        let Ok(text) = fs::read_to_string(&generated) else {
+            return;
+        };
+        let t = repo();
+        fs::write(t.path().join("Podfile"), text).unwrap();
+        assert_eq!(ecosystems(t.path()), Vec::<Ecosystem>::new());
+    }
+
+    /// The case this must NOT swallow: real dependencies, no lockfile.
+    /// That is a genuine finding, and hiding it was exactly the failure
+    /// #567 fixed.
+    #[test]
+    fn pods_without_a_lockfile_still_warn() {
+        let t = repo();
+        fs::write(t.path().join("Podfile"), "  pod 'Alamofire'\n").unwrap();
+        assert_eq!(ecosystems(t.path()), vec![Ecosystem::Cocoapods]);
+    }
+
+    /// A lockfile means pods existed, whatever the Podfile says now.
+    #[test]
+    fn an_empty_podfile_with_a_lockfile_is_still_scanned() {
+        let t = repo();
+        fs::write(t.path().join("Podfile"), "target 'App' do\nend\n").unwrap();
+        fs::write(
+            t.path().join("Podfile.lock"),
+            "PODS:\n  - Alamofire (5.0)\n",
+        )
+        .unwrap();
+        assert_eq!(ecosystems(t.path()), vec![Ecosystem::Cocoapods]);
+    }
+
+    /// `pod` as a statement, not as a prefix. `pod_target_xcconfig` is a
+    /// configuration hook that appears in Podfiles with no dependencies.
+    #[test]
+    fn a_word_beginning_with_pod_is_not_a_pod_declaration() {
+        let t = repo();
+        fs::write(
+            t.path().join("Podfile"),
+            "target 'App' do\n  pod_target_xcconfig = {}\nend\n",
+        )
+        .unwrap();
+        assert_eq!(ecosystems(t.path()), Vec::<Ecosystem>::new());
     }
 
     #[test]
