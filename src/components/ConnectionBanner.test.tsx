@@ -39,6 +39,7 @@ describe("ConnectionBanner", () => {
       desktop: "octocat's laptop",
       lastPoll: null,
       protocolVersion: REQUIRED_PROTOCOL_VERSION,
+      stale: false,
     };
     const { container } = render(<ConnectionBanner />);
     expect(container.innerHTML).toBe("");
@@ -60,6 +61,7 @@ describe("ConnectionBanner", () => {
       desktop: "octocat's laptop",
       lastPoll: tenMinutesAgo,
       protocolVersion: REQUIRED_PROTOCOL_VERSION,
+      stale: false,
     };
     render(<ConnectionBanner />);
     const banner = screen.getByRole("button", { name: /octocat's laptop/ });
@@ -74,6 +76,7 @@ describe("ConnectionBanner", () => {
       desktop: "octocat's laptop",
       lastPoll: null,
       protocolVersion: REQUIRED_PROTOCOL_VERSION - 1,
+      stale: false,
     };
     render(<ConnectionBanner />);
     // A link to the desktop release, not a button into pairing
@@ -103,6 +106,7 @@ describe("ConnectionBanner", () => {
         desktop: "octocat's laptop",
         lastPoll: null,
         protocolVersion,
+        stale: false,
       };
       const { unmount } = render(<ConnectionBanner />);
       expect(screen.getByRole("button").textContent).toContain("reachable");
@@ -117,6 +121,7 @@ describe("ConnectionBanner", () => {
       kind: "unreachable",
       desktop: "octocat's laptop",
       lastPoll: new Date(Date.now() - 2 * 3_600_000).toISOString(),
+      stale: true,
     };
     render(<ConnectionBanner />);
     expect(screen.getByRole("button").textContent).toContain(

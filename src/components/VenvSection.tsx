@@ -1,3 +1,4 @@
+import { ActingOnDesktop } from "./ActingOnDesktop";
 import { useState } from "react";
 import { toast } from "sonner";
 import type { Venv, VenvState } from "@/types/pr";
@@ -159,6 +160,7 @@ export function VenvSection() {
             <DialogTitle>
               Remove {checked.size} virtualenv{checked.size === 1 ? "" : "s"}?
             </DialogTitle>
+            <ActingOnDesktop />
             <p className="mt-3 text-sm text-[#e6edf3]">
               This frees {formatSize(selectedBytes)}. Every one of these belongs to a
               project directory that no longer exists, so nothing can use them again.
