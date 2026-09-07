@@ -12,14 +12,11 @@
   "app": {
     "windows": [
       {
-        "title": "Headstate Companion",
-        "label": "main",
-        "theme": "Dark",
-        "backgroundColor": "#0d1117"
+        "label": "main"
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' data: https://avatars.githubusercontent.com; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost"
+      "csp": "default-src 'self'; img-src 'self' data: https://user-images.githubusercontent.com https://github.com https://raw.githubusercontent.com https://camo.githubusercontent.com; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost"
     }
   },
   "bundle": {

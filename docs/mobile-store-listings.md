@@ -276,15 +276,21 @@ so they must not drift from the plist.
 | `NSLocalNetworkUsageDescription` | Headstate Companion looks for your desktop Headstate on the local network to pair with it and send it commands. |
 | `NSBonjourServiceTypes` | `_headstate._tcp` |
 
-Two more are needed before a store build and are **not in the plist
-yet**; they belong with the plugins that use them (`capabilities/
-default.json` says as much) and are recorded here so the wording is
-settled before they are added:
+Two more are also in the plist, for the plugins that use them:
 
-| Key | Proposed value |
+| Key | Value |
 |---|---|
 | `NSCameraUsageDescription` | Headstate Companion uses the camera to scan the pairing code shown on your desktop. |
-| `NSFaceIDUsageDescription` | Headstate Companion uses Face ID to unlock the key that authorises deleting things from your desktop. |
+| `NSFaceIDUsageDescription` | Headstate Companion confirms it is you before deleting anything on your desktop. |
+
+These are transcribed FROM `Info.ios.plist`, which is the source of
+truth: the strings appear verbatim in the iOS permission prompt, so a
+value invented here and never added there would be a prompt nobody
+wrote. This section previously said both keys were missing when both had
+shipped, and quoted a different Face ID sentence than the binary carried
+-- which is exactly the drift the rule below is meant to prevent, and
+which a reviewer comparing the binary against the App Review note would
+have seen.
 
 iOS terminates an app that touches the camera or Face ID without the
 matching string, and App Review rejects a binary whose strings do not

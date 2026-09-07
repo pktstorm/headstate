@@ -2,4 +2,19 @@
     <!-- WorkManager needs no permission of its own; the periodic
          request's NetworkType.CONNECTED constraint is checked by the
          system. -->
+
+    <!-- mDNS discovery (src-mobile/src/discovery.rs) browses
+         `_headstate._tcp` to find a desktop whose address has changed.
+         On Android, RECEIVING multicast over Wi-Fi requires this
+         permission and a held WifiManager.MulticastLock; without them
+         the browse silently returns nothing, which is
+         indistinguishable from "the desktop is not on this network".
+
+         Declared here rather than in a new plugin of its own because
+         AGP merges every dependency's manifest into the app's, and this
+         plugin is already the one that owns Android-side lifecycle. The
+         lock itself is not yet acquired; see #610. The permission is
+         normal, not dangerous, so it is granted at install with no
+         runtime prompt and no Play Console declaration. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
 </manifest>
