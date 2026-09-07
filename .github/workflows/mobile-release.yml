@@ -373,6 +373,22 @@ jobs:
             # here where the log says why.
             unzip -l "release-assets/$NAME" | grep -q 'embedded.mobileprovision' \
               || { echo "IPA has no embedded provisioning profile; it is not signed for the App Store." >&2; exit 1; }
+
+            # ITSAppUsesNonExemptEncryption must reach the BUILT app, not
+            # just the source Info.ios.plist, or the upload lands in
+            # TestFlight as "Missing Compliance" and testers cannot
+            # install it until someone answers the question by hand
+            # (build 8). Checked against the IPA because that is the
+            # artifact Apple reads: a merge that silently dropped the key
+            # would look fine in the repository.
+            unzip -p "release-assets/$NAME" 'Payload/*.app/Info.plist' > "$RUNNER_TEMP/built.plist"
+            COMPLIANCE=$(plutil -extract ITSAppUsesNonExemptEncryption raw -o - "$RUNNER_TEMP/built.plist" 2>/dev/null || echo MISSING)
+            if [ "$COMPLIANCE" != "false" ]; then
+              echo "The built app declares ITSAppUsesNonExemptEncryption=$COMPLIANCE, expected false." >&2
+              echo "Every TestFlight build will stall on Missing Compliance; see src-mobile/Info.ios.plist." >&2
+              exit 1
+            fi
+            echo "Export compliance declared in the built app (exempt)."
           fi
           (cd release-assets && shasum -a 256 "$NAME" | tee "$NAME.sha256")
           echo "IPA=release-assets/$NAME" >> "$GITHUB_ENV"

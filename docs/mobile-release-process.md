@@ -56,6 +56,32 @@ different pipeline with a different tag prefix. Nothing here touches it.
 The GitHub pre-release holds the `.ipa`, the `.aab`, and a `SHA256SUMS`
 file for provenance. Users do not install from it.
 
+## Export compliance
+
+`ITSAppUsesNonExemptEncryption` is set to `false` in `src-mobile/Info.ios.plist`,
+so a build reaches testers without anyone answering the export-compliance
+question in App Store Connect. Build 8 predates this and stalled on
+**Missing Compliance**, which blocks installation until the question is
+answered by hand.
+
+"Collect the IPA" reads the key back out of the built `.ipa` and fails the job
+if it is missing, because the artifact Apple reads is the one that matters: a
+merge that silently dropped the key would still look correct in the repository.
+
+The `false` is a declaration that the app's encryption is exempt. It does not
+rest on the app using only Apple's cryptography, since it links aws-lc-rs, p256
+and ml-dsa, but on every use being a supporting one, with no cryptography
+offered to the user as a feature:
+
+- TLS 1.3 with mutual authentication to the paired desktop,
+- ECDSA P-256 and ML-DSA-65 signatures authenticating commands, and
+- Stronghold, plus an AES-GCM key in the Keystore or Secure Enclave, protecting
+  the app's own secrets on the device.
+
+**Revisit this if that changes.** A user-facing encryption feature, or carrying
+third-party data, would make the answer `true`, which requires a BIS
+self-classification and an `ITSEncryptionExportComplianceCode` alongside it.
+
 ## Rehearsing without a tag
 
 The workflow has a **Run workflow** button with a `dry_run` input, default
