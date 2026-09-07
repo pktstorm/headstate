@@ -50,18 +50,19 @@ LOCKS = ("src-tauri/Cargo.lock", "src-mobile/Cargo.lock")
 # making, and `tauri-plugin` is the plugin-authoring crate rather than a
 # plugin. The rest are ordinary Tauri plugins we happen to call only
 # from Rust: `notification`, `log` and `autostart` on the desktop,
-# `barcode-scanner` and `stronghold` on the phone.
+# `stronghold` on the phone.
 #
 # The second kind is a judgement, not a fact about the crate: adding the
-# npm half later is normal (the barcode scanner's JS package is expected
-# when the phone's pairing screen lands). So an unpaired crate is
-# reported as a note rather than a failure -- see `main`.
+# npm half later is normal, which is what happened to the barcode
+# scanner when the pairing screen landed -- it moved out of this set
+# and is now version-checked like any other paired plugin. So an
+# unpaired crate is reported as a note rather than a failure -- see
+# `main`.
 RUST_ONLY = {
     "tauri-plugin",
     "tauri-plugin-headstate-keys",
     "tauri-plugin-headstate-refresh",
     "tauri-plugin-autostart",
-    "tauri-plugin-barcode-scanner",
     "tauri-plugin-log",
     "tauri-plugin-notification",
     "tauri-plugin-stronghold",
