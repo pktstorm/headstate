@@ -403,3 +403,13 @@ jobs:
         run: rustup target add aarch64-apple-ios
       - name: Check the iOS target
         run: make check-mobile-ios
+      # The mobile FRONTEND bundle, which nothing else in CI built. The
+      # Rust jobs above deliberately do not need `dist/`, and
+      # `yarn tsc -b` is target-agnostic, so the `VITE_TARGET=mobile`
+      # half of the bundle -- `src/api/remote.ts`, the `select("mobile")`
+      # branch, every mobile-only render path -- was first built by
+      # `tauri ios build` in the RELEASE workflow, after tag and version
+      # stamping. That is the most expensive place to discover a break.
+      # Needs no simulator and no signing: it is a Vite build.
+      - name: Build the mobile frontend
+        run: make mobile-frontend
