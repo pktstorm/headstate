@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { renderHook, waitFor } from "@testing-library/react";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -20,6 +20,13 @@ async function load(target: "desktop" | "mobile") {
 }
 
 afterEach(() => {
+  // Unmount BEFORE `clearMocks`. The connection hook now subscribes to
+  // `connection-state`, and Tauri's unlisten is async: `clearMocks`
+  // deletes `__TAURI_EVENT_PLUGIN_INTERNALS__.unregisterListener`
+  // (mocks.js), so a teardown still in flight rejects against a
+  // function that no longer exists. Harmless, but it surfaces as an
+  // unhandled rejection Vitest warns can cause false positives.
+  cleanup();
   clearMocks();
   vi.unstubAllEnvs();
 });
@@ -212,5 +219,46 @@ describe("the stale marker", () => {
       last_poll: null,
     });
     expect(isStale(state)).toBe(true);
+  });
+});
+
+describe("the connection-state event", () => {
+  /// The companion emits `connection-state` on every change
+  /// (`STATE_EVENT` in `src-mobile/src/connection.rs`), and nothing
+  /// listened for it -- so the banner woke the webview twelve times a
+  /// minute for a value it was being handed for free, and still showed
+  /// a state up to five seconds stale.
+  it("updates the state from a pushed event, with no poll in between", async () => {
+    vi.stubEnv("VITE_TARGET", "mobile");
+    vi.resetModules();
+    // The transport is the seam the hook listens through. Driving it
+    // directly is what proves the EVENT path carries the update: the
+    // poll below answers `connecting` and never changes its answer, so
+    // a `connected` result can only have arrived by event.
+    let push: ((e: { payload: unknown }) => void) | undefined;
+    vi.doMock("./transport", () => ({
+      call: () =>
+        Promise.resolve({ state: "connecting", desktop: "octocat's laptop", last_poll: null }),
+      listen: (_event: string, cb: (e: { payload: unknown }) => void) => {
+        push = cb;
+        return Promise.resolve(() => {});
+      },
+    }));
+    const { useConnectionState } = await import("./connection");
+    const { result } = renderHook(() => useConnectionState(), { wrapper });
+    await waitFor(() => expect(result.current.kind).toBe("connecting"));
+
+    act(() => {
+      push?.({
+        payload: {
+          state: "unreachable",
+          desktop: "octocat's laptop",
+          last_poll: null,
+          stale: true,
+        },
+      });
+    });
+    await waitFor(() => expect(result.current.kind).toBe("unreachable"));
+    vi.doUnmock("./transport");
   });
 });

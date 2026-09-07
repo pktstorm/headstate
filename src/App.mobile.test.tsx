@@ -170,22 +170,6 @@ describe("App shell on a phone", () => {
     expect(useFilters.getState().filtersByView["my-prs"].repo).toBe("octocat/hello-world");
   });
 
-  it("offers no Stats entry", async () => {
-    renderApp();
-    fireEvent.click(screen.getByRole("button", { name: /open navigation/i }));
-    await waitFor(() => expect(screen.getByRole("navigation")).toBeTruthy());
-    expect(within(screen.getByRole("navigation")).queryByText("Stats")).toBeNull();
-  });
-
-  it("shows the list rather than Stats even when Stats was the last panel", () => {
-    // The panel persists across launches, and a desktop that closed on
-    // Stats must not open a phone on a page the phone does not have.
-    useFilters.setState({ panel: "stats" } as never);
-    renderApp();
-    expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Pull requests");
-    expect(screen.getByText(/^\d+ Open$/)).toBeTruthy();
-  });
-
   it("renders the connection banner above everything", () => {
     renderApp();
     const banner = screen.getByRole("button", { name: /octocat's laptop/ });
@@ -201,5 +185,64 @@ describe("App shell on a phone", () => {
     // `getAll`: a blocked pull request is also named in the priorities
     // strip above the list.
     for (const pr of PR_FIXTURES) expect(screen.getAllByText(pr.title).length).toBeGreaterThan(0);
+  });
+});
+
+/// Stats is absent from the COMPANION, not from narrow windows.
+///
+/// These were phone-viewport tests, which meant a desktop user who
+/// dragged their window under 768px lost a page their build genuinely
+/// has -- and `RepoSidebar` hid the entry to reach it by, on the same
+/// wrong condition.
+describe("Stats on the companion build", () => {
+  async function renderMobileApp() {
+    vi.stubEnv("VITE_TARGET", "mobile");
+    vi.resetModules();
+    const { default: MobileApp } = await import("./App");
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    return render(
+      <QueryClientProvider client={qc}>
+        <MobileApp />
+      </QueryClientProvider>,
+    );
+  }
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("offers no Stats entry", async () => {
+    stubViewport(390);
+    await renderMobileApp();
+    fireEvent.click(screen.getByRole("button", { name: /open navigation/i }));
+    await waitFor(() => expect(screen.getByRole("navigation")).toBeTruthy());
+    expect(within(screen.getByRole("navigation")).queryByText("Stats")).toBeNull();
+  });
+
+  it("shows the list rather than Stats even when Stats was the last panel", async () => {
+    // The panel persists across launches, and a desktop that closed on
+    // Stats must not open a companion on a page it does not have.
+    useFilters.setState({ panel: "stats" } as never);
+    stubViewport(390);
+    await renderMobileApp();
+    expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Pull requests");
+    expect(screen.getByText(/^\d+ Open$/)).toBeTruthy();
+  });
+
+  it("keeps Stats on a narrow DESKTOP window", async () => {
+    // The case the viewport guard got wrong.
+    vi.stubEnv("VITE_TARGET", "desktop");
+    vi.resetModules();
+    const { default: DesktopApp } = await import("./App");
+    stubViewport(390);
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <DesktopApp />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /open navigation/i }));
+    await waitFor(() => expect(screen.getByRole("navigation")).toBeTruthy());
+    expect(within(screen.getByRole("navigation")).getByText("Stats")).toBeTruthy();
   });
 });

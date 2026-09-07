@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, screen } from "@testing-library/react";
 // The sidebar renders ViewSwitcher, which reads `useUiPrefs`.
 import { renderWithQuery as render } from "@/test-utils";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { PR_FIXTURES } from "@/fixtures/prs";
 import { useFilters } from "@/store/filters";
 import { stubViewport } from "@/test-utils";
@@ -9,25 +9,33 @@ import { RepoSidebar } from "./RepoSidebar";
 
 afterEach(() => {
   cleanup();
+  vi.unstubAllEnvs();
   stubViewport(null);
   useFilters.getState().reset();
 });
 
-describe("RepoSidebar on a phone", () => {
+describe("RepoSidebar on the companion", () => {
   /// Stats is desktop-only in the companion's first release, so the
   /// entry that opens it must not be offered -- a row that leads to a
   /// page the phone does not have is a row that looks broken.
-  it("drops the Stats entry but keeps every repo row", () => {
-    stubViewport(390);
-    render(<RepoSidebar prs={PR_FIXTURES} />);
+  ///
+  /// Keyed on the BUILD, not the viewport. The viewport version took
+  /// Stats away from a desktop user who dragged their window under
+  /// 768px, on a page that build genuinely has.
+  it("drops the Stats entry but keeps every repo row", async () => {
+    vi.stubEnv("VITE_TARGET", "mobile");
+    vi.resetModules();
+    const { RepoSidebar: Mobile } = await import("./RepoSidebar");
+    render(<Mobile prs={PR_FIXTURES} />);
     expect(screen.queryByRole("button", { name: /stats/i })).toBeNull();
     expect(screen.getByText("All repositories")).toBeTruthy();
     expect(screen.getByText("octocat/hello-world")).toBeTruthy();
     expect(screen.getByText("octocat/spoon-knife")).toBeTruthy();
   });
 
-  it("keeps Stats at the desktop width", () => {
-    stubViewport(1400);
+  it("keeps Stats on the desktop build, however narrow the window", () => {
+    // 390px on a DESKTOP build: still a desktop, still has Stats.
+    stubViewport(390);
     render(<RepoSidebar prs={PR_FIXTURES} />);
     expect(screen.getByRole("button", { name: /stats/i })).toBeTruthy();
   });

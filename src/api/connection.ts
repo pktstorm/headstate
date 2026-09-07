@@ -1,5 +1,6 @@
-import { useQuery } from "@tanstack/react-query";
-import { call } from "./transport";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect } from "react";
+import { call, listen, type UnlistenFn } from "./transport";
 
 /// What the mobile crate's `connection_state` command answers with.
 ///
@@ -78,10 +79,18 @@ export function isStale(state: ConnectionState): boolean {
   }
 }
 
-/// How often the banner re-asks. Five seconds is fast enough that a
-/// desktop going away is noticed before the user acts on stale data,
-/// and the call is a local IPC round trip, not a network request.
-const CONNECTION_POLL_MS = 5_000;
+/// How often the banner re-asks WITHOUT an event to go on.
+///
+/// The companion pushes `connection-state` on every change, so this is a
+/// backstop rather than the mechanism: it catches a change whose event
+/// was missed, which is most plausible around a suspension. Thirty
+/// seconds costs the phone two webview wake-ups a minute instead of
+/// twelve, and no state transition waits on it in practice.
+const CONNECTION_POLL_MS = 30_000;
+
+/// The event the companion emits on every connection change. Must match
+/// `STATE_EVENT` in `src-mobile/src/connection.rs`.
+const STATE_EVENT = "connection-state";
 
 /// The mobile crate's answer. Through the transport, like every other
 /// command: on the mobile build `remote.ts` invokes the companion's own
@@ -124,10 +133,22 @@ function useLocalConnectionState(): ConnectionState {
   return LOCAL;
 }
 
-/// The phone's answer: poll `connection_state` and report `unknown`
-/// until it answers, which it will not do until #514 fills the command
-/// in -- the banner says so rather than crashing.
+/// The phone's answer: the companion pushes every change, and a slow
+/// poll underneath catches anything a missed event would have stranded.
+///
+/// It used to poll alone, every five seconds. `connection.rs` emits
+/// `connection-state` on EVERY change (`STATE_EVENT`) and `remote.ts`
+/// documents it -- "plus `connection-state` on every change, so `listen`
+/// is Tauri's" -- and nothing listened. So the phone woke its webview
+/// twelve times a minute for a value it was being handed for free, and
+/// still showed a state up to five seconds stale.
+///
+/// The poll is kept, at a much longer interval, as a safety net: an
+/// event dropped while the app was suspended would otherwise leave the
+/// banner wrong until the next change, and a wrong connection banner is
+/// what the stale marker depends on.
 function useRemoteConnectionState(): ConnectionState {
+  const client = useQueryClient();
   const { data } = useQuery({
     queryKey: ["connection-state"],
     queryFn: connectionState,
@@ -136,6 +157,44 @@ function useRemoteConnectionState(): ConnectionState {
     // backoff before the next interval only delays the same answer.
     retry: false,
   });
+
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    let live = true;
+    try {
+      // `listen` throws SYNCHRONOUSLY outside a Tauri runtime -- see the
+      // note on the pass-throughs in `transport.ts`, which is why this
+      // is a try/catch and not only a `.catch`. Without a runtime there
+      // are no events to receive, and the poll below is the whole
+      // mechanism; the banner is exactly as correct as it was before.
+      void listen<ConnectionReport>(STATE_EVENT, (e) => {
+        // Written straight into the cache rather than held in component
+        // state: the query is the single source for this value, and two
+        // copies would disagree the moment a poll landed between events.
+        client.setQueryData(["connection-state"], e.payload);
+      }).then(
+        (off) => {
+          // Unmounted before the subscription resolved: stop it now
+          // rather than leaking a listener outliving the component.
+          if (live) unlisten = off;
+          else off();
+        },
+        () => {},
+      );
+    } catch {
+      // As above: fall back to polling alone.
+    }
+    return () => {
+      live = false;
+      try {
+        unlisten?.();
+      } catch {
+        // Tearing down a listener the runtime no longer knows about is
+        // not worth failing an unmount over.
+      }
+    };
+  }, [client]);
+
   return data === undefined ? { kind: "unknown" } : fromReport(data);
 }
 
