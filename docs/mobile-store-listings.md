@@ -461,6 +461,11 @@ Run through in order for every store submission, not only the first.
 - [ ] Apple: the nutrition label reads *Data Not Collected*; the review
       note is pasted and the video attached; *Sign-in required* is
       unchecked; the version release is set to manual.
+- [ ] Apple: the **accessibility** declaration claims only features
+      whose common tasks have actually been walked with that feature on
+      (#581 for iOS, #582 for macOS). Claiming an unverified feature is
+      worse than claiming none; nothing is claimed until that work is
+      done.
 - [ ] Apple: **France is still excluded** under Monetization > Pricing
       and Availability. The App Encryption Documentation answers that
       spare this app from uploading any documentation depend on it, and
