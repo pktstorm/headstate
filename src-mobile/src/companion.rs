@@ -298,14 +298,25 @@ mod tests {
         )
     }
 
+    /// Polls until `cond` holds, or fails the test.
+    ///
+    /// The budget is deliberately generous and overridable: these tests
+    /// pass in milliseconds on a developer machine and have taken over
+    /// five minutes on a loaded CI runner, where the suite itself ran
+    /// for 316s. A timeout that fits a laptop turns a slow runner into a
+    /// red build for no reason (#569, and again on mobile-v0.1.10).
     async fn until(mut cond: impl FnMut() -> bool) {
-        tokio::time::timeout(Duration::from_secs(10), async {
+        let secs = std::env::var("HEADSTATE_TEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120);
+        tokio::time::timeout(Duration::from_secs(secs), async {
             while !cond() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("condition within 10s");
+        .unwrap_or_else(|_| panic!("condition within {secs}s"));
     }
 
     fn token() -> String {
@@ -562,14 +573,21 @@ mod tests {
             again.connection_state().last_poll.is_some(),
             "from the snapshot"
         );
-        until(|| again.connection_state().state == State::Connected).await;
-        assert!(
+        // Wait for the RESUBSCRIBE itself, not merely for the state to
+        // read Connected. Those are different moments: the restarted
+        // client can report Connected while its `/v1/events` request is
+        // still in flight, so asserting the count immediately after is a
+        // race that only loses on a slow runner -- which is how
+        // mobile-v0.1.10 went red with 85 of 86 tests passing.
+        until(|| {
             server
                 .requests()
                 .iter()
                 .filter(|r| r.path == "/v1/events")
                 .count()
                 >= 2
-        );
+        })
+        .await;
+        assert_eq!(again.connection_state().state, State::Connected);
     }
 }
