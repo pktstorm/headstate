@@ -461,6 +461,11 @@ Run through in order for every store submission, not only the first.
 - [ ] Apple: the nutrition label reads *Data Not Collected*; the review
       note is pasted and the video attached; *Sign-in required* is
       unchecked; the version release is set to manual.
+- [ ] Apple: **France is still excluded** under Monetization > Pricing
+      and Availability. The App Encryption Documentation answers that
+      spare this app from uploading any documentation depend on it, and
+      re-enabling France requires an ANSSI declaration first. See
+      [Export compliance](mobile-release-process.md#export-compliance).
 - [ ] Google: *Data safety* answers "No" to collection; *App access* has
       the restricted-functionality note; the content rating is
       Everyone; the target audience is 18+.

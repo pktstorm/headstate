@@ -90,28 +90,25 @@ than authentication. Treat those two builds as mis-declared.
 Every algorithm above is published and standard (IETF, NIST, ISO), so this is
 not "non-standard cryptography" in BIS terms.
 
-### What you have to do, once
+### What was done, once
 
 Per Apple's own table, a **CCATS is required only for proprietary algorithms**,
-so none is needed here. What is needed is the declaration:
+so none is needed here. The App Encryption Documentation questionnaire was
+completed in App Store Connect (**Apps** > the app > **App Information** >
+**App Encryption Documentation**), and it concluded that **no documentation
+needs to be uploaded** for this app, on the condition that it is **not
+available in France**.
 
-1. App Store Connect > **Apps** > the app > **App Information**.
-2. Next to **App Encryption Documentation**, click **+** and answer the
-   questions. For distribution in France an ANSSI declaration is also required;
-   Apple's form asks.
-3. Apple reviews it, roughly two business days, and shows a **code** next to the
-   approved documentation.
-4. Put that code in the `APPLE_EXPORT_COMPLIANCE_CODE` repository secret:
+Those recorded answers are what clear each upload. Nothing has to be repeated
+per build, and no code exists to put anywhere: Apple issues an
+`ITSEncryptionExportComplianceCode` only when it has reviewed *uploaded*
+documentation, which this app does not have.
 
-   ```
-   gh secret set APPLE_EXPORT_COMPLIANCE_CODE
-   ```
+`APPLE_EXPORT_COMPLIANCE_CODE` therefore stays **unset**, and the build carries
+no code key. If a future change did require documentation, setting that secret
+is all that is needed; the build merges it in and the guard checks it.
 
-   The build merges it into the app, and uploads stop asking.
-
-**Until that secret is set, iOS releases cannot ship.** There is no "declare
-`true` and answer later" state: an upload whose code does not match the
-documentation on file is rejected, and that includes having no code at all.
+Builds 10 and 11 failed at upload with
 
 ```
 Invalid Export Compliance Code. The export compliance key value [] in the
@@ -119,14 +116,26 @@ app's Info.plist doesn't match the key value of the app's export compliance
 documentation.
 ```
 
-Build 10 hit this with the key present but empty, and build 11 hit the same
-error with the key absent entirely. Preflight now requires the secret, so a
-release without it fails in seconds with the reason named rather than after a
-nine-minute build.
+first with the key present but empty, then with it absent, because the
+questionnaire had not been completed yet. Completing it is what fixed that, not
+anything in the build.
 
-The code is merged in through a second plist rather than living in
-`Info.ios.plist`, because Apple validates the key whenever it is present and an
-empty value is a *wrong* code rather than no code.
+The key must be **absent** unless there is a real code: Apple validates it
+whenever it is present, so an empty value is a *wrong* code rather than no code.
+That is why it is merged in through a second plist rather than living in
+`Info.ios.plist`.
+
+### France
+
+The app is **excluded from the French App Store**, in App Store Connect under
+**Monetization > Pricing and Availability**. France controls the import of
+encryption software, and an app that links its own cryptography needs a
+declaration with ANSSI: a postal submission, in French, processed in about a
+month. Excluding France avoids that filing, and the questionnaire's "no
+documentation required" answer depends on it.
+
+**Do not re-enable France without filing the ANSSI declaration first**, and note
+that doing so also changes the export compliance answers recorded above.
 
 ### The BIS report, which nothing here does for you
 
@@ -144,9 +153,9 @@ signatures.
 
 "Collect the IPA" reads both keys back out of the built `.ipa` and fails if:
 
-- the declaration is not `true`, or
-- the code in the built app is not exactly the one in the secret, whether it is
-  missing, empty or stale.
+- the declaration is not `true`,
+- no secret is set yet the app carries a code, empty or stale, or
+- a secret is set and a different value shipped.
 
 It checks the artifact rather than the source because that is what Apple reads:
 a key that failed to merge, or a reference that expanded to nothing, both look
@@ -204,7 +213,7 @@ and names the missing ones.
 | `APPSTORE_API_KEY_ID` | The App Store Connect API key's Key ID |
 | `APPSTORE_API_ISSUER_ID` | The Issuer ID shown above the keys table |
 | `APPSTORE_API_PRIVATE_KEY` | The contents of the key's `.p8` file, including the BEGIN/END lines |
-| `APPLE_EXPORT_COMPLIANCE_CODE` | Apple's code for the encryption declaration on file; see [Export compliance](#export-compliance). **Required**: the app declares non-exempt encryption, and an upload without a matching code is rejected |
+| `APPLE_EXPORT_COMPLIANCE_CODE` | **Not set, and not needed.** Apple issues a code only for *uploaded* documentation, which this app's questionnaire did not require; see [Export compliance](#export-compliance) |
 | `APPLE_TEAM_ID` | The ten-character Apple team ID, used for signing and shared with the desktop release |
 
 How to generate them:
