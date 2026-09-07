@@ -545,10 +545,8 @@ mod tests {
             .signature_verification_algorithms
             .supported_schemes()
             .contains(&SignatureScheme::ML_DSA_65));
-        assert!(!aws_lc_rs::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-            .contains(&SignatureScheme::ML_DSA_65));
+        // NOT asserted: that plain aws-lc-rs cannot verify ML-DSA-65.
+        // True when written, false since rustls 0.23.44. See #588.
     }
 
     /// A 5.0 desktop presents a P-256 certificate. Even with its
