@@ -80,7 +80,12 @@ vi.mock("./components/AuthGate", () => ({
 }));
 
 const connection = vi.hoisted(() => ({ current: { kind: "local" } as ConnectionState }));
-vi.mock("./api/connection", () => ({
+// Spread the real module rather than replacing it: only the hook needs
+// to be driven from the test, and `isStale` -- which `StaleRibbon` and
+// `useWritesPaused` both read -- should be the real logic under test,
+// not a stub that could disagree with it.
+vi.mock("./api/connection", async (orig) => ({
+  ...(await orig<Record<string, unknown>>()),
   useConnectionState: () => connection.current,
 }));
 
@@ -124,6 +129,7 @@ describe("App shell on the desktop", () => {
       desktop: "octocat's laptop",
       lastPoll: null,
       protocolVersion: REQUIRED_PROTOCOL_VERSION,
+      stale: false,
     };
     renderApp();
     const nav = screen.getByRole("navigation");
@@ -142,6 +148,7 @@ describe("App shell on a phone", () => {
       desktop: "octocat's laptop",
       lastPoll: new Date(Date.now() - 3 * 60_000).toISOString(),
       protocolVersion: REQUIRED_PROTOCOL_VERSION,
+      stale: false,
     };
   });
 

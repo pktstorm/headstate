@@ -192,7 +192,12 @@ pub fn run() {
         // on each platform, running the refresher `background::install`
         // puts in state. On a desktop host it registers an inert
         // scheduler.
-        .plugin(tauri_plugin_headstate_refresh::init());
+        .plugin(tauri_plugin_headstate_refresh::init())
+        // External links, exactly as the desktop registers them:
+        // the shared frontend's `ExternalLink` calls `openUrl` for
+        // every PR title and every "View on GitHub", and the phone
+        // had no plugin to answer it.
+        .plugin(tauri_plugin_opener::init());
     // The scanner is UI the frontend drives (`scan()` from
     // `@tauri-apps/plugin-barcode-scanner`, then `pair_from_qr` with the
     // text); the crate is empty on the desktop host.

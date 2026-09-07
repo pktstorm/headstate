@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/mobile-schema.json",
   "identifier": "default",
-  "description": "Minimal grants for the companion's single window: subscribe to the events the client re-emits from the desktop's stream, and scan the pairing QR. App-defined commands registered via generate_handler! are not ACL-gated and need no entry here. The stronghold plugin's JS commands are deliberately NOT granted: the Rust side owns the store (src/store.rs) and the webview never reads a seed.",
+  "description": "Minimal grants for the companion's single window: subscribe to the events the client re-emits from the desktop's stream, scan the pairing QR, and open external links in the phone's browser. The opener needs BOTH entries: `allow-open-url` grants the command and `allow-default-urls` grants the http/https URL SCOPE, and without the scope the command is permitted and then every call is refused -- silently, so the link simply does nothing. App-defined commands registered via generate_handler! are not ACL-gated and need no entry here. The stronghold plugin's JS commands are deliberately NOT granted: the Rust side owns the store (src/store.rs) and the webview never reads a seed.",
   "windows": [
     "main"
   ],
@@ -9,6 +9,8 @@
     "core:event:allow-listen",
     "core:event:allow-unlisten",
     "core:app:default",
-    "barcode-scanner:default"
+    "barcode-scanner:default",
+    "opener:allow-open-url",
+    "opener:allow-default-urls"
   ]
 }

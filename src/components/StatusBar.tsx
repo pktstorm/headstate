@@ -8,6 +8,7 @@ import { useEffect, useState } from "react";
 import { usePollError, usePollInterval, usePollState, useRemovalProgress } from "../api/hooks";
 import { relativeTime } from "../lib/time";
 import { useIsMobile } from "../lib/useIsMobile";
+import { IS_MOBILE_BUILD } from "../lib/target";
 import { SettingsDialog } from "./SettingsDialog";
 
 const CHOICES = [60, 120, 300, 900];
@@ -128,6 +129,20 @@ export function StatusBar({ updatedAt }: { updatedAt: number }) {
   // A failure is silent: a missing update hint is better than a broken
   // status bar, and the app works perfectly well without knowing.
   useEffect(() => {
+    // Desktop only, and not merely as an optimisation.
+    //
+    // `latest_release` is `Class::Read` and therefore allowlisted, so on
+    // the phone it succeeded -- and returned the newest DESKTOP release,
+    // which the phone then compared against its OWN version and offered
+    // to install over itself. The dialog it opened says "Installing
+    // replaces the app and restarts it" and calls
+    // `@tauri-apps/plugin-updater`, which is not in the mobile crate at
+    // all, so Install rejected with a raw plugin error.
+    //
+    // Both halves are wrong on a phone: the comparison is against the
+    // wrong product, and the remedy is one Apple prohibits. Mobile
+    // updates come from the App Store and TestFlight.
+    if (IS_MOBILE_BUILD) return;
     let live = true;
     const ask = () =>
       latestRelease().then(

@@ -47,12 +47,36 @@ export type ConnectionState =
       lastPoll: string | null;
       /// Null while unknown; never null once the desktop has answered.
       protocolVersion: number | null;
+      /// See `stale` on `ConnectionReport`. False in the ordinary
+      /// connected case; true for a desktop that answers but must not
+      /// be driven, such as one below the required protocol.
+      stale: boolean;
     }
   | {
       kind: "connecting" | "unreachable" | "revoked";
       desktop: string;
       lastPoll: string | null;
+      stale: boolean;
     };
+
+/// Whether what the app is showing may be out of date.
+///
+/// The companion serves `get_cached` from its stored snapshot while the
+/// desktop is away, so the list renders normally with no hint that its
+/// rows are hours old -- which is exactly what this answers. `local` is
+/// never stale: the desktop holds the data itself.
+export function isStale(state: ConnectionState): boolean {
+  switch (state.kind) {
+    // The desktop holds the data itself, and an unpaired phone is
+    // showing nothing to be stale about.
+    case "local":
+    case "unknown":
+    case "unpaired":
+      return false;
+    default:
+      return state.stale;
+  }
+}
 
 /// How often the banner re-asks. Five seconds is fast enough that a
 /// desktop going away is noticed before the user acts on stale data,
@@ -68,6 +92,10 @@ function connectionState(): Promise<ConnectionReport> {
 
 function fromReport(report: ConnectionReport): ConnectionState {
   if (report.state === "unpaired") return { kind: "unpaired" };
+  // Absent means stale for every state but `connected`: a report from
+  // before the field existed still describes a desktop the phone cannot
+  // reach, and defaulting THAT to fresh would mark hours-old rows live.
+  const stale = report.stale ?? report.state !== "connected";
   // A paired desktop always has a name -- it came from the QR -- but
   // the wire type allows null, and a banner reading "null is
   // unreachable" is worse than a generic noun.
@@ -81,9 +109,10 @@ function fromReport(report: ConnectionReport): ConnectionState {
       // unknown version as fine, so a report that predates the field
       // does not turn into an update demand.
       protocolVersion: report.protocol_version ?? null,
+      stale,
     };
   }
-  return { kind: report.state, desktop, lastPoll: report.last_poll };
+  return { kind: report.state, desktop, lastPoll: report.last_poll, stale };
 }
 
 const LOCAL: ConnectionState = { kind: "local" };

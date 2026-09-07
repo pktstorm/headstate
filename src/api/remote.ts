@@ -43,7 +43,18 @@ let installed = false;
 /// not an error here: pairing starts the stream itself, and the next
 /// foreground resume asks again.
 function subscribeEvents(): void {
-  invoke("subscribe_events").catch(() => {});
+  invoke("subscribe_events").catch((e: unknown) => {
+    // Rejected while unpaired is normal and documented -- pairing
+    // starts the stream itself. Anything else is a resume that failed
+    // to reopen the stream, which used to be indistinguishable from a
+    // normal one because every rejection was swallowed. There is no
+    // console on a phone, so a log line is the only way this is ever
+    // diagnosable.
+    const message = e instanceof Error ? e.message : String(e);
+    if (!/not paired/i.test(message)) {
+      console.error(`could not open the event stream: ${message}`);
+    }
+  });
 }
 
 /// Once: the first subscription, and the foreground hook for every

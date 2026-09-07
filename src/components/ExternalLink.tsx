@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { toast } from "sonner";
 
 /// A link that actually opens the user's browser.
 ///
@@ -49,7 +50,17 @@ export function ExternalLink({
         e.preventDefault();
         e.stopPropagation();
         onClick?.();
-        void openUrl(href);
+        // The rejection is NOT dropped. It used to be, and that is how
+        // the mobile build shipped with every external link inert: the
+        // opener plugin was in neither the phone's crate nor its
+        // capabilities, so each call rejected and vanished, leaving a
+        // tap that did nothing at all -- no navigation, no error, no
+        // log. A link that cannot open should say so.
+        void openUrl(href).catch((e: unknown) => {
+          const detail = e instanceof Error ? e.message : String(e);
+          console.error(`could not open ${href}: ${detail}`);
+          toast.error("Could not open that link", { description: href });
+        });
       }}
     >
       {children}

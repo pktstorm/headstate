@@ -1,4 +1,4 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, focusManager } from "@tanstack/react-query";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
@@ -26,6 +26,34 @@ import "sonner/dist/styles.css";
 initSplash();
 
 const queryClient = new QueryClient();
+
+// iOS suspends the webview, and a resume fires `visibilitychange` but
+// does NOT reliably fire `window.focus` -- which is what TanStack's
+// default `refetchOnWindowFocus` waits for. So on the one platform where
+// suspension is guaranteed, the focus-based refetch that keeps the
+// desktop current was unreliable: the `prs` list recovered (the
+// companion replays a snapshot frame on resubscribe) but everything
+// pulled rather than pushed did not. Leave a PR detail view, background
+// the app for an hour, come back: hour-old checks and review threads,
+// with nothing to say so.
+//
+// Driving `focusManager` rather than calling `invalidateQueries` keeps
+// each query's own `staleTime` in charge -- a blanket invalidate would
+// refetch things that are deliberately cached forever. Registered for
+// both builds: on the desktop `visibilitychange` fires when the window
+// is minimised or hidden, which is a moment worth refetching on there
+// too, and the desktop's existing focus behaviour is unchanged.
+if (typeof document !== "undefined") {
+  focusManager.setEventListener((handleFocus) => {
+    const onChange = () => handleFocus(document.visibilityState === "visible");
+    document.addEventListener("visibilitychange", onChange, false);
+    window.addEventListener("focus", onChange, false);
+    return () => {
+      document.removeEventListener("visibilitychange", onChange);
+      window.removeEventListener("focus", onChange);
+    };
+  });
+}
 
 createRoot(document.getElementById("root") as HTMLElement).render(
   <StrictMode>

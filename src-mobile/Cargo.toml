@@ -135,6 +135,13 @@ tauri-plugin-stronghold = { version = "2.3", default-features = false }
 # Scans the pairing QR. `#![cfg(mobile)]` inside the crate: it compiles to
 # nothing on the desktop host, so lib.rs registers it under the same cfg.
 tauri-plugin-barcode-scanner = "2.4"
+
+# External links. Every `ExternalLink` in the shared frontend goes
+# through `openUrl`, so without this the PR titles, "View on GitHub"
+# and the too-old-desktop banner's update link were all inert on the
+# phone -- and silently, because the plugin's absence is a rejected
+# promise the component dropped.
+tauri-plugin-opener = "2"
 # ISO 8601 for `connection_state.last_poll` and the snapshot's
 # `received_at`. Already in the lock.
 chrono = "0.4"

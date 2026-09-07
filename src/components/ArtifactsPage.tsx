@@ -1,3 +1,4 @@
+import { ActingOnDesktop } from "./ActingOnDesktop";
 import { useMemo, useState } from "react";
 import { HardDrive } from "lucide-react";
 import type { Artifact, ArtifactKind } from "@/types/pr";
@@ -250,6 +251,7 @@ export function ArtifactsPage() {
             <DialogTitle>
               Remove {checked.size} director{checked.size === 1 ? "y" : "ies"}?
             </DialogTitle>
+            <ActingOnDesktop />
             {/* The specific loss, computed now. "Are you sure?" is not
                 something anyone can act on -- and here the honest answer
                 is that the loss is TIME, not work, which is exactly what

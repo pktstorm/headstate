@@ -1,3 +1,4 @@
+import { ActingOnDesktop } from "./ActingOnDesktop";
 import { ExternalLink } from "./ExternalLink";
 import { Sparkles } from "lucide-react";
 import { useState } from "react";
@@ -421,6 +422,7 @@ function ConfirmRemove({
     <Dialog open onOpenChange={(open) => !open && onCancel()}>
       <DialogContent className="max-w-lg">
         <DialogTitle>Remove this worktree?</DialogTitle>
+        <ActingOnDesktop />
         <p className="mt-3 break-all font-mono text-xs text-[#8b949e]">{wt.path}</p>
         <p className="mt-2 text-sm text-[#8b949e]">
           Branch <span className="font-mono">{wt.branch || "detached"}</span> is merged and
@@ -940,6 +942,7 @@ export function WorktreesPage() {
         <Dialog open onOpenChange={(o) => !o && setForcing(null)}>
           <DialogContent className="max-w-lg">
             <DialogTitle>Remove {pathBasename(forcing.path)}?</DialogTitle>
+            <ActingOnDesktop />
             <p className="mt-3 break-all font-mono text-xs text-[#8b949e]">{forcing.path}</p>
             {/* The specific loss, computed now -- "are you sure?" is not
                 something anyone can act on, and this is the only
@@ -999,6 +1002,7 @@ export function WorktreesPage() {
             <DialogTitle>
               Remove {safeCount} safe worktree{safeCount === 1 ? "" : "s"}?
             </DialogTitle>
+            <ActingOnDesktop />
             <p className="mt-2 text-sm text-[#8b949e]">
               {/* Sizes are already computed, and reclaimed space is the
                   number that makes this decision -- it is why the view

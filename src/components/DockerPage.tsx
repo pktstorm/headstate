@@ -1,3 +1,4 @@
+import { ActingOnDesktop } from "./ActingOnDesktop";
 import { useState } from "react";
 import { toast } from "sonner";
 import {
@@ -537,6 +538,7 @@ export function DockerPage() {
         <Dialog open onOpenChange={(o) => !o && setPendingVolume(null)}>
           <DialogContent className="max-w-lg">
             <DialogTitle>Delete this volume?</DialogTitle>
+            <ActingOnDesktop />
             <p className="mt-3 break-all font-mono text-xs text-[#8b949e]">
               {pendingVolume.name}
             </p>
@@ -581,6 +583,7 @@ export function DockerPage() {
         <Dialog open onOpenChange={(o) => !o && setPending(null)}>
           <DialogContent className="max-w-lg">
             <DialogTitle>Remove this image?</DialogTitle>
+            <ActingOnDesktop />
             <p className="mt-3 break-all font-mono text-xs text-[#8b949e]">
               {pending.repository}
               {pending.tags.length > 0 ? `:${pending.tags.join(", :")}` : ""}
@@ -640,6 +643,7 @@ export function DockerPage() {
               {bulkOpen === "superseded" ? "superseded" : "stale"} image
               {bulkSet.length === 1 ? "" : "s"}?
             </DialogTitle>
+            <ActingOnDesktop />
             {/* The wider set needs a DIFFERENT sentence, not a louder
                 one: some of its images belong to branches that are
                 still open, and the dialog has to say so plainly rather
@@ -721,6 +725,7 @@ export function DockerPage() {
         <Dialog open onOpenChange={(o) => !o && setRestartOpen(null)}>
           <DialogContent className="max-w-lg">
             <DialogTitle>Restart Docker?</DialogTitle>
+            <ActingOnDesktop />
             {/* Name what will be stopped: the user may have a database
                 up that they would otherwise notice the hard way. */}
             <p className="mt-3 text-sm text-[#8b949e]">

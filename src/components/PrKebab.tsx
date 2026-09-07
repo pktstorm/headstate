@@ -1,4 +1,5 @@
 import { ExternalLink } from "./ExternalLink";
+import { useWritesPaused } from "@/lib/useWritesPaused";
 import { copyText } from "../lib/clipboard";
 import { Bot, Copy, ExternalLink as ExternalLinkIcon, MoreHorizontal } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
@@ -74,6 +75,9 @@ const LABEL: Record<PrActionName, string> = {
 /// else's pull request is usually not yours to do, and offering an action
 /// that fails with a permissions error is worse than not offering it.
 export function PrKebab({ pr, canWrite = true }: { pr: PullRequest; canWrite?: boolean }) {
+  // Null on the desktop and whenever the paired desktop is reachable,
+  // so this changes nothing there.
+  const paused = useWritesPaused();
   const act = useActOnPr();
   const updateBranch = useUpdatePrBranch();
   const setAuto = useSetAutoMerge();
@@ -154,7 +158,10 @@ export function PrKebab({ pr, canWrite = true }: { pr: PullRequest; canWrite?: b
         >
           {canWrite
             ? writes.map((action) => {
-                const why = unavailable(pr, action);
+                // Paused beats specific: naming "merge conflicts" for
+                // a desktop the phone cannot reach describes the wrong
+                // obstacle, and fixing it would not help.
+                const why = paused ?? unavailable(pr, action);
                 return (
                   <button
                     key={action}

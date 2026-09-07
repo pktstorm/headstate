@@ -41,6 +41,7 @@ import { RepoSidebar } from "./components/RepoSidebar";
 import { StatusBar } from "./components/StatusBar";
 import { StatsPage } from "./components/StatsPage";
 import { ConnectionBanner } from "./components/ConnectionBanner";
+import { StaleRibbon } from "./components/StaleRibbon";
 import { Sheet, SheetContent, SheetTitle } from "./components/ui/sheet";
 import { applyFilters, hasActiveFilters, sortPrs } from "./lib/derive";
 import { shortcutFor } from "./lib/shortcuts";
@@ -254,6 +255,12 @@ export default function App() {
           desktop the whole screen is describing. Renders nothing on
           the desktop itself. */}
       <ConnectionBanner />
+      {/* Below the banner and above everything else: the banner says
+          which desktop, this says the rows underneath may be old. The
+          banner alone was not enough -- it is one line that scrolls out
+          of mind, and `ConnectionBanner` was the only component in the
+          app reading the connection state at all. */}
+      <StaleRibbon />
       <div className="flex min-h-0 flex-1">
       {isMobile ? (
         // The same sidebar component, in a sheet. Its own `w-64` and
