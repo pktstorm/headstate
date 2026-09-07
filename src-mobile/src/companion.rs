@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use crate::client::{Client, ClientError};
 use crate::connection::{Connection, EventSink, Report, State};
 use crate::events;
-use crate::keys::DeviceKeys;
+use crate::keys::{DeviceKeys, KeyError};
 use crate::pairing::{self, Desktop};
 use crate::stepup;
 use crate::store::Store;
@@ -73,12 +73,41 @@ impl Companion {
         self.conn.set_desktop(Some(desktop.name.clone()), last_poll);
         let identity = match self.keys.session_identity() {
             Ok(id) => id,
-            Err(e) => {
+            // The keys are GONE: `generate` was never called, or
+            // `destroy` was. Nothing here will fix itself, and the
+            // pairing is over.
+            Err(KeyError::NoKeys) => {
                 log::warn!(
-                    "companion: paired with {} but the keys are unusable: {e}",
+                    "companion: paired with {} but the device keys are gone",
                     desktop.name
                 );
                 self.conn.set_state(State::Revoked);
+                return Ok(());
+            }
+            // The keys exist and could not be READ right now. On iOS
+            // that is routine rather than exceptional: the session
+            // items are `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`,
+            // so a cold start from a background launch -- a
+            // `BGAppRefreshTask` wake, a notification -- reads them
+            // while the device is still locked and gets
+            // `errSecInteractionNotAllowed`.
+            //
+            // Reporting that as `Revoked` told the user their desktop
+            // had removed this phone, on a healthy pairing, and the
+            // banner's advice ("pair again") would have made them
+            // discard a perfectly good one. `load` runs once from
+            // `setup`, so nothing ever retried and it persisted until
+            // the process was killed and cold-started unlocked.
+            //
+            // `Unreachable` is the honest state: we are paired, we
+            // cannot talk to the desktop yet, and `retry_load` below
+            // gets another go on the next foreground.
+            Err(e) => {
+                log::warn!(
+                    "companion: paired with {} but the keys are not readable yet: {e}",
+                    desktop.name
+                );
+                self.conn.set_state(State::Unreachable);
                 return Ok(());
             }
         };
@@ -141,6 +170,26 @@ impl Companion {
     /// wake it if it is. The frontend calls this on first listen and on
     /// every return to the foreground.
     pub fn subscribe(&self) -> Result<(), String> {
+        // A paired phone with no live client is the transient-key case
+        // in `load`: the pairing is on disk, but the Keychain would not
+        // hand over the session identity when the app started, most
+        // likely because the device was still locked. `load` runs once
+        // from `setup`, so without this it never ran again and the
+        // phone stayed dead until the process was cold-started
+        // unlocked. The foreground is exactly the moment the device is
+        // known to be unlocked, so it is the right place to try again.
+        if self
+            .live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none()
+            && self.conn.state() != State::Unpaired
+            && self.conn.state() != State::Revoked
+        {
+            if let Err(e) = self.load() {
+                log::warn!("companion: retrying the paired desktop failed: {e}");
+            }
+        }
         let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
         match live.as_ref() {
             None => Err("not paired with a desktop".into()),
@@ -280,11 +329,12 @@ impl Companion {
 mod tests {
     use super::*;
     use crate::connection::tests::Recorder;
-    use crate::keys::{KeyError, SoftwareKeys};
+    use crate::keys::{KeyError, PublicKeys, SessionIdentity, Signatures, SoftwareKeys};
     use crate::store::MemoryStore;
     use crate::testing::{Reply, TestServer};
     use base64::Engine;
     use serde_json::json;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     fn companion(store: Arc<MemoryStore>, rec: Arc<Recorder>) -> Companion {
@@ -296,6 +346,142 @@ mod tests {
                 tokio::spawn(f);
             }),
         )
+    }
+
+    /// Keys that refuse to be read until told otherwise, wrapping a
+    /// real `SoftwareKeys` for everything else.
+    ///
+    /// Models the iOS Keychain on a locked device: the items exist, and
+    /// `SecItemCopyMatching` answers `errSecInteractionNotAllowed`,
+    /// which reaches Rust as `KeyError::Unavailable`. Nothing is
+    /// missing and nothing is broken; it is simply not readable yet.
+    struct LockedKeys {
+        inner: SoftwareKeys,
+        locked: AtomicBool,
+    }
+
+    impl LockedKeys {
+        fn new(store: Arc<MemoryStore>) -> Self {
+            Self {
+                inner: SoftwareKeys::new(store),
+                locked: AtomicBool::new(false),
+            }
+        }
+        fn lock(&self) {
+            self.locked.store(true, Ordering::SeqCst);
+        }
+        fn unlock(&self) {
+            self.locked.store(false, Ordering::SeqCst);
+        }
+        fn blocked(&self) -> bool {
+            self.locked.load(Ordering::SeqCst)
+        }
+    }
+
+    impl DeviceKeys for LockedKeys {
+        fn generate(&self) -> Result<PublicKeys, KeyError> {
+            self.inner.generate()
+        }
+        fn destroy(&self) -> Result<(), KeyError> {
+            self.inner.destroy()
+        }
+        fn public_keys(&self) -> Result<PublicKeys, KeyError> {
+            self.inner.public_keys()
+        }
+        fn sign(&self, bytes: &[u8]) -> Result<Signatures, KeyError> {
+            self.inner.sign(bytes)
+        }
+        fn session_identity(&self) -> Result<SessionIdentity, KeyError> {
+            if self.blocked() {
+                return Err(KeyError::Unavailable("the device is locked".into()));
+            }
+            self.inner.session_identity()
+        }
+    }
+
+    /// A phone whose keys cannot be READ at startup is not a phone whose
+    /// desktop revoked it.
+    ///
+    /// `load` reported every `session_identity` failure as `Revoked`,
+    /// and on iOS the common cause is entirely benign: the session items
+    /// are `WhenUnlockedThisDeviceOnly`, so a cold start from a
+    /// background launch reads them while the device is still locked.
+    /// The user was told their desktop had removed this phone, and the
+    /// banner told them to pair again -- discarding a healthy pairing.
+    #[tokio::test]
+    async fn a_locked_keychain_is_not_a_revocation() {
+        let store = Arc::new(MemoryStore::default());
+        // One keys object across both companions: the store is shared,
+        // so the session identity -- and therefore the fingerprint the
+        // desktop paired with -- is the same one either way. Locking it
+        // models the Keychain refusing to hand that identity over, not
+        // the identity changing.
+        let keys = Arc::new(LockedKeys::new(store.clone()));
+        let spawn: Spawner = Arc::new(|f| {
+            tokio::spawn(f);
+        });
+        let c = Companion::new(
+            store.clone(),
+            keys.clone(),
+            Arc::new(Recorder::default()),
+            spawn.clone(),
+        );
+        let server = TestServer::start().await;
+        server.open_window(true);
+        server.reply("/v1/events", Reply::sse(&[("prs-updated", "[]")], true));
+        let qr = server.qr(&token(), Utc::now().timestamp() + 120);
+        c.pair(&qr, None).await.unwrap();
+        // The harness admits a fingerprint only once told to, the way
+        // the desktop does after a person approves the request.
+        let fp = server.requests()[0].peer_fp.clone();
+        server.pair(&fp);
+        server.open_window(false);
+        // Stop the first companion's subscriber so only the reloaded
+        // one is talking to the server.
+        c.detach();
+
+        // Restart with the device locked, as a background launch does.
+        keys.lock();
+        let again = Companion::new(
+            store.clone(),
+            keys.clone(),
+            Arc::new(Recorder::default()),
+            spawn.clone(),
+        );
+        again.load().unwrap();
+        assert_ne!(
+            again.connection_state().state,
+            State::Revoked,
+            "a locked keychain must not read as the desktop removing this phone"
+        );
+        assert_eq!(again.connection_state().state, State::Unreachable);
+        // The desktop's name still belongs in the banner.
+        assert!(again.connection_state().desktop.is_some());
+
+        // Unlocked, the next foreground recovers on its own -- no
+        // re-pairing, and no cold start.
+        keys.unlock();
+        again.subscribe().unwrap();
+        until(|| again.connection_state().state == State::Connected).await;
+    }
+
+    /// Keys that are genuinely GONE still end the pairing: nothing will
+    /// bring them back, and pretending otherwise leaves the phone
+    /// retrying forever.
+    #[tokio::test]
+    async fn destroyed_keys_are_still_a_revocation() {
+        let store = Arc::new(MemoryStore::default());
+        let c = companion(store.clone(), Arc::new(Recorder::default()));
+        let server = TestServer::start().await;
+        server.open_window(true);
+        server.reply("/v1/events", Reply::sse(&[("prs-updated", "[]")], true));
+        let qr = server.qr(&token(), Utc::now().timestamp() + 120);
+        c.pair(&qr, None).await.unwrap();
+
+        SoftwareKeys::new(store.clone()).destroy().unwrap();
+        let again = companion(store.clone(), Arc::new(Recorder::default()));
+        again.load().unwrap();
+        assert_eq!(again.connection_state().state, State::Revoked);
     }
 
     /// Polls until `cond` holds, or fails the test.

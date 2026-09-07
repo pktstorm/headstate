@@ -22,18 +22,28 @@
 //!
 //! # Where the client calls this
 //!
-//! `client.rs` (#514), before it tries the `addrs` stored for the paired
-//! desktop: `browse(&fp_prefix(&paired.fp), Duration::from_secs(3))`,
-//! and on `Some((ip, port))` that address goes to the front of the list.
+//! `Client::rediscover` in `client.rs`, AFTER every stored address has
+//! failed rather than before any is tried: while one of them answers
+//! there is nothing to look up, and browsing on each call would add
+//! three seconds of latency to a question already answered. On
+//! `Some((ip, port))` that address is tried, and if it answers it is
+//! kept and tried first from then on.
+//!
 //! It BLOCKS for up to `timeout` on a multicast channel, so the async
 //! client runs it on a blocking task
 //! (`tauri::async_runtime::spawn_blocking`). A `None` is not an error --
 //! a different network, no multicast, a desktop whose listener is off --
-//! and the stored addresses are tried exactly as they would have been.
+//! and the caller reports the same unreachable it would have anyway.
+//!
+//! # Platform gates
 //!
 //! iOS gates all of this behind `NSLocalNetworkUsageDescription` and the
 //! `_headstate._tcp` entry in `NSBonjourServiceTypes` (`Info.ios.plist`);
 //! without them the browse sees nothing and never says why.
+//!
+//! Android needs `CHANGE_WIFI_MULTICAST_STATE` and a held
+//! `WifiManager.MulticastLock` for the same reason, and fails the same
+//! silent way without them -- tracked in #610.
 
 use mdns_sd::{ServiceDaemon, ServiceEvent, TxtProperties};
 use std::net::IpAddr;
