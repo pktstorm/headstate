@@ -58,29 +58,89 @@ file for provenance. Users do not install from it.
 
 ## Export compliance
 
-`ITSAppUsesNonExemptEncryption` is set to `false` in `src-mobile/Info.ios.plist`,
-so a build reaches testers without anyone answering the export-compliance
-question in App Store Connect. Build 8 predates this and stalled on
-**Missing Compliance**, which blocks installation until the question is
-answered by hand.
+The app declares `ITSAppUsesNonExemptEncryption` **true** in
+`src-mobile/Info.ios.plist`, and carries Apple's compliance code beside it once
+there is one. Answering in the app is what keeps a build from stalling on
+**Missing Compliance**, which blocks testers from installing until someone
+clears it by hand.
 
-"Collect the IPA" reads the key back out of the built `.ipa` and fails the job
-if it is missing, because the artifact Apple reads is the one that matters: a
-merge that silently dropped the key would still look correct in the repository.
+### Why `true`
 
-The `false` is a declaration that the app's encryption is exempt. It does not
-rest on the app using only Apple's cryptography, since it links aws-lc-rs, p256
-and ml-dsa, but on every use being a supporting one, with no cryptography
-offered to the user as a feature:
+Apple requires documentation for an app containing
 
-- TLS 1.3 with mutual authentication to the paired desktop,
-- ECDSA P-256 and ML-DSA-65 signatures authenticating commands, and
-- Stronghold, plus an AES-GCM key in the Keystore or Secure Enclave, protecting
-  the app's own secrets on the device.
+> Standard encryption algorithms instead of, or in addition to, using or
+> accessing the encryption within Apple's operating system
 
-**Revisit this if that changes.** A user-facing encryption feature, or carrying
-third-party data, would make the answer `true`, which requires a BIS
-self-classification and an `ITSEncryptionExportComplianceCode` alongside it.
+which is this app exactly. It does not go through Apple's networking stack or
+CryptoKit; it links its own:
+
+- **TLS 1.3** with mutual authentication to the paired desktop, over rustls on
+  `aws-lc-rs` rather than URLSession,
+- **ECDSA P-256** and **ML-DSA-65** (FIPS 204) signatures authenticating
+  commands, via `p256` and `ml-dsa`, and
+- **Stronghold**, plus an **AES-GCM** key in the Keystore or Secure Enclave,
+  protecting the app's own secrets at rest.
+
+Builds 8 and 9 declared `false`, reading authentication and protecting one's own
+data as an exempt supporting use. That exemption is real in the EAR, but it
+governs whether the software is *controlled*, which is a different question from
+whether Apple wants documentation, and the third item is confidentiality rather
+than authentication. Treat those two builds as mis-declared.
+
+Every algorithm above is published and standard (IETF, NIST, ISO), so this is
+not "non-standard cryptography" in BIS terms.
+
+### What you have to do, once
+
+Per Apple's own table, a **CCATS is required only for proprietary algorithms**,
+so none is needed here. What is needed is the declaration:
+
+1. App Store Connect > **Apps** > the app > **App Information**.
+2. Next to **App Encryption Documentation**, click **+** and answer the
+   questions. For distribution in France an ANSSI declaration is also required;
+   Apple's form asks.
+3. Apple reviews it, roughly two business days, and shows a **code** next to the
+   approved documentation.
+4. Put that code in the `APPLE_EXPORT_COMPLIANCE_CODE` repository secret:
+
+   ```
+   gh secret set APPLE_EXPORT_COMPLIANCE_CODE
+   ```
+
+   The build substitutes it into the app, and uploads stop asking.
+
+Until the secret is set the release still works: the build logs a warning, and
+that upload is asked to clear compliance once in App Store Connect. Nothing
+fails.
+
+### The BIS report, which nothing here does for you
+
+Separately from Apple, a US exporter of 5D002 software owes BIS an **annual
+self-classification report**, due **1 February** for the preceding calendar
+year, sent to BIS and the ENC Encryption Request Coordinator. It lists the
+product, the encryption it uses, and its classification. It is a report, not a
+licence application, and no part of this repository files it.
+
+**This is not legal advice, and the classification is worth confirming with
+someone who does export compliance**, particularly given the post-quantum
+signatures.
+
+### The guard
+
+"Collect the IPA" reads both keys back out of the built `.ipa` and fails if:
+
+- the declaration is not `true`,
+- the code is still an unexpanded `$(...)` reference, or
+- `APPLE_EXPORT_COMPLIANCE_CODE` is set but a different value shipped.
+
+It checks the artifact rather than the source because that is what Apple reads:
+a key that failed to merge, or a reference that expanded to nothing, both look
+correct in the repository.
+
+### Revisit this if
+
+the app gains a user-facing encryption feature, starts carrying third-party
+data, or adopts a proprietary algorithm. The last would require a CCATS.
 
 ## Rehearsing without a tag
 
@@ -129,6 +189,8 @@ and names the missing ones.
 | `APPSTORE_API_KEY_ID` | The App Store Connect API key's Key ID |
 | `APPSTORE_API_ISSUER_ID` | The Issuer ID shown above the keys table |
 | `APPSTORE_API_PRIVATE_KEY` | The contents of the key's `.p8` file, including the BEGIN/END lines |
+| `APPLE_EXPORT_COMPLIANCE_CODE` | **Optional.** Apple's code for the encryption declaration on file; see [Export compliance](#export-compliance). Without it a build still ships, and is asked to clear compliance once per upload |
+| `APPLE_TEAM_ID` | The ten-character Apple team ID, used for signing and shared with the desktop release |
 
 How to generate them:
 
@@ -154,7 +216,12 @@ How to generate them:
   the `.p8` downloads once and cannot be re-downloaded, so put it in the
   secret immediately: `pbcopy < AuthKey_XXXXXXXXXX.p8`.
 
-The Apple team ID is not a secret: Tauri reads it from the certificate.
+`APPLE_TEAM_ID` is shared with the desktop release, which notarizes with it.
+It is not really sensitive, since it ships inside every signed app, but it is an
+account identifier and this repository is public. The build needs it explicitly:
+Tauri does not infer the team from the certificate, and without it the Xcode
+project has no signing team and the build fails with a message about the
+Signing & Capabilities editor.
 
 ### Android
 
@@ -199,11 +266,21 @@ for the build and deleted afterwards; that path is in `.gitignore` twice.
 
 **iOS** (`macos-latest`, Xcode 26): run the mobile checks; create a
 throwaway keychain and import the certificate; install the provisioning
-profile; `tauri ios build --ci --export-method app-store-connect` with the
-certificate and profile also given to the Tauri CLI, which switches the
-Xcode project to manual signing for that build; `xcrun altool
---upload-package` with the API key; delete the keychain, profile and key
-(also on failure).
+profile, failing early if it is not for this app; export the identity, team,
+profile name and compliance code as `HEADSTATE_*` build settings, which the
+committed Xcode project references; `tauri ios build --ci --export-method
+app-store-connect`; `xcrun altool --upload-package` with the API key; delete the
+keychain, profile and key (also on failure).
+
+The signing settings go through the project rather than the command line
+because nothing else survives: the CLI's trailing `--` arguments go to Cargo,
+and `XCODE_XCCONFIG_FILE` is not honoured through it. The project declares each
+setting as a `$(HEADSTATE_*)` reference, and Xcode expands build settings from
+the environment, so the workflow supplies the values without committing any of
+them. Unset, as in a local build, they expand to empty and Xcode's own defaults
+apply. `CODE_SIGN_STYLE` is the exception and is written literally, because the
+CLI copies it into `ExportOptions.plist` as a raw string and an unexpanded
+reference is rejected at export.
 
 **Android** (`ubuntu-latest`, pinned NDK, the same toolchain steps as CI's
 `mobile-android` job): run the mobile checks; generate `gen/android` if it
