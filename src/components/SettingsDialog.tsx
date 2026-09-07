@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { toast } from "sonner";
 import { revealLog } from "@/api/tauri";
+import { useIsMobile } from "@/lib/useIsMobile";
 import { HelpButton } from "./HelpButton";
 import { PairPhonePanel } from "./PairPhonePanel";
 import { PairedDesktopPanel } from "./PairedDesktopPanel";
@@ -69,6 +70,9 @@ export function SettingsDialog({
   /// since that is the only reason it was tapped.
   initialSection?: SectionId;
 }) {
+  // Layout, not capability: a desktop window dragged phone-narrow wants
+  // the stacked layout too, and it is still a desktop with `gh`.
+  const isMobile = useIsMobile();
   const { seconds, set: setInterval } = usePollInterval();
   const { dirs, set: setDirs } = useWorktreeDirs();
   const { prefs, set: setPrefs } = useNotifyPrefs();
@@ -137,7 +141,21 @@ export function SettingsDialog({
           `max-w-3xl` loses to it above 640px and the dialog would come
           out NARROWER than the 32rem it started at. Verified against
           twMerge rather than assumed. */}
-      <DialogContent className="flex h-[32rem] max-w-3xl flex-col sm:max-w-3xl">
+      {/* On a phone: nearly full height, and the nav rail stacks ABOVE
+          the content rather than beside it. `h-[32rem]` is a hard 512px
+          slab with 144px of that spent on a fixed-width rail, leaving
+          ~214px of content pane at 390px -- not enough for the `w-40`
+          selects or the keyboard-shortcut grid inside it, and the
+          pairing panel's fingerprint collapsed to an unreadable column.
+          This dialog is also where the connection banner sends a phone
+          user, so it had to be usable there. */}
+      <DialogContent
+        className={
+          isMobile
+            ? "flex h-[calc(100dvh-4rem)] max-w-none flex-col sm:max-w-none"
+            : "flex h-[32rem] max-w-3xl flex-col sm:max-w-3xl"
+        }
+      >
         <DialogTitle>Settings</DialogTitle>
 
         {/* TWO PANES: topics on the left, the chosen one on the right.
@@ -151,10 +169,24 @@ export function SettingsDialog({
             changed. The existing tests assert specific labels and keep
             passing rather than being rewritten to match a new layout --
             a reorganisation that hides a control is a regression. */}
-        <div className="-mx-1 flex min-h-0 flex-1 gap-4 overflow-hidden px-1">
+        <div
+          className={
+            isMobile
+              ? "-mx-1 flex min-h-0 flex-1 flex-col gap-3 overflow-hidden px-1"
+              : "-mx-1 flex min-h-0 flex-1 gap-4 overflow-hidden px-1"
+          }
+        >
           <nav
             aria-label="Settings sections"
-            className="flex w-36 shrink-0 flex-col gap-0.5 border-r border-[#30363d] pr-2"
+            className={
+              isMobile
+                ? // A horizontal strip of topics that scrolls, rather
+                  // than a rail that eats a third of the width. Same
+                  // buttons, same order, same labels -- the existing
+                  // tests find them either way.
+                  "flex shrink-0 gap-1 overflow-x-auto border-b border-[#30363d] pb-2"
+                : "flex w-36 shrink-0 flex-col gap-0.5 border-r border-[#30363d] pr-2"
+            }
           >
             {SECTIONS.map((s) => (
               <button

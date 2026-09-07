@@ -250,7 +250,7 @@ export default function App() {
     );
 
   return (
-    <div className="flex h-screen flex-col bg-[#0d1117] text-[#e6edf3]">
+    <div className="flex h-dvh flex-col bg-[#0d1117] text-[#e6edf3] px-safe">
       {/* Above everything, including the header: it says which
           desktop the whole screen is describing. Renders nothing on
           the desktop itself. */}
@@ -282,13 +282,13 @@ export default function App() {
         sidebar
       )}
       <main ref={mainRef} className="flex-1 overflow-auto">
-        <header className="flex items-center gap-2 border-b border-[#30363d] px-4 py-3">
+        <header className="sticky top-0 z-20 flex items-center gap-2 border-b border-[#30363d] bg-[#0d1117] px-4 py-3">
           {isMobile ? (
             <button
               type="button"
               onClick={() => setNavOpen(true)}
               aria-label="Open navigation"
-              className="-ml-1 rounded p-1 hover:bg-[#161b22]"
+              className="tap-target -ml-1 flex items-center justify-center rounded hover:bg-[#161b22]"
             >
               <Menu className="h-4 w-4" aria-hidden="true" />
             </button>

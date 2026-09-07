@@ -10,8 +10,12 @@ import { SettingsDialog } from "./SettingsDialog";
 /// is what needs replacing, and the phone cannot do that for it.
 const DESKTOP_RELEASES = "https://github.com/pktstorm/headstate/releases/latest";
 
+/// `pt-safe` because this is the top-most element of the phone's shell:
+/// with `viewport-fit=cover` the page paints into the notch strip, and
+/// without the inset the banner's text sits under the Dynamic Island.
+/// The inset is 0 on the desktop and on phones without a notch.
 const BANNER_CLASS =
-  "flex w-full shrink-0 items-center gap-2 border-b border-[#30363d] bg-[#161b22] px-4 py-2 text-left text-xs text-[#e6edf3] hover:bg-[#21262d]";
+  "pt-safe flex w-full shrink-0 items-center gap-2 border-b border-[#30363d] bg-[#161b22] px-4 py-2 text-left text-xs text-[#e6edf3] hover:bg-[#21262d]";
 
 /// One line of text per state, and the dot colour beside it.
 ///

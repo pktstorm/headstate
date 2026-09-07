@@ -200,3 +200,67 @@
 ::-webkit-scrollbar-corner {
   background: transparent;
 }
+
+/* --- Phone-shaped viewports -------------------------------------- */
+
+/* Everything below applies only under the `md` breakpoint, which is the
+   same 768px `useIsMobile` uses, so a desktop window is untouched unless
+   someone drags it phone-narrow -- where these rules are right anyway.
+   They are viewport rules, not capability rules: how a control is SIZED
+   depends on whether a finger is pointing at it, not on which binary is
+   running. */
+@media (max-width: 767px) {
+  /* iOS auto-zooms the viewport when a focused control's font is under
+     16px, and does not zoom back out: the header and the only
+     navigation button scroll off, and the user has to pinch back by
+     hand. Every input in the app was `text-sm` (14px) or `text-xs`
+     (12px), including the PR search -- the most-used control on the
+     phone.
+
+     Deliberately global rather than per-component: the rule is about
+     the platform, and one missed input is one zoom trap. `!important`
+     because these compete with Tailwind utilities of equal
+     specificity that are correct on the desktop. */
+  input:not([type="checkbox"]):not([type="radio"]),
+  textarea,
+  select {
+    font-size: 16px !important;
+  }
+
+  /* Apple's HIG minimum is 44x44pt. The app was well under it in
+     places that matter most: the hamburger is 24x24 and is the ONLY
+     route to navigation on a phone, and the settings gear is 22x22 in
+     the corner the home indicator occupies.
+
+     `min-height`/`min-width` rather than padding so the glyph keeps its
+     size and only the hit area grows -- a 44px icon would look wrong
+     where a 16px one is right. Scoped to the marker class rather than
+     every button, so dense in-row controls that are already part of a
+     larger tap target are not forced apart. */
+  .tap-target {
+    min-height: 44px;
+    min-width: 44px;
+  }
+}
+
+/* --- Safe areas --------------------------------------------------- */
+
+/* The other half of `viewport-fit=cover` in `index.html`. With it the
+   page paints edge to edge, which is what stops the notch and
+   home-indicator strips rendering as the webview's own background --
+   and which also lets content slide underneath them. These put it back.
+
+   The insets are 0 on every desktop and on any phone without a notch,
+   so this is inert everywhere it does not apply. */
+.pt-safe {
+  padding-top: env(safe-area-inset-top);
+}
+
+.pb-safe {
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+.px-safe {
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
+}
