@@ -48,8 +48,12 @@ pub enum Class {
     /// signature (see the module docs) before dispatch.
     Destructive,
     /// Not exposed remotely: opens a window, reveals a file, changes
-    /// autostart, restarts a daemon, runs an agent, or steers the
-    /// desktop's own view.
+    /// autostart, runs an agent, or decides who may pair.
+    ///
+    /// The test is whether the phone could act on the answer, not
+    /// whether the command touches the desktop -- driving the desktop
+    /// is what the companion is for. Revealing a file in a Finder the
+    /// phone cannot see fails that test; restarting Docker does not.
     Local,
 }
 
@@ -90,12 +94,16 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("cleanup_log", Class::Read),
     ("get_cleanup_prefs", Class::Read),
     ("assessed_worktrees", Class::Read),
+    // Reads the desktop's disk to summarise a worktree; no side
+    // effects, and the phone needs it to decide what to clean up.
+    ("assess_worktree", Class::Read),
     ("check_packages", Class::Read),
     ("packages_markdown", Class::Read),
     ("scan_claude_md", Class::Read),
     ("read_claude_md", Class::Read),
     ("get_poll_interval", Class::Read),
     ("get_worktree_dirs", Class::Read),
+    ("get_ui_prefs", Class::Read),
     // write: changes GitHub state through the existing write module, or
     // a desktop setting.
     ("act_on_pr", Class::Write),
@@ -113,6 +121,25 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("set_cleanup_prefs", Class::Write),
     ("set_poll_interval", Class::Write),
     ("open_update_pr", Class::Write),
+    // Driving the desktop IS the companion, so these are Write
+    // rather than Local: pulling a checkout, starting the desktop's
+    // Docker and restarting it are the things a person opens the
+    // phone to do. They change the desktop but delete nothing, so
+    // they do not carry the step-up signature.
+    ("pull_checkout", Class::Write),
+    ("docker_start", Class::Write),
+    ("docker_restart", Class::Write),
+    // Preferences, not machine capabilities: they live in the
+    // desktop's SQLite beside `cleanup_prefs` (already Read/Write),
+    // and a phone that could not read them fell back to the
+    // hardcoded defaults for every `?? value` in the frontend --
+    // silently ignoring hidden_views and forcing announce_updates on.
+    ("set_ui_prefs", Class::Write),
+    // A hint to the desktop's poll loop about what this client
+    // needs, not an action on the desktop's machine. Left Local, the
+    // loop never learned a phone had stopped needing GitHub data and
+    // the cadence optimisation was dead for every remote client.
+    ("set_view_needs_github", Class::Write),
     // destructive: deletes files, branches, images, or volumes.
     ("delete_head_branch", Class::Destructive),
     ("delete_branches", Class::Destructive),
@@ -130,20 +157,13 @@ pub const SURFACE: &[(&str, Class)] = &[
     // local: not exposed remotely.
     ("diag_log", Class::Local),
     ("reveal_log", Class::Local),
-    ("pull_checkout", Class::Local),
-    ("get_ui_prefs", Class::Local),
-    ("set_ui_prefs", Class::Local),
     ("get_autostart", Class::Local),
     ("set_autostart", Class::Local),
     ("get_notify_prefs", Class::Local),
     ("set_notify_prefs", Class::Local),
     ("set_worktree_dirs", Class::Local),
-    ("assess_worktree", Class::Local),
     ("claudify_command", Class::Local),
     ("apply_updates_in_background", Class::Local),
-    ("docker_restart", Class::Local),
-    ("docker_start", Class::Local),
-    ("set_view_needs_github", Class::Local),
     // The remote feature's own commands. Pairing and the on/off switch
     // are decisions the desktop's user makes at the desktop: a phone
     // that could approve its own pairing request, revoke a rival, or
@@ -332,6 +352,12 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "cleanup_log" => res(commands::cleanup_log(app.clone())),
         "get_cleanup_prefs" => ok(commands::get_cleanup_prefs(app.clone())),
         "assessed_worktrees" => ok(commands::assessed_worktrees(app.clone())),
+        "assess_worktree" => res(commands::assess_worktree(
+            a.get("repoPath")?,
+            a.get("worktreePath")?,
+            a.get("branch")?,
+        )
+        .await),
         "check_packages" => res(commands::check_packages(a.get("repoPath")?).await),
         "packages_markdown" => ok(commands::packages_markdown(
             a.get("repoPath")?,
@@ -342,6 +368,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "read_claude_md" => res(commands::read_claude_md(a.get("path")?)),
         "get_poll_interval" => ok(commands::get_poll_interval(app.state())),
         "get_worktree_dirs" => ok(commands::get_worktree_dirs(app.clone())),
+        "get_ui_prefs" => ok(commands::get_ui_prefs(app.clone())),
 
         // ---- write ------------------------------------------------------
         "act_on_pr" => res(commands::act_on_pr(
@@ -432,6 +459,16 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             a.get("worktreePath")?,
         )),
         "set_cleanup_prefs" => res(commands::set_cleanup_prefs(app.clone(), a.get("prefs")?)),
+        "set_ui_prefs" => res(commands::set_ui_prefs(app.clone(), a.get("prefs")?)),
+        "pull_checkout" => res(commands::pull_checkout(a.get("path")?).await),
+        // Shell out like the other sync Docker commands, so a slow
+        // engine start does not stall the listener for everyone else.
+        "docker_start" => res(blocking(commands::docker_start).await?),
+        "docker_restart" => res(blocking(commands::docker_restart).await?),
+        "set_view_needs_github" => {
+            commands::set_view_needs_github(a.get("needs")?, app.state(), app.state());
+            ok(())
+        }
         "set_poll_interval" => ok(commands::set_poll_interval(
             app.clone(),
             a.get("secs")?,
@@ -587,10 +624,10 @@ mod tests {
     fn local_commands_are_refused() {
         for name in [
             "reveal_log",
-            "pull_checkout",
             "set_autostart",
-            "assess_worktree",
-            "docker_restart",
+            "set_worktree_dirs",
+            "claudify_command",
+            "apply_updates_in_background",
             "issue_pairing_token",
             "respond_to_pairing",
             "list_paired_devices",
@@ -602,6 +639,34 @@ mod tests {
                 admit(name),
                 Err(RemoteError::Local(name.to_string())),
                 "{name} must be refused as local"
+            );
+        }
+    }
+
+    /// The commands v5.5.0 moved OFF `Class::Local`.
+    ///
+    /// Kept as its own test rather than folded into the admission test
+    /// above, because the reason they moved is a product decision and
+    /// not an implementation detail: driving the desktop is what the
+    /// companion is for, and a phone that could see a stopped Docker
+    /// engine but not start it was offering a button that could only
+    /// ever fail. Anything that moves one of these back to `Local` is
+    /// removing a feature, and should have to say so here.
+    #[test]
+    fn the_companion_may_drive_the_desktop() {
+        for (name, class) in [
+            ("assess_worktree", Class::Read),
+            ("get_ui_prefs", Class::Read),
+            ("pull_checkout", Class::Write),
+            ("docker_start", Class::Write),
+            ("docker_restart", Class::Write),
+            ("set_ui_prefs", Class::Write),
+            ("set_view_needs_github", Class::Write),
+        ] {
+            assert_eq!(
+                admit(name),
+                Ok(class),
+                "{name} must be drivable from a phone"
             );
         }
     }

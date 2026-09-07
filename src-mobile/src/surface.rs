@@ -63,12 +63,16 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("cleanup_log", Class::Read),
     ("get_cleanup_prefs", Class::Read),
     ("assessed_worktrees", Class::Read),
+    // Reads the desktop's disk to summarise a worktree; no side
+    // effects, and the phone needs it to decide what to clean up.
+    ("assess_worktree", Class::Read),
     ("check_packages", Class::Read),
     ("packages_markdown", Class::Read),
     ("scan_claude_md", Class::Read),
     ("read_claude_md", Class::Read),
     ("get_poll_interval", Class::Read),
     ("get_worktree_dirs", Class::Read),
+    ("get_ui_prefs", Class::Read),
     // write: changes GitHub state through the existing write module, or
     // a desktop setting.
     ("act_on_pr", Class::Write),
@@ -86,6 +90,25 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("set_cleanup_prefs", Class::Write),
     ("set_poll_interval", Class::Write),
     ("open_update_pr", Class::Write),
+    // Driving the desktop IS the companion, so these are Write
+    // rather than Local: pulling a checkout, starting the desktop's
+    // Docker and restarting it are the things a person opens the
+    // phone to do. They change the desktop but delete nothing, so
+    // they do not carry the step-up signature.
+    ("pull_checkout", Class::Write),
+    ("docker_start", Class::Write),
+    ("docker_restart", Class::Write),
+    // Preferences, not machine capabilities: they live in the
+    // desktop's SQLite beside `cleanup_prefs` (already Read/Write),
+    // and a phone that could not read them fell back to the
+    // hardcoded defaults for every `?? value` in the frontend --
+    // silently ignoring hidden_views and forcing announce_updates on.
+    ("set_ui_prefs", Class::Write),
+    // A hint to the desktop's poll loop about what this client
+    // needs, not an action on the desktop's machine. Left Local, the
+    // loop never learned a phone had stopped needing GitHub data and
+    // the cadence optimisation was dead for every remote client.
+    ("set_view_needs_github", Class::Write),
     // destructive: deletes files, branches, images, or volumes.
     ("delete_head_branch", Class::Destructive),
     ("delete_branches", Class::Destructive),
@@ -103,20 +126,17 @@ pub const SURFACE: &[(&str, Class)] = &[
     // local: not exposed remotely.
     ("diag_log", Class::Local),
     ("reveal_log", Class::Local),
-    ("pull_checkout", Class::Local),
-    ("get_ui_prefs", Class::Local),
-    ("set_ui_prefs", Class::Local),
     ("get_autostart", Class::Local),
     ("set_autostart", Class::Local),
     ("get_notify_prefs", Class::Local),
     ("set_notify_prefs", Class::Local),
     ("set_worktree_dirs", Class::Local),
-    ("assess_worktree", Class::Local),
     ("claudify_command", Class::Local),
     ("apply_updates_in_background", Class::Local),
-    ("docker_restart", Class::Local),
-    ("docker_start", Class::Local),
-    ("set_view_needs_github", Class::Local),
+    // The remote feature's own commands. Pairing and the on/off switch
+    // are decisions the desktop's user makes at the desktop: a phone
+    // that could approve its own pairing request, revoke a rival, or
+    // turn the listener off would defeat the point of each.
     ("issue_pairing_token", Class::Local),
     ("respond_to_pairing", Class::Local),
     ("list_paired_devices", Class::Local),
