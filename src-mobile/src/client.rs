@@ -39,7 +39,9 @@ use rustls::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::Duration;
 
 use crate::discovery;
@@ -57,9 +59,32 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// The one signature scheme the desktop may sign the handshake with.
 const SERVER_SIGNATURE_SCHEME: SignatureScheme = SignatureScheme::ML_DSA_65;
 
-/// Per address. A LAN address that has gone away fails fast; an overlay
-/// address on a slow link still connects within this.
-pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Per address, and only the TCP connect -- not the TLS handshake, and
+/// not the request. `CALL_TIMEOUT` bounds the whole thing.
+///
+/// A LAN peer that is up answers a connect in single-digit
+/// milliseconds; an overlay hop (Tailscale, WireGuard) over cellular is
+/// the slow case, and still an order of magnitude inside this. What the
+/// old three seconds bought was a pathological WAN that this app does
+/// not have -- and it cost that on EVERY dead address, serially, before
+/// the phone could say the desktop was unreachable.
+///
+/// It is deliberately not tighter than a second. Below that a cold
+/// radio waking for the first packet starts to look like a dead
+/// address, and the cost of a false "unreachable" is a user who thinks
+/// their desktop is off.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long one attempt gets to itself before the next starts beside
+/// it.
+///
+/// RFC 8305 suggests 250ms for happy-eyeballs, and that is the right
+/// order here for the same reason: long enough that a healthy address
+/// wins outright and nothing speculative is ever sent, short enough
+/// that a dead one does not hold the user. A LAN peer answers a connect
+/// in single-digit milliseconds, so in the common case the second
+/// attempt is never started at all.
+const ATTEMPT_STAGGER: Duration = Duration::from_millis(250);
 
 /// A whole command, connect included. `size_worktrees` on a large disk
 /// is the slowest thing on the surface.
@@ -244,6 +269,58 @@ impl std::fmt::Debug for Client {
     }
 }
 
+/// Wait for the first of `running` to settle, removing and returning it.
+///
+/// With `widen`, gives up after [`ATTEMPT_STAGGER`] and returns `None`
+/// so the caller can start another attempt alongside these; without it
+/// there is nothing left to add, so it waits as long as the attempts
+/// themselves take.
+///
+/// Hand-rolled rather than `FuturesUnordered` because the mobile crate
+/// deliberately carries no `futures` dependency, and this is the only
+/// place that needs it. Polling every attempt on each wake is O(n) in a
+/// list that is at most a handful of addresses.
+///
+/// The settled future's value is captured AS it becomes ready -- taken
+/// out of the poll rather than recovered by polling again, since a
+/// future that has returned `Ready` must not be polled a second time.
+async fn poll_settled<T, Fut>(
+    running: &mut Vec<(String, Pin<Box<Fut>>)>,
+    widen: bool,
+) -> Option<(String, Result<T, ClientError>)>
+where
+    Fut: Future<Output = Result<T, ClientError>>,
+{
+    let mut done: Option<(usize, Result<T, ClientError>)> = None;
+    let settled = std::future::poll_fn(|cx| {
+        for (i, (_, fut)) in running.iter_mut().enumerate() {
+            if let Poll::Ready(v) = fut.as_mut().poll(cx) {
+                done = Some((i, v));
+                return Poll::Ready(());
+            }
+        }
+        Poll::Pending
+    });
+
+    if widen {
+        // The stagger elapsing is not a failure: it is the signal to
+        // start the next address beside the ones already running, which
+        // keep running.
+        if tokio::time::timeout(ATTEMPT_STAGGER, settled)
+            .await
+            .is_err()
+        {
+            return None;
+        }
+    } else {
+        settled.await;
+    }
+
+    let (i, value) = done?;
+    let (base, _) = running.remove(i);
+    Some((base, value))
+}
+
 impl Client {
     pub fn new(
         identity: &SessionIdentity,
@@ -339,19 +416,78 @@ impl Client {
         Some(base)
     }
 
-    /// Run `f` against each base URL until one answers. An address that
-    /// cannot be reached is skipped for the next; any other outcome --
-    /// a handshake refusal, a status, a bad reply -- is the desktop's
-    /// answer and is returned at once, since the other addresses lead
-    /// to the same desktop.
+    /// Run `f` against each base URL until one answers, starting them
+    /// STAGGERED rather than strictly one after another.
+    ///
+    /// # Why not purely serial
+    ///
+    /// The QR carries a LAN address and an overlay address, and the
+    /// phone has no way to know which is live. Serially, a phone that
+    /// has left the desktop's LAN paid the full connect timeout on the
+    /// dead address before trying the one that works -- on the first
+    /// call after every network change, and on every call until one
+    /// succeeded and `preferred` was set.
+    ///
+    /// # Why not all at once
+    ///
+    /// Firing every address simultaneously is worse than it sounds
+    /// here. Each attempt that gets past TCP does a full mTLS handshake
+    /// with ML-DSA-65 certificates on both sides, and `bases()` can
+    /// return an address found over mDNS PLUS every stored one. On a
+    /// phone that is several post-quantum handshakes for a question one
+    /// of them was going to answer, paid in radio and battery.
+    ///
+    /// # What this does
+    ///
+    /// RFC 8305's shape, minus the address-family interleaving that
+    /// does not apply: start the first attempt, and only if it has not
+    /// settled within [`ATTEMPT_STAGGER`] start the next alongside it.
+    /// A reachable first address -- the overwhelmingly common case,
+    /// since `bases()` puts the last one that worked first -- therefore
+    /// costs exactly one attempt, and nothing is fired speculatively
+    /// until an address has actually been slow.
+    ///
+    /// # Error precedence
+    ///
+    /// Unchanged, and load-bearing. An address that cannot be REACHED is
+    /// skipped; any other outcome -- a handshake refusal, a status, a
+    /// bad reply -- is the desktop's own answer and is returned at once,
+    /// because every address leads to the same desktop and asking it
+    /// again elsewhere would get the same answer. Under concurrency that
+    /// has to hold against the clock too: a refusal from the second
+    /// attempt must win over a slower `Unreachable` from the first,
+    /// rather than being raced out by it. `select!` on a set that drops
+    /// the losers gives exactly that -- the first NON-`Unreachable`
+    /// outcome returns and the rest are cancelled where they stand.
     async fn try_each<T, F, Fut>(&self, f: F) -> Result<T, ClientError>
     where
         F: Fn(String) -> Fut,
         Fut: Future<Output = Result<T, ClientError>>,
     {
+        let bases = self.bases();
         let mut last = None;
-        for base in self.bases() {
-            match f(base.clone()).await {
+        // Attempts started and not yet settled, each tagged with the
+        // base it is for so a win can be remembered.
+        let mut running: Vec<(String, Pin<Box<Fut>>)> = Vec::new();
+        let mut next = 0;
+
+        loop {
+            if next < bases.len() {
+                running.push((bases[next].clone(), Box::pin(f(bases[next].clone()))));
+                next += 1;
+            } else if running.is_empty() {
+                break;
+            }
+
+            // Wait for whichever attempt settles first, but no longer
+            // than the stagger while there is still an address to add.
+            // `poll_settled` returns None on the stagger elapsing, which
+            // is the signal to widen rather than to give up.
+            let more = next < bases.len();
+            let Some((base, result)) = poll_settled(&mut running, more).await else {
+                continue;
+            };
+            match result {
                 Ok(v) => {
                     self.remember(&base);
                     return Ok(v);
@@ -360,6 +496,8 @@ impl Client {
                     log::info!("companion: {base} did not answer: {m}");
                     last = Some(m);
                 }
+                // The desktop's own answer. Returning here drops every
+                // other in-flight attempt.
                 Err(e) => return Err(e),
             }
         }
@@ -394,6 +532,52 @@ impl Client {
         }
         // A discovered address is already at the front of `bases()`, so
         // there is nothing to reorder when that is what answered.
+    }
+
+    /// The address currently believed good: what `bases()` would try
+    /// first, or `None` before anything has answered.
+    ///
+    /// For the caller to persist. `Client` deliberately holds no store
+    /// handle -- it is the network layer, and giving it one to write a
+    /// preference through would put disk I/O behind every request.
+    /// `Companion` owns the store and writes this back after a
+    /// successful call, so the next COLD START begins with the address
+    /// that last worked instead of re-walking the QR's list from the
+    /// top and paying a discovery browse again.
+    pub fn best_address(&self) -> Option<String> {
+        // A bare address in both branches, matching `Desktop::addrs`.
+        // `discovered` holds a base URL because that is what `bases()`
+        // hands to the request; it is unwrapped back here rather than
+        // stored twice, so there is one representation on disk.
+        if let Some(base) = self
+            .discovered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_deref()
+        {
+            return Self::addr_of(base);
+        }
+        let preferred = *self.preferred.lock().unwrap_or_else(|e| e.into_inner());
+        preferred.map(|i| self.addrs[i].clone())
+    }
+
+    /// The host out of a base URL this module built, undoing
+    /// [`Self::base_url`] -- including the brackets it puts around an
+    /// IPv6 literal.
+    fn addr_of(base: &str) -> Option<String> {
+        let rest = base.strip_prefix("https://")?;
+        let host = match rest.rsplit_once(':') {
+            // `]` means the colon we found is inside an IPv6 literal
+            // rather than the port separator.
+            Some((h, _)) if !h.ends_with(']') => h,
+            _ => rest,
+        };
+        Some(
+            host.strip_prefix('[')
+                .and_then(|h| h.strip_suffix(']'))
+                .unwrap_or(host)
+                .to_string(),
+        )
     }
 
     /// `GET /v1/hello`.
@@ -699,6 +883,103 @@ mod tests {
             "the answering address moves first"
         );
         assert_eq!(server.requests().len(), 1);
+    }
+
+    /// A dead address must not hold the user for its whole timeout when
+    /// a live one is sitting behind it.
+    ///
+    /// Serially this cost `CONNECT_TIMEOUT` before the second address
+    /// was tried at all -- on the first call after every network
+    /// change, which is exactly when a phone changes networks. The
+    /// assertion is on the CLOCK, because "eventually answers" was
+    /// already true of the serial version.
+    #[tokio::test]
+    async fn a_live_address_behind_a_dead_one_answers_without_waiting_it_out() {
+        let id = identity();
+        let server = TestServer::start().await;
+        server.pair(&id.fingerprint());
+        // 192.0.2.1 is TEST-NET-1: nothing routes there, so the attempt
+        // hangs until CONNECT_TIMEOUT rather than being refused.
+        let client = Client::new(
+            &id,
+            &server.fp,
+            vec!["192.0.2.1".into(), server.addr()],
+            server.port(),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        client.hello().await.unwrap();
+        let took = started.elapsed();
+        assert!(
+            took < CONNECT_TIMEOUT,
+            "waited {took:?} for a live second address; the stagger should have \
+             started it after {ATTEMPT_STAGGER:?}"
+        );
+        // And it is remembered, so the next call skips the dead one.
+        assert_eq!(client.order(), vec![1, 0]);
+    }
+
+    /// The desktop's own answer beats a slower "cannot reach you".
+    ///
+    /// This is the precedence rule the serial version got for free and
+    /// concurrency puts at risk: a handshake refusal from the SECOND
+    /// address must win, not be raced out by the first address finally
+    /// timing out. Every address leads to the same desktop, so asking
+    /// another one would only get the same refusal.
+    #[tokio::test]
+    async fn a_refusal_wins_over_a_slower_unreachable() {
+        let id = identity();
+        let server = TestServer::start().await;
+        // NOT paired: the server refuses this phone's certificate, which
+        // is a handshake failure rather than an unreachable.
+        let client = Client::new(
+            &id,
+            &server.fp,
+            vec!["192.0.2.1".into(), server.addr()],
+            server.port(),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let err = client.hello().await.unwrap_err();
+        assert!(
+            err.is_handshake(),
+            "expected the desktop's refusal, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < CONNECT_TIMEOUT,
+            "the refusal waited for the dead address to time out"
+        );
+    }
+
+    /// Nothing speculative while the first address is healthy.
+    ///
+    /// The point of staggering rather than firing everything at once:
+    /// each extra attempt that gets past TCP is a full mTLS handshake
+    /// with ML-DSA-65 certificates on both ends, which on a phone is
+    /// paid in radio and battery. A reachable first address must cost
+    /// exactly one.
+    #[tokio::test]
+    async fn a_healthy_first_address_starts_no_second_attempt() {
+        let id = identity();
+        let server = TestServer::start().await;
+        server.pair(&id.fingerprint());
+        // The live address first, then one that would answer too. If
+        // the second were started, the server would see two requests.
+        let client = Client::new(
+            &id,
+            &server.fp,
+            vec![server.addr(), server.addr()],
+            server.port(),
+        )
+        .unwrap();
+        client.hello().await.unwrap();
+        assert_eq!(
+            server.requests().len(),
+            1,
+            "a healthy first address must not trigger a second attempt"
+        );
     }
 
     #[tokio::test]
