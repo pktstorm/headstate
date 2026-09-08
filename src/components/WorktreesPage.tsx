@@ -39,6 +39,7 @@ import {
 import { HelpButton } from "./HelpButton";
 import { WorktreeKebab } from "./WorktreeKebab";
 import { claudifyCommand } from "../api/tauri";
+import { isCancelled } from "@/lib/cancelled";
 import { copyText } from "../lib/clipboard";
 import { relativeTime } from "../lib/time";
 import { useIsMobile } from "../lib/useIsMobile";
@@ -1081,6 +1082,11 @@ export function WorktreesPage() {
                     },
                     (e: unknown) => {
                       setBulkBusy(false);
+                      // Silent when the user dismissed the biometric
+                      // prompt: they declined, nothing was removed, and
+                      // telling them the action "could not run" reports
+                      // their own decision back as a failure.
+                      if (isCancelled(e)) return;
                       toast.error("The bulk removal could not run", {
                         description: typeof e === "string" ? e : undefined,
                       });

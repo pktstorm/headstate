@@ -31,6 +31,16 @@ struct Live {
     events: events::Handle,
 }
 
+/// What `call` rejects with when the user dismisses the biometric
+/// prompt.
+///
+/// A cancel is a decision, not a failure, and the UI should say nothing
+/// at all -- so it needs to be recognisable rather than merely worded
+/// differently from a real error. A Tauri command's error crosses the
+/// IPC boundary as a `String`, which is why this is a marker and not a
+/// variant; the frontend matches it exactly and swallows it.
+pub const CANCELLED: &str = "headstate:cancelled";
+
 pub struct Companion {
     store: Arc<dyn Store>,
     keys: Arc<dyn DeviceKeys>,
@@ -283,10 +293,32 @@ impl Companion {
             }
         }
         let signature = if class == Class::Destructive {
-            Some(
-                stepup::sign_request(self.keys.as_ref(), command, &args, Utc::now().timestamp())
-                    .map_err(|e| e.to_string())?,
-            )
+            // On the blocking pool, not this worker. `sign_request`
+            // reaches the hardware keys, and on a phone that is where
+            // Face ID or the Android BiometricPrompt is SHOWN and
+            // waited on -- a sheet that can sit for the full system
+            // timeout while the user decides. Inline, that parked a
+            // tokio worker for the duration, and the runtime here is
+            // small enough that it could starve the event subscriber
+            // and any concurrent command.
+            let keys = self.keys.clone();
+            let cmd = command.to_string();
+            let args_for_sig = args.clone();
+            let signed = tauri::async_runtime::spawn_blocking(move || {
+                stepup::sign_request(keys.as_ref(), &cmd, &args_for_sig, Utc::now().timestamp())
+            })
+            .await
+            .map_err(|e| format!("the confirmation could not run: {e}"))?;
+            match signed {
+                Ok(sig) => Some(sig),
+                // The user declined. Reported with a STABLE marker
+                // rather than an empty string or prose: `remote.ts`
+                // matches on it to stay silent, and an empty error
+                // would be indistinguishable from a bug that lost its
+                // message. See `CANCELLED` for the contract.
+                Err(e) if e.is_cancelled() => return Err(CANCELLED.to_string()),
+                Err(e) => return Err(e.to_string()),
+            }
         } else {
             None
         };

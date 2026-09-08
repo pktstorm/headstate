@@ -1,3 +1,4 @@
+import { isCancelled } from "@/lib/cancelled";
 import { ActingOnDesktop } from "./ActingOnDesktop";
 import { useState } from "react";
 import { toast } from "sonner";
@@ -477,10 +478,15 @@ export function DockerPage() {
           // be helping any current work.
           prune("168h").then(
             (freed) => toast.success(`Freed ${formatDockerSize(freed || null)} of build cache`),
-            (e: unknown) =>
+            (e: unknown) => {
+              // Silent when the user dismissed the biometric prompt:
+              // they declined, nothing was pruned, and reporting their
+              // own decision back as a failure is noise.
+              if (isCancelled(e)) return;
               toast.error("Could not clear the build cache", {
                 description: typeof e === "string" ? e : undefined,
-              }),
+              });
+            },
           )
         }
       />
@@ -564,10 +570,12 @@ export function DockerPage() {
                   setPendingVolume(null);
                   removeVolume(target.name).then(
                     () => toast.success(`Removed ${target.name}`),
-                    (e: unknown) =>
+                    (e: unknown) => {
+                      if (isCancelled(e)) return;
                       toast.error(`Could not remove ${target.name}`, {
                         description: typeof e === "string" ? e : undefined,
-                      }),
+                      });
+                    },
                   );
                 }}
                 className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#f85149]"
@@ -620,6 +628,7 @@ export function DockerPage() {
                     },
                     (e: unknown) => {
                       setRemoving(null);
+                      if (isCancelled(e)) return;
                       toast.error("Could not remove the image", {
                         description: typeof e === "string" ? e : undefined,
                       });
