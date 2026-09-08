@@ -6,6 +6,7 @@ const state = vi.hoisted(() => ({
   current: "idle" as "idle" | "fetching" | "retrying",
   error: null as string | null,
   removal: null as { done: number; total: number } | null,
+  updating: null as { done: number; total: number } | null,
 }));
 const setInterval_ = vi.hoisted(() => vi.fn((s: number) => Promise.resolve(s)));
 
@@ -35,6 +36,7 @@ vi.mock("../api/hooks", () => ({
   useRemoteEnabled: () => ({ enabled: false, set: () => Promise.resolve() }),
   usePollState: () => state.current,
   useRemovalProgress: () => state.removal,
+  useUpdateProgress: () => state.updating,
   usePollError: () => state.error,
   usePollInterval: () => ({ seconds: 120, set: setInterval_ }),
   useWorktreeDirs: () => ({ dirs: [], set: () => Promise.resolve([]) }),
@@ -330,5 +332,30 @@ describe("StatusBar", () => {
     state.removal = null;
     render(<StatusBar updatedAt={Date.now()} />);
     expect(screen.queryByText(/Removing worktrees/)).toBeNull();
+  });
+
+  /// The same case, and more so: `apply_updates_in_background` returns
+  /// immediately by design, so the wizard that started the run is
+  /// already closed. Until #626 nothing was said until the whole run
+  /// finished -- minutes, on a large selection.
+  it("shows background update progress, which outlives the wizard", () => {
+    state.updating = { done: 8, total: 47 };
+    const { unmount } = render(<StatusBar updatedAt={Date.now()} />);
+    expect(screen.getByText(/Updating packages . 8 of 47/)).toBeTruthy();
+    unmount();
+    state.updating = null;
+  });
+
+  it("prefers the removal count when both somehow run at once", () => {
+    // They cannot overlap in practice, which is why they share one live
+    // region -- but the fallback must be deterministic rather than
+    // rendering two counters into the same span.
+    state.removal = { done: 1, total: 2 };
+    state.updating = { done: 8, total: 47 };
+    render(<StatusBar updatedAt={Date.now()} />);
+    expect(screen.getByText(/Removing worktrees . 1 of 2/)).toBeTruthy();
+    expect(screen.queryByText(/Updating packages/)).toBeNull();
+    state.removal = null;
+    state.updating = null;
   });
 });
