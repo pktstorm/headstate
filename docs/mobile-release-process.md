@@ -58,11 +58,14 @@ file for provenance. Users do not install from it.
 
 ## Export compliance
 
-The app declares `ITSAppUsesNonExemptEncryption` **true** in
-`src-mobile/Info.ios.plist`, and carries Apple's compliance code beside it once
-there is one. Answering in the app is what keeps a build from stalling on
-**Missing Compliance**, which blocks testers from installing until someone
-clears it by hand.
+The app declares `ITSAppUsesNonExemptEncryption` **false** in
+`src-mobile/Info.ios.plist`, and carries no compliance code. Answering in the
+app is what keeps a build from stalling on **Missing Compliance**, which blocks
+testers from installing until someone clears it by hand.
+
+Why `false` rather than `true` is the next section, and it is not a preference:
+`true` without a code Apple has issued is rejected at upload. Three builds were
+lost to that.
 
 ### Why `false`
 
