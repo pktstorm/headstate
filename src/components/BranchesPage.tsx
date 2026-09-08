@@ -141,12 +141,15 @@ export function BranchesPage() {
     return <p className="text-sm text-[#8b949e]">Select a repository to see its branches.</p>;
   }
   if (isLoading) {
-    // Named as slow rather than shown as a bare spinner: ~9s on a large
-    // repository is long enough that silence reads as a hang.
+    // Named as slow rather than shown as a bare spinner: silence reads
+    // as a hang. Measured at 10-13s on a 512-branch, 1784-commit
+    // repository -- ~5s building the default branch's patch-ids, then
+    // the per-branch comparison across eight threads -- so "a few
+    // seconds" undersold it and made the wait feel like a fault.
     return (
       <p className="text-sm text-[#8b949e]">
-        Scanning branches… this checks every branch for squash merges and can take a
-        few seconds.
+        Scanning branches… this compares every branch against the default one to find
+        squash merges, and takes around ten seconds on a large repository.
       </p>
     );
   }
