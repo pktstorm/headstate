@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { describePairingFailure } from "./pairingError";
+import { describePairingFailure, redactPairingDetail } from "./pairingError";
 import { REQUIRED_PROTOCOL_VERSION } from "./protocol";
 
 /// The message strings below are copied from `PairingError`'s
@@ -81,5 +81,53 @@ describe("describePairingFailure", () => {
   it("handles a bare string, which is what Tauri actually rejects with", () => {
     const f = describePairingFailure(RUST.expired);
     expect(f.title).toMatch(/expired/i);
+  });
+});
+
+describe("technical details", () => {
+  it("keeps the underlying cause even when the friendly copy replaces it", () => {
+    // The whole point of #633: the advice ("check the same network") is
+    // useless to someone whose devices ARE on the same network, and the
+    // cause was being discarded by the very branch that matched.
+    const f = describePairingFailure(
+      new Error("could not reach the desktop: 192.168.1.5:8765: connection refused"),
+    );
+    expect(f.detail).toMatch(/same network/i);
+    expect(f.technical).toContain("192.168.1.5:8765");
+    expect(f.technical).toContain("connection refused");
+  });
+
+  it("carries every address that was tried, not just the last", () => {
+    // `Client::try_each` joins one line per attempt, so a user can see
+    // that the LAN address was refused while the mDNS one timed out.
+    const f = describePairingFailure(
+      new Error(
+        "could not reach the desktop: 192.168.1.5:8765: connection refused; " +
+          "10.0.0.9:8765 (found by mDNS): timed out",
+      ),
+    );
+    expect(f.technical).toContain("192.168.1.5");
+    expect(f.technical).toContain("10.0.0.9");
+    expect(f.technical).toMatch(/mDNS/);
+  });
+
+  it("redacts a pairing token rather than showing it on screen", () => {
+    // A parse failure can quote the QR payload back, and the payload
+    // carries a bearer token. It must not reach the display, nor
+    // whatever the user pastes into an issue.
+    const withToken = 'not a Headstate pairing code: {"token":"s3cr3t-value","v":1}';
+    const f = describePairingFailure(new Error(withToken));
+    expect(f.technical).not.toContain("s3cr3t-value");
+    expect(f.technical).toContain("[redacted]");
+  });
+
+  it("redacts a bare base64url run long enough to be key material", () => {
+    const key = "A".repeat(43);
+    expect(redactPairingDetail(`presented ${key}`)).toBe("presented [redacted]");
+  });
+
+  it("leaves addresses and error kinds alone -- they are the useful part", () => {
+    const msg = "192.168.1.5:8765: connection refused";
+    expect(redactPairingDetail(msg)).toBe(msg);
   });
 });

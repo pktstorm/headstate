@@ -30,10 +30,23 @@ import { Button } from "./ui/button";
 /// reinstall.
 
 /// A phone's own name for itself, offered to the desktop so its paired
-/// device list says something better than "iPhone". Best effort: the
-/// webview cannot read the device name, so this is a placeholder the
-/// user can edit before pairing.
-const DEFAULT_DEVICE_NAME = "My phone";
+/// device list says something better than "My phone".
+///
+/// The user's OWN name for the device -- the one in iOS Settings -- is
+/// what belongs here and is not reachable: since iOS 16
+/// `UIDevice.current.name` returns the model unless the app holds
+/// `com.apple.developer.device-information.user-assigned-device-name`,
+/// which must be applied for (#634). Until that is granted this guesses
+/// from the platform, which at least beats "My phone" and matches what
+/// `pairing.rs::default_device_name` would send if the field were left
+/// blank.
+function defaultDeviceName(): string {
+  const ua = typeof navigator === "undefined" ? "" : navigator.userAgent;
+  if (/iPad/i.test(ua)) return "iPad";
+  if (/iPhone|iPod/i.test(ua)) return "iPhone";
+  if (/Android/i.test(ua)) return "Android phone";
+  return "My phone";
+}
 
 /// Steps that own the whole screen. `scanning` is not one: the scanner
 /// is the OS's own full-screen UI, so during a scan this component is
@@ -46,7 +59,7 @@ export function PairingScreen({ revokedBy }: { revokedBy?: string } = {}) {
   const [mode, setMode] = useState<Mode>("choose");
   const [camera, setCamera] = useState<CameraPermission | null>(null);
   const [pasted, setPasted] = useState("");
-  const [deviceName, setDeviceName] = useState(DEFAULT_DEVICE_NAME);
+  const [deviceName, setDeviceName] = useState(defaultDeviceName);
   const [failure, setFailure] = useState<PairingFailure | null>(null);
   const [scanning, setScanning] = useState(false);
   const pair = usePairFromQr();
@@ -125,12 +138,26 @@ export function PairingScreen({ revokedBy }: { revokedBy?: string } = {}) {
               equivalent screen learned this lesson already: the one
               statement of scope used to live in a branch most people
               never saw. */}
+          {/* What the app IS, and the prerequisite, before any
+              instruction. The GitHub sign-in sentence used to live here:
+              accurate, but it answers a question nobody is asking while
+              trying to pair, and it pushed the thing that actually
+              matters -- you need the desktop app first -- below the
+              fold (#634). */}
           <p className="text-sm text-[#8b949e]">
             Headstate Companion drives Headstate on your computer — reviewing pull
             requests and cleaning up worktrees, artifacts and Docker from your phone.
-            Your desktop keeps your GitHub sign-in; this phone never holds it.
           </p>
         </header>
+
+        {/* Said plainly, and before the steps. Someone who has not
+            installed the desktop app is otherwise being told to open
+            menus in software they do not have. */}
+        <p className="rounded border border-[#30363d] bg-[#161b22] p-3 text-sm text-[#e6edf3]">
+          <span className="font-medium">Set up your computer first.</span> This app does
+          nothing on its own — install Headstate on your Mac, Windows or Linux machine and
+          leave it running, then pair this phone to it.
+        </p>
 
         <ol className="space-y-1 text-sm text-[#8b949e]">
           <li>1. On your desktop, open Headstate → Settings → Phone.</li>
@@ -144,7 +171,7 @@ export function PairingScreen({ revokedBy }: { revokedBy?: string } = {}) {
             value={deviceName}
             onChange={(e) => setDeviceName(e.target.value)}
             aria-label="This phone’s name"
-            placeholder={DEFAULT_DEVICE_NAME}
+            placeholder={defaultDeviceName()}
             // 16px: anything smaller and iOS zooms the viewport on
             // focus and never zooms back out.
             className="w-full rounded border border-[#30363d] bg-[#161b22] px-3 py-2 text-base text-[#e6edf3] placeholder:text-[#8b949e]"
@@ -298,6 +325,23 @@ function PairingFailureNotice({ failure }: { failure: PairingFailure }) {
     <div role="alert" className="space-y-1 rounded border border-[#f85149]/30 bg-[#f85149]/10 p-3">
       <p className="text-sm font-medium text-[#f85149]">{failure.title}</p>
       <p className="text-sm text-[#e6edf3]">{failure.detail}</p>
+      {/* Collapsed by default: when the advice above is right, this is
+          noise. When it is wrong -- "check both devices are on the same
+          network" to someone whose devices are on the same network --
+          it is the only way to learn anything without a debugger
+          (#633). `<details>` rather than a state hook so it costs
+          nothing and works with VoiceOver's native affordance.
+
+          `select-all` and `break-all`: the point is to get this into an
+          issue, and an IPv6 address does not wrap on a phone. */}
+      {failure.technical !== "" && failure.technical !== failure.detail ? (
+        <details className="pt-1">
+          <summary className="cursor-pointer text-xs text-[#8b949e]">Show details</summary>
+          <p className="mt-1 select-all break-all font-mono text-xs text-[#8b949e]">
+            {failure.technical}
+          </p>
+        </details>
+      ) : null}
     </div>
   );
 }
