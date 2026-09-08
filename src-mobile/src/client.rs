@@ -1,5 +1,5 @@
 //! The HTTPS client for the paired desktop: reqwest on rustls with the
-//! `rustls-post-quantum` provider (aws-lc-rs plus ML-DSA), the ML-DSA-65
+//! aws-lc-rs provider (which carries ML-DSA as of 0.23.44), the ML-DSA-65
 //! session certificate as the client identity, and a server verifier
 //! that accepts one certificate -- the one whose SHA256 fingerprint was
 //! pinned at pairing -- signed with ML-DSA-65 and nothing else.
@@ -126,10 +126,13 @@ impl ClientError {
     }
 }
 
-/// `rustls-post-quantum`'s provider -- aws-lc-rs plus the ML-DSA signing
-/// keys and verifiers rustls 0.23 only names -- with X25519MLKEM768
-/// first, spelled out rather than left to rustls's `prefer-post-quantum`
-/// feature, exactly as the desktop does.
+/// aws-lc-rs, which carries the ML-DSA signing keys and verifiers
+/// itself as of rustls 0.23.44 -- it was `rustls-post-quantum`'s
+/// provider until #588 -- with X25519MLKEM768 first, spelled out rather
+/// than left to rustls's `prefer-post-quantum` feature, exactly as the
+/// desktop does. That explicit order is what kept the key exchange
+/// hybrid when the post-quantum crate (and the feature it enabled) went
+/// away.
 pub(crate) fn provider() -> CryptoProvider {
     CryptoProvider {
         kx_groups: vec![
@@ -137,7 +140,7 @@ pub(crate) fn provider() -> CryptoProvider {
             aws_lc_rs::kx_group::X25519,
             aws_lc_rs::kx_group::SECP256R1,
         ],
-        ..rustls_post_quantum::provider()
+        ..aws_lc_rs::default_provider()
     }
 }
 

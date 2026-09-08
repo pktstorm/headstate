@@ -95,28 +95,42 @@ reqwest = { version = "0.13", default-features = false, features = ["json"] }
 # "no process-level CryptoProvider available" unless one is installed
 # first. `lib.rs` installs `ring` as the process default at startup, so
 # octocrab and reqwest keep using exactly what they used before; the
-# listener picks the `rustls-post-quantum` provider (aws-lc-rs plus
-# ML-DSA, below) explicitly per `ServerConfig` and never relies on the
-# default.
-rustls = { version = "0.23", default-features = false, features = ["ring", "aws_lc_rs"] }
-# Post-quantum certificates (remote/identity.rs, remote/listener.rs).
-# rustls 0.23 names the ML-DSA signature schemes but ships neither a
-# signing key nor a verifier for them on that line; this crate's
-# `provider()` is aws-lc-rs plus exactly those, behind its
-# `aws-lc-rs-unstable` feature (rustls #2579, #2997). Unstable is a
-# statement about the crate API, which may move between minor versions,
-# not about the algorithm: FIPS 204 is final. The plain aws-lc-rs
-# provider cannot load an ML-DSA key at all, so every TLS config the
-# listener builds is on this provider and nothing else.
+# listener picks the aws-lc-rs provider explicitly per `ServerConfig`
+# and never relies on the default.
 #
-# What the feature drags in is already in the tree:
-# `rustls-webpki/aws-lc-rs-unstable` (the ML-DSA verifiers),
-# `aws-lc-rs/unstable` and `rcgen/aws_lc_rs_unstable`. It also declares
-# rustls WITH default features, which adds `prefer-post-quantum` (moot:
-# the listener orders its key-exchange groups explicitly) and `tls12`
-# (already on here through hyper-rustls; the listener still offers TLS
-# 1.3 only).
-rustls-post-quantum = { version = "0.2.4", features = ["aws-lc-rs-unstable"] }
+# ML-DSA comes from that provider directly as of 0.23.44. It used to
+# need `rustls-post-quantum`, whose `provider()` was aws-lc-rs plus
+# ML-DSA signing keys and verifiers that rustls only NAMED; both halves
+# of that are now in `aws_lc_rs::default_provider()`, which loads an
+# ML-DSA key and whose `signature_verification_algorithms` table is
+# byte-identical to the post-quantum crate's -- ML_DSA_44, ML_DSA_65 and
+# ML_DSA_87 included. Measured, not assumed (#588).
+#
+# Dropping it also dropped two features it was turning on here, and the
+# second is worth understanding rather than just noting.
+#
+# `rustls-webpki/aws-lc-rs-unstable` turned out not to be where the
+# ML-DSA verifiers come from at all -- the table above is the
+# provider's, on both providers alike.
+#
+# `prefer-post-quantum` is one of rustls's OWN default features, and
+# every manifest here declares rustls with `default-features = false`,
+# so it was off by our choice. `rustls-post-quantum` then depended on
+# rustls WITHOUT disabling defaults, which turned it back on across the
+# whole graph -- features being additive. Removing the crate returns
+# rustls to what this manifest actually asked for, which is why
+# `cargo tree -e features` loses both `default` and
+# `prefer-post-quantum` in the same change.
+#
+# What that feature does is order X25519MLKEM768 first. `listener.rs`
+# and `client.rs` spell that order out in `kx_groups` instead of
+# inheriting it, precisely "so the preference does not depend on a
+# feature flag anyone can drop by accident" -- and this is the change
+# that dropped it. `key_exchange_is_hybrid_post_quantum` holds it.
+#
+# This does NOT get the tree off unstable features: `rcgen` needs
+# `aws_lc_rs_unstable` independently, for `PKCS_ML_DSA_65`.
+rustls = { version = "0.23", default-features = false, features = ["ring", "aws_lc_rs"] }
 # The identity's private key, re-derived from its stored 32-byte FIPS
 # 204 seed (`PqdsaKeyPair::from_seed`): rcgen can mint an ML-DSA key but
 # not load one, and the seed is what the keychain holds because the

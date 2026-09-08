@@ -780,12 +780,12 @@ mod tests {
         assert!(!format!("{id:?}").contains("key_pkcs8"));
         // rustls accepts the pair as a client identity -- on the
         // post-quantum provider, which is the one the client uses; the
-        // plain one cannot load an ML-DSA key.
+        // provider carries ML-DSA as of rustls 0.23.44 (#588).
         let key = || rustls::pki_types::PrivateKeyDer::Pkcs8(id.key_pkcs8.clone().into());
         rustls::sign::CertifiedKey::from_der(
             vec![rustls::pki_types::CertificateDer::from(id.cert_der.clone())],
             key(),
-            &rustls_post_quantum::provider(),
+            &rustls::crypto::aws_lc_rs::default_provider(),
         )
         .unwrap();
         // NOT asserted: that plain aws-lc-rs cannot load this key.

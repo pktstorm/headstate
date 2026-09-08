@@ -9,17 +9,19 @@
 //! be silently regenerated: a new certificate is a new fingerprint, and
 //! every paired phone would refuse the desktop until re-paired.
 //!
-//! # ML-DSA-65, on rustls' unstable path
+//! # ML-DSA-65
 //!
-//! rustls 0.23 names the ML-DSA signature schemes but ships neither a
-//! signing key nor a verifier for them on that line. Both come from
-//! `rustls-post-quantum` built with its `aws-lc-rs-unstable` feature,
-//! and the key and certificate are minted by rcgen behind its
-//! `aws_lc_rs_unstable` feature. "Unstable" is a statement about the
-//! crate API, which may move between minor versions, not about the
-//! algorithm: FIPS 204 is final. The plain aws-lc-rs provider cannot
-//! load an ML-DSA key at all, so every TLS config on both ends is built
-//! on the post-quantum provider and on nothing else.
+//! The signing key and the verifier both come from rustls's own
+//! aws-lc-rs provider as of 0.23.44. They used to need
+//! `rustls-post-quantum`, because rustls NAMED the ML-DSA signature
+//! schemes without shipping either; that crate was dropped in #588 once
+//! the plain provider carried both.
+//!
+//! The key and certificate are still minted by rcgen behind its
+//! `aws_lc_rs_unstable` feature, which is the one unstable path left
+//! here -- `PKCS_ML_DSA_65` lives there. "Unstable" is a statement
+//! about the crate API, which may move between minor versions, not
+//! about the algorithm: FIPS 204 is final.
 //!
 //! # What is stored, and where
 //!
@@ -204,7 +206,7 @@ impl Identity {
     /// handshake afterwards.
     fn from_seed_and_cert(seed: &Seed, cert_der: Vec<u8>) -> Result<Self, IdentityError> {
         let key_pkcs8 = pkcs8_from_seed(seed)?;
-        let provider = rustls_post_quantum::provider();
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
         rustls::sign::CertifiedKey::from_der(
             vec![CertificateDer::from(cert_der.clone())],
             PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pkcs8.clone())),
@@ -641,7 +643,7 @@ mod tests {
     #[test]
     fn the_key_is_ml_dsa_65_and_the_certificate_is_self_signed() {
         let id = Identity::generate().unwrap();
-        let pq = rustls_post_quantum::provider();
+        let pq = rustls::crypto::aws_lc_rs::default_provider();
         let certified =
             rustls::sign::CertifiedKey::from_der(vec![id.cert()], id.key(), &pq).unwrap();
         assert_eq!(

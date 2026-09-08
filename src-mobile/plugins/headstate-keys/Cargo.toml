@@ -64,9 +64,9 @@ ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc"] }
 # SHA256 of the canonical-bytes test vector, pinned to the desktop's.
 sha2 = "0.10"
 # Proves the session identity is what rustls wants: the key loads and
-# matches the certificate. Both already in the mobile crate's graph;
-# the post-quantum provider because the plain aws-lc-rs one cannot load
-# an ML-DSA key, which is exactly what the client (src-mobile/src/client.rs)
-# builds on.
+# matches the certificate. Already in the mobile crate's graph, and on
+# the same provider the client (src-mobile/src/client.rs) builds on --
+# aws-lc-rs, which carries ML-DSA itself as of rustls 0.23.44. This used
+# to add `rustls-post-quantum` for that; see src-tauri/Cargo.toml for
+# why it went (#588).
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
-rustls-post-quantum = { version = "0.2.4", features = ["aws-lc-rs-unstable"] }
