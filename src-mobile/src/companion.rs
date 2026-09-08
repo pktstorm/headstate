@@ -176,6 +176,50 @@ impl Companion {
         }
     }
 
+    /// Persist the address that just worked, so the next COLD START
+    /// begins with it.
+    ///
+    /// `Client` keeps `preferred` and `discovered` in memory only, and
+    /// `load` rebuilds it from `Desktop::addrs` verbatim on every
+    /// launch. So a phone that had found its desktop at a new address --
+    /// after a DHCP renewal, over mDNS -- threw that away when the
+    /// process died and paid the whole walk, plus a three-second
+    /// browse, all over again on the next open.
+    ///
+    /// Writes only when the address has actually CHANGED. A store write
+    /// behind every successful command would put disk I/O on the hot
+    /// path for a value that changes about as often as the desktop's
+    /// lease does.
+    ///
+    /// Best effort throughout: a failure here costs one slow start, and
+    /// is not worth failing the user's command over.
+    fn remember_address(&self, client: &Client) {
+        let Some(best) = client.best_address() else {
+            return;
+        };
+        let mut list = match pairing::load_desktops(self.store.as_ref()) {
+            Ok(l) => l,
+            Err(e) => {
+                log::warn!("companion: could not read the paired desktops to update them: {e}");
+                return;
+            }
+        };
+        let Some(d) = list.first_mut() else {
+            return;
+        };
+        if d.addrs.first().is_some_and(|a| *a == best) {
+            return;
+        }
+        // Moved to the front rather than made the only one: the others
+        // are still how this desktop is reached from another network,
+        // and the QR is not shown again.
+        d.addrs.retain(|a| *a != best);
+        d.addrs.insert(0, best);
+        if let Err(e) = pairing::save_desktops(self.store.as_ref(), &list) {
+            log::warn!("companion: could not save the desktop's address order: {e}");
+        }
+    }
+
     /// `connection_state`.
     pub fn connection_state(&self) -> Report {
         self.conn.report()
@@ -253,6 +297,7 @@ impl Companion {
                     // fill in the protocol version.
                     events.resume();
                 }
+                self.remember_address(&client);
                 Ok(value)
             }
             Err(e) if e.is_handshake() => {
@@ -502,6 +547,50 @@ mod tests {
         let again = companion(store.clone(), Arc::new(Recorder::default()));
         again.load().unwrap();
         assert_eq!(again.connection_state().state, State::Revoked);
+    }
+
+    /// The address that worked survives a cold start.
+    ///
+    /// `Client` keeps `preferred` and `discovered` in memory, and
+    /// `load` rebuilds it from `Desktop::addrs` verbatim -- so a phone
+    /// that had walked past a dead address paid that walk again on
+    /// every launch, and a desktop found at a NEW address over mDNS was
+    /// forgotten entirely when the process died.
+    #[tokio::test]
+    async fn the_address_that_answered_is_remembered_across_a_restart() {
+        let store = Arc::new(MemoryStore::default());
+        let c = companion(store.clone(), Arc::new(Recorder::default()));
+        let server = TestServer::start().await;
+        server.open_window(true);
+        server.reply("/v1/events", Reply::sse(&[("prs-updated", "[]")], true));
+        server.reply("/v1/call/get_cached", Reply::json(200, json!([])));
+        let qr = server.qr(&token(), Utc::now().timestamp() + 120);
+        c.pair(&qr, None).await.unwrap();
+        let fp = server.requests()[0].peer_fp.clone();
+        server.pair(&fp);
+        server.open_window(false);
+
+        // Put a dead address in front, as a stale QR entry would be.
+        let mut list = pairing::load_desktops(store.as_ref()).unwrap();
+        let live = list[0].addrs[0].clone();
+        list[0].addrs = vec!["192.0.2.1".into(), live.clone()];
+        pairing::save_desktops(store.as_ref(), &list).unwrap();
+
+        // A restart picks that order up, and one successful call is
+        // enough to correct it on disk.
+        let again = companion(store.clone(), Arc::new(Recorder::default()));
+        again.load().unwrap();
+        again.call("get_cached", json!({})).await.unwrap();
+
+        let saved = pairing::load_desktops(store.as_ref()).unwrap();
+        assert_eq!(
+            saved[0].addrs.first().map(String::as_str),
+            Some(live.as_str()),
+            "the address that answered should be tried first next launch"
+        );
+        // The others are kept: they are still how this desktop is
+        // reached from another network, and the QR is not shown again.
+        assert!(saved[0].addrs.iter().any(|a| a == "192.0.2.1"));
     }
 
     /// Polls until `cond` holds, or fails the test.
