@@ -39,6 +39,33 @@ export interface PairingFailure {
   /// Whether trying the same code again could plausibly work. Drives
   /// whether the screen offers "Try again" or only "Scan a new code".
   retryable: boolean;
+  /// The underlying message, for the "Show details" disclosure.
+  ///
+  /// The friendly copy above is a guess at what a person should DO; when
+  /// the guess is wrong -- "check both devices are on the same network"
+  /// when they demonstrably are -- there was previously no way to learn
+  /// anything more without a debugger (#633). This is that way, kept out
+  /// of the default view so it costs nothing when the advice is right.
+  ///
+  /// Redacted: see `redactPairingDetail`.
+  technical: string;
+}
+
+/// Strip anything secret from a message before it can be displayed.
+///
+/// The QR payload carries a pairing token, and a message that quotes the
+/// payload back (a parse failure, most likely) would put it on screen
+/// and into whatever the user pastes into an issue. Addresses, ports and
+/// error kinds are the useful part and are not secret; the token, the
+/// signing keys and the certificate are neither.
+export function redactPairingDetail(message: string): string {
+  return (
+    message
+      // `token` / `"token":"..."` in any JSON the message quotes.
+      .replace(/("?\b(?:token|signing_keys|cert|certificate|key)"?\s*[:=]\s*)"[^"]*"/gi, '$1"[redacted]"')
+      // A bare base64url run long enough to be key material.
+      .replace(/\b[A-Za-z0-9_-]{32,}\b/g, "[redacted]")
+  );
 }
 
 /// The QR carries a `v` the phone does not implement.
@@ -65,6 +92,7 @@ export function describePairingFailure(error: unknown): PairingFailure {
         `Its pairing code is version ${version[1]}, and this app needs version ` +
         `${REQUIRED_PROTOCOL_VERSION}. Update Headstate on the desktop, then show a new code.`,
       retryable: false,
+      technical: redactPairingDetail(message),
     };
   }
 
@@ -76,6 +104,7 @@ export function describePairingFailure(error: unknown): PairingFailure {
         "expired, check that this phone's date and time are correct — a clock that is " +
         "ahead makes a valid code look expired.",
       retryable: false,
+      technical: redactPairingDetail(message),
     };
   }
 
@@ -89,6 +118,7 @@ export function describePairingFailure(error: unknown): PairingFailure {
         "stopped. Make sure you scanned the code from your own desktop, and try again " +
         "on a network you trust.",
       retryable: false,
+      technical: redactPairingDetail(message),
     };
   }
 
@@ -100,6 +130,7 @@ export function describePairingFailure(error: unknown): PairingFailure {
         "code had already been used. Show a fresh code on the desktop and approve the " +
         "request when it appears.",
       retryable: false,
+      technical: redactPairingDetail(message),
     };
   }
 
@@ -111,6 +142,7 @@ export function describePairingFailure(error: unknown): PairingFailure {
         "allowed, and that both devices are on the same network — or connected through " +
         "the same VPN.",
       retryable: true,
+      technical: redactPairingDetail(message),
     };
   }
 
@@ -121,6 +153,7 @@ export function describePairingFailure(error: unknown): PairingFailure {
         "Scan the code shown by Headstate on your desktop, under Settings, Phone. " +
         `(${message})`,
       retryable: false,
+      technical: redactPairingDetail(message),
     };
   }
 
@@ -129,7 +162,8 @@ export function describePairingFailure(error: unknown): PairingFailure {
   // own sentence, so show it rather than replacing it with a shrug.
   return {
     title: "Pairing failed",
-    detail: message,
+    detail: redactPairingDetail(message),
     retryable: true,
+    technical: redactPairingDetail(message),
   };
 }

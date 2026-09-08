@@ -465,7 +465,13 @@ impl Client {
         Fut: Future<Output = Result<T, ClientError>>,
     {
         let bases = self.bases();
-        let mut last = None;
+        // EVERY attempt, not just the most recent. A phone that cannot
+        // reach its desktop is the hardest failure to diagnose from the
+        // outside -- the user sees one red box and has no way to learn
+        // whether the address was refused, timed out, or was never
+        // tried. Overwriting a single `last` threw away exactly the
+        // facts that distinguish those (#633).
+        let mut attempts: Vec<String> = Vec::new();
         // Attempts started and not yet settled, each tagged with the
         // base it is for so a win can be remembered.
         let mut running: Vec<(String, Pin<Box<Fut>>)> = Vec::new();
@@ -494,7 +500,7 @@ impl Client {
                 }
                 Err(ClientError::Unreachable(m)) => {
                     log::info!("companion: {base} did not answer: {m}");
-                    last = Some(m);
+                    attempts.push(format!("{base}: {m}"));
                 }
                 // The desktop's own answer. Returning here drops every
                 // other in-flight attempt.
@@ -513,14 +519,20 @@ impl Client {
                 }
                 Err(ClientError::Unreachable(m)) => {
                     log::info!("companion: the address from mDNS did not answer: {m}");
-                    last = Some(m);
+                    attempts.push(format!("{base} (found by mDNS): {m}"));
                 }
                 Err(e) => return Err(e),
             }
         }
-        Err(ClientError::Unreachable(
-            last.unwrap_or_else(|| "no addresses to try".into()),
-        ))
+        // One line per address tried, so the message names what was
+        // attempted and why each failed. Addresses and error kinds only:
+        // the pairing token, the session certificate and any key
+        // material stay out of a string the UI will display.
+        Err(ClientError::Unreachable(if attempts.is_empty() {
+            "no addresses to try".into()
+        } else {
+            attempts.join("; ")
+        }))
     }
 
     /// Record which base URL answered, so it is tried first next time.
@@ -859,6 +871,32 @@ mod tests {
         let client = Client::new(&id, &server.fp, vec![server.addr()], server.port()).unwrap();
         let err = client.hello().await.unwrap_err();
         assert!(err.is_handshake(), "{err:?}");
+    }
+
+    /// Every address that failed is named, not just the last one.
+    ///
+    /// This is what makes "could not reach that desktop" diagnosable
+    /// (#633): a user on the same network as their desktop needs to see
+    /// WHICH addresses were tried and how each failed, and the previous
+    /// code overwrote a single `last`, so the first failure was lost.
+    #[tokio::test]
+    async fn unreachable_names_every_address_that_was_tried() {
+        let id = identity();
+        // Both TEST-NET-1: nothing routes there, so both fail and the
+        // error has to account for both.
+        let client = Client::new(
+            &id,
+            "aa:bb",
+            vec!["192.0.2.1".into(), "192.0.2.2".into()],
+            9,
+        )
+        .unwrap();
+        let err = client.hello().await.unwrap_err();
+        let ClientError::Unreachable(m) = err else {
+            panic!("expected Unreachable, got {err:?}");
+        };
+        assert!(m.contains("192.0.2.1"), "{m}");
+        assert!(m.contains("192.0.2.2"), "{m}");
     }
 
     #[tokio::test]
