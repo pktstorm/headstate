@@ -1,4 +1,5 @@
 import { ActingOnDesktop } from "./ActingOnDesktop";
+import { summarisePull } from "@/lib/pullSummary";
 import { ExternalLink } from "./ExternalLink";
 import { Sparkles } from "lucide-react";
 import { useState } from "react";
@@ -316,7 +317,17 @@ function Row({
           Disabled rather than hidden when the tree is dirty, with the
           reason in the title: an absent button just looks broken, while
           a greyed one that says "3 uncommitted files" teaches. Same
-          rule `PrActions` applies to an unavailable merge. */}
+          rule `PrActions` applies to an unavailable merge.
+
+          In practice this branch is unreachable for the button, which
+          only renders when `is_main`: `classify` returns
+          `Safety::MainCheckout` for the main checkout BEFORE it looks at
+          `git status`, so `safety.kind` is never "dirty" there. The
+          refusal the user actually meets comes from `pull_checkout`,
+          which re-checks on the spot. Kept because the cost is a title
+          attribute and the alternative -- deleting it and later giving
+          the main checkout a real dirty verdict -- silently loses the
+          explanation. */}
       {wt.is_main ? (
         <button
           type="button"
@@ -635,10 +646,13 @@ export function WorktreesPage() {
     pull(wt.path).then(
       (out) => {
         setPullingPath(null);
-        // Git says "Already up to date." when there was nothing to
-        // fetch, which is a real answer and worth passing through
-        // rather than replacing with a claim that something changed.
-        toast.success(out.trim() || "Updated");
+        // Summarised, not verbatim: a real fast-forward's stdout is the
+        // whole diffstat, and on a busy repository that filled the
+        // screen to say "it worked" (#652). `summarisePull` keeps the
+        // distinction the old comment here was protecting -- git's
+        // "Already up to date." is passed through, because replacing it
+        // with "Updated" would claim a change that did not happen.
+        toast.success(summarisePull(out));
       },
       (e: unknown) => {
         setPullingPath(null);

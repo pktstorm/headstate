@@ -2405,6 +2405,8 @@ mod live {
         /// The gate that matters most: a pull into uncommitted changes
         /// can conflict or abort halfway, and recovering from that is
         /// exactly what a GUI button should not create.
+        ///
+        /// A MODIFIED tracked file, which is the case that warrants it.
         #[test]
         fn refuses_a_dirty_checkout_and_says_how_dirty() {
             let tmp = tempfile::TempDir::new().unwrap();
@@ -2413,15 +2415,48 @@ mod live {
                 &origin,
                 &["commit", "-q", "--allow-empty", "-m", "two"]
             ));
-            std::fs::write(clone.join("scratch.txt"), "uncommitted").unwrap();
+            // A TRACKED file, modified: `origin_and_clone` makes only
+            // empty commits, so one has to be committed here before it
+            // can be dirtied. An untracked file would not refuse, which
+            // is the point of the test below.
+            std::fs::write(clone.join("tracked.txt"), "one").unwrap();
+            assert!(run(&clone, &["add", "tracked.txt"]));
+            assert!(run(&clone, &["commit", "-q", "-m", "add tracked"]));
+            std::fs::write(clone.join("tracked.txt"), "edited").unwrap();
 
             let err = pull_checkout(&clone.to_string_lossy())
                 .expect_err("a dirty checkout must be refused");
-            assert!(err.contains("1 uncommitted file"), "{err}");
+            assert!(err.contains("1 uncommitted change"), "{err}");
 
             // And nothing was pulled.
             let log = git(&clone, &["log", "--oneline"]).unwrap();
             assert!(!log.contains("two"), "the pull must not have run: {log}");
+        }
+
+        /// An UNTRACKED file does not block a fast-forward.
+        ///
+        /// This test asserted the opposite, because the check counted
+        /// `git status --porcelain` whole. A user hit it for real: the
+        /// button refused with "1 uncommitted file -- commit or stash
+        /// first" while `git pull` in a shell on the same repo worked
+        /// (#653). Git only refuses when an incoming commit would
+        /// overwrite the untracked path, and it says so itself.
+        #[test]
+        fn an_untracked_file_does_not_block_a_pull() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (origin, clone) = origin_and_clone(tmp.path());
+            assert!(run(
+                &origin,
+                &["commit", "-q", "--allow-empty", "-m", "two"]
+            ));
+            std::fs::write(clone.join("scratch.txt"), "untracked").unwrap();
+
+            pull_checkout(&clone.to_string_lossy()).expect("an untracked file must not block");
+
+            let log = git(&clone, &["log", "--oneline"]).unwrap();
+            assert!(log.contains("two"), "the pull should have run: {log}");
+            // And the file is still there: nothing was cleaned up.
+            assert!(clone.join("scratch.txt").is_file());
         }
 
         /// `--ff-only`: a merge commit created by a background click is
@@ -2940,12 +2975,22 @@ pub fn pull_checkout(path: &str) -> Result<String, String> {
     }
 
     // Fresh, not from the scan.
-    let status = git(dir, &["status", "--porcelain"])
+    //
+    // `--untracked-files=no`, unlike the `Safety` gate this used to
+    // share. Untracked files do not stop a fast-forward: git only
+    // refuses when an incoming commit would OVERWRITE one, and it says
+    // so itself. Counting them here refused to update a checkout whose
+    // only change was one untracked file, while `git pull` in a shell on
+    // the same repo succeeded (#653).
+    //
+    // `Safety` keeps counting them, and must: it gates DELETION, where
+    // an untracked file is precisely the one with no copy anywhere else.
+    let status = git(dir, &["status", "--porcelain", "--untracked-files=no"])
         .map_err(|e| format!("could not read the checkout's state: {e}"))?;
     let dirty = status.lines().filter(|l| !l.trim().is_empty()).count();
     if dirty > 0 {
         return Err(format!(
-            "{dirty} uncommitted file{} -- commit or stash first",
+            "{dirty} uncommitted change{} -- commit or stash first",
             if dirty == 1 { "" } else { "s" }
         ));
     }
