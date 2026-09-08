@@ -23,7 +23,24 @@ export default defineConfig(({ mode }) => ({
     ),
   },
   // Tauri expects a fixed port and fails if it is taken.
-  server: { port: 1420, strictPort: true },
+  //
+  // `host` comes from TAURI_DEV_HOST, which `tauri ios dev --host` sets
+  // to the machine's public network address: a phone on the same LAN
+  // cannot reach `localhost`, so a device run needs the dev server
+  // bound to an address it can actually route to. Unset -- every
+  // desktop run, and CI -- it stays on Vite's default loopback bind
+  // rather than exposing the dev server on the network by accident.
+  //
+  // Read through `loadEnv` rather than `process.env`, for the same
+  // reason as VITE_TARGET below: the project deliberately carries no
+  // `@types/node`, and `loadEnv` sees the process environment anyway.
+  // The prefix is the full variable name because `loadEnv` filters by
+  // prefix and this one does not start with VITE_.
+  server: {
+    port: 1420,
+    strictPort: true,
+    host: loadEnv(mode, root, "TAURI_DEV_HOST").TAURI_DEV_HOST ?? false,
+  },
   build: { target: "safari15", sourcemap: true },
   test: {
     // Vitest's default glob walks the whole tree, and this project keeps
