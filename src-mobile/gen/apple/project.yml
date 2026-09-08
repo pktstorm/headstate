@@ -2,7 +2,11 @@ name: headstate-companion
 options:
   bundleIdPrefix: com.pktstorm.headstate.companion
   deploymentTarget:
-    iOS: 14.0
+    # 15.0, not 14.0: App Store Connect warns on every upload that from
+    # Spring 2027 it will refuse anything below 15.0. iOS 15 also covers
+    # every device this app can pair from, and 14 was only ever Tauri's
+    # generated default rather than a considered floor.
+    iOS: 15.0
 fileGroups: [../../src]
 configs:
   debug: debug

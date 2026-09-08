@@ -64,51 +64,16 @@ there is one. Answering in the app is what keeps a build from stalling on
 **Missing Compliance**, which blocks testers from installing until someone
 clears it by hand.
 
-### Why `true`
+### Why `false`
 
-Apple requires documentation for an app containing
+The App Encryption Documentation questionnaire in App Store Connect was
+completed for this app and concluded that **no documentation needs to be
+uploaded**, provided the app is not available in France.
 
-> Standard encryption algorithms instead of, or in addition to, using or
-> accessing the encryption within Apple's operating system
-
-which is this app exactly. It does not go through Apple's networking stack or
-CryptoKit; it links its own:
-
-- **TLS 1.3** with mutual authentication to the paired desktop, over rustls on
-  `aws-lc-rs` rather than URLSession,
-- **ECDSA P-256** and **ML-DSA-65** (FIPS 204) signatures authenticating
-  commands, via `p256` and `ml-dsa`, and
-- **Stronghold**, plus an **AES-GCM** key in the Keystore or Secure Enclave,
-  protecting the app's own secrets at rest.
-
-Builds 8 and 9 declared `false`, reading authentication and protecting one's own
-data as an exempt supporting use. That exemption is real in the EAR, but it
-governs whether the software is *controlled*, which is a different question from
-whether Apple wants documentation, and the third item is confidentiality rather
-than authentication. Treat those two builds as mis-declared.
-
-Every algorithm above is published and standard (IETF, NIST, ISO), so this is
-not "non-standard cryptography" in BIS terms.
-
-### What was done, once
-
-Per Apple's own table, a **CCATS is required only for proprietary algorithms**,
-so none is needed here. The App Encryption Documentation questionnaire was
-completed in App Store Connect (**Apps** > the app > **App Information** >
-**App Encryption Documentation**), and it concluded that **no documentation
-needs to be uploaded** for this app, on the condition that it is **not
-available in France**.
-
-Those recorded answers are what clear each upload. Nothing has to be repeated
-per build, and no code exists to put anywhere: Apple issues an
-`ITSEncryptionExportComplianceCode` only when it has reviewed *uploaded*
-documentation, which this app does not have.
-
-`APPLE_EXPORT_COMPLIANCE_CODE` therefore stays **unset**, and the build carries
-no code key. If a future change did require documentation, setting that secret
-is all that is needed; the build merges it in and the guard checks it.
-
-Builds 10 and 11 failed at upload with
+`false` is not a judgement call weighed against `true`; the two are a **pair
+with the code**. Apple issues an `ITSEncryptionExportComplianceCode` only for
+documentation it has *reviewed*, and it refuses any upload that declares `true`
+without a matching code:
 
 ```
 Invalid Export Compliance Code. The export compliance key value [] in the
@@ -116,14 +81,28 @@ app's Info.plist doesn't match the key value of the app's export compliance
 documentation.
 ```
 
-first with the key present but empty, then with it absent, because the
-questionnaire had not been completed yet. Completing it is what fixed that, not
-anything in the build.
+Builds 10, 11 and 12 all hit exactly that — with the code key empty, then
+absent, then absent again after the questionnaire was answered. The constant
+across all three was `true`. With no documentation on file there is no code, so
+`true` cannot be satisfied, and `false` is the only answer that matches what
+App Store Connect actually holds.
 
-The key must be **absent** unless there is a real code: Apple validates it
-whenever it is present, so an empty value is a *wrong* code rather than no code.
-That is why it is merged in through a second plist rather than living in
-`Info.ios.plist`.
+What the app does with cryptography is unchanged and was what the questionnaire
+was answered against:
+
+- TLS 1.3 with mutual authentication to the paired desktop, over rustls,
+- ECDSA P-256 and ML-DSA-65 signatures authenticating commands, and
+- Stronghold, plus an AES-GCM key in the Keystore or Secure Enclave, protecting
+  the app's own secrets at rest.
+
+Re-run the questionnaire if that changes — a user-facing encryption feature, or
+carrying third-party data. If it then requires documentation, the answer becomes
+`true` **plus** the code Apple issues, set as `APPLE_EXPORT_COMPLIANCE_CODE`.
+The build and its guard already handle that case.
+
+Separately, and satisfied by nothing in this repository: a US exporter of 5D002
+software owes BIS an **annual self-classification report**, due **1 February**
+for the preceding calendar year.
 
 ### France
 
@@ -153,9 +132,12 @@ signatures.
 
 "Collect the IPA" reads both keys back out of the built `.ipa` and fails if:
 
-- the declaration is not `true`,
-- no secret is set yet the app carries a code, empty or stale, or
-- a secret is set and a different value shipped.
+- no `APPLE_EXPORT_COMPLIANCE_CODE` is set and the app declares anything other
+  than `false` with no code key, or
+- a code **is** set and the app does not declare `true` carrying exactly it.
+
+The two halves are checked together because either one alone is a rejected
+upload.
 
 It checks the artifact rather than the source because that is what Apple reads:
 a key that failed to merge, or a reference that expanded to nothing, both look
@@ -164,7 +146,10 @@ correct in the repository.
 ### Revisit this if
 
 the app gains a user-facing encryption feature, starts carrying third-party
-data, or adopts a proprietary algorithm. The last would require a CCATS.
+data, or adopts a proprietary algorithm. Re-run the questionnaire; if it then
+requires documentation, set `APPLE_EXPORT_COMPLIANCE_CODE` to the code Apple
+issues and the build switches to `true` automatically. A proprietary algorithm
+would additionally require a CCATS.
 
 ## Rehearsing without a tag
 
