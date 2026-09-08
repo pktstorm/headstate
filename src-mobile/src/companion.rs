@@ -6,7 +6,7 @@
 //! against the loopback server with no `AppHandle`: the sink and the
 //! task spawner are injected.
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
@@ -40,6 +40,24 @@ pub struct Companion {
     live: Mutex<Option<Live>>,
 }
 
+/// The cached snapshot's timestamp, or `None`, saying so out loud when
+/// the cache is unreadable.
+///
+/// This was `.ok().flatten()`, which threw away `StoreError::Corrupt` --
+/// a variant `store.rs` went to deliberate trouble to produce rather
+/// than a silent `None` that would read as "not paired". The effect is
+/// bounded (the banner loses its timestamp), but on a phone there is no
+/// console, so a corrupt cache was undiagnosable.
+fn last_poll_from_cache(store: &dyn Store) -> Option<DateTime<Utc>> {
+    match events::cached_snapshot(store) {
+        Ok(snapshot) => snapshot.and_then(|s| s.received_at()),
+        Err(e) => {
+            log::warn!("companion: the cached snapshot could not be read: {e}");
+            None
+        }
+    }
+}
+
 impl Companion {
     pub fn new(
         store: Arc<dyn Store>,
@@ -66,10 +84,7 @@ impl Companion {
         let Some(desktop) = list.into_iter().next() else {
             return Ok(());
         };
-        let last_poll = events::cached_snapshot(self.store.as_ref())
-            .ok()
-            .flatten()
-            .and_then(|s| s.received_at());
+        let last_poll = last_poll_from_cache(self.store.as_ref());
         self.conn.set_desktop(Some(desktop.name.clone()), last_poll);
         let identity = match self.keys.session_identity() {
             Ok(id) => id,
@@ -252,7 +267,15 @@ impl Companion {
                 self.conn.set_state(State::Unreachable);
                 events.resume();
                 if command == "get_cached" {
-                    if let Ok(Some(snap)) = events::cached_snapshot(self.store.as_ref()) {
+                    // An `Err` here is a corrupt cache, not an absent
+                    // one, and it decides whether the phone shows a list
+                    // at all -- worth a line rather than a silent empty
+                    // screen.
+                    let cached = events::cached_snapshot(self.store.as_ref()).unwrap_or_else(|e| {
+                        log::warn!("companion: the cached snapshot could not be read: {e}");
+                        None
+                    });
+                    if let Some(snap) = cached {
                         log::info!(
                             "companion: {desktop_name} unreachable; serving the cached list"
                         );
@@ -268,10 +291,7 @@ impl Companion {
     fn attach(&self, desktop: Desktop, client: Arc<Client>) {
         self.conn.set_desktop(
             Some(desktop.name.clone()),
-            events::cached_snapshot(self.store.as_ref())
-                .ok()
-                .flatten()
-                .and_then(|s| s.received_at()),
+            last_poll_from_cache(self.store.as_ref()),
         );
         self.conn.set_state(State::Connecting);
         let live = Live {

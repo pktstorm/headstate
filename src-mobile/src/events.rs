@@ -133,6 +133,20 @@ pub struct Frame {
 /// across chunks, `\r\n` line ends, comment lines, and multi-line
 /// `data:` (joined with `\n`, per the spec, though the desktop never
 /// sends one).
+///
+/// # Bounds
+///
+/// Both accumulators are capped. A phone has a hard per-app memory
+/// limit and the OS kills the app outright when it is crossed -- no
+/// dialog, no log, and to the user an app that "just closes". The
+/// desktop is a trusted peer, so this is not an attack path; it is a
+/// resource path, and a stream that never sends a newline (or a blank
+/// line) would grow `buf` (or `data`) without limit until jetsam took
+/// the process.
+///
+/// Crossing a cap drops the buffered bytes and resets the parser rather
+/// than trying to resynchronise mid-frame: the frame is already lost,
+/// and the reconnect that follows replays the desktop's snapshot.
 #[derive(Debug, Default)]
 pub struct SseParser {
     buf: Vec<u8>,
@@ -140,9 +154,29 @@ pub struct SseParser {
     data: Vec<String>,
 }
 
+/// The longest single line to buffer before giving up on it. Generous
+/// against the real traffic -- a `prs-updated` frame for a large account
+/// is tens of kilobytes on one `data:` line -- and still far below what
+/// a phone can absorb.
+const MAX_LINE: usize = 8 * 1024 * 1024;
+
+/// The most `data:` to accumulate across one frame's lines, before the
+/// blank line that dispatches it.
+const MAX_FRAME: usize = 8 * 1024 * 1024;
+
 impl SseParser {
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Frame> {
         self.buf.extend_from_slice(bytes);
+        // No newline in this much data means the peer is not speaking
+        // the framing; nothing further in `buf` can be parsed.
+        if self.buf.len() > MAX_LINE && !self.buf.contains(&b'\n') {
+            log::warn!(
+                "companion: dropping {} buffered bytes with no line end; resetting the parser",
+                self.buf.len()
+            );
+            self.reset();
+            return Vec::new();
+        }
         let mut out = Vec::new();
         while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = self.buf.drain(..=nl).collect();
@@ -164,12 +198,28 @@ impl SseParser {
             };
             match field {
                 "event" => self.event = Some(value.to_string()),
-                "data" => self.data.push(value.to_string()),
+                "data" => {
+                    self.data.push(value.to_string());
+                    if self.data.iter().map(String::len).sum::<usize>() > MAX_FRAME {
+                        log::warn!("companion: dropping an oversized frame; resetting the parser");
+                        self.reset();
+                        return out;
+                    }
+                }
                 // `id` and `retry` are not used by the desktop.
                 _ => {}
             }
         }
         out
+    }
+
+    /// Forget everything buffered. Whatever was mid-parse is gone, and
+    /// the frames already returned from this `feed` are still good.
+    fn reset(&mut self) {
+        self.buf.clear();
+        self.buf.shrink_to_fit();
+        self.event = None;
+        self.data.clear();
     }
 
     fn dispatch(&mut self) -> Option<Frame> {
@@ -462,6 +512,54 @@ mod tests {
         assert!(save_snapshot(&store, "not json", at).is_err());
         forget_snapshot(&store).unwrap();
         assert!(cached_snapshot(&store).unwrap().is_none());
+    }
+
+    /// A stream that never sends a line end must not grow the buffer
+    /// until the OS kills the app. There is no dialog and no log when
+    /// jetsam takes a process; the user sees an app that "just closes".
+    #[test]
+    fn a_line_that_never_ends_is_dropped_rather_than_buffered() {
+        let mut p = SseParser::default();
+        // Well past MAX_LINE, in chunks, with no `\n` anywhere.
+        let chunk = vec![b'x'; 1024 * 1024];
+        for _ in 0..9 {
+            assert!(p.feed(&chunk).is_empty());
+        }
+        assert!(p.buf.len() <= 1024 * 1024, "buffer grew to {}", p.buf.len());
+
+        // And the parser still works afterwards: the reset is a
+        // recovery, not a poisoning.
+        let frames = p.feed(b"event: prs-updated\ndata: []\n\n");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].name, "prs-updated");
+    }
+
+    /// The same bound on the other accumulator: `data:` lines pile up
+    /// until a blank line dispatches them, so a frame that never ends
+    /// is the same unbounded growth by another route.
+    #[test]
+    fn a_frame_that_never_dispatches_is_dropped() {
+        let mut p = SseParser::default();
+        let line = format!("data: {}\n", "x".repeat(1024 * 1024));
+        for _ in 0..9 {
+            assert!(p.feed(line.as_bytes()).is_empty());
+        }
+        assert!(p.data.is_empty(), "data held {} lines", p.data.len());
+
+        let frames = p.feed(b"event: prs-updated\ndata: []\n\n");
+        assert_eq!(frames.len(), 1);
+    }
+
+    /// The bounds are generous against real traffic: a `prs-updated`
+    /// frame for a large account is tens of kilobytes on one line, and
+    /// must pass through untouched.
+    #[test]
+    fn an_ordinary_large_frame_is_not_dropped() {
+        let mut p = SseParser::default();
+        let big = "y".repeat(256 * 1024);
+        let frames = p.feed(format!("event: prs-updated\ndata: {big}\n\n").as_bytes());
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data.len(), big.len());
     }
 
     #[test]

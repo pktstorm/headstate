@@ -42,6 +42,7 @@ import { StatusBar } from "./components/StatusBar";
 import { StatsPage } from "./components/StatsPage";
 import { ConnectionBanner } from "./components/ConnectionBanner";
 import { StaleRibbon } from "./components/StaleRibbon";
+import { IS_DESKTOP_BUILD, IS_MOBILE_BUILD } from "./lib/target";
 import { Sheet, SheetContent, SheetTitle } from "./components/ui/sheet";
 import { applyFilters, hasActiveFilters, sortPrs } from "./lib/derive";
 import { shortcutFor } from "./lib/shortcuts";
@@ -68,7 +69,13 @@ export default function App() {
   // persists across launches, so a desktop closed on Stats would
   // otherwise open a phone on a page the phone does not offer -- with
   // no sidebar entry to leave it by, since that entry is hidden too.
-  const panel = isMobile && storedPanel === "stats" ? "list" : storedPanel;
+  //
+  // On the BUILD, not the viewport: "the companion does not offer
+  // Stats" is a statement about which app this is, and the viewport
+  // version took Stats away from a desktop user who dragged their
+  // window under 768px -- on a page they can still reach from the
+  // sidebar there, since `RepoSidebar` hides that entry by viewport too.
+  const panel = IS_MOBILE_BUILD && storedPanel === "stats" ? "list" : storedPanel;
   // The sidebar is a sheet on the phone, opened from a button in the
   // header. Any navigation closes it: the point of picking a repo is
   // to look at it, and a sheet still covering the list would hide the
@@ -166,7 +173,17 @@ export default function App() {
       if (action === "onRefresh") {
         void emit("refresh-requested", null);
       } else if (action === "onHide") {
-        void getCurrentWindow().hide();
+        // Desktop only. `core:window:*` is not in the phone's
+        // capabilities, so this rejects there -- unhandled, because
+        // `void` drops it -- and "hide to the tray" is meaningless on a
+        // platform with no tray. Guarded on the build target rather
+        // than the viewport: a narrow desktop window still has a tray.
+        //
+        // The other shortcuts are left bound. A phone has no hardware
+        // keyboard, but an iPad with one reaches them, and j/k/Enter/x
+        // all do something sensible there -- it is only this branch
+        // that cannot work.
+        if (IS_DESKTOP_BUILD) void getCurrentWindow().hide();
       } else if (action === "onFocusSearch") {
         const el = document.querySelector<HTMLInputElement>('input[type="search"]');
         el?.focus();
