@@ -63,10 +63,31 @@ describe("ConnectionBanner", () => {
       protocolVersion: REQUIRED_PROTOCOL_VERSION,
       stale: false,
     };
+    // `updatedAt` is GitHub's freshness, which moved here from the
+    // bottom status bar (#649): while the desktop is reachable, whether
+    // the DATA is current is the more useful of the two timestamps, and
+    // showing both in two strips said almost the same thing twice.
+    render(<ConnectionBanner updatedAt={Date.now() - 10 * 60_000} />);
+    const banner = screen.getByRole("button", { name: /octocat's laptop/ });
+    expect(banner.textContent).toContain("reachable");
+    expect(banner.textContent).toContain("updated 10 minutes ago");
+  });
+
+  /// Without a GitHub timestamp the line is just the desktop, rather
+  /// than "updated never" or a dangling separator.
+  it("says only what it knows when GitHub has not been polled", () => {
+    stubViewport(390);
+    connection.current = {
+      kind: "connected",
+      desktop: "octocat's laptop",
+      lastPoll: new Date().toISOString(),
+      protocolVersion: REQUIRED_PROTOCOL_VERSION,
+      stale: false,
+    };
     render(<ConnectionBanner />);
     const banner = screen.getByRole("button", { name: /octocat's laptop/ });
     expect(banner.textContent).toContain("reachable");
-    expect(banner.textContent).toContain("last poll 10 minutes ago");
+    expect(banner.textContent).not.toContain("updated");
   });
 
   it("tells the user to update the desktop when its protocol is too old", () => {

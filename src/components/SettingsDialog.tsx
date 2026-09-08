@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { ChevronLeft, ChevronRight } from "lucide-react";
 import { toast } from "sonner";
 import { revealLog } from "@/api/tauri";
 import { useIsMobile } from "@/lib/useIsMobile";
@@ -82,7 +83,14 @@ export function SettingsDialog({
   const [autostartError, setAutostartError] = useState<string | null>(null);
   const { enabled: remote, set: setRemote } = useRemoteEnabled();
   const [remoteError, setRemoteError] = useState<string | null>(null);
-  const [section, setSection] = useState<SectionId>(initialSection);
+  // `null` is the phone's list view; the desktop always has a section
+  // selected, because its rail is always visible beside the panel.
+  //
+  // Opening straight to a section (the banner does, with "phone") still
+  // works and still shows that section -- with the back row above it,
+  // which is where a user who arrived that way would expect to find
+  // the rest of Settings.
+  const [section, setSection] = useState<SectionId | null>(initialSection);
   const [draft, setDraft] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -176,15 +184,21 @@ export function SettingsDialog({
               : "-mx-1 flex min-h-0 flex-1 gap-4 overflow-hidden px-1"
           }
         >
+          {/* On the phone, a vertical LIST that pushes to a section --
+              the iOS settings pattern -- rather than a strip of tabs
+              that scrolls sideways. A horizontal scroller has no
+              affordance saying more topics exist, so sections past the
+              third were simply undiscoverable (#650).
+
+              Hidden with CSS rather than unmounted, for the same reason
+              the panels below are: the buttons must stay in the
+              accessibility tree and in the DOM, and the existing tests
+              find them by role either way. */}
           <nav
             aria-label="Settings sections"
             className={
               isMobile
-                ? // A horizontal strip of topics that scrolls, rather
-                  // than a rail that eats a third of the width. Same
-                  // buttons, same order, same labels -- the existing
-                  // tests find them either way.
-                  "flex shrink-0 gap-1 overflow-x-auto border-b border-[#30363d] pb-2"
+                ? `flex shrink-0 flex-col gap-0.5 ${section === null ? "" : "hidden"}`
                 : "flex w-36 shrink-0 flex-col gap-0.5 border-r border-[#30363d] pr-2"
             }
           >
@@ -194,16 +208,38 @@ export function SettingsDialog({
                 type="button"
                 aria-current={section === s.id ? "page" : undefined}
                 onClick={() => setSection(s.id)}
-                className={`rounded px-2 py-1 text-left text-sm ${
-                  section === s.id
-                    ? "bg-[#1f6feb] text-white"
-                    : "text-[#e6edf3] hover:bg-[#21262d]"
-                }`}
+                className={
+                  isMobile
+                    ? // A row, with the chevron every iOS list row has.
+                      // 44pt minimum: this is the primary target here.
+                      "flex min-h-11 items-center justify-between rounded px-2 text-left text-sm text-[#e6edf3] hover:bg-[#21262d]"
+                    : `rounded px-2 py-1 text-left text-sm ${
+                        section === s.id
+                          ? "bg-[#1f6feb] text-white"
+                          : "text-[#e6edf3] hover:bg-[#21262d]"
+                      }`
+                }
               >
                 {s.label}
+                {isMobile ? (
+                  <ChevronRight className="size-4 shrink-0 text-[#8b949e]" aria-hidden="true" />
+                ) : null}
               </button>
             ))}
           </nav>
+
+          {/* The way back out of a section. Only on the phone, where the
+              list replaced the always-visible rail. */}
+          {isMobile && section !== null ? (
+            <button
+              type="button"
+              onClick={() => setSection(null)}
+              className="flex min-h-11 shrink-0 items-center gap-1 self-start px-1 text-sm text-[#58a6ff]"
+            >
+              <ChevronLeft className="size-4" aria-hidden="true" />
+              Settings
+            </button>
+          ) : null}
 
           {/* `min-h-0` is load-bearing here as it was on the old
               scroller: a flex child defaults to min-height:auto and

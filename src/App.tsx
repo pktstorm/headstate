@@ -292,7 +292,7 @@ export default function App() {
       {/* Above everything, including the header: it says which
           desktop the whole screen is describing. Renders nothing on
           the desktop itself. */}
-      <ConnectionBanner />
+      <ConnectionBanner updatedAt={dataUpdatedAt} />
       {/* Below the banner and above everything else: the banner says
           which desktop, this says the rows underneath may be old. The
           banner alone was not enough -- it is one line that scrolls out

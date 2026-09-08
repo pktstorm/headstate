@@ -178,7 +178,11 @@ describe("App shell on a phone", () => {
     renderApp();
     const banner = screen.getByRole("button", { name: /octocat's laptop/ });
     expect(banner.textContent).toContain("reachable");
-    expect(banner.textContent).toContain("last poll 3 minutes ago");
+    // The desktop's own poll time moved out of this line: while the
+    // desktop is reachable, GitHub's freshness is the useful timestamp
+    // and the bottom bar no longer repeats it (#649). This test is
+    // about the banner's POSITION, asserted below.
+    expect(banner.textContent).not.toContain("last poll");
     // Above the header, not inside it or below the list.
     const header = screen.getByRole("heading", { level: 1 });
     expect(banner.compareDocumentPosition(header) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();

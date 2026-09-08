@@ -55,13 +55,29 @@ describe("StatusBar on a phone", () => {
 
   /// The poll cadence is the desktop's setting and lives in Settings
   /// too; on a 390px bar it cost the "Up to date" line its one line.
-  it("drops the poll-interval control but keeps state, version and settings", () => {
+  /// The phone keeps what has no second home and drops what does.
+  ///
+  /// The GitHub poll state and its timestamp moved to
+  /// `ConnectionBanner`, which is already at the top of every phone
+  /// screen: two strips both saying "last polled X ago" cost a phone
+  /// more list than they informed (#649). The version, the settings
+  /// entry point and the progress counter stay, because nothing else
+  /// carries them.
+  it("drops the poll state and interval, keeping version and settings", () => {
     stubViewport(390);
     render(<StatusBar updatedAt={Date.now() - 90_000} />);
     expect(screen.queryByLabelText("Poll interval")).toBeNull();
+    expect(screen.queryByText(/up to date/i)).toBeNull();
+    expect(screen.queryByText(/^updated /i)).toBeNull();
+    expect(screen.getByRole("button", { name: "Settings" })).toBeTruthy();
+  });
+
+  /// And the desktop keeps both, unchanged.
+  it("keeps the poll state and timestamp on the desktop", () => {
+    stubViewport(1400);
+    render(<StatusBar updatedAt={Date.now() - 90_000} />);
     expect(screen.getByText(/up to date/i)).toBeTruthy();
     expect(screen.getByText(/updated/i)).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Settings" })).toBeTruthy();
   });
 
   it("keeps the poll-interval control on the desktop", () => {
