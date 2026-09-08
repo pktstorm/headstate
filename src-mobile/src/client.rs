@@ -697,24 +697,70 @@ impl Client {
 
     /// `POST /v1/call/{command}` with `args` as the body and, for a
     /// destructive command, the step-up header.
+    ///
+    /// A SIGNED call goes to exactly one address; an unsigned one races
+    /// them all.
+    ///
+    /// The step-up signature covers a single-use nonce, so sending the
+    /// same header to two addresses that both reach the desktop means
+    /// the first request performs the command and the second is refused
+    /// as a replay -- correctly, since that is what the nonce window is
+    /// for. The user then sees "signature nonce was already used", or a
+    /// second-order version of it like "not a worktree of this
+    /// repository" once the first request has already removed the
+    /// worktree (#656).
+    ///
+    /// So a signed call resolves the address first, with an UNSIGNED
+    /// request that is safe to duplicate, and only then sends the signed
+    /// one. That costs a round trip on a destructive command, which is
+    /// the right trade: those are rare, and a false security warning
+    /// over a command that actually succeeded is worse than a few
+    /// milliseconds.
     pub async fn call(
         &self,
         command: &str,
         args: &Value,
         signature: Option<&str>,
     ) -> Result<Value, ClientError> {
-        self.try_each(|base| async move {
-            let mut req = self
-                .calls
-                .post(format!("{base}/v1/call/{command}"))
-                .json(args);
-            if let Some(sig) = signature {
-                req = req.header(stepup::HEADER, sig);
-            }
-            let resp = req.send().await.map_err(classify)?;
-            json_body(resp).await
-        })
-        .await
+        let Some(sig) = signature else {
+            return self
+                .try_each(|base| async move {
+                    let resp = self
+                        .calls
+                        .post(format!("{base}/v1/call/{command}"))
+                        .json(args)
+                        .send()
+                        .await
+                        .map_err(classify)?;
+                    json_body(resp).await
+                })
+                .await;
+        };
+
+        // Which address is live. `/v1/hello` is a GET that changes
+        // nothing, so racing it is free and duplicates are harmless --
+        // and it leaves `preferred`/`discovered` pointing at the winner.
+        self.hello().await?;
+        let base = self
+            .best_base()
+            .ok_or_else(|| ClientError::Unreachable("no address answered".into()))?;
+
+        let resp = self
+            .calls
+            .post(format!("{base}/v1/call/{command}"))
+            .json(args)
+            .header(stepup::HEADER, sig)
+            .send()
+            .await
+            .map_err(classify)?;
+        json_body(resp).await
+    }
+
+    /// The base URL `bases()` would try first: the address `hello()`
+    /// just proved live. Unlike [`Client::best_address`], which hands a
+    /// bare address to the store, this is the URL a request goes to.
+    fn best_base(&self) -> Option<String> {
+        self.bases().into_iter().next()
     }
 
     /// `GET /v1/events`: the response whose body is the event stream,
@@ -1281,6 +1327,59 @@ mod tests {
             client.hello().await,
             Err(ClientError::Unreachable(_))
         ));
+    }
+
+    /// A signed call reaches the desktop ONCE, however many addresses
+    /// are on offer.
+    ///
+    /// The step-up nonce is single-use, so a signed header sent to two
+    /// live addresses means the first request runs the command and the
+    /// second is refused as a replay -- which is what put "signature
+    /// nonce was already used" in front of a user whose worktree
+    /// removal had actually succeeded (#656).
+    #[tokio::test]
+    async fn a_signed_call_is_sent_to_one_address_only() {
+        let id = identity();
+        let server = TestServer::start().await;
+        server.pair(&id.fingerprint());
+        server.reply(
+            "/v1/call/remove_worktree",
+            Reply::json(200, json!({"ok": true})),
+        );
+        // Four addresses, all reaching the same desktop. Whatever the
+        // race does, the SIGNED request must be made once: the nonce is
+        // spent by the first and every later copy is a replay.
+        let client = Client::new(
+            &id,
+            &server.fp,
+            vec![server.addr(), server.addr(), server.addr(), server.addr()],
+            server.port(),
+        )
+        .unwrap();
+        client
+            .call(
+                "remove_worktree",
+                &json!({"path": "/srv/x"}),
+                Some("v1;ts=1;nonce=n;ecdsa=e"),
+            )
+            .await
+            .unwrap();
+        let signed = server
+            .requests()
+            .iter()
+            .filter(|r| {
+                r.headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case(stepup::HEADER))
+            })
+            .count();
+        assert_eq!(signed, 1, "the signed request must not be duplicated");
+        // And it went out on the address `hello` proved live, not
+        // speculatively to all of them.
+        assert!(
+            server.requests().iter().any(|r| r.path == "/v1/hello"),
+            "the address is resolved with an unsigned request first"
+        );
     }
 
     #[tokio::test]
