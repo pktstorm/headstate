@@ -124,6 +124,14 @@ pub enum PairingError {
     Expired,
     #[error("the desktop presented a certificate that does not match the pairing code")]
     FingerprintMismatch,
+    /// TLS refused, but NOT because this phone rejected the desktop's
+    /// certificate. Most often the reverse: the desktop refusing this
+    /// phone's, which is what a session identity that is not ML-DSA-65
+    /// looks like from here. Carries what TLS said, because guessing
+    /// between the two and getting it wrong accuses the user's desktop
+    /// of presenting a bad certificate (#640).
+    #[error("the secure connection to the desktop failed: {0}")]
+    Handshake(String),
     /// 403: denied, timed out, or the token was already used.
     #[error("the desktop refused the pairing: {0}")]
     Denied(String),
@@ -231,7 +239,13 @@ pub async fn pair(
             proof: proof(&qr.token, &identity.fingerprint(), &qr.fp),
         };
         let outcome: PairOutcome = client.pair(&request).await.map_err(|e| match e {
-            ClientError::Handshake(_) => PairingError::FingerprintMismatch,
+            // Only OUR verifier rejecting the desktop's certificate is a
+            // fingerprint mismatch. Every other TLS failure keeps its own
+            // message: the handshake is mutual, so it is at least as
+            // likely to be the desktop refusing THIS phone, which says
+            // nothing about the desktop's identity (#640).
+            ClientError::FingerprintMismatch => PairingError::FingerprintMismatch,
+            ClientError::Handshake(m) => PairingError::Handshake(m),
             ClientError::Unreachable(m) => PairingError::Unreachable(m),
             ClientError::Status {
                 status: 403,
