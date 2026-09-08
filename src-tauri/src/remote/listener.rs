@@ -2,7 +2,7 @@
 //!
 //! axum on a tokio task, port [`PORT`] on every interface (IPv4 and
 //! IPv6 on one dual-stack socket), TLS 1.3 only, rustls on the
-//! `rustls-post-quantum` provider (aws-lc-rs plus ML-DSA; see
+//! aws-lc-rs provider (which carries ML-DSA as of rustls 0.23.44; see
 //! [`provider`]). Client certificates are required at the handshake,
 //! must be ML-DSA-65, and are checked by fingerprint against the paired
 //! devices -- no CA, no chain -- so an unpaired client never reaches
@@ -281,21 +281,23 @@ impl Drop for Handle {
 
 /// The provider the listener uses, regardless of the process default.
 ///
-/// `rustls-post-quantum`'s: aws-lc-rs, which is the only rustls
-/// provider with a post-quantum key exchange, plus the ML-DSA signing
-/// keys and verifiers that rustls 0.23 itself only names. That is what
-/// signs the handshake with the desktop's ML-DSA-65 key and verifies
-/// the phone's; the plain aws-lc-rs provider cannot load an ML-DSA key
-/// at all, so this is the one provider every TLS config in this module
-/// is built on. It comes from the crate's `aws-lc-rs-unstable` feature
-/// -- see Cargo.toml for what "unstable" does and does not mean.
+/// aws-lc-rs, the only rustls provider with a post-quantum key
+/// exchange, and since 0.23.44 the one that also loads ML-DSA keys and
+/// verifies ML-DSA signatures. That is what signs the handshake with the
+/// desktop's ML-DSA-65 key and verifies the phone's, so every TLS config
+/// in this module is built on it.
 ///
-/// X25519MLKEM768 placed FIRST explicitly. rustls orders it first only
-/// under its `prefer-post-quantum` cargo feature (which the
-/// post-quantum crate happens to turn on); spelling the order out here
-/// means the preference does not depend on a feature flag anyone can
-/// drop by accident, and the test `key_exchange_is_hybrid_post_quantum`
-/// holds it.
+/// This used to be `rustls-post-quantum::provider()`, back when rustls
+/// only NAMED the ML-DSA schemes. Both halves moved into the plain
+/// provider and the crate went away in #588.
+///
+/// X25519MLKEM768 placed FIRST explicitly, and that mattered more than
+/// it looked. rustls orders it first only under its
+/// `prefer-post-quantum` cargo feature, which the post-quantum crate
+/// happened to turn on -- so removing that crate turned it off, and
+/// this line is why nothing changed. Spelling the order out means the
+/// preference does not depend on a feature flag anyone can drop by
+/// accident; `key_exchange_is_hybrid_post_quantum` holds it.
 fn provider() -> CryptoProvider {
     CryptoProvider {
         kx_groups: vec![
@@ -303,7 +305,7 @@ fn provider() -> CryptoProvider {
             aws_lc_rs::kx_group::X25519,
             aws_lc_rs::kx_group::SECP256R1,
         ],
-        ..rustls_post_quantum::provider()
+        ..aws_lc_rs::default_provider()
     }
 }
 

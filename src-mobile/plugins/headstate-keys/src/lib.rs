@@ -143,8 +143,9 @@ impl fmt::Debug for Signatures {
 pub struct SessionIdentity {
     /// The self-signed ML-DSA-65 certificate, DER.
     pub cert_der: Vec<u8>,
-    /// The private key, PKCS#8 DER: the seed form, which only the
-    /// post-quantum provider loads.
+    /// The private key, PKCS#8 DER: the seed form, which the aws-lc-rs
+    /// provider loads as of rustls 0.23.44 (before that it needed
+    /// `rustls-post-quantum`; see #588).
     pub key_pkcs8: Vec<u8>,
 }
 
@@ -476,9 +477,13 @@ mod tests {
         assert_eq!(k.sign(CANONICAL).unwrap_err(), Error::NotGenerated);
     }
 
-    /// rustls accepts the identity: the key loads through the
-    /// post-quantum provider (and not the plain one) and its public half
-    /// matches the certificate's; the certificate is an ML-DSA-65 one.
+    /// rustls accepts the identity: the key loads through the aws-lc-rs
+    /// provider and its public half matches the certificate's; the
+    /// certificate is an ML-DSA-65 one.
+    ///
+    /// This used to assert the PLAIN provider could not load it, which
+    /// was true until rustls 0.23.44 and is the whole reason
+    /// `rustls-post-quantum` was a dependency (#588).
     #[test]
     fn the_session_identity_is_an_ml_dsa_65_rustls_client_identity() {
         let k = keys(Fake::new(true));
@@ -487,11 +492,11 @@ mod tests {
         assert!(!format!("{id:?}").contains("key_pkcs8: ["));
 
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-        let pq = rustls_post_quantum::provider();
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
         let certified = rustls::sign::CertifiedKey::from_der(
             vec![CertificateDer::from(id.cert_der.clone())],
             PrivateKeyDer::Pkcs8(id.key_pkcs8.clone().into()),
-            &pq,
+            &provider,
         )
         .unwrap();
         assert_eq!(

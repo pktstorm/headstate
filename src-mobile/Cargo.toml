@@ -63,22 +63,15 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "j
 # `CryptoProvider::install_default` without adding a dependency. Feature
 # names match what reqwest enables, so nothing is compiled twice.
 # TLS 1.3 only per the spec: no `tls12`.
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "logging"] }
-# Post-quantum certificates (client.rs, keys.rs; #521). rustls 0.23
-# names the ML-DSA signature schemes but ships neither a signing key nor
-# a verifier for them; this crate's `provider()` is aws-lc-rs plus
-# exactly those, behind its `aws-lc-rs-unstable` feature (rustls #2579,
-# #2997) -- unstable meaning the crate API may move between minor
-# versions, not that FIPS 204 is a draft. Every TLS config the client
-# builds is on this provider and nothing else: the plain aws-lc-rs one
-# cannot load the ML-DSA-65 session key at all. The desktop's listener
-# is built the same way; see src-tauri/Cargo.toml.
 #
-# It declares rustls WITH default features, so `tls12` and
-# `prefer-post-quantum` come along. The first was already on through
-# reqwest's hyper-rustls and the client still offers TLS 1.3 only; the
-# second is moot because the key-exchange order is spelled out.
-rustls-post-quantum = { version = "0.2.4", features = ["aws-lc-rs-unstable"] }
+# Post-quantum certificates (client.rs, keys.rs; #521) come from this
+# provider directly as of 0.23.44. They used to need
+# `rustls-post-quantum`, whose `provider()` supplied ML-DSA signing keys
+# and verifiers that rustls only NAMED; `aws_lc_rs::default_provider()`
+# now loads an ML-DSA-65 key and carries the same verification table.
+# Removed in #588, with the reasoning in src-tauri/Cargo.toml -- the two
+# ends of this connection have to agree, so keep them in step.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "logging"] }
 # Self-signed session certificate at pairing. On aws-lc-rs for the same
 # reason as above: the default `ring` feature would compile a second
 # crypto library into the phone. `aws_lc_rs_unstable` is where rcgen
