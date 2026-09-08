@@ -122,6 +122,21 @@ export function describePairingFailure(error: unknown): PairingFailure {
     };
   }
 
+  // Before the mismatch branch: this is the TLS failure that is NOT an
+  // accusation, and it must not fall through to one.
+  if (/secure connection to the desktop failed/i.test(message)) {
+    return {
+      title: "The secure connection failed",
+      detail:
+        "The desktop and this phone could not agree on a secure connection. That is " +
+        "usually this phone's own certificate being refused rather than anything wrong " +
+        "with the desktop — open the details below, and check the desktop is running a " +
+        "version new enough to pair with this app.",
+      retryable: true,
+      technical: redactPairingDetail(message),
+    };
+  }
+
   if (/refused the pairing/i.test(message)) {
     return {
       title: "The desktop refused the pairing",

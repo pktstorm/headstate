@@ -11,6 +11,8 @@ const RUST = {
   mismatch: "the desktop presented a certificate that does not match the pairing code",
   denied: "the desktop refused the pairing: token already used",
   unreachable: "could not reach the desktop: connection refused",
+  handshake:
+    "the secure connection to the desktop failed: received fatal alert: CertificateRequired",
   oldVersion: "not a Headstate pairing code: version 1 is not supported",
   malformed: "not a Headstate pairing code: expected value at line 1 column 1",
 };
@@ -129,5 +131,30 @@ describe("technical details", () => {
   it("leaves addresses and error kinds alone -- they are the useful part", () => {
     const msg = "192.168.1.5:8765: connection refused";
     expect(redactPairingDetail(msg)).toBe(msg);
+  });
+});
+
+describe("a TLS failure that is not a fingerprint mismatch", () => {
+  it("does not accuse the desktop of presenting a bad certificate", () => {
+    // #640: the handshake is mutual, so the desktop refusing THIS phone
+    // used to surface as "that desktop did not match its pairing code",
+    // which reads as an attack and is not what happened.
+    const f = describePairingFailure(new Error(RUST.handshake));
+    expect(f.title).not.toMatch(/did not match/i);
+    expect(f.title).toMatch(/secure connection/i);
+    expect(f.retryable).toBe(true);
+  });
+
+  it("keeps what TLS actually said, for the details disclosure", () => {
+    const f = describePairingFailure(new Error(RUST.handshake));
+    expect(f.technical).toContain("CertificateRequired");
+  });
+
+  it("still calls a real mismatch a mismatch", () => {
+    // The security-relevant case keeps its wording and stays
+    // non-retryable.
+    const f = describePairingFailure(new Error(RUST.mismatch));
+    expect(f.title).toMatch(/did not match/i);
+    expect(f.retryable).toBe(false);
   });
 });

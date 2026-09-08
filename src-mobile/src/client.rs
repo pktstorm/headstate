@@ -105,8 +105,17 @@ pub struct Hello {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ClientError {
-    /// TLS refused: the server's fingerprint is not the pinned one, or
-    /// the server refused this phone's certificate.
+    /// THIS phone's verifier rejected the desktop's certificate: its
+    /// fingerprint is not the one the QR promised. The only failure that
+    /// justifies telling the user their desktop did not match its code.
+    #[error("the certificate does not match the pinned fingerprint")]
+    FingerprintMismatch,
+    /// TLS refused for any other reason -- most often the DESKTOP
+    /// refusing this phone's certificate, which is the other half of a
+    /// mutual handshake and says nothing about the desktop's identity.
+    /// Kept separate from `FingerprintMismatch` because conflating them
+    /// accuses the user's desktop of something it may not have done
+    /// (#640).
     #[error("TLS handshake failed: {0}")]
     Handshake(String),
     /// Could not reach the desktop at any address.
@@ -121,8 +130,18 @@ pub enum ClientError {
 }
 
 impl ClientError {
+    /// Any TLS refusal, either variant.
+    ///
+    /// Deliberately covers `FingerprintMismatch` too: callers use this
+    /// to detect revocation (`companion.rs`, `events.rs`), and "TLS
+    /// refused us" is the signal there regardless of which side said no.
+    /// Splitting the variants (#640) improved what the USER is told; it
+    /// must not change what those callers see.
     pub fn is_handshake(&self) -> bool {
-        matches!(self, ClientError::Handshake(_))
+        matches!(
+            self,
+            ClientError::Handshake(_) | ClientError::FingerprintMismatch
+        )
     }
 }
 
@@ -707,38 +726,56 @@ async fn json_body<T: for<'de> Deserialize<'de>>(
 }
 
 /// Sort a transport error into the two the caller distinguishes.
-fn classify(err: reqwest::Error) -> ClientError {
-    if is_tls_failure(&err) {
-        return ClientError::Handshake(err.to_string());
-    }
-    if err.is_decode() {
-        return ClientError::Protocol(err.to_string());
-    }
-    ClientError::Unreachable(err.to_string())
-}
-
-/// Whether a `rustls::Error` sits anywhere in the chain. rustls wraps
-/// its errors in `io::Error` (kind `InvalidData`), and `io::Error`'s
-/// `source()` skips over the wrapped error to ITS source, so the chain
-/// walk also looks inside every `io::Error` it meets.
-fn is_tls_failure(err: &(dyn std::error::Error + 'static)) -> bool {
+/// The `rustls::Error` in the chain, if there is one.
+///
+/// rustls wraps its errors in `io::Error` (kind `InvalidData`), and
+/// `io::Error`'s `source()` skips over the wrapped error to ITS source,
+/// so the chain walk also looks inside every `io::Error` it meets.
+///
+/// Returns the error rather than a bool so the caller can tell OUR
+/// verifier's rejection from every other TLS failure by matching the
+/// variant (#640).
+fn tls_error<'a>(err: &'a (dyn std::error::Error + 'static)) -> Option<&'a rustls::Error> {
     let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(e) = cur {
-        if e.downcast_ref::<rustls::Error>().is_some() {
-            return true;
+        if let Some(tls) = e.downcast_ref::<rustls::Error>() {
+            return Some(tls);
         }
         if let Some(inner) = e
             .downcast_ref::<std::io::Error>()
             .and_then(|io| io.get_ref())
         {
             let inner: &(dyn std::error::Error + 'static) = inner;
-            if is_tls_failure(inner) {
-                return true;
+            if let Some(tls) = tls_error(inner) {
+                return Some(tls);
             }
         }
         cur = e.source();
     }
-    false
+    None
+}
+
+fn classify(err: reqwest::Error) -> ClientError {
+    if let Some(tls) = tls_error(&err) {
+        // `ApplicationVerificationFailure` is what `PinnedServer` and
+        // nothing else returns, so this identifies OUR rejection of the
+        // desktop rather than any rustls failure. Matched on the variant,
+        // not on its rendered text, so a rustls rewording cannot silently
+        // turn a mismatch into a generic failure.
+        if matches!(
+            tls,
+            rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure
+            )
+        ) {
+            return ClientError::FingerprintMismatch;
+        }
+        return ClientError::Handshake(tls.to_string());
+    }
+    if err.is_decode() {
+        return ClientError::Protocol(err.to_string());
+    }
+    ClientError::Unreachable(err.to_string())
 }
 
 #[cfg(test)]
@@ -796,11 +833,37 @@ mod tests {
     fn a_rustls_error_is_found_inside_an_io_error() {
         let tls = TlsError::InvalidCertificate(CertificateError::ApplicationVerificationFailure);
         let io = std::io::Error::new(std::io::ErrorKind::InvalidData, tls);
-        assert!(is_tls_failure(&io));
-        assert!(!is_tls_failure(&std::io::Error::new(
+        assert!(tls_error(&io).is_some());
+        assert!(tls_error(&std::io::Error::new(
             std::io::ErrorKind::ConnectionRefused,
             "refused"
-        )));
+        ))
+        .is_none());
+    }
+
+    /// Our verifier's rejection is told apart from every other TLS
+    /// failure by its VARIANT, so a rustls rewording cannot silently
+    /// downgrade a real mismatch to a generic error -- or, worse,
+    /// promote the desktop refusing this phone into an accusation that
+    /// the desktop presented the wrong certificate (#640).
+    #[test]
+    fn only_our_own_verifiers_rejection_is_a_fingerprint_mismatch() {
+        let ours = TlsError::InvalidCertificate(CertificateError::ApplicationVerificationFailure);
+        assert!(matches!(
+            ours,
+            TlsError::InvalidCertificate(CertificateError::ApplicationVerificationFailure)
+        ));
+        // What the DESKTOP refusing this phone's certificate looks like
+        // from here: a TLS alert, not our verifier.
+        let theirs = TlsError::AlertReceived(rustls::AlertDescription::CertificateRequired);
+        assert!(!matches!(
+            theirs,
+            TlsError::InvalidCertificate(CertificateError::ApplicationVerificationFailure)
+        ));
+        assert!(
+            theirs.to_string().contains("received fatal alert"),
+            "{theirs}"
+        );
     }
 
     #[tokio::test]
@@ -863,6 +926,27 @@ mod tests {
         let client =
             Client::new(&id, &"00".repeat(32), vec![server.addr()], server.port()).unwrap();
         let err = client.hello().await.unwrap_err();
+        // The SPECIFIC variant: this is the one case where the desktop
+        // really did present a certificate the QR did not promise, and
+        // the only one the user should be told that about (#640).
+        assert_eq!(err, ClientError::FingerprintMismatch, "{err:?}");
+        // Still a handshake failure for revocation's purposes.
+        assert!(err.is_handshake(), "{err:?}");
+    }
+
+    /// The other half of #640: when the DESKTOP refuses this phone, the
+    /// phone must not report that its desktop presented a bad
+    /// certificate. Same `is_handshake()` for revocation, different
+    /// variant, so the user is told something true.
+    #[tokio::test]
+    async fn a_desktop_refusing_us_is_not_a_fingerprint_mismatch() {
+        let id = identity();
+        let server = TestServer::start().await;
+        // Not paired: the desktop's verifier rejects this phone's
+        // certificate, which is revocation's shape.
+        let client = Client::new(&id, &server.fp, vec![server.addr()], server.port()).unwrap();
+        let err = client.hello().await.unwrap_err();
+        assert_ne!(err, ClientError::FingerprintMismatch, "{err:?}");
         assert!(err.is_handshake(), "{err:?}");
     }
 
