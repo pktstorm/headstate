@@ -106,14 +106,27 @@ reqwest = { version = "0.13", default-features = false, features = ["json"] }
 # byte-identical to the post-quantum crate's -- ML_DSA_44, ML_DSA_65 and
 # ML_DSA_87 included. Measured, not assumed (#588).
 #
-# Dropping that crate also dropped the features it declared
-# transitively: `rustls-webpki/aws-lc-rs-unstable` and rustls's own
-# `prefer-post-quantum`. Neither is load-bearing here. The verifiers
-# turned out not to come from webpki's unstable feature at all -- the
-# table above is the provider's -- and the key-exchange preference is
-# spelled out explicitly in `listener.rs` and `client.rs` rather than
-# inherited from a cargo feature, which is exactly what that code's
-# comment says it is for. `key_exchange_is_hybrid_post_quantum` holds it.
+# Dropping it also dropped two features it was turning on here, and the
+# second is worth understanding rather than just noting.
+#
+# `rustls-webpki/aws-lc-rs-unstable` turned out not to be where the
+# ML-DSA verifiers come from at all -- the table above is the
+# provider's, on both providers alike.
+#
+# `prefer-post-quantum` is one of rustls's OWN default features, and
+# every manifest here declares rustls with `default-features = false`,
+# so it was off by our choice. `rustls-post-quantum` then depended on
+# rustls WITHOUT disabling defaults, which turned it back on across the
+# whole graph -- features being additive. Removing the crate returns
+# rustls to what this manifest actually asked for, which is why
+# `cargo tree -e features` loses both `default` and
+# `prefer-post-quantum` in the same change.
+#
+# What that feature does is order X25519MLKEM768 first. `listener.rs`
+# and `client.rs` spell that order out in `kx_groups` instead of
+# inheriting it, precisely "so the preference does not depend on a
+# feature flag anyone can drop by accident" -- and this is the change
+# that dropped it. `key_exchange_is_hybrid_post_quantum` holds it.
 #
 # This does NOT get the tree off unstable features: `rcgen` needs
 # `aws_lc_rs_unstable` independently, for `PKCS_ML_DSA_65`.
