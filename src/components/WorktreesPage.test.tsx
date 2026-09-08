@@ -966,12 +966,38 @@ describe("WorktreesPage", () => {
     /// absent button just looks broken, while a greyed one that says
     /// "3 uncommitted files" teaches. The Rust side refuses too -- this
     /// is the explanation, not the gate.
+    ///
+    /// The state below is SYNTHETIC: `classify` returns `MainCheckout`
+    /// for the main checkout before it reads `git status`, so a real
+    /// scan never pairs `is_main` with a dirty verdict. The gate a user
+    /// meets is `pull_checkout`'s own check, which ignores untracked
+    /// files (#653).
     it("refuses a dirty checkout and says how dirty", () => {
       state.classified = withMain({ kind: "dirty", detail: 3 });
       render(<WorktreesPage />);
       const btn = screen.getByRole("button", { name: /update to latest/i });
       expect(btn).toHaveProperty("disabled", true);
       expect(btn.getAttribute("title")).toMatch(/3 uncommitted files/);
+    });
+
+    /// A real fast-forward is summarised, not shown whole.
+    ///
+    /// The reported bug (#652): a busy repository's diffstat is hundreds
+    /// of lines, and all of them went into the toast.
+    it("summarises a fast-forward instead of dumping the diffstat", async () => {
+      state.classified = withMain();
+      pullFn.mockResolvedValueOnce(
+        "Updating a1b2c3d..e4f5a6b\nFast-forward\n" +
+          Array.from({ length: 300 }, (_, i) => ` src/f${i}.ts | 3 ++-`).join("\n") +
+          "\n 300 files changed, 900 insertions(+), 300 deletions(-)\n",
+      );
+      render(<WorktreesPage />);
+      fireEvent.click(screen.getByRole("button", { name: /update to latest/i }));
+      await waitFor(() => expect(toastSuccess).toHaveBeenCalled());
+      const shown = toastSuccess.mock.calls[0][0] as string;
+      expect(shown.split("\n")).toHaveLength(1);
+      expect(shown).toContain("300 files changed");
+      expect(shown).not.toContain("src/f0.ts");
     });
 
     /// Git says "Already up to date." when there was nothing to fetch,
