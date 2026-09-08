@@ -1,3 +1,4 @@
+import { isCancelled } from "@/lib/cancelled";
 import { ActingOnDesktop } from "./ActingOnDesktop";
 import { useState } from "react";
 import { toast } from "sonner";
@@ -209,6 +210,10 @@ export function VenvSection() {
                     },
                     (e: unknown) => {
                       setBusy(false);
+                      // Silent when the user dismissed the biometric prompt:
+                      // they declined, nothing was removed, and reporting
+                      // their own decision back as a failure is noise.
+                      if (isCancelled(e)) return;
                       toast.error("The removal could not run", {
                         description: typeof e === "string" ? e : undefined,
                       });

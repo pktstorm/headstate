@@ -1,3 +1,4 @@
+import { isCancelled } from "@/lib/cancelled";
 import { ActingOnDesktop } from "./ActingOnDesktop";
 import { useMemo, useState } from "react";
 import { HardDrive } from "lucide-react";
@@ -335,6 +336,10 @@ export function ArtifactsPage() {
                     },
                     (e: unknown) => {
                       setBusy(false);
+                      // Silent when the user dismissed the biometric prompt:
+                      // they declined, nothing was removed, and reporting
+                      // their own decision back as a failure is noise.
+                      if (isCancelled(e)) return;
                       toast.error("The removal could not run", {
                         description: typeof e === "string" ? e : undefined,
                       });

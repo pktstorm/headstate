@@ -90,8 +90,36 @@ pub enum KeyError {
     /// [`FallbackKeys`] answers it by using software keys instead.
     #[error("hardware-backed keys are not available on this device: {0}")]
     Unavailable(String),
+    /// The user dismissed the biometric prompt. Not a failure: they
+    /// declined, and the action they declined simply does not happen.
+    ///
+    /// Kept apart from [`Self::AuthFailed`] because the two want
+    /// opposite treatment. This one should be silent -- an error toast
+    /// for "you tapped Cancel" is noise about a decision the user just
+    /// made deliberately.
+    #[error("the confirmation prompt was cancelled")]
+    Cancelled,
+    /// The prompt ran and the platform refused: the wrong biometric too
+    /// many times, a lockout, or an invalidated key.
+    ///
+    /// The message is the native side's, and it matters: Android says
+    /// "the signing key was invalidated; re-pair this phone" for a
+    /// `KeyPermanentlyInvalidatedException`, which is a different
+    /// instruction from waiting out a lockout. Flattened into
+    /// [`Self::Crypto`] the text survived but the CLASS did not, so
+    /// nothing downstream could treat them differently.
+    #[error("the confirmation failed: {0}")]
+    AuthFailed(String),
     #[error("device keys: {0}")]
     Crypto(String),
+}
+
+impl KeyError {
+    /// Whether this is the user declining rather than anything going
+    /// wrong. Callers use it to stay quiet.
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, KeyError::Cancelled)
+    }
 }
 
 /// The step-up public keys, as raw bytes in the encodings above.
@@ -418,11 +446,27 @@ impl HardwareKeys {
 /// keeps its meaning so [`FallbackKeys`] can act on it; everything else
 /// (a cancelled or failed prompt, a malformed reply, a certificate or
 /// plugin fault) is reported with the plugin's own wording.
+/// Carry the plugin's classification across, rather than flattening it.
+///
+/// The native sides already do this work carefully -- Swift maps
+/// `LAError.userCancel/appCancel/systemCancel/userFallback` to
+/// `cancelled` and the rest of the LA domain to `authFailed`; Kotlin
+/// maps `KeyPermanentlyInvalidatedException` to `authFailed` with
+/// "re-pair this phone" -- and it all reached here intact, where a
+/// single `other =>` arm threw the variant away and kept only the
+/// string. So "you tapped Cancel", "wait out the lockout" and "re-pair
+/// this phone" arrived at the UI indistinguishable from each other.
+///
+/// `Malformed`, `Certificate` and `Plugin` stay [`KeyError::Crypto`]:
+/// they are plugin bugs rather than things a user can act on, and
+/// nothing downstream would treat them differently.
 fn plugin_error(e: tauri_plugin_headstate_keys::Error) -> KeyError {
     use tauri_plugin_headstate_keys::Error as E;
     match e {
         E::NotGenerated => KeyError::NoKeys,
         E::Unavailable(why) => KeyError::Unavailable(why),
+        E::Cancelled => KeyError::Cancelled,
+        E::AuthFailed(why) => KeyError::AuthFailed(why),
         other => KeyError::Crypto(other.to_string()),
     }
 }
@@ -551,14 +595,56 @@ mod tests {
             plugin_error(E::Unavailable("simulator".into())),
             KeyError::Unavailable("simulator".into())
         );
+        // These two used to collapse into `Crypto`, which kept the
+        // message and lost the class -- so "you tapped Cancel", "wait
+        // out the lockout" and "re-pair this phone" were one thing to
+        // every caller. The native sides classify them precisely and
+        // that now survives the crossing.
+        assert_eq!(plugin_error(E::Cancelled), KeyError::Cancelled);
         assert_eq!(
-            plugin_error(E::Cancelled),
-            KeyError::Crypto(E::Cancelled.to_string())
+            plugin_error(E::AuthFailed("the signing key was invalidated".into())),
+            KeyError::AuthFailed("the signing key was invalidated".into())
         );
+        // The rest stay `Crypto`: plugin bugs, not things a user acts
+        // on, and nothing downstream treats them differently.
         assert!(matches!(
-            plugin_error(E::AuthFailed("x".into())),
+            plugin_error(E::Malformed("bad base64".into())),
             KeyError::Crypto(_)
         ));
+    }
+
+    /// A cancel must NOT fall through to software keys.
+    ///
+    /// `FallbackKeys` exists so a device without a Secure Enclave can
+    /// still sign, and it falls back on `NoKeys` and `Unavailable`.
+    /// Adding the new variants to that arm would mean a user who
+    /// dismissed the biometric prompt got the action signed anyway, in
+    /// software -- silently defeating the confirmation the prompt is
+    /// there to obtain.
+    #[test]
+    fn a_cancelled_prompt_does_not_fall_back_to_software_keys() {
+        let store = Arc::new(MemoryStore::default());
+        let software = SoftwareKeys::new(store.clone());
+        software.generate().unwrap();
+        let keys = FallbackKeys::new(Fake::Refusing(KeyError::Cancelled), software);
+        assert_eq!(keys.sign(b"anything"), Err(KeyError::Cancelled));
+    }
+
+    /// Same for a failed confirmation: a lockout must not be quietly
+    /// signed around either.
+    #[test]
+    fn a_failed_confirmation_does_not_fall_back_to_software_keys() {
+        let store = Arc::new(MemoryStore::default());
+        let software = SoftwareKeys::new(store.clone());
+        software.generate().unwrap();
+        let keys = FallbackKeys::new(
+            Fake::Refusing(KeyError::AuthFailed("locked out".into())),
+            software,
+        );
+        assert_eq!(
+            keys.sign(b"anything"),
+            Err(KeyError::AuthFailed("locked out".into()))
+        );
     }
 
     /// A stand-in hardware backend: either absent on this device, or
@@ -567,6 +653,10 @@ mod tests {
     enum Fake {
         Absent,
         Working(SoftwareKeys),
+        /// Present and working, and refusing this particular call --
+        /// how a real device behaves when the user dismisses the
+        /// biometric prompt or the platform locks them out.
+        Refusing(KeyError),
     }
 
     impl Fake {
@@ -577,6 +667,7 @@ mod tests {
             match self {
                 Fake::Absent => Err(KeyError::Unavailable("no secure enclave".into())),
                 Fake::Working(k) => op(k),
+                Fake::Refusing(e) => Err(e.clone()),
             }
         }
     }
