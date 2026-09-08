@@ -28,6 +28,7 @@ vi.mock("./api/hooks", () => ({
   usePullRequests: () => ({ data: mockPrs(), isSuccess: true, isLoading: false }),
   usePollError: () => null,
   useRefreshRequested: () => undefined,
+  useRefreshFromGesture: () => () => Promise.resolve(),
   useTruncation: () => null,
   // No refused fields: the advisory banner stays hidden.
   useIncomplete: () => mockRefused(),

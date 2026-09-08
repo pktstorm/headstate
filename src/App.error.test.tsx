@@ -13,6 +13,7 @@ vi.mock("./api/hooks", async (orig) => {
     usePullRequests: () => mockQuery(),
     usePollError: () => null,
     useRefreshRequested: () => undefined,
+  useRefreshFromGesture: () => () => Promise.resolve(),
   useTruncation: () => null,
   useViewCadence: () => undefined,
   usePollState: () => "idle",

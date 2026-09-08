@@ -4,6 +4,7 @@ import { Menu } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import {
   usePullRequests,
+  useRefreshFromGesture,
   useRefreshRequested,
   useReviewing,
   useReviewingCount,
@@ -43,6 +44,8 @@ import { StatsPage } from "./components/StatsPage";
 import { ConnectionBanner } from "./components/ConnectionBanner";
 import { StaleRibbon } from "./components/StaleRibbon";
 import { IS_DESKTOP_BUILD, IS_MOBILE_BUILD } from "./lib/target";
+import { usePullToRefresh } from "./lib/usePullToRefresh";
+import { PullIndicator } from "./components/PullIndicator";
 import { Sheet, SheetContent, SheetTitle } from "./components/ui/sheet";
 import { applyFilters, hasActiveFilters, sortPrs } from "./lib/derive";
 import { shortcutFor } from "./lib/shortcuts";
@@ -90,6 +93,19 @@ export default function App() {
   // The main panel is the scroll container for every view, so the reset
   // hangs off it rather than off each page.
   const mainRef = useRef<HTMLElement>(null);
+  // Pull-to-refresh, mobile build only. The desktop has `r` and the
+  // tray's "Refresh now"; a phone has neither, and the poll loop that
+  // would otherwise correct a stale list runs on the DESKTOP. Guarded
+  // on the build rather than the viewport: a narrow desktop window
+  // still has the keyboard, and attaching touch handlers to its scroll
+  // container would be the same category error #598 fixed.
+  //
+  // `refreshNow()` directly, for the same reason `useRefreshRequested`
+  // does it: invalidating `["prs"]` re-reads the SQLite snapshot the
+  // poll loop just wrote, so the user would see the rows they were
+  // already looking at. Pull to refresh has to mean "ask GitHub now".
+  const refreshFromGesture = useRefreshFromGesture();
+  const pull = usePullToRefresh(mainRef, refreshFromGesture, IS_MOBILE_BUILD);
   // Every axis that changes WHAT is rendered, and nothing that merely
   // changes the data within it. A poll tick refreshing the same list
   // must not scroll the user away from what they are reading.
@@ -298,7 +314,11 @@ export default function App() {
       ) : (
         sidebar
       )}
-      <main ref={mainRef} className="flex-1 overflow-auto">
+      <main ref={mainRef} className="relative flex-1 overflow-auto">
+        {/* Absolutely positioned inside the scroll container, so it
+            needs the container to be a positioning context. Renders
+            nothing at rest. */}
+        <PullIndicator state={pull} />
         <header className="sticky top-0 z-20 flex items-center gap-2 border-b border-[#30363d] bg-[#0d1117] px-4 py-3">
           {isMobile ? (
             <button
