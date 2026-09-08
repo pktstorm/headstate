@@ -25,6 +25,7 @@ vi.mock("./api/hooks", () => ({
   usePullRequests: () => ({ data: PR_FIXTURES, isSuccess: true, isLoading: false }),
   usePollError: () => null,
   useRefreshRequested: () => undefined,
+  useRefreshFromGesture: () => () => Promise.resolve(),
   useTruncation: () => null,
   useIncomplete: () => 0,
   useReviewShortfall: () => 0,

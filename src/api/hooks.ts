@@ -4,7 +4,7 @@ import { useFilters } from "../store/filters";
 import { listen, type UnlistenFn } from "./transport";
 import { safeUnlisten } from "./unlisten";
 import { timeCall, timed } from "./diag";
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import type {
   Artifact,
   CleanupPrefs,
@@ -194,6 +194,47 @@ export function clearPollError(): void {
 /// It calls `refreshNow()` directly rather than invalidating the `["prs"]`
 /// query -- see the comment on the call itself for why. (This paragraph
 /// previously claimed the opposite of what the code does.)
+/// Ask GitHub now, and put the answer where the list reads it.
+///
+/// Shared by the tray's "Refresh now" (through `refresh-requested`) and
+/// by the phone's pull-to-refresh gesture, which have identical
+/// meaning and had better not drift: both are "the user asked for fresh
+/// data", as opposed to the poll loop's own cadence.
+///
+/// `refreshNow()` directly, NOT `invalidateQueries`. Invalidating would
+/// re-run `usePullRequests`'s queryFn, which reads the SQLite snapshot
+/// first and only falls back to the network when that snapshot is
+/// empty. The poll loop writes a snapshot every tick, so it never is --
+/// meaning an invalidate would re-read the same rows the user is
+/// already looking at. A manual refresh has to mean "ask GitHub now",
+/// or the user waits out the 60s/300s cadence believing they refreshed.
+///
+/// Rejections go into the poll-error store rather than being thrown:
+/// that is the channel the banner already watches, and a manual refresh
+/// that failed silently is how the tray menu item used to behave.
+async function refreshFromGitHub(qc: QueryClient): Promise<void> {
+  try {
+    const prs = await refreshNow();
+    qc.setQueryData(["prs"], prs);
+    // A successful manual refresh is proof the failure is over.
+    clearPollError();
+  } catch (err: unknown) {
+    setLastPollError(
+      typeof err === "string" ? err : err instanceof Error ? err.message : "Refresh failed",
+    );
+  }
+}
+
+/// A stable "refresh now" for the phone's pull-to-refresh gesture.
+///
+/// Stable because `usePullToRefresh` keys its effect on the callback:
+/// a new function each render would tear down and re-attach three
+/// touch listeners on every render of the whole app shell.
+export function useRefreshFromGesture(): () => Promise<void> {
+  const qc = useQueryClient();
+  return useCallback(() => refreshFromGitHub(qc), [qc]);
+}
+
 export function useRefreshRequested(): void {
   const qc = useQueryClient();
 
@@ -204,30 +245,12 @@ export function useRefreshRequested(): void {
     let cancelled = false;
 
     listen("refresh-requested", () => {
-      // `refreshNow()` directly, NOT `invalidateQueries`. Invalidating would
-      // re-run `usePullRequests`'s queryFn, which reads the SQLite snapshot
-      // first and only falls back to the network when that snapshot is
-      // empty. The poll loop writes a snapshot every tick, so it never is --
-      // meaning an invalidate would re-read the same rows the user is
-      // already looking at. "Refresh now" has to mean "ask GitHub now", or
-      // the user waits out the 60s/300s poll cadence while believing they
-      // just refreshed.
-      refreshNow().then(
-        (prs) => {
-          qc.setQueryData(["prs"], prs);
-          // A successful manual refresh is proof the failure is over.
-          clearPollError();
-        },
-        // Single-argument `.then` left this as an unhandled rejection in a
-        // console nobody watches: the tray menu closed and nothing changed.
-        // Routing it into the same store the poll loop uses means a failed
-        // tray refresh says so.
-        (err: unknown) => {
-          setLastPollError(
-            typeof err === "string" ? err : err instanceof Error ? err.message : "Refresh failed",
-          );
-        },
-      );
+      // The shared implementation: see `refreshFromGitHub` for why this
+      // is a direct call rather than an invalidate, and why a failure
+      // goes to the poll-error store. Extracted when the phone's
+      // pull-to-refresh gained the same meaning (#639); a second copy
+      // would have drifted.
+      void refreshFromGitHub(qc);
     }).then((fn) => {
       if (cancelled) safeUnlisten(fn);
       else unlisten = fn;
