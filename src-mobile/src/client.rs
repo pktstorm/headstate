@@ -722,37 +722,49 @@ impl Client {
         args: &Value,
         signature: Option<&str>,
     ) -> Result<Value, ClientError> {
-        let Some(sig) = signature else {
-            return self
-                .try_each(|base| async move {
-                    let resp = self
-                        .calls
-                        .post(format!("{base}/v1/call/{command}"))
-                        .json(args)
-                        .send()
-                        .await
-                        .map_err(classify)?;
-                    json_body(resp).await
-                })
-                .await;
+        // Which address is live, before the command itself. `/v1/hello`
+        // is a GET that changes nothing and answers in milliseconds, so
+        // racing IT is free and duplicates are harmless -- and it leaves
+        // `preferred`/`discovered` pointing at the winner.
+        //
+        // Then the command goes to that one address. Racing the command
+        // is wrong for two separate reasons:
+        //
+        // - A signed command carries a single-use nonce, so a duplicate
+        //   is refused as a replay after the first has already run
+        //   (#656).
+        // - A SLOW command is duplicated by the race itself. The stagger
+        //   is 250ms, so anything taking longer starts on every address:
+        //   `list_branches` takes ten seconds or more on a large
+        //   repository, and four concurrent scans then compete for the
+        //   desktop's CPU and make each other slower still (#657).
+        //
+        // The cost is one extra round trip to a LAN peer that answers a
+        // GET in single digits of milliseconds. `hello` is also what
+        // recovers a moved desktop, so the fallback behaviour the race
+        // provided is not lost -- `try_each` inside it still walks every
+        // address and rediscovers over mDNS.
+        // Only when the address is not already known. `remember()` and
+        // mDNS both set it, so a client that has answered once -- the
+        // common case, including every background refresh -- pays
+        // nothing extra here.
+        let base = match self.known_base() {
+            Some(base) => base,
+            None => {
+                self.hello().await?;
+                self.best_base()
+                    .ok_or_else(|| ClientError::Unreachable("no address answered".into()))?
+            }
         };
 
-        // Which address is live. `/v1/hello` is a GET that changes
-        // nothing, so racing it is free and duplicates are harmless --
-        // and it leaves `preferred`/`discovered` pointing at the winner.
-        self.hello().await?;
-        let base = self
-            .best_base()
-            .ok_or_else(|| ClientError::Unreachable("no address answered".into()))?;
-
-        let resp = self
+        let mut req = self
             .calls
             .post(format!("{base}/v1/call/{command}"))
-            .json(args)
-            .header(stepup::HEADER, sig)
-            .send()
-            .await
-            .map_err(classify)?;
+            .json(args);
+        if let Some(sig) = signature {
+            req = req.header(stepup::HEADER, sig);
+        }
+        let resp = req.send().await.map_err(classify)?;
         json_body(resp).await
     }
 
@@ -761,6 +773,24 @@ impl Client {
     /// bare address to the store, this is the URL a request goes to.
     fn best_base(&self) -> Option<String> {
         self.bases().into_iter().next()
+    }
+
+    /// The address something has already ANSWERED on, if there is one.
+    ///
+    /// Distinct from [`Client::best_base`], which returns the first
+    /// address to try whether or not it has ever worked. Only a proven
+    /// address lets a call skip the `hello` probe.
+    fn known_base(&self) -> Option<String> {
+        if let Some(base) = self
+            .discovered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            return Some(base);
+        }
+        let preferred = (*self.preferred.lock().unwrap_or_else(|e| e.into_inner()))?;
+        Some(Self::base_url(&self.addrs[preferred], self.port))
     }
 
     /// `GET /v1/events`: the response whose body is the event stream,
@@ -1327,6 +1357,39 @@ mod tests {
             client.hello().await,
             Err(ClientError::Unreachable(_))
         ));
+    }
+
+    /// An UNSIGNED call is not duplicated either, however slow it is.
+    ///
+    /// Distinct from the nonce problem (#656): a command that takes
+    /// longer than `ATTEMPT_STAGGER` used to be started on every
+    /// address, because the race widens whenever an attempt has not
+    /// settled. `list_branches` takes ten seconds or more on a large
+    /// repository, so four concurrent scans ran on the desktop and
+    /// competed for its CPU (#657).
+    #[tokio::test]
+    async fn a_slow_call_is_not_started_on_every_address() {
+        let id = identity();
+        let server = TestServer::start().await;
+        server.pair(&id.fingerprint());
+        server.reply("/v1/call/list_branches", Reply::json(200, json!([])));
+        let client = Client::new(
+            &id,
+            &server.fp,
+            vec![server.addr(), server.addr(), server.addr()],
+            server.port(),
+        )
+        .unwrap();
+        client
+            .call("list_branches", &json!({"repoPath": "/srv/r"}), None)
+            .await
+            .unwrap();
+        let calls = server
+            .requests()
+            .iter()
+            .filter(|r| r.path == "/v1/call/list_branches")
+            .count();
+        assert_eq!(calls, 1, "the command must reach the desktop once");
     }
 
     /// A signed call reaches the desktop ONCE, however many addresses
