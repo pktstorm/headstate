@@ -40,47 +40,43 @@
        without this string. Wording from docs/mobile-store-listings.md. -->
   <key>NSCameraUsageDescription</key>
   <string>Headstate Companion uses the camera to scan the pairing code shown on your desktop.</string>
-  <!-- Export compliance. Apple asks this of every upload; answering it
-       here means a build reaches testers without someone clearing it by
-       hand in App Store Connect, which is what stalled build 8.
+  <!-- Export compliance, answered here so an upload is not asked again.
 
-       `true` because Apple requires documentation for an app carrying
-       "standard encryption algorithms instead of, or in addition to,
-       using or accessing the encryption within Apple's operating
-       system", and that is exactly this app. It does not go through
-       Apple's networking or CryptoKit; it links its own:
+       `false` because App Store Connect's App Encryption Documentation
+       questionnaire was completed for this app and concluded that NO
+       documentation needs to be uploaded, on the condition that the app
+       is not available in France (see docs/mobile-release-process.md).
 
-         1. TLS 1.3 with mutual authentication to the paired desktop,
-            over rustls on aws-lc-rs rather than URLSession.
-         2. ECDSA P-256 and ML-DSA-65 (FIPS 204) signatures
-            authenticating commands (remote/stepup.rs), via p256 and
-            ml-dsa.
-         3. Stronghold, plus an AES-GCM key in the Keystore or Secure
-            Enclave, protecting the app's own secrets at rest.
+       `false` and `true` are not a judgement call here; they are a pair
+       with the code. Apple issues an ITSEncryptionExportComplianceCode
+       only for documentation it has REVIEWED, and it refuses any upload
+       that declares `true` without a matching code:
 
-       Builds 8 and 9 declared `false`, on the reading that authenticating
-       and protecting one's OWN data is an exempt supporting use. That
-       exemption is real in the EAR, but it decides whether the software
-       is CONTROLLED, a different question from whether Apple wants
-       documentation. Item 3 is also confidentiality, not
-       authentication. `true` is the defensible answer.
+         Invalid Export Compliance Code. The export compliance key value
+         [] in the app's Info.plist doesn't match the key value of the
+         app's export compliance documentation.
 
-       Every algorithm above is published and standard (IETF, NIST,
-       ISO), so this is NOT "non-standard cryptography": no CCATS is
-       needed, only the declaration in App Store Connect. Apple issues a
-       code once that is on file, which
-       ITSEncryptionExportComplianceCode carries that code, and the
-       release workflow INSERTS that key only when it has one to put
-       there. The key is deliberately absent here: Apple validates it
-       whenever it is present, and an empty string is not "no code" but a
-       wrong one, which altool rejects with `Invalid Export Compliance
-       Code. The export compliance key value []` (build 10).
+       Builds 10, 11 and 12 all hit that, with the code key empty, then
+       absent, then absent with the questionnaire answered. The constant
+       was `true`. With no documentation on file there is no code, so
+       `true` cannot be satisfied and `false` is the only answer that
+       matches what App Store Connect actually holds.
 
-       Separately and not satisfied by anything in this repository: US
+       What the app does with cryptography has not changed: TLS 1.3 to
+       the paired desktop over rustls, ECDSA P-256 and ML-DSA-65
+       signatures authenticating commands, and Stronghold plus an
+       AES-GCM key protecting the app's own secrets at rest. The
+       questionnaire was answered against exactly that, and its verdict
+       is what this key now reports.
+
+       Revisit if the app gains a user-facing encryption feature or
+       carries third-party data: re-run the questionnaire, and if it then
+       requires documentation, `true` plus the code it issues.
+
+       Separately, and not satisfied by anything in this repository: US
        exporters of 5D002 software owe BIS an annual self-classification
-       report, due 1 February for the preceding calendar year. See
-       docs/mobile-release-process.md. -->
+       report, due 1 February for the preceding calendar year. -->
   <key>ITSAppUsesNonExemptEncryption</key>
-  <true/>
+  <false/>
 </dict>
 </plist>

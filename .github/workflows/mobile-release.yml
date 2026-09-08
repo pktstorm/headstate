@@ -428,35 +428,38 @@ jobs:
             # The export-compliance answer must reach the BUILT app, not
             # just the source Info.ios.plist. Checked against the IPA
             # because that is the artifact Apple reads: a plist key that
-            # failed to merge, or a $(...) reference that expanded to
-            # nothing, both look fine in the repository.
+            # failed to merge looks fine in the repository.
+            #
+            # `false` and the ABSENCE of a code are one answer, not two.
+            # Apple issues an ITSEncryptionExportComplianceCode only for
+            # documentation it has reviewed, and this app's questionnaire
+            # concluded none is needed -- so no code exists, and a `true`
+            # declaration cannot be satisfied. Builds 10, 11 and 12 were
+            # all rejected with `Invalid Export Compliance Code ... key
+            # value []` while declaring `true`, with the code key empty,
+            # then absent, then absent again. Either half alone is a
+            # rejected upload, so both are checked here.
             unzip -p "release-assets/$NAME" 'Payload/*.app/Info.plist' > "$RUNNER_TEMP/built.plist"
             COMPLIANCE=$(plutil -extract ITSAppUsesNonExemptEncryption raw -o - "$RUNNER_TEMP/built.plist" 2>/dev/null || echo MISSING)
-            if [ "$COMPLIANCE" != "true" ]; then
-              echo "The built app declares ITSAppUsesNonExemptEncryption=$COMPLIANCE, expected true." >&2
-              echo "This app links its own standard crypto, so Apple requires the declaration; see src-mobile/Info.ios.plist." >&2
-              exit 1
-            fi
-            # The code key must be ABSENT or exactly right, never
-            # present and wrong: Apple validates it whenever it is there,
-            # and both an empty value (build 10) and a stale one are
-            # rejected at upload. Absent is the normal case for an app
-            # whose questionnaire needed no documentation.
             BUILT_CODE=$(plutil -extract ITSEncryptionExportComplianceCode raw -o - "$RUNNER_TEMP/built.plist" 2>/dev/null || echo ABSENT)
             if [ -n "$APPLE_EXPORT_COMPLIANCE_CODE" ]; then
-              if [ "$BUILT_CODE" != "$APPLE_EXPORT_COMPLIANCE_CODE" ]; then
-                echo "The built app carries export compliance code '$BUILT_CODE', not the one in the secret." >&2
-                echo "The infoPlist merge in the build step did not take effect." >&2
+              # A code exists only if documentation was later uploaded and
+              # approved. Then, and only then, `true` is correct.
+              if [ "$COMPLIANCE" != "true" ] || [ "$BUILT_CODE" != "$APPLE_EXPORT_COMPLIANCE_CODE" ]; then
+                echo "APPLE_EXPORT_COMPLIANCE_CODE is set, so the app must declare true with that code." >&2
+                echo "It declares $COMPLIANCE with code '$BUILT_CODE'; see src-mobile/Info.ios.plist." >&2
                 exit 1
               fi
-              echo "Export compliance declared (non-exempt) with a matching code."
+              echo "Export compliance: non-exempt, with a matching code."
             else
-              if [ "$BUILT_CODE" != "ABSENT" ]; then
-                echo "No APPLE_EXPORT_COMPLIANCE_CODE is set, but the app carries '$BUILT_CODE'." >&2
-                echo "An empty or stale code is rejected at upload; the key must be absent instead." >&2
+              if [ "$COMPLIANCE" != "false" ] || [ "$BUILT_CODE" != "ABSENT" ]; then
+                echo "With no compliance code, the app must declare ITSAppUsesNonExemptEncryption=false and carry no code key." >&2
+                echo "It declares $COMPLIANCE with code '$BUILT_CODE'. Apple rejects any other combination:" >&2
+                echo "  Invalid Export Compliance Code ... key value []" >&2
+                echo "See the Export compliance section of docs/mobile-release-process.md." >&2
                 exit 1
               fi
-              echo "Export compliance declared (non-exempt); no code, cleared by the answers in App Store Connect."
+              echo "Export compliance: exempt per the App Store Connect questionnaire, no code needed."
             fi
           fi
           (cd release-assets && shasum -a 256 "$NAME" | tee "$NAME.sha256")
