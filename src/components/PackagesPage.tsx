@@ -10,6 +10,7 @@ import type {
 } from "@/types/pr";
 import { usePackages } from "@/api/hooks";
 import { packagesMarkdown } from "@/api/tauri";
+import { IS_MOBILE_BUILD } from "@/lib/target";
 import { copyText } from "@/lib/clipboard";
 import { useActiveFilters } from "@/store/filters";
 import { HelpButton } from "./HelpButton";
@@ -231,14 +232,26 @@ export function PackagesPage() {
               Distinct from Claudify, which delegates the work to an
               agent; this does it in a worktree and shows what actually
               landed. */}
-          <button
-            type="button"
-            disabled={total === 0}
-            onClick={() => setWizardOpen(true)}
-            className="rounded border border-[#238636]/40 px-2 py-1 text-xs text-[#3fb950] hover:bg-[#238636]/10 disabled:opacity-50"
-          >
-            Update in worktree
-          </button>
+          {/* Desktop only, for now. `apply_updates_in_background` is
+              still `Class::Local`, so on the phone this rejected AFTER
+              the wizard had closed and an optimistic "Updating 47
+              packages…" toast had already fired -- the worst order to
+              fail in. Reclassifying it needs cancellation and a
+              concurrency guard first (#626): the run spawns a
+              long-lived task, and a phone that can start one it cannot
+              stop or see the end of is not an improvement.
+              The READ side stays: seeing what is behind is genuinely
+              useful on a phone. */}
+          {IS_MOBILE_BUILD ? null : (
+            <button
+              type="button"
+              disabled={total === 0}
+              onClick={() => setWizardOpen(true)}
+              className="rounded border border-[#238636]/40 px-2 py-1 text-xs text-[#3fb950] hover:bg-[#238636]/10 disabled:opacity-50"
+            >
+              Update in worktree
+            </button>
+          )}
 
           <button
             type="button"

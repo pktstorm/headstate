@@ -1563,6 +1563,45 @@ export function useRemovalProgress(): { done: number; total: number } | null {
   return progress;
 }
 
+/// How far a background package-update run has got, or null when none
+/// is running.
+///
+/// The same shape as `useRemovalProgress`, and for the same reason: a
+/// run is one package-manager invocation per package, so a selection of
+/// 122 sits for minutes. `apply_updates_in_background` returns
+/// immediately, and until #626 the ONLY event it ever emitted was the
+/// terminal one -- so the wizard closed and nothing said anything until
+/// the whole run finished.
+///
+/// It matters most on the phone. A desktop user can leave the window
+/// open; a phone that has been backgrounded holds no event stream at
+/// all (`src-mobile/src/background.rs` is explicit that a suspended app
+/// gets no `/v1/events`), so what it can show is what arrives while it
+/// is in the foreground.
+export function useUpdateProgress(): { done: number; total: number } | null {
+  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
+
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    listen<[number, number]>("update-run-progress", (e) => {
+      const [done, total] = e.payload;
+      // Cleared on the last one rather than leaving "47 of 47" up after
+      // the work is over; `update-run-done` carries the outcome.
+      setProgress(done >= total ? null : { done, total });
+    }).then((fn) => {
+      if (cancelled) safeUnlisten(fn);
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      safeUnlisten(unlisten);
+    };
+  }, []);
+
+  return progress;
+}
+
 /// What one worktree is holding, fetched on demand.
 ///
 /// `enabled` so it costs nothing until a row is actually opened:

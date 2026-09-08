@@ -56,6 +56,7 @@ pub const EVENT_NAMES: &[&str] = &[
     "store-error",
     "worktree-removal-progress",
     "reviewing-short",
+    "update-run-progress",
     "update-run-done",
 ];
 

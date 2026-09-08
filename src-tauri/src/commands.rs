@@ -2266,8 +2266,15 @@ pub async fn delete_remote_branches(
 /// selected it sat there for minutes with the app unusable (#495).
 ///
 /// Progress and completion arrive as events, the same shape the
-/// worktree removal uses. The work runs to completion regardless of
-/// what is on screen, so navigating away does not cancel it.
+/// worktree removal uses: `update-run-progress` with (done, total)
+/// after each package, then `update-run-done`. The work runs to
+/// completion regardless of what is on screen, so navigating away does
+/// not cancel it.
+///
+/// The progress half was missing until #626 -- this comment described
+/// it, `run_on_branch` took no callback, and only the terminal event
+/// ever fired. A phone feels that hardest: it has no window to leave
+/// open and watch.
 #[tauri::command]
 pub async fn apply_updates_in_background(
     app: AppHandle,
@@ -2289,11 +2296,17 @@ pub async fn apply_updates_in_background(
     tauri::async_runtime::spawn(async move {
         let repo = repo_path.clone();
         let reqs = requests.clone();
+        let progress_app = app.clone();
         let applied = tauri::async_runtime::spawn_blocking(move || {
-            crate::packages::apply::run_on_branch(
+            crate::packages::apply::run_on_branch_with_progress(
                 std::path::Path::new(&repo),
                 &reqs,
                 branch.as_deref(),
+                |done, total| {
+                    // Counts only -- never package names. Same rule as
+                    // the worktree removal's progress beside it.
+                    let _ = progress_app.emit("update-run-progress", (done, total));
+                },
             )
         })
         .await;

@@ -714,6 +714,29 @@ pub fn run(repo: &Path, requests: &[UpdateRequest]) -> Result<RunReport, String>
     run_on_branch(repo, requests, None)
 }
 
+/// `run_on_branch`, reporting progress as each package settles.
+///
+/// A run is one package-manager invocation per package, so a selection
+/// of 122 sits for minutes. `apply_updates_in_background` returns
+/// immediately and its doc claimed "progress and completion arrive as
+/// events, the same shape the worktree removal uses" -- but only
+/// completion ever did: `run_on_branch` took no callback, so there was
+/// nothing to emit from. This is that shape, matching
+/// `remove_worktrees_with_progress`.
+///
+/// `on_progress` is called with (done, total) AFTER each package, so
+/// `done` counts finished work rather than started work. Counts only,
+/// never names: a progress event is not a place to leak what someone is
+/// working on.
+pub fn run_on_branch_with_progress(
+    repo: &Path,
+    requests: &[UpdateRequest],
+    branch_override: Option<&str>,
+    on_progress: impl Fn(usize, usize) + Sync,
+) -> Result<RunReport, String> {
+    run_inner(repo, requests, branch_override, &on_progress)
+}
+
 /// `run`, with the branch name optionally chosen by the caller.
 ///
 /// #409 asked for the generated name to be overridable. `None` keeps
@@ -722,6 +745,18 @@ pub fn run_on_branch(
     repo: &Path,
     requests: &[UpdateRequest],
     branch_override: Option<&str>,
+) -> Result<RunReport, String> {
+    run_inner(repo, requests, branch_override, &|_, _| {})
+}
+
+/// The run itself. `on_progress` is a reference so the two public
+/// entry points share one body rather than one being a copy that
+/// drifts.
+fn run_inner(
+    repo: &Path,
+    requests: &[UpdateRequest],
+    branch_override: Option<&str>,
+    on_progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Result<RunReport, String> {
     if requests.is_empty() {
         return Err("nothing to update".into());
@@ -754,16 +789,24 @@ pub fn run_on_branch(
 
     create_worktree(repo, &branch, &dir)?;
 
+    let total = requests.len();
     let results = requests
         .iter()
-        .map(|r| {
-            match r
+        .enumerate()
+        .map(|(i, r)| {
+            let outcome = match r
                 .dir(&dir)
                 .and_then(|p| apply_one_in(&dir, &p, r.ecosystem, &r.name, &r.version))
             {
                 Ok(a) => UpdateOutcome::from_applied(a),
                 Err(e) => UpdateOutcome::failed(r, e),
-            }
+            };
+            // After the package, not before: `done` is finished work.
+            // A failure still counts as done -- the run does not stop
+            // at the first one, and a progress bar that stalled on a
+            // refused package would misreport a run still going.
+            on_progress(i + 1, total);
+            outcome
         })
         .collect();
 
@@ -1354,6 +1397,64 @@ mod tests {
     fn run_refuses_an_empty_request() {
         let tmp = repo();
         assert!(run(tmp.path(), &[]).is_err());
+    }
+
+    /// Progress is reported per package, counting FINISHED work.
+    ///
+    /// `apply_updates_in_background`'s doc claimed "progress and
+    /// completion arrive as events" long before either could:
+    /// `run_on_branch` took no callback, so only the terminal event
+    /// ever fired and a run of 122 packages said nothing for minutes.
+    ///
+    /// The packages here are made to fail -- there is no real registry
+    /// in a test repo -- which is the point: a run does not stop at the
+    /// first failure, so a failed package still counts as done. A
+    /// progress bar that stalled on a refused package would misreport a
+    /// run that is still going.
+    #[test]
+    fn progress_counts_every_package_including_the_ones_that_fail() {
+        let tmp = repo();
+        let reqs: Vec<UpdateRequest> = ["lodash", "express", "chalk"]
+            .iter()
+            .map(|n| UpdateRequest {
+                name: (*n).into(),
+                version: "2.0.0".into(),
+                ecosystem: Ecosystem::Npm,
+                project: String::new(),
+            })
+            .collect();
+
+        let seen = std::sync::Mutex::new(Vec::new());
+        let report = run_on_branch_with_progress(tmp.path(), &reqs, None, |done, total| {
+            seen.lock().unwrap().push((done, total));
+        });
+        // The run itself may fail for want of a registry; what is being
+        // asserted is the callback, which fires either way.
+        let _ = report;
+
+        let seen = seen.into_inner().unwrap();
+        assert_eq!(
+            seen,
+            vec![(1, 3), (2, 3), (3, 3)],
+            "progress should count each package once, finishing at the total"
+        );
+    }
+
+    /// The plain entry point still works, and reports nothing.
+    ///
+    /// `run` and `run_on_branch` share one body with the progress
+    /// version, so this pins that the no-callback path is still there
+    /// for every existing caller.
+    #[test]
+    fn run_on_branch_needs_no_callback() {
+        let tmp = repo();
+        let reqs = [UpdateRequest {
+            name: "lodash".into(),
+            version: "2.0.0".into(),
+            ecosystem: Ecosystem::Npm,
+            project: String::new(),
+        }];
+        let _ = run_on_branch(tmp.path(), &reqs, None);
     }
 
     /// A refusal must not leave a worktree behind.

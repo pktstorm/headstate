@@ -5,7 +5,13 @@ import { UpdateDialog } from "./UpdateDialog";
 import { useUiPrefs } from "../api/hooks";
 import { Settings } from "lucide-react";
 import { useEffect, useState } from "react";
-import { usePollError, usePollInterval, usePollState, useRemovalProgress } from "../api/hooks";
+import {
+  usePollError,
+  usePollInterval,
+  usePollState,
+  useRemovalProgress,
+  useUpdateProgress,
+} from "../api/hooks";
 import { relativeTime } from "../lib/time";
 import { useIsMobile } from "../lib/useIsMobile";
 import { IS_MOBILE_BUILD } from "../lib/target";
@@ -93,6 +99,7 @@ export function StatusBar({ updatedAt }: { updatedAt: number }) {
   // Subscribed here, not only on the Worktrees page, so the count
   // survives navigating away from it.
   const removal = useRemovalProgress();
+  const updating = useUpdateProgress();
   // Which version's announcement has been dismissed. localStorage, not
   // the settings table: it is a transient acknowledgement of one
   // release, not a preference, and it is meaningless on another machine.
@@ -203,8 +210,18 @@ export function StatusBar({ updatedAt }: { updatedAt: number }) {
           the one that matters most, since it is the one saying work
           started. `polite` because a removal count must not interrupt
           whatever the user is reading. */}
+      {/* A background update run is the same case, and more so: it
+          returns immediately by design (#495), so the wizard that
+          started it is already closed. It said nothing at all until the
+          run finished -- minutes, on a large selection. Sharing one
+          live region because the two cannot overlap in practice and
+          two adjacent counters would be worse than one. */}
       <span aria-live="polite" className="text-[#58a6ff]">
-        {removal ? `Removing worktrees — ${removal.done} of ${removal.total}` : ""}
+        {removal
+          ? `Removing worktrees — ${removal.done} of ${removal.total}`
+          : updating
+            ? `Updating packages — ${updating.done} of ${updating.total}`
+            : ""}
       </span>
 
       {isMobile ? (
