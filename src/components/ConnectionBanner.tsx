@@ -28,10 +28,13 @@ function describeState(state: Exclude<ConnectionState, { kind: "local" }>): {
 } {
   switch (state.kind) {
     case "connected":
+      // The desktop is reachable, so its own poll timestamp is the less
+      // interesting half: what the reader wants to know is whether the
+      // DATA is current, and that is GitHub's freshness. Both were shown,
+      // in two strips, saying almost the same thing (#649); this keeps
+      // the useful one and the caller supplies it.
       return {
-        text: `${state.desktop} · reachable · last poll ${
-          state.lastPoll ? relativeTime(state.lastPoll) : "not yet"
-        }`,
+        text: `${state.desktop} · reachable`,
         dot: "bg-[#3fb950]",
       };
     case "connecting":
@@ -62,7 +65,7 @@ function describeState(state: Exclude<ConnectionState, { kind: "local" }>): {
 /// Renders nothing on the desktop, where the app IS the desktop and
 /// there is no connection to describe. Tapping opens Settings on the
 /// Phone topic, which is where pairing lives.
-export function ConnectionBanner() {
+export function ConnectionBanner({ updatedAt = 0 }: { updatedAt?: number } = {}) {
   const isMobile = useIsMobile();
   const state = useConnectionState();
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -91,6 +94,14 @@ export function ConnectionBanner() {
     );
   }
   const { text, dot } = describeState(state);
+  // Appended rather than folded into `describeState`, which every state
+  // shares: GitHub freshness is only meaningful while the desktop is
+  // reachable. When it is not, the desktop is the problem and a stale
+  // GitHub timestamp is noise on top of it.
+  const line =
+    state.kind === "connected" && updatedAt > 0
+      ? `${text} · updated ${relativeTime(new Date(updatedAt).toISOString())}`
+      : text;
   return (
     <>
       <button
@@ -100,7 +111,7 @@ export function ConnectionBanner() {
         className={BANNER_CLASS}
       >
         <span className={`h-2 w-2 shrink-0 rounded-full ${dot}`} aria-hidden="true" />
-        <span className="min-w-0 flex-1 truncate">{text}</span>
+        <span className="min-w-0 flex-1 truncate">{line}</span>
         <span className="shrink-0 text-[#8b949e]">Pairing</span>
       </button>
       {/* Mounted only while open: Settings reads half a dozen

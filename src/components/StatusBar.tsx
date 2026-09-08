@@ -192,18 +192,31 @@ export function StatusBar({ updatedAt }: { updatedAt: number }) {
       />
     ) : null}
     <div className="pb-safe flex shrink-0 items-center gap-3 border-t border-[#30363d] bg-[#0d1117] px-4 py-1.5 text-xs text-[#8b949e]">
-      <span className="flex items-center gap-1.5">
-        <span className={`h-1.5 w-1.5 rounded-full ${DOT[status]}`} aria-hidden="true" />
-        <span className={status === "failed" ? "text-[#f85149]" : undefined}>
-          {TEXT[status]}
-        </span>
-      </span>
+      {/* Hidden on the phone, where `ConnectionBanner` carries the same
+          two facts at the top of the screen (#649). Two strips saying
+          "last polled X ago" cost a phone more list than they inform,
+          and the banner is the one that can also say the desktop is
+          unreachable -- which makes GitHub freshness moot.
 
-      {/* `dataUpdatedAt`, not `isFetching`: the tray path advances the
-          former on both routes but never flips the latter. */}
-      {updatedAt > 0 ? (
-        <span>Updated {relativeTime(new Date(updatedAt).toISOString())}</span>
-      ) : null}
+          Only this pair moves. The progress counter, its cancel button,
+          the version and the settings entry point below have no second
+          home and stay on both. */}
+      {isMobile ? null : (
+        <>
+          <span className="flex items-center gap-1.5">
+            <span className={`h-1.5 w-1.5 rounded-full ${DOT[status]}`} aria-hidden="true" />
+            <span className={status === "failed" ? "text-[#f85149]" : undefined}>
+              {TEXT[status]}
+            </span>
+          </span>
+
+          {/* `dataUpdatedAt`, not `isFetching`: the tray path advances the
+              former on both routes but never flips the latter. */}
+          {updatedAt > 0 ? (
+            <span>Updated {relativeTime(new Date(updatedAt).toISOString())}</span>
+          ) : null}
+        </>
+      )}
 
       {/* Bulk worktree removal reported progress only on the Worktrees
           page's own button -- but the work runs on the backend and
