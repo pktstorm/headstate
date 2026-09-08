@@ -33,7 +33,9 @@ vi.mock("./api/hooks", () => ({
   usePollState: () => "idle",
   useRemovalProgress: () => null,
   useUpdateProgress: () => null,
+  useCancelUpdateRun: () => () => Promise.resolve(),
   useUpdateRunOutcome: () => undefined,
+  useUpdateRunResume: () => undefined,
   usePollInterval: () => ({ seconds: 120, set: () => Promise.resolve(120) }),
   useWorktreeDirs: () => ({ dirs: [], set: () => Promise.resolve([]) }),
   useNotifyPrefs: () => ({

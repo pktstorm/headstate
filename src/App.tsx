@@ -14,6 +14,7 @@ import {
   useReviewShortfall,
   usePollError,
   useUpdateRunOutcome,
+  useUpdateRunResume,
 } from "./api/hooks";
 import { useReviewingDiag } from "./api/diag";
 import { useScrollReset } from "./lib/scrollReset";
@@ -125,6 +126,10 @@ export default function App() {
   // that started it, and the user is expected to be elsewhere by the
   // time it finishes (#495).
   useUpdateRunOutcome();
+  // And the catch-up for a run whose outcome arrived while the app
+  // was not listening -- which on a phone is any run it slept
+  // through, since a suspended app holds no event stream.
+  useUpdateRunResume(filters.repo);
   const pollError = usePollError();
   // The LIST only where it is rendered. The badge below uses a count
   // query instead, so Docker and Worktrees no longer fetch 100 pull

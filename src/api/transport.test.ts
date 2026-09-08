@@ -185,6 +185,8 @@ const ROWS: Row[] = [
   row(api.deleteBranches, [repoPath, names], "delete_branches", { repoPath, names }),
   row(api.deleteRemoteBranches, [repoPath, names], "delete_remote_branches", { repoPath, names }),
   row(api.applyUpdatesInBackground, [repoPath, requests, branch], "apply_updates_in_background", { repoPath, requests, branch }),
+  row(api.cancelUpdateRun, [repoPath], "cancel_update_run", { repoPath }),
+  row(api.updateRunState, [repoPath], "update_run_state", { repoPath }),
   row(api.issuePairingToken, [], "issue_pairing_token"),
   // `replaceExisting` is sent as null when omitted, so the key is always
   // present; this row pins the explicit-value shape.

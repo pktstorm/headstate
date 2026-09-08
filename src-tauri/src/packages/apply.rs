@@ -734,7 +734,29 @@ pub fn run_on_branch_with_progress(
     branch_override: Option<&str>,
     on_progress: impl Fn(usize, usize) + Sync,
 ) -> Result<RunReport, String> {
-    run_inner(repo, requests, branch_override, &on_progress)
+    run_inner(repo, requests, branch_override, &on_progress, &|| false)
+}
+
+/// `run_on_branch_with_progress`, stoppable.
+///
+/// `should_stop` is consulted BETWEEN packages, never during one. A
+/// package manager killed halfway through leaves the worktree in a
+/// state nobody asked for -- a half-written `node_modules`, a lockfile
+/// that matches neither the old nor the new manifest -- so the current
+/// package always finishes. Cancellation is "stop after this one",
+/// which is both safer and the only kind this can honestly offer.
+///
+/// The report still comes back, holding whatever was applied before the
+/// stop. A cancelled run is not a failed one: the packages that landed
+/// really did land, and the worktree they landed in still exists.
+pub fn run_on_branch_cancellable(
+    repo: &Path,
+    requests: &[UpdateRequest],
+    branch_override: Option<&str>,
+    on_progress: impl Fn(usize, usize) + Sync,
+    should_stop: impl Fn() -> bool + Sync,
+) -> Result<RunReport, String> {
+    run_inner(repo, requests, branch_override, &on_progress, &should_stop)
 }
 
 /// `run`, with the branch name optionally chosen by the caller.
@@ -746,7 +768,7 @@ pub fn run_on_branch(
     requests: &[UpdateRequest],
     branch_override: Option<&str>,
 ) -> Result<RunReport, String> {
-    run_inner(repo, requests, branch_override, &|_, _| {})
+    run_inner(repo, requests, branch_override, &|_, _| {}, &|| false)
 }
 
 /// The run itself. `on_progress` is a reference so the two public
@@ -757,6 +779,7 @@ fn run_inner(
     requests: &[UpdateRequest],
     branch_override: Option<&str>,
     on_progress: &(dyn Fn(usize, usize) + Sync),
+    should_stop: &(dyn Fn() -> bool + Sync),
 ) -> Result<RunReport, String> {
     if requests.is_empty() {
         return Err("nothing to update".into());
@@ -790,25 +813,35 @@ fn run_inner(
     create_worktree(repo, &branch, &dir)?;
 
     let total = requests.len();
-    let results = requests
-        .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            let outcome = match r
-                .dir(&dir)
-                .and_then(|p| apply_one_in(&dir, &p, r.ecosystem, &r.name, &r.version))
-            {
-                Ok(a) => UpdateOutcome::from_applied(a),
-                Err(e) => UpdateOutcome::failed(r, e),
-            };
-            // After the package, not before: `done` is finished work.
-            // A failure still counts as done -- the run does not stop
-            // at the first one, and a progress bar that stalled on a
-            // refused package would misreport a run still going.
-            on_progress(i + 1, total);
-            outcome
-        })
-        .collect();
+    // A plain loop rather than `map().collect()`: this one can stop
+    // early, and an iterator chain cannot.
+    let mut results = Vec::with_capacity(total);
+    for (i, r) in requests.iter().enumerate() {
+        // Checked BEFORE the package, so a cancel takes effect at the
+        // next boundary rather than mid-install. See
+        // `run_on_branch_cancellable` for why halfway is not offered.
+        if should_stop() {
+            log::info!(
+                "update run: stopped after {} of {} packages",
+                results.len(),
+                total
+            );
+            break;
+        }
+        let outcome = match r
+            .dir(&dir)
+            .and_then(|p| apply_one_in(&dir, &p, r.ecosystem, &r.name, &r.version))
+        {
+            Ok(a) => UpdateOutcome::from_applied(a),
+            Err(e) => UpdateOutcome::failed(r, e),
+        };
+        results.push(outcome);
+        // After the package, not before: `done` is finished work.
+        // A failure still counts as done -- the run does not stop
+        // at the first one, and a progress bar that stalled on a
+        // refused package would misreport a run still going.
+        on_progress(i + 1, total);
+    }
 
     let mut ecosystems: Vec<Ecosystem> = requests.iter().map(|r| r.ecosystem).collect();
     ecosystems.sort_by_key(|e| format!("{e:?}"));
@@ -1438,6 +1471,73 @@ mod tests {
             vec![(1, 3), (2, 3), (3, 3)],
             "progress should count each package once, finishing at the total"
         );
+    }
+
+    /// A cancelled run stops at a package boundary and still reports
+    /// what it managed to apply.
+    ///
+    /// The stop is checked BEFORE each package, never during one: a
+    /// package manager killed halfway leaves a worktree in a state
+    /// nobody asked for. So "cancel" means "stop after this one", and
+    /// the packages that already landed stay landed.
+    #[test]
+    fn a_cancelled_run_stops_at_the_next_package_boundary() {
+        let tmp = repo();
+        let reqs: Vec<UpdateRequest> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|n| UpdateRequest {
+                name: (*n).into(),
+                version: "2.0.0".into(),
+                ecosystem: Ecosystem::Npm,
+                project: String::new(),
+            })
+            .collect();
+
+        let seen = std::sync::Mutex::new(Vec::new());
+        // Stop once two have gone through.
+        let stop_after_two = || seen.lock().unwrap().len() >= 2;
+        let report = run_on_branch_cancellable(
+            tmp.path(),
+            &reqs,
+            None,
+            |done, total| seen.lock().unwrap().push((done, total)),
+            stop_after_two,
+        );
+
+        assert_eq!(
+            seen.into_inner().unwrap(),
+            vec![(1, 4), (2, 4)],
+            "the run should stop after the second package, not mid-package"
+        );
+        // And the report still describes what was applied, rather than
+        // being an error: a cancelled run is not a failed one.
+        if let Ok(r) = report {
+            assert_eq!(r.results.len(), 2);
+        }
+    }
+
+    /// Never stopping is the ordinary case, and must not change.
+    #[test]
+    fn a_run_that_is_never_cancelled_does_every_package() {
+        let tmp = repo();
+        let reqs: Vec<UpdateRequest> = ["a", "b", "c"]
+            .iter()
+            .map(|n| UpdateRequest {
+                name: (*n).into(),
+                version: "2.0.0".into(),
+                ecosystem: Ecosystem::Npm,
+                project: String::new(),
+            })
+            .collect();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let _ = run_on_branch_cancellable(
+            tmp.path(),
+            &reqs,
+            None,
+            |done, total| seen.lock().unwrap().push((done, total)),
+            || false,
+        );
+        assert_eq!(seen.into_inner().unwrap(), vec![(1, 3), (2, 3), (3, 3)]);
     }
 
     /// The plain entry point still works, and reports nothing.

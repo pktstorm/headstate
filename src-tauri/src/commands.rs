@@ -2290,6 +2290,14 @@ pub async fn apply_updates_in_background(
     if let Some(b) = branch.as_deref() {
         crate::packages::apply::valid_branch_name(b)?;
     }
+    // Claimed BEFORE anything is spawned, and the claim is what refuses
+    // a second run: two package managers in one worktree is not a thing
+    // to discover afterwards. It also returns the flag the run reads to
+    // stop, so the registry owns both halves.
+    let stop = app
+        .state::<crate::packages::runs::UpdateRuns>()
+        .start(&repo_path, requests.len())?;
+
     // Cloned OUT of `State` before spawning: the guard borrows the
     // app handle and cannot outlive this function, but the task must.
     let gh = GhClient(client.0.clone());
@@ -2297,8 +2305,10 @@ pub async fn apply_updates_in_background(
         let repo = repo_path.clone();
         let reqs = requests.clone();
         let progress_app = app.clone();
+        let progress_repo = repo_path.clone();
+        let stop_flag = stop.clone();
         let applied = tauri::async_runtime::spawn_blocking(move || {
-            crate::packages::apply::run_on_branch_with_progress(
+            crate::packages::apply::run_on_branch_cancellable(
                 std::path::Path::new(&repo),
                 &reqs,
                 branch.as_deref(),
@@ -2306,10 +2316,17 @@ pub async fn apply_updates_in_background(
                     // Counts only -- never package names. Same rule as
                     // the worktree removal's progress beside it.
                     let _ = progress_app.emit("update-run-progress", (done, total));
+                    // And into the registry, so a client that was
+                    // asleep for the whole run can still ask.
+                    progress_app
+                        .state::<crate::packages::runs::UpdateRuns>()
+                        .progress(&progress_repo, done, total);
                 },
+                move || stop_flag.load(std::sync::atomic::Ordering::SeqCst),
             )
         })
         .await;
+        let was_cancelled = stop.load(std::sync::atomic::Ordering::SeqCst);
 
         let report = match applied {
             Ok(Ok(r)) => r,
@@ -2322,6 +2339,17 @@ pub async fn apply_updates_in_background(
                 return;
             }
         };
+
+        // Stopped by the user. Not a failure: the packages that landed
+        // before the stop really did land, and the worktree holding
+        // them still exists -- so this reports what happened rather
+        // than opening a pull request nobody asked to finish.
+        if was_cancelled {
+            let mut done = UpdateRunDone::worktree_only(&repo_path, &report, "cancelled");
+            done.cancelled = true;
+            finish(&app, done);
+            return;
+        }
 
         // Every package failed: there is nothing to open a pull request
         // about, and saying one is coming would be a lie.
@@ -2343,6 +2371,41 @@ pub async fn apply_updates_in_background(
     Ok(())
 }
 
+/// Ask a background update run to stop.
+///
+/// It stops after the package it is on, never during one: a package
+/// manager killed halfway leaves a worktree in a state nobody asked
+/// for. So this returns immediately and the run ends a moment later,
+/// reporting what it managed to apply.
+///
+/// Errors when nothing is running in that repository, rather than
+/// succeeding quietly -- a Cancel that appears to work on a run that
+/// already finished is its own small lie.
+#[tauri::command]
+pub fn cancel_update_run(
+    runs: State<'_, crate::packages::runs::UpdateRuns>,
+    repo_path: String,
+) -> Result<(), String> {
+    runs.cancel(&repo_path)
+}
+
+/// How a repository's background update run is going, or how it ended.
+///
+/// The read a client uses when it was not listening. Progress and
+/// completion are events, and a suspended phone holds no event stream
+/// (`src-mobile/src/background.rs`), so one that started a run and went
+/// to sleep missed every frame including the terminal one. Without this
+/// it could start a run and then genuinely never learn how it ended.
+///
+/// `None` when this process has never run one for that repository.
+#[tauri::command]
+pub fn update_run_state(
+    runs: State<'_, crate::packages::runs::UpdateRuns>,
+    repo_path: String,
+) -> Option<crate::packages::runs::RunState> {
+    runs.state(&repo_path)
+}
+
 /// What a background update run produced.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2353,6 +2416,10 @@ pub struct UpdateRunDone {
     pub branch: Option<String>,
     pub applied: usize,
     pub failed: usize,
+    /// Whether the user stopped it. Distinct from `error`: a cancelled
+    /// run did not fail, it was asked to stop, and the packages that
+    /// landed before it did really did land.
+    pub cancelled: bool,
     /// Why no pull request, when there is none. Never a claim that one
     /// exists.
     pub error: Option<String>,
@@ -2366,6 +2433,7 @@ impl UpdateRunDone {
             branch: Some(r.branch.clone()),
             applied: r.results.iter().filter(|x| x.error.is_none()).count(),
             failed: r.results.iter().filter(|x| x.error.is_some()).count(),
+            cancelled: false,
             error: None,
         }
     }
@@ -2376,6 +2444,7 @@ impl UpdateRunDone {
             branch: Some(r.branch.clone()),
             applied: r.results.iter().filter(|x| x.error.is_none()).count(),
             failed: r.results.iter().filter(|x| x.error.is_some()).count(),
+            cancelled: false,
             error: Some(why.to_string()),
         }
     }
@@ -2386,6 +2455,7 @@ impl UpdateRunDone {
             branch: None,
             applied: 0,
             failed: 0,
+            cancelled: false,
             error: Some(why),
         }
     }
@@ -2394,6 +2464,17 @@ impl UpdateRunDone {
 /// Emit the outcome and, when a pull request went up, notify.
 fn finish(app: &AppHandle, done: UpdateRunDone) {
     use tauri_plugin_notification::NotificationExt;
+
+    // Recorded BEFORE the event. Every exit from the run goes through
+    // here -- the three error arms, the all-failed case, and success --
+    // which makes this the one place that cannot be forgotten, and the
+    // reason the registry entry is always consistent with what was
+    // emitted.
+    //
+    // It is also what a client that missed the event reads later:
+    // `update_run_state` returns exactly this.
+    app.state::<crate::packages::runs::UpdateRuns>()
+        .finished(&done.repo_path, done.clone());
 
     if let Err(e) = app.emit("update-run-done", &done) {
         log::warn!("could not emit update-run-done: {e}");

@@ -44,6 +44,7 @@ vi.mock("../api/hooks", () => ({
   // Idle: the progress line only appears mid-removal.
   useRemovalProgress: () => null,
   useUpdateProgress: () => null,
+  useCancelUpdateRun: () => () => Promise.resolve(),
   // Not opened in these tests: the disclosure is closed by default.
   useAssessment: () => ({ data: undefined, isLoading: false }),
   // The cleanup manifest joins worktrees to the images they own, so the

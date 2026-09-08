@@ -536,9 +536,34 @@ export interface UpdateRunDone {
   branch: string | null;
   applied: number;
   failed: number;
+  /// Whether the user stopped it. Distinct from `error`: a cancelled
+  /// run did not fail, and the packages that landed before the stop
+  /// really did land.
+  cancelled: boolean;
   /// Why there is no pull request, when there is none.
   error: string | null;
 }
+
+/// Ask a background update run to stop.
+///
+/// It stops after the package it is on, never during one -- a package
+/// manager killed halfway leaves a worktree in a state nobody asked
+/// for. Rejects when nothing is running in that repository.
+export const cancelUpdateRun = (repoPath: string) =>
+  call<void>("cancel_update_run", { repoPath });
+
+/// How a repository's update run is going, or how it ended.
+///
+/// The read for a client that was not listening. Progress and
+/// completion are events, and a suspended phone holds no event stream,
+/// so one that started a run and slept missed every frame including the
+/// terminal one. Null when this desktop has run none for that repo.
+export type UpdateRunState =
+  | { state: "running"; done: number; total: number }
+  | { state: "done"; outcome: UpdateRunDone };
+
+export const updateRunState = (repoPath: string) =>
+  call<UpdateRunState | null>("update_run_state", { repoPath });
 
 // ---------------------------------------------------------------------
 // Phone pairing (mobile companion). Rust side: src-tauri/src/remote/pairing.rs

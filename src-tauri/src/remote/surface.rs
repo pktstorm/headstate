@@ -110,6 +110,9 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("get_poll_interval", Class::Read),
     ("get_worktree_dirs", Class::Read),
     ("get_ui_prefs", Class::Read),
+    // How a run is going, or how it ended. The resume path: a
+    // suspended phone holds no event stream, so it asks instead.
+    ("update_run_state", Class::Read),
     // write: changes GitHub state through the existing write module, or
     // a desktop setting.
     ("act_on_pr", Class::Write),
@@ -146,6 +149,15 @@ pub const SURFACE: &[(&str, Class)] = &[
     // loop never learned a phone had stopped needing GitHub data and
     // the cadence optimisation was dead for every remote client.
     ("set_view_needs_github", Class::Write),
+    // Starts a long-running task on the desktop. Write rather than
+    // Destructive: it creates a worktree and edits manifests in it,
+    // deleting nothing, and the pull request it opens is reviewable
+    // before anything lands. Only drivable from a phone now that it
+    // can be STOPPED and its outcome read back after a suspension
+    // (#626) -- starting something you cannot stop or see the end of
+    // is not a feature.
+    ("apply_updates_in_background", Class::Write),
+    ("cancel_update_run", Class::Write),
     // destructive: deletes files, branches, images, or volumes.
     ("delete_head_branch", Class::Destructive),
     ("delete_branches", Class::Destructive),
@@ -168,7 +180,6 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("get_notify_prefs", Class::Local),
     ("set_notify_prefs", Class::Local),
     ("set_worktree_dirs", Class::Local),
-    ("apply_updates_in_background", Class::Local),
     // The remote feature's own commands. Pairing and the on/off switch
     // are decisions the desktop's user makes at the desktop: a phone
     // that could approve its own pairing request, revoke a rival, or
@@ -379,6 +390,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "get_poll_interval" => ok(commands::get_poll_interval(app.state())),
         "get_worktree_dirs" => ok(commands::get_worktree_dirs(app.clone())),
         "get_ui_prefs" => ok(commands::get_ui_prefs(app.clone())),
+        "update_run_state" => ok(commands::update_run_state(app.state(), a.get("repoPath")?)),
 
         // ---- write ------------------------------------------------------
         "act_on_pr" => res(commands::act_on_pr(
@@ -470,6 +482,15 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         )),
         "set_cleanup_prefs" => res(commands::set_cleanup_prefs(app.clone(), a.get("prefs")?)),
         "set_ui_prefs" => res(commands::set_ui_prefs(app.clone(), a.get("prefs")?)),
+        "apply_updates_in_background" => res(commands::apply_updates_in_background(
+            app.clone(),
+            app.state(),
+            a.get("repoPath")?,
+            a.get("requests")?,
+            a.get("branch")?,
+        )
+        .await),
+        "cancel_update_run" => res(commands::cancel_update_run(app.state(), a.get("repoPath")?)),
         "pull_checkout" => res(commands::pull_checkout(a.get("path")?).await),
         // Shell out like the other sync Docker commands, so a slow
         // engine start does not stall the listener for everyone else.
@@ -636,7 +657,6 @@ mod tests {
             "reveal_log",
             "set_autostart",
             "set_worktree_dirs",
-            "apply_updates_in_background",
             "issue_pairing_token",
             "respond_to_pairing",
             "list_paired_devices",
@@ -667,11 +687,14 @@ mod tests {
             ("assess_worktree", Class::Read),
             ("claudify_command", Class::Read),
             ("get_ui_prefs", Class::Read),
+            ("update_run_state", Class::Read),
             ("pull_checkout", Class::Write),
             ("docker_start", Class::Write),
             ("docker_restart", Class::Write),
             ("set_ui_prefs", Class::Write),
             ("set_view_needs_github", Class::Write),
+            ("apply_updates_in_background", Class::Write),
+            ("cancel_update_run", Class::Write),
         ] {
             assert_eq!(
                 admit(name),

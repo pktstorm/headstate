@@ -19,6 +19,7 @@ pub mod model;
 pub mod pr;
 pub mod registry;
 pub mod run;
+pub mod runs;
 pub mod swift;
 pub mod terraform;
 pub mod tools;
