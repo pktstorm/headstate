@@ -102,6 +102,19 @@ const claudify = vi.hoisted(() =>
 );
 vi.mock("../api/tauri", () => ({ claudifyCommand: claudify }));
 
+// The build target, as a mock: `IS_MOBILE_BUILD` is read at module
+// scope, and re-importing the component to change it would lose
+// every other mock in this file.
+const mobileBuild = vi.hoisted(() => ({ current: false }));
+vi.mock("@/lib/target", () => ({
+  get IS_MOBILE_BUILD() {
+    return mobileBuild.current;
+  },
+  get IS_DESKTOP_BUILD() {
+    return !mobileBuild.current;
+  },
+}));
+
 import { WorktreesPage } from "./WorktreesPage";
 
 const wt = (over: Partial<Worktree>): Worktree => ({
@@ -563,6 +576,44 @@ describe("WorktreesPage", () => {
       render(<WorktreesPage />);
       expect(screen.queryByRole("button", { name: /claudify/i })).toBeNull();
       expect(screen.getByRole("button", { name: /remove/i })).toBeTruthy();
+    });
+
+    /// The phone has no terminal to paste into, and `copyText` reports
+    /// "no clipboard access" in a non-secure webview context anyway --
+    /// so on the mobile build the command is SHOWN instead of copied.
+    it("shows the command on the mobile build rather than copying it", async () => {
+      mobileBuild.current = true;
+      state.classified = [wt({ safety: { kind: "dirty", detail: 2 } })];
+      const writeText = vi.fn(() => Promise.resolve());
+      Object.assign(navigator, { clipboard: { writeText } });
+
+      render(<WorktreesPage />);
+      fireEvent.click(screen.getByRole("button", { name: /claudify/i }));
+
+      // The command itself, readable, and never sent to a clipboard
+      // that would have refused it.
+      expect(await screen.findByText(/claude 'assess'/)).toBeTruthy();
+      expect(writeText).not.toHaveBeenCalled();
+      mobileBuild.current = false;
+    });
+
+    /// The assessment action used to live inside the clipboard's
+    /// success branch, and a failed copy took an early return -- so the
+    /// ONLY route to "Remove anyway…" disappeared whenever the
+    /// clipboard was unavailable. That is every phone, and any desktop
+    /// whose window is not focused.
+    it("still offers the assessment action when the copy fails", async () => {
+      state.classified = [wt({ safety: { kind: "dirty", detail: 2 } })];
+      Object.assign(navigator, {
+        clipboard: { writeText: () => Promise.reject(new Error("denied")) },
+      });
+
+      render(<WorktreesPage />);
+      fireEvent.click(screen.getByRole("button", { name: /claudify/i }));
+      await waitFor(() => expect(toastError).toHaveBeenCalled());
+
+      const opts = toastError.mock.calls.at(-1)?.[1] as { action?: { label: string } } | undefined;
+      expect(opts?.action?.label).toMatch(/read the assessment/i);
     });
 
     // Offering an action based on a verdict that has not arrived is the

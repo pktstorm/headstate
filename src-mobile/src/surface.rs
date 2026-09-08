@@ -66,6 +66,12 @@ pub const SURFACE: &[(&str, Class)] = &[
     // Reads the desktop's disk to summarise a worktree; no side
     // effects, and the phone needs it to decide what to clean up.
     ("assess_worktree", Class::Read),
+    // Builds a command STRING and returns it; its own comment in
+    // `commands.rs` records that copying deliberately marks
+    // nothing. `mark_assessed` is the write, and it is already
+    // Write -- so the phone could record an assessment it had no
+    // way to obtain.
+    ("claudify_command", Class::Read),
     ("check_packages", Class::Read),
     ("packages_markdown", Class::Read),
     ("scan_claude_md", Class::Read),
@@ -131,7 +137,6 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("get_notify_prefs", Class::Local),
     ("set_notify_prefs", Class::Local),
     ("set_worktree_dirs", Class::Local),
-    ("claudify_command", Class::Local),
     ("apply_updates_in_background", Class::Local),
     // The remote feature's own commands. Pairing and the on/off switch
     // are decisions the desktop's user makes at the desktop: a phone
