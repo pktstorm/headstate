@@ -486,6 +486,13 @@ impl Client {
         F: Fn(String) -> Fut,
         Fut: Future<Output = Result<T, ClientError>>,
     {
+        /// One address that did not work, kept so the caller can be
+        /// told what was tried rather than only what failed last.
+        struct Attempt {
+            base: String,
+            err: ClientError,
+        }
+
         let bases = self.bases();
         // EVERY attempt, not just the most recent. A phone that cannot
         // reach its desktop is the hardest failure to diagnose from the
@@ -493,7 +500,7 @@ impl Client {
         // whether the address was refused, timed out, or was never
         // tried. Overwriting a single `last` threw away exactly the
         // facts that distinguish those (#633).
-        let mut attempts: Vec<String> = Vec::new();
+        let mut attempts: Vec<Attempt> = Vec::new();
         // Attempts started and not yet settled, each tagged with the
         // base it is for so a win can be remembered.
         let mut running: Vec<(String, Pin<Box<Fut>>)> = Vec::new();
@@ -520,12 +527,25 @@ impl Client {
                     self.remember(&base);
                     return Ok(v);
                 }
-                Err(ClientError::Unreachable(m)) => {
-                    log::info!("companion: {base} did not answer: {m}");
-                    attempts.push(format!("{base}: {m}"));
+                // Anything about the PATH: record it and let the other
+                // addresses keep running. A TLS failure is not the
+                // desktop's answer -- one interface can be refused while
+                // another is accepted, which is exactly what a Thread
+                // ULA did on a real phone: the race aborted on it while
+                // a working address was still in flight, and the user
+                // was shown a security warning for a connection that
+                // succeeded ten seconds later (#645).
+                Err(
+                    e @ (ClientError::Unreachable(_)
+                    | ClientError::Handshake(_)
+                    | ClientError::FingerprintMismatch),
+                ) => {
+                    log::info!("companion: {base} did not answer: {e}");
+                    attempts.push(Attempt { base, err: e });
                 }
-                // The desktop's own answer. Returning here drops every
-                // other in-flight attempt.
+                // The desktop's own answer -- a status or a malformed
+                // body. Every address would give the same one, so
+                // returning here costs nothing and says more.
                 Err(e) => return Err(e),
             }
         }
@@ -533,28 +553,56 @@ impl Client {
         // desktop unreachable, ask the LAN where it went: this is the
         // DHCP-renewal case, which otherwise stranded the phone for
         // good.
-        if let Some(base) = self.rediscover().await {
+        //
+        // Skipped when something already ANSWERED. mDNS is for finding a
+        // desktop that moved, and a TLS refusal proves we found it -- so
+        // rediscovering would spend `DISCOVERY_TIMEOUT` to be told the
+        // same thing by the same machine.
+        let answered = attempts.iter().any(|a| rank(&a.err) > 0);
+        if let Some(base) = if answered {
+            None
+        } else {
+            self.rediscover().await
+        } {
             match f(base.clone()).await {
                 Ok(v) => {
                     *self.discovered.lock().unwrap_or_else(|e| e.into_inner()) = Some(base);
                     return Ok(v);
                 }
-                Err(ClientError::Unreachable(m)) => {
-                    log::info!("companion: the address from mDNS did not answer: {m}");
-                    attempts.push(format!("{base} (found by mDNS): {m}"));
+                Err(
+                    e @ (ClientError::Unreachable(_)
+                    | ClientError::Handshake(_)
+                    | ClientError::FingerprintMismatch),
+                ) => {
+                    log::info!("companion: the address from mDNS did not answer: {e}");
+                    attempts.push(Attempt {
+                        base: format!("{base} (found by mDNS)"),
+                        err: e,
+                    });
                 }
                 Err(e) => return Err(e),
             }
         }
-        // One line per address tried, so the message names what was
-        // attempted and why each failed. Addresses and error kinds only:
-        // the pairing token, the session certificate and any key
-        // material stay out of a string the UI will display.
-        Err(ClientError::Unreachable(if attempts.is_empty() {
-            "no addresses to try".into()
-        } else {
-            attempts.join("; ")
-        }))
+        // Every address failed. One line per attempt, so the message
+        // names what was tried and why each failed -- addresses and
+        // error kinds only, never the pairing token, the certificate or
+        // key material, since the UI displays this.
+        let Some(worst) = attempts.iter().map(|a| rank(&a.err)).max() else {
+            return Err(ClientError::Unreachable("no addresses to try".into()));
+        };
+        let detail = attempts
+            .iter()
+            .map(|a| format!("{}: {}", a.base, a.err))
+            .collect::<Vec<_>>()
+            .join("; ");
+        // The most informative failure wins the KIND of the error, so a
+        // handshake refusal is not hidden behind a timeout on some other
+        // interface -- while the detail still lists every address.
+        Err(match worst {
+            2 => ClientError::FingerprintMismatch,
+            1 => ClientError::Handshake(detail),
+            _ => ClientError::Unreachable(detail),
+        })
     }
 
     /// Record which base URL answered, so it is tried first next time.
@@ -755,6 +803,18 @@ fn tls_error<'a>(err: &'a (dyn std::error::Error + 'static)) -> Option<&'a rustl
     None
 }
 
+/// How much a failure tells us, for choosing which one to report when
+/// every address failed. A timeout says the least; our own verifier
+/// rejecting the certificate says the most, and is the one the user must
+/// see even if three other interfaces merely timed out (#645).
+fn rank(err: &ClientError) -> u8 {
+    match err {
+        ClientError::FingerprintMismatch => 2,
+        ClientError::Handshake(_) => 1,
+        _ => 0,
+    }
+}
+
 fn classify(err: reqwest::Error) -> ClientError {
     if let Some(tls) = tls_error(&err) {
         // `ApplicationVerificationFailure` is what `PinnedServer` and
@@ -938,6 +998,97 @@ mod tests {
     /// phone must not report that its desktop presented a bad
     /// certificate. Same `is_handshake()` for revocation, different
     /// variant, so the user is told something true.
+    /// A TLS refusal on ONE address must not abort the race.
+    ///
+    /// The real failure this reproduces (#645): a desktop offered four
+    /// addresses, one a Thread ULA whose connection it refused. The race
+    /// returned that refusal immediately, killing an attempt that
+    /// succeeded ten seconds later, and the phone showed a security
+    /// warning for a pairing that worked.
+    ///
+    /// Driven through `try_each` directly: `TestServer` binds a random
+    /// port and `Client::new` takes ONE port for every address, so two
+    /// real servers cannot be raced. The closure here is the same shape
+    /// the real callers pass -- one address refuses, a later one works.
+    #[tokio::test]
+    async fn a_refused_address_does_not_abort_a_working_one() {
+        let id = identity();
+        let server = TestServer::start().await;
+        server.pair(&id.fingerprint());
+        let client = Client::new(
+            &id,
+            &server.fp,
+            vec!["bad-1".into(), "bad-2".into(), "good".into()],
+            server.port(),
+        )
+        .unwrap();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let got = client
+            .try_each(|base| {
+                seen.lock().unwrap().push(base.clone());
+                async move {
+                    match base.as_str() {
+                        // What the Thread ULA did: TCP connects, then TLS
+                        // is refused. The delay is what makes this a
+                        // RACE -- an instant failure settles before the
+                        // stagger starts the next address, and the bug
+                        // being fixed only appears when another attempt
+                        // is still in flight.
+                        b if b.contains("bad-1") => {
+                            tokio::time::sleep(Duration::from_millis(80)).await;
+                            Err(ClientError::Handshake("received fatal alert".into()))
+                        }
+                        b if b.contains("bad-2") => {
+                            tokio::time::sleep(Duration::from_millis(80)).await;
+                            Err(ClientError::FingerprintMismatch)
+                        }
+                        _ => Ok(42),
+                    }
+                }
+            })
+            .await;
+        assert_eq!(got, Ok(42), "a refusal must not end the race");
+        assert!(
+            seen.lock().unwrap().iter().any(|b| b.contains("good")),
+            "the working address was reached: {:?}",
+            seen.lock().unwrap()
+        );
+    }
+
+    /// When EVERY address fails, the most informative failure is the one
+    /// reported -- a real certificate rejection is not hidden behind a
+    /// timeout on some other interface -- and the detail still lists
+    /// every address tried.
+    #[tokio::test]
+    async fn the_worst_failure_wins_and_the_detail_names_them_all() {
+        let id = identity();
+        let server = TestServer::start().await;
+        let client = Client::new(
+            &id,
+            &server.fp,
+            vec!["slow".into(), "refused".into()],
+            server.port(),
+        )
+        .unwrap();
+        let err = client
+            .try_each(|base| async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Err::<(), _>(if base.contains("slow") {
+                    ClientError::Unreachable("timed out".into())
+                } else {
+                    ClientError::Handshake("received fatal alert: AccessDenied".into())
+                })
+            })
+            .await
+            .unwrap_err();
+        let ClientError::Handshake(detail) = err else {
+            panic!("the handshake failure should win, got {err:?}");
+        };
+        assert!(detail.contains("slow"), "{detail}");
+        assert!(detail.contains("refused"), "{detail}");
+        assert!(detail.contains("AccessDenied"), "{detail}");
+    }
+
     #[tokio::test]
     async fn a_desktop_refusing_us_is_not_a_fingerprint_mismatch() {
         let id = identity();
@@ -1045,13 +1196,20 @@ mod tests {
         assert_eq!(client.order(), vec![1, 0]);
     }
 
-    /// The desktop's own answer beats a slower "cannot reach you".
+    /// A refusal beats a slower "cannot reach you" in what is REPORTED.
     ///
-    /// This is the precedence rule the serial version got for free and
-    /// concurrency puts at risk: a handshake refusal from the SECOND
-    /// address must win, not be raced out by the first address finally
-    /// timing out. Every address leads to the same desktop, so asking
-    /// another one would only get the same refusal.
+    /// The precedence rule the serial version got for free: a handshake
+    /// refusal from the second address must not be hidden behind the
+    /// first one finally timing out.
+    ///
+    /// It no longer short-circuits, and the original reasoning here --
+    /// "every address leads to the same desktop, so asking another one
+    /// would only get the same refusal" -- turned out to be false. A
+    /// real desktop offered four addresses and refused one of them while
+    /// pairing succeeded on another (#645), so a refusal is a fact about
+    /// the PATH and the race must continue. The cost is bounded by
+    /// `CONNECT_TIMEOUT`, which is one second; the benefit is that a
+    /// pairing that works is not reported as a security failure.
     #[tokio::test]
     async fn a_refusal_wins_over_a_slower_unreachable() {
         let id = identity();
@@ -1072,9 +1230,14 @@ mod tests {
             err.is_handshake(),
             "expected the desktop's refusal, got {err:?}"
         );
+        // Bounded, not instant: the dead address is allowed to finish
+        // in case IT was the one that would have worked. One
+        // `CONNECT_TIMEOUT` and a margin -- NOT a further
+        // `DISCOVERY_TIMEOUT`, because a refusal proves the desktop was
+        // found and mDNS is skipped.
         assert!(
-            started.elapsed() < CONNECT_TIMEOUT,
-            "the refusal waited for the dead address to time out"
+            started.elapsed() < CONNECT_TIMEOUT * 2,
+            "a refusal should cost about one connect timeout, not a rediscovery too"
         );
     }
 
