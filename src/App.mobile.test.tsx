@@ -174,6 +174,22 @@ describe("App shell on a phone", () => {
     expect(useFilters.getState().filtersByView["my-prs"].repo).toBe("octocat/hello-world");
   });
 
+  /// Exactly one element carries the status-bar inset.
+  ///
+  /// The banner is above the header and already has `pt-safe`; the
+  /// header briefly had it too, and the inset applied twice left a
+  /// notch-height gap between them -- about a tenth of an iPhone screen.
+  /// Asserted on the class rather than by measuring, because jsdom
+  /// resolves `env()` to nothing and would pass either way.
+  it("does not pay the safe-area inset twice", () => {
+    renderApp();
+    const banner = screen.getByRole("button", { name: /octocat's laptop/ });
+    const header = screen.getByRole("heading", { level: 1 }).closest("header");
+    expect(banner.className).toContain("pt-safe");
+    // The header sits below the banner, so it must NOT add the inset.
+    expect(header?.className ?? "").not.toContain("safe");
+  });
+
   it("renders the connection banner above everything", () => {
     renderApp();
     const banner = screen.getByRole("button", { name: /octocat's laptop/ });

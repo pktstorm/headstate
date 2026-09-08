@@ -324,11 +324,17 @@ export default function App() {
             needs the container to be a positioning context. Renders
             nothing at rest. */}
         <PullIndicator state={pull} />
-        {/* `pt-` carries the status-bar inset on top of the existing
-            padding, so the title and the menu button sit below the
-            clock rather than under it (#648). Zero on the desktop, so
-            the `py-3` there is unchanged. */}
-        <header className="sticky top-0 z-20 flex items-center gap-2 border-b border-[#30363d] bg-[#0d1117] px-4 py-3 pt-3-safe">
+        {/* NO safe-area padding here, deliberately. `ConnectionBanner`
+            is above this and already carries `pt-safe`, so it is what
+            clears the status bar; adding the inset again here applied it
+            TWICE and left a notch-height gap between the banner and the
+            header -- about a tenth of the screen on an iPhone.
+
+            The inset belongs to whatever is top-most, and on the phone
+            that is always the banner: it renders for every state
+            including "unpaired", and returns null only on the desktop,
+            where the inset is zero anyway. */}
+        <header className="sticky top-0 z-20 flex items-center gap-2 border-b border-[#30363d] bg-[#0d1117] px-4 py-3">
           {isMobile ? (
             <button
               type="button"
