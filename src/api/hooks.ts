@@ -1,6 +1,6 @@
 import { type QueryClient, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { useFilters } from "../store/filters";
+import { type View, useFilters } from "../store/filters";
 import { listen, type UnlistenFn } from "./transport";
 import { safeUnlisten } from "./unlisten";
 import { timeCall, timed } from "./diag";
@@ -76,7 +76,9 @@ import {
   getCachedReviewing,
   countReviewing,
   getStats,
+  cancelUpdateRun,
   refreshNow,
+  updateRunState,
   setPollInterval,
   setViewNeedsGithub,
   setWorktreeDirs,
@@ -1878,6 +1880,64 @@ export function useBranches(repoPath: string | undefined) {
 /// pull request that actually exists gets a toast whose action opens
 /// it in My pull requests; a run that stopped at the worktree says so
 /// without claiming one is coming.
+/// Report a finished run, however it was learned about.
+///
+/// Shared by the `update-run-done` listener and by the resume read that
+/// asks how a run ended after a suspension -- the two describe the same
+/// event and must say the same thing. A phone that slept through a run
+/// gets this from `update_run_state` instead of from the stream it was
+/// not holding.
+function reportRunOutcome(
+  d: UpdateRunDone,
+  qc: QueryClient,
+  setView: (v: View) => void,
+  selectPr: (pr: { repo: string; number: number }) => void,
+): void {
+  // Refresh whatever the run changed, whichever way it ended.
+  void qc.invalidateQueries({ queryKey: ["packages"] });
+  void qc.invalidateQueries({ queryKey: ["worktrees"] });
+
+  // Stopped by the user: neither a success nor a failure, and saying
+  // either would be wrong. The packages that landed before the stop
+  // really did land, and the worktree holding them still exists.
+  if (d.cancelled) {
+    toast.info("Update run stopped", {
+      description:
+        d.applied === 0
+          ? "Nothing had been applied yet."
+          : `${d.applied} package${d.applied === 1 ? "" : "s"} were applied before it stopped, in ${d.branch ?? "the worktree"}.`,
+    });
+    return;
+  }
+
+  if (d.url !== null) {
+    const pr = prFromUrl(d.url);
+    toast.success("Package update pull request is ready", {
+      description:
+        d.failed === 0
+          ? `${d.applied} package${d.applied === 1 ? "" : "s"} updated.`
+          : `${d.applied} updated, ${d.failed} could not be.`,
+      // Only offered when the URL parses. A button that silently
+      // does nothing is worse than no button.
+      action: pr
+        ? {
+            label: "Open",
+            onClick: () => {
+              setView("my-prs");
+              selectPr(pr);
+            },
+          }
+        : undefined,
+    });
+    return;
+  }
+
+  // No pull request. Never phrased as though one is on its way.
+  toast.warning("Updates applied, but no pull request was opened", {
+    description: d.error ?? undefined,
+  });
+}
+
 export function useUpdateRunOutcome(): void {
   const setView = useFilters((s) => s.setView);
   const selectPr = useFilters((s) => s.selectPr);
@@ -1893,37 +1953,7 @@ export function useUpdateRunOutcome(): void {
     let started: Promise<UnlistenFn>;
     try {
       started = listen<UpdateRunDone>("update-run-done", (e) => {
-      const d = e.payload;
-      // Refresh whatever the run changed, whichever way it ended.
-      void qc.invalidateQueries({ queryKey: ["packages"] });
-      void qc.invalidateQueries({ queryKey: ["worktrees"] });
-
-      if (d.url !== null) {
-        const pr = prFromUrl(d.url);
-        toast.success("Package update pull request is ready", {
-          description:
-            d.failed === 0
-              ? `${d.applied} package${d.applied === 1 ? "" : "s"} updated.`
-              : `${d.applied} updated, ${d.failed} could not be.`,
-          // Only offered when the URL parses. A button that silently
-          // does nothing is worse than no button.
-          action: pr
-            ? {
-                label: "Open",
-                onClick: () => {
-                  setView("my-prs");
-                  selectPr(pr);
-                },
-              }
-            : undefined,
-        });
-        return;
-      }
-
-      // No pull request. Never phrased as though one is on its way.
-      toast.warning("Updates applied, but no pull request was opened", {
-        description: d.error ?? undefined,
-      });
+        reportRunOutcome(e.payload, qc, setView, selectPr);
       });
     } catch {
       return;
@@ -1940,6 +1970,70 @@ export function useUpdateRunOutcome(): void {
       if (unlisten) safeUnlisten(unlisten);
     };
   }, [setView, selectPr, qc]);
+}
+
+/// Stop a background update run.
+///
+/// It stops after the package it is on, so this resolving means "asked
+/// to stop", not "stopped". The terminal `update-run-done` -- carrying
+/// `cancelled: true` -- is what says it actually has.
+export function useCancelUpdateRun(): (repoPath: string) => Promise<void> {
+  return useCallback((repoPath: string) => cancelUpdateRun(repoPath), []);
+}
+
+/// Catch up on a run that ended while nobody was listening.
+///
+/// `useUpdateRunOutcome` hears the terminal event -- if the app is
+/// there to hear it. A phone is often not: `src-mobile/src/background.rs`
+/// is explicit that a suspended app holds no `/v1/events` stream, so a
+/// run started and then backgrounded delivers its progress and its
+/// outcome to nobody. Without this a phone could start a run and never
+/// learn how it ended, which is most of why #626 held the action back
+/// from the phone in the first place.
+///
+/// Asks on mount and on every return to the foreground, for the repo
+/// currently selected. Reports a finished run once: `seen` keeps a
+/// second foreground from re-toasting an outcome already shown, which
+/// on a phone would otherwise fire on every app switch.
+export function useUpdateRunResume(repoPath: string | undefined): void {
+  const setView = useFilters((s) => s.setView);
+  const selectPr = useFilters((s) => s.selectPr);
+  const qc = useQueryClient();
+
+  useEffect(() => {
+    if (repoPath === undefined || repoPath === "") return;
+    let live = true;
+    // Outcomes already reported, so returning to the foreground twice
+    // does not announce the same run twice. Keyed by branch and counts
+    // rather than identity: the registry holds one outcome per repo,
+    // and a NEW run in the same repo has different ones.
+    let seen: string | null = null;
+
+    const ask = () => {
+      updateRunState(repoPath).then(
+        (state) => {
+          if (!live || state === null || state.state !== "done") return;
+          const key = `${state.outcome.branch ?? ""}:${state.outcome.applied}:${state.outcome.failed}:${String(state.outcome.cancelled)}`;
+          if (seen === key) return;
+          seen = key;
+          reportRunOutcome(state.outcome, qc, setView, selectPr);
+        },
+        // A desktop that predates the command, or no runtime at all.
+        // The live event is the primary path; this is the backstop.
+        () => {},
+      );
+    };
+
+    ask();
+    const onVisible = () => {
+      if (document.visibilityState === "visible") ask();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      live = false;
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [repoPath, qc, setView, selectPr]);
 }
 
 /// `owner/repo` and number from a pull request URL.

@@ -76,6 +76,9 @@ describe("the remote surface's frontend half", () => {
     // `IS_MOBILE_BUILD` (see `src/lib/target.ts`), so the phone never
     // renders a control that can only reject.
     //
+    // #626 moved `apply_updates_in_background` off Local once it
+    // could be cancelled and its outcome read back after a
+    // suspension.
     // If it fails because a command was RECLASSIFIED away from Local
     // (v5.5.0 did that for `assess_worktree`, `pull_checkout`,
     // `docker_start` and `docker_restart`; #625 for `claudify_command`,
@@ -83,7 +86,6 @@ describe("the remote surface's frontend half", () => {
     // Note `diag_log` is absent: it is `Class::Local` but has no
     // wrapper in `tauri.ts` at all, so there is nothing to guard.
     const DESKTOP_ONLY_WRAPPERS = [
-      "applyUpdatesInBackground",
       "getAutostart",
       "getNotifyPrefs",
       "getRemoteEnabled",

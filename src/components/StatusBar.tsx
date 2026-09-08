@@ -1,3 +1,5 @@
+import { toast } from "sonner";
+import { useActiveFilters } from "@/store/filters";
 import { ExternalLink } from "./ExternalLink";
 import { getVersion } from "@tauri-apps/api/app";
 import { latestRelease } from "../api/tauri";
@@ -10,6 +12,7 @@ import {
   usePollInterval,
   usePollState,
   useRemovalProgress,
+  useCancelUpdateRun,
   useUpdateProgress,
 } from "../api/hooks";
 import { relativeTime } from "../lib/time";
@@ -100,6 +103,10 @@ export function StatusBar({ updatedAt }: { updatedAt: number }) {
   // survives navigating away from it.
   const removal = useRemovalProgress();
   const updating = useUpdateProgress();
+  const cancelRun = useCancelUpdateRun();
+  // The repo a run would belong to: runs are per-repository, and
+  // the status bar shows the selected one.
+  const repo = useActiveFilters().repo;
   // Which version's announcement has been dismissed. localStorage, not
   // the settings table: it is a transient acknowledgement of one
   // release, not a preference, and it is meaningless on another machine.
@@ -223,6 +230,29 @@ export function StatusBar({ updatedAt }: { updatedAt: number }) {
             ? `Updating packages — ${updating.done} of ${updating.total}`
             : ""}
       </span>
+      {/* Cancel sits beside the count rather than in the wizard, for
+          the same reason the count does: the wizard is already closed.
+          Only for updates -- a worktree removal is a sequence of quick
+          deletions with nothing useful to stop halfway. */}
+      {updating && repo ? (
+        <button
+          type="button"
+          onClick={() => {
+            void cancelRun(repo).then(
+              // Not "stopped": it stops after the package it is on, and
+              // `update-run-done` is what reports that it actually has.
+              () => toast.info("Stopping after the current package…"),
+              (e: unknown) =>
+                toast.error("Could not stop the run", {
+                  description: typeof e === "string" ? e : undefined,
+                }),
+            );
+          }}
+          className="tap-target rounded px-2 text-[#8b949e] hover:text-[#e6edf3]"
+        >
+          Cancel
+        </button>
+      ) : null}
 
       {isMobile ? (
         <span className="ml-auto" />

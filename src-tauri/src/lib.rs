@@ -134,6 +134,8 @@ pub fn run() {
             commands::apply_package_updates,
             commands::open_update_pr,
             commands::apply_updates_in_background,
+            commands::cancel_update_run,
+            commands::update_run_state,
             commands::scan_claude_md,
             commands::read_claude_md,
             commands::check_packages,
@@ -276,6 +278,10 @@ pub fn run() {
             // Starts true: the app opens on a PR view.
             let needs_gh = Arc::new(AtomicBool::new(true));
             app.manage(poll::ViewNeedsGithub(needs_gh.clone()));
+            // Which repositories have a background update run going,
+            // and how the last one ended. Default-constructed: it is
+            // empty until someone starts a run.
+            app.manage(packages::runs::UpdateRuns::default());
 
             // Phone pairing. Managed whether or not the listener is on,
             // because Settings lists and revokes paired devices either
