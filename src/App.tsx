@@ -324,7 +324,11 @@ export default function App() {
             needs the container to be a positioning context. Renders
             nothing at rest. */}
         <PullIndicator state={pull} />
-        <header className="sticky top-0 z-20 flex items-center gap-2 border-b border-[#30363d] bg-[#0d1117] px-4 py-3">
+        {/* `pt-` carries the status-bar inset on top of the existing
+            padding, so the title and the menu button sit below the
+            clock rather than under it (#648). Zero on the desktop, so
+            the `py-3` there is unchanged. */}
+        <header className="sticky top-0 z-20 flex items-center gap-2 border-b border-[#30363d] bg-[#0d1117] px-4 py-3 pt-3-safe">
           {isMobile ? (
             <button
               type="button"

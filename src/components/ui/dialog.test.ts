@@ -53,3 +53,34 @@ describe("the dialog's side margin", () => {
     }
   });
 });
+
+/// The safe-area budget survives the `max-h` a caller might pass, and
+/// the sheet's padding survives `p-0`.
+///
+/// Both are tailwind-merge questions, and both were nearly wrong (#648):
+/// a sheet's inset padding written as plain `pt-*` WOULD be deleted by
+/// the `p-0` that `App.tsx` passes to the navigation sheet. It survives
+/// only because it is variant-prefixed (`data-[side=left]:pt-*`), which
+/// merges under a different key. That is subtle enough to deserve a
+/// test rather than a comment.
+describe("safe-area insets survive the classes callers pass", () => {
+  it("keeps a variant-prefixed inset padding through p-0", () => {
+    const out = cn("data-[side=left]:pt-[env(safe-area-inset-top)]", "p-0");
+    expect(out).toContain("data-[side=left]:pt-[env(safe-area-inset-top)]");
+    expect(out).toContain("p-0");
+  });
+
+  it("shows why a PLAIN padding would not have survived", () => {
+    // The mistake this guards against: same intent, wrong key.
+    expect(cn("pt-[env(safe-area-inset-top)]", "p-0")).toBe("p-0");
+  });
+
+  it("keeps the dialog's inset-aware height unless a caller sets max-h", () => {
+    const H = "max-h-[calc(100dvh-2rem-env(safe-area-inset-top)-env(safe-area-inset-bottom))]";
+    expect(cn(H, "w-full")).toContain("env(safe-area-inset-top)");
+    // A caller that sets its own max-h still wins, which is intended --
+    // but it then owns the inset budget too.
+    expect(cn(H, "max-h-96")).toBe("max-h-96");
+  });
+});
+
