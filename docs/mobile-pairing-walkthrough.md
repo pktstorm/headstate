@@ -36,9 +36,14 @@ a finding: record it rather than working around it.
   number**.
 
 Keep every completed run. Copy this file, fill in the header, tick the
-boxes, and commit the copy under `docs/walkthroughs/` named
-`YYYY-MM-DD-<platform>.md`. Runs are evidence, not paperwork: a run with a
-finding is more useful than one without.
+boxes, and commit the copy under [`docs/walkthroughs/`](walkthroughs/)
+named `YYYY-MM-DD-<platform>.md`. Runs are evidence, not paperwork: a run
+with a finding is more useful than one without.
+
+Getting a build onto a device is the part with no CI job behind it:
+`make ios-device` (Xcode, where you select your signing team) and
+`make android-device` (adb). [`docs/walkthroughs/README.md`](walkthroughs/README.md)
+covers both, and what else is worth recording while a device is in hand.
 
 ## Run record
 

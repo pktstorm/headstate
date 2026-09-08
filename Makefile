@@ -1,6 +1,6 @@
 .PHONY: dev build test test-rust test-ui lint lint-rust lint-ui lint-deps fmt icons \
 	mobile-frontend lint-mobile test-mobile check-mobile-ios check-mobile-android \
-	deny-mobile ios-init android-init icons-mobile
+	deny-mobile ios-init android-init icons-mobile ios-device android-device
 
 # ---- Mobile companion (src-mobile) ---------------------------------------
 #
@@ -47,6 +47,35 @@ check-mobile-android:
 
 deny-mobile:
 	cd src-mobile && cargo deny check
+
+# Install and run on a REAL device, for the pairing walkthrough
+# (docs/mobile-pairing-walkthrough.md). The walkthrough refuses
+# simulators and emulators, correctly: they have no Secure Enclave, no
+# Keystore-backed biometric gate, and iOS does not show the
+# local-network prompt in the simulator -- so three of the things the
+# run exists to check cannot be checked there.
+#
+# `--open` hands off to Xcode rather than building headless. Signing a
+# development build needs a team, and the committed project carries none
+# (`DEVELOPMENT_TEAM` is absent by design -- it is personal to whoever
+# builds, and the release workflow injects its own). Xcode's Signing &
+# Capabilities tab is where a person selects theirs, once, and the
+# setting stays in their local checkout.
+#
+# `--host` goes with `--open`, per Tauri's own help: a device cannot
+# reach `localhost`, so the dev server has to be served on the public
+# network address. Vite already listens on 0.0.0.0 for this to work.
+#
+# Not a release path. Store builds come from `mobile-release.yml` on a
+# `mobile-v*` tag; see docs/mobile-release-process.md.
+ios-device:
+	TAURI_APP_PATH=src-mobile yarn tauri ios dev --open --host
+
+# The Android equivalent. `tauri android dev` installs over adb, so a
+# device with USB debugging on and `adb devices` listing it is all that
+# is needed -- no signing team, and no Play Console.
+android-device:
+	TAURI_APP_PATH=src-mobile yarn tauri android dev
 
 # Regenerates gen/apple. The generated project is committed; re-run only
 # when Tauri's template changes, and review the diff.
