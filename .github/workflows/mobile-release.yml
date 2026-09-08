@@ -365,12 +365,13 @@ jobs:
             export HEADSTATE_CODE_SIGN_IDENTITY="$SIGNING_IDENTITY"
             export HEADSTATE_PROVISIONING_PROFILE="$PROFILE_NAME"
             # Apple's export-compliance code, if there is one yet. The
-            # app declares ITSAppUsesNonExemptEncryption=true, so uploads
-            # are asked to clear compliance until the declaration is on
-            # file in App Store Connect and this carries the code it
-            # issues. Empty is valid and simply means the question is
-            # asked once per build, so a missing code does not fail the
-            # release.
+            # app declares ITSAppUsesNonExemptEncryption=FALSE and carries
+            # no code, which is what the App Store Connect questionnaire
+            # concluded; the verification step below enforces exactly that
+            # pairing. Setting this secret is the other half of a
+            # deliberate switch to `true` WITH a code, once documentation
+            # has been uploaded and approved. Empty is the normal case and
+            # does not fail the release.
             # ITSEncryptionExportComplianceCode is merged in ONLY when
             # there is a code, through a second plist handed to
             # `bundle.iOS.infoPlist`.
