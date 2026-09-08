@@ -39,6 +39,7 @@ import {
 import { HelpButton } from "./HelpButton";
 import { WorktreeKebab } from "./WorktreeKebab";
 import { claudifyCommand } from "../api/tauri";
+import { IS_MOBILE_BUILD } from "@/lib/target";
 import { isCancelled } from "@/lib/cancelled";
 import { copyText } from "../lib/clipboard";
 import { relativeTime } from "../lib/time";
@@ -49,6 +50,7 @@ import { useActiveFilters, useFilters } from "../store/filters";
 import type { PullRequest, Worktree } from "../types/pr";
 import { toast } from "sonner";
 import { QueryError, errorMessage } from "./QueryError";
+import { Button } from "./ui/button";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 
 /// Local git worktrees, so lingering ones can be found and removed.
@@ -496,16 +498,51 @@ export function WorktreesPage() {
     );
   };
 
+  /// "I read the assessment", the ONLY route to "Remove anyway…".
+  ///
+  /// Hoisted out of the clipboard's success branch, where it used to
+  /// live. A failed copy took an early return, so the action vanished
+  /// with it -- and the copy fails on a phone, where `copyText` reports
+  /// "This window has no clipboard access." in a non-secure webview
+  /// context, and on any desktop whose window is not focused. Losing
+  /// the ONLY path to force-removal because the clipboard was busy is
+  /// not a reasonable failure mode.
+  const assessmentAction = (wt: Worktree) => ({
+    label: "I read the assessment",
+    onClick: () => {
+      void markRead(wt.path).then(
+        () => toast.success(`${pathBasename(wt.path)} can now be removed`),
+        (e: unknown) =>
+          toast.error("Could not record the assessment", {
+            description: typeof e === "string" ? e : undefined,
+          }),
+      );
+    },
+  });
+
   const claudify = (wt: Worktree) => {
     claudifyCommand(selected?.path ?? "", wt.path, wt.branch).then(
       async ({ command, claude_installed }) => {
+        // The phone has no terminal to paste into, and no usable
+        // clipboard either. Show the command instead, framed for the
+        // machine it actually runs on -- the desktop this phone drives.
+        if (IS_MOBILE_BUILD) {
+          setClaudifying({ worktree: wt, command, claudeInstalled: claude_installed });
+          return;
+        }
         // `copyText` rather than `navigator.clipboard` directly: an
         // ABSENT clipboard throws synchronously on property access, so
         // the old `.then(ok, err)` attached neither handler and the
         // click produced no toast of either kind.
         const failure = await copyText(command);
         if (failure !== null) {
-          toast.error("Could not copy the command", { description: failure });
+          // The action rides along even here: the command could not be
+          // copied, but the user can still read the assessment by
+          // other means, and this is their only way to say so.
+          toast.error("Could not copy the command", {
+            description: failure,
+            action: assessmentAction(wt),
+          });
           return;
         }
         toast.success("Command copied to the clipboard", {
@@ -519,18 +556,7 @@ export function WorktreesPage() {
           // rather than automatic because that button removes a worktree
           // past its safety gate. Copying a prompt is not evidence
           // anyone read the answer; clicking this is.
-          action: {
-            label: "I read the assessment",
-            onClick: () => {
-              void markRead(wt.path).then(
-                () => toast.success(`${pathBasename(wt.path)} can now be removed`),
-                (e: unknown) =>
-                  toast.error("Could not record the assessment", {
-                    description: typeof e === "string" ? e : undefined,
-                  }),
-              );
-            },
-          },
+          action: assessmentAction(wt),
         });
       },
       (e: unknown) =>
@@ -539,6 +565,13 @@ export function WorktreesPage() {
         }),
     );
   };
+  /// The command to show on the phone, which has no terminal to paste
+  /// into. Null on the desktop, always: that path copies instead.
+  const [claudifying, setClaudifying] = useState<{
+    worktree: Worktree;
+    command: string;
+    claudeInstalled: boolean;
+  } | null>(null);
   const [pending, setPending] = useState<Worktree | null>(null);
   /// The path currently being removed, or null. A path rather than a
   /// boolean so only the clicked row goes busy.
@@ -908,6 +941,42 @@ export function WorktreesPage() {
       {/* Per worktree, not bulk. Bulk-deleting directories is where a
           wrong predicate becomes unrecoverable at scale, and with 149
           removable worktrees on one repo the temptation is real. */}
+      {claudifying !== null ? (
+        <Dialog open onOpenChange={() => setClaudifying(null)}>
+          <DialogContent className="max-w-lg">
+            <DialogTitle>Assess {pathBasename(claudifying.worktree.path)}</DialogTitle>
+            <ActingOnDesktop />
+            <p className="text-sm text-[#8b949e]">
+              {claudifying.claudeInstalled
+                ? "Run this on that desktop to have Claude Code assess what removing this worktree would lose."
+                : "Run this on that desktop. Claude Code was not found there, so it may need installing first."}
+            </p>
+            {/* Selectable, and wrapped rather than truncated: the point
+                is that a person can read and retype it. No copy button
+                -- `copyText` is exactly what does not work here, and
+                offering one that fails is worse than offering none. */}
+            <pre className="max-h-48 overflow-auto rounded border border-[#30363d] bg-[#0d1117] p-3 text-xs break-all whitespace-pre-wrap select-text">
+              {claudifying.command}
+            </pre>
+            <div className="flex justify-end gap-2">
+              <Button
+                variant="outline"
+                className="min-h-11"
+                onClick={() => {
+                  const wt = claudifying.worktree;
+                  setClaudifying(null);
+                  assessmentAction(wt).onClick();
+                }}
+              >
+                I read the assessment
+              </Button>
+              <Button variant="ghost" className="min-h-11" onClick={() => setClaudifying(null)}>
+                Close
+              </Button>
+            </div>
+          </DialogContent>
+        </Dialog>
+      ) : null}
       {pending ? (
         <ConfirmRemove
           wt={pending}

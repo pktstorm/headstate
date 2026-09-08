@@ -77,13 +77,13 @@ describe("the remote surface's frontend half", () => {
     // renders a control that can only reject.
     //
     // If it fails because a command was RECLASSIFIED away from Local
-    // (v5.5.0 did exactly that for `assess_worktree`, `pull_checkout`,
-    // `docker_start` and `docker_restart`), delete its line.
+    // (v5.5.0 did that for `assess_worktree`, `pull_checkout`,
+    // `docker_start` and `docker_restart`; #625 for `claudify_command`,
+    // which only ever built a string), delete its line.
     // Note `diag_log` is absent: it is `Class::Local` but has no
     // wrapper in `tauri.ts` at all, so there is nothing to guard.
     const DESKTOP_ONLY_WRAPPERS = [
       "applyUpdatesInBackground",
-      "claudifyCommand",
       "getAutostart",
       "getNotifyPrefs",
       "getRemoteEnabled",

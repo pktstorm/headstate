@@ -97,6 +97,12 @@ pub const SURFACE: &[(&str, Class)] = &[
     // Reads the desktop's disk to summarise a worktree; no side
     // effects, and the phone needs it to decide what to clean up.
     ("assess_worktree", Class::Read),
+    // Builds a command STRING and returns it; its own comment in
+    // `commands.rs` records that copying deliberately marks
+    // nothing. `mark_assessed` is the write, and it is already
+    // Write -- so the phone could record an assessment it had no
+    // way to obtain.
+    ("claudify_command", Class::Read),
     ("check_packages", Class::Read),
     ("packages_markdown", Class::Read),
     ("scan_claude_md", Class::Read),
@@ -162,7 +168,6 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("get_notify_prefs", Class::Local),
     ("set_notify_prefs", Class::Local),
     ("set_worktree_dirs", Class::Local),
-    ("claudify_command", Class::Local),
     ("apply_updates_in_background", Class::Local),
     // The remote feature's own commands. Pairing and the on/off switch
     // are decisions the desktop's user makes at the desktop: a phone
@@ -358,6 +363,11 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             a.get("branch")?,
         )
         .await),
+        "claudify_command" => ok(commands::claudify_command(
+            a.get("repoPath")?,
+            a.get("worktreePath")?,
+            a.get("branch")?,
+        )),
         "check_packages" => res(commands::check_packages(a.get("repoPath")?).await),
         "packages_markdown" => ok(commands::packages_markdown(
             a.get("repoPath")?,
@@ -626,7 +636,6 @@ mod tests {
             "reveal_log",
             "set_autostart",
             "set_worktree_dirs",
-            "claudify_command",
             "apply_updates_in_background",
             "issue_pairing_token",
             "respond_to_pairing",
@@ -656,6 +665,7 @@ mod tests {
     fn the_companion_may_drive_the_desktop() {
         for (name, class) in [
             ("assess_worktree", Class::Read),
+            ("claudify_command", Class::Read),
             ("get_ui_prefs", Class::Read),
             ("pull_checkout", Class::Write),
             ("docker_start", Class::Write),
