@@ -24,6 +24,10 @@ interface ConnectionReport {
   /// write and destructive commands (`remote_call` rejects with a
   /// message naming the desktop and the reason).
   stale?: boolean;
+  /// Whether THIS phone holds a post-quantum step-up key. Absent or
+  /// null when it could not be determined -- a locked keychain is not
+  /// evidence of a classical-only device. Desktop builds never set it.
+  has_mldsa?: boolean | null;
 }
 
 /// The connection as the UI sees it.
@@ -196,6 +200,29 @@ function useRemoteConnectionState(): ConnectionState {
   }, [client]);
 
   return data === undefined ? { kind: "unknown" } : fromReport(data);
+}
+
+/// Whether this phone holds a post-quantum step-up key.
+///
+/// `null` means unanswered -- no keys yet, a keychain that would not
+/// open, or a desktop build. Deliberately NOT folded into
+/// `ConnectionState`: that union describes the LINK to a desktop and
+/// each variant is shaped by what is known in that state, while this is
+/// a fact about the phone's own hardware that does not vary with
+/// connectivity. Adding it to five variants would imply it does.
+///
+/// Reads the cache `useRemoteConnectionState` already fills, so this
+/// costs no extra call -- `connection_state` is one command answering
+/// both questions.
+export function usePhoneHasMldsa(): boolean | null {
+  const { data } = useQuery({
+    queryKey: ["connection-state"],
+    queryFn: connectionState,
+    refetchInterval: CONNECTION_POLL_MS,
+    retry: false,
+    enabled: import.meta.env.VITE_TARGET === "mobile",
+  });
+  return data?.has_mldsa ?? null;
 }
 
 /// The current connection to the paired desktop.

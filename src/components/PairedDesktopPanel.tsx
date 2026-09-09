@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useUnpair } from "@/api/pairing";
-import { type ConnectionState, useConnectionState } from "@/api/connection";
+import { type ConnectionState, useConnectionState, usePhoneHasMldsa } from "@/api/connection";
 import { Button } from "./ui/button";
 
 /// The phone's half of the Phone settings section.
@@ -38,6 +38,7 @@ function describe(state: ConnectionState): { desktop: string; status: string } |
 
 export function PairedDesktopPanel() {
   const state = useConnectionState();
+  const hasMldsa = usePhoneHasMldsa();
   const unpair = useUnpair();
   const [confirming, setConfirming] = useState(false);
   const paired = describe(state);
@@ -61,6 +62,34 @@ export function PairedDesktopPanel() {
       <span className="text-sm font-medium">Desktop</span>
       <p className="text-sm">{paired.desktop}</p>
       <p className="text-xs text-[#8b949e]">{paired.status}</p>
+
+      {/* What this phone's own signatures carry.
+          
+          The desktop has always shown this in its paired-devices list,
+          but the phone is the device someone is holding when they
+          wonder what their hardware does -- and it was the one place
+          that could not say. #670.
+          
+          `null` renders nothing at all rather than "unknown": on a
+          desktop build there is no phone to describe, and on a phone
+          whose keychain would not open, an absent line is honest where
+          a claim either way would not be. */}
+      {hasMldsa === null ? null : (
+        <p className="text-xs text-[#8b949e]">
+          {hasMldsa ? (
+            <>
+              This phone signs with a{" "}
+              <span className="text-[#58a6ff]">post-quantum</span> key (ML-DSA-65)
+              alongside ECDSA P-256.
+            </>
+          ) : (
+            // Stated plainly rather than warned about: ECDSA P-256 is
+            // not broken, and this device simply cannot hold an ML-DSA
+            // key. A warning would imply a fault the user can fix.
+            <>This phone signs with ECDSA P-256. Its hardware has no post-quantum key.</>
+          )}
+        </p>
+      )}
 
       {confirming ? (
         <div className="mt-2 space-y-2 rounded border border-[#f85149]/30 bg-[#f85149]/10 p-3">
