@@ -488,6 +488,41 @@ export function withOwnReview(detail: PrDetail, viewer: string, state: string): 
   return { ...detail, latest_reviews: [...others, { author: viewer, state }] };
 }
 
+/// Re-read one pull request's mergeability after a review, without
+/// disturbing the verdict this app just seeded.
+///
+/// A whole-object refetch is what we cannot do here: it would overwrite
+/// `latest_reviews` with GitHub's pre-approval set, which lags
+/// `addPullRequestReview` by a second or two, and the button would
+/// revert to "Approve" for an approval that succeeded. That is the very
+/// failure the seeding exists to prevent, so this copies the three
+/// merge-related fields across and leaves everything else alone.
+///
+/// Failure is swallowed on purpose. The review itself already
+/// succeeded; a failed follow-up read must not report it as failed. The
+/// poll loop and `usePrDetail`'s own refetching still catch up.
+async function mergeFieldsAfterReview(
+  qc: QueryClient,
+  repo: string,
+  number: number,
+): Promise<void> {
+  try {
+    const fresh = await getPrDetail(repo, number);
+    qc.setQueryData<PrDetail>(["pr-detail", repo, number], (prev) =>
+      prev === undefined
+        ? prev
+        : {
+            ...prev,
+            merge_status: fresh.merge_status,
+            merge_queue_enabled: fresh.merge_queue_enabled,
+            in_merge_queue: fresh.in_merge_queue,
+          },
+    );
+  } catch {
+    // Deliberately silent; see above.
+  }
+}
+
 /// Submit a review on a pull request.
 ///
 /// Invalidates `["reviewing"]` and refreshes the PR list: approving a PR
@@ -530,7 +565,7 @@ export function useReviewPr() {
           prev === undefined ? prev : withOwnReview(prev, viewer, state),
         );
       }
-      // NOT refetched here, and that is the whole point.
+      // The REVIEW is not refetched here, and that is deliberate.
       //
       // The seed above writes the verdict we know landed. Immediately
       // awaiting a refetch of THE SAME KEY replaced it with GitHub's
@@ -541,9 +576,42 @@ export function useReviewPr() {
       // PR and coming back.
       //
       // The seed is authoritative rather than optimistic (the mutation
-      // rejects a PENDING review), so there is nothing to confirm. The
-      // next natural fetch overwrites it once GitHub agrees.
-      await refreshPrs(qc);
+      // rejects a PENDING review), so there is nothing to confirm.
+      //
+      // But MERGEABILITY is a different field with the opposite
+      // problem, and leaving it alone was a bug (#699). An approval is
+      // exactly what makes a pull request mergeable, or auto-merge
+      // enqueue it -- so `merge_status` and `in_merge_queue` are stale
+      // the instant the review lands, and nothing was re-reading them:
+      //
+      // - a queue-enabled PR still showed "Add to merge queue" for a
+      //   pull request GitHub had already queued, and clicking it got
+      //   an "already in the merge queue" error;
+      // - a PR that became mergeable kept a disabled Merge button, so
+      //   the user had to finish the job on github.com.
+      //
+      // `usePrDetail` polls while `merge_status` is `unknown`, but that
+      // could never fix this: the stale value is not `unknown`, it is
+      // the PRE-approval verdict (`blocked`), which looks like a
+      // settled answer. Something has to ask again once, and the poller
+      // takes over from there if GitHub is still recomputing.
+      //
+      // `mergeFieldsAfterReview` re-reads the one pull request and
+      // copies ONLY those fields over, so the seeded verdict survives.
+      // Awaited: the detail view the user is looking at, one request.
+      await mergeFieldsAfterReview(qc, repo, number);
+      // NOT awaited: the whole-world list refresh.
+      //
+      // `refreshPrs` calls `refresh_now`, which searches EVERY watched
+      // repository. Awaiting it meant approving one pull request took
+      // ~20s to register in the UI while the write itself had landed on
+      // GitHub instantly -- the click looked ignored, and re-clicking
+      // was the natural response.
+      //
+      // The list still updates: this runs, and the Rust side wakes the
+      // poll loop on success besides. It just no longer stands between
+      // the user and the button they pressed.
+      void refreshPrs(qc);
     });
 }
 

@@ -87,3 +87,111 @@ describe("useReviewPr", () => {
     expect(after?.latest_reviews).toEqual([{ author: "me", state: "CHANGES_REQUESTED" }]);
   });
 });
+
+/// #699: approving is exactly what makes a pull request mergeable, or
+/// makes auto-merge enqueue it -- so the merge fields are stale the
+/// instant the review lands, and nothing was re-reading them.
+///
+/// `usePrDetail` polls while `merge_status` is `unknown`, but that
+/// could never fix this: the stale value is the PRE-approval verdict
+/// (`blocked`), which looks like a settled answer rather than a
+/// transient one.
+describe("useReviewPr and the merge buttons", () => {
+  /// GitHub after the approval: mergeable, and auto-merge has queued it.
+  const FRESH = {
+    latest_reviews: [],
+    merge_status: "clean",
+    merge_queue_enabled: true,
+    in_merge_queue: true,
+  } as unknown as PrDetail;
+
+  /// The cache before it: the pre-approval verdict.
+  const BEFORE = {
+    latest_reviews: [],
+    merge_status: "blocked",
+    merge_queue_enabled: true,
+    in_merge_queue: false,
+  } as unknown as PrDetail;
+
+  beforeEach(() => {
+    invoke.mockReset();
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_pr_detail") return Promise.resolve(FRESH);
+      return Promise.resolve();
+    });
+  });
+
+  const wrap = (qc: QueryClient) =>
+    ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={qc}>{children}</QueryClientProvider>
+    );
+
+  /// The reported symptom: "Add to merge queue" offered for a pull
+  /// request GitHub had already queued, and clicking it errored with
+  /// "already in the merge queue".
+  it("re-reads whether the pull request is now queued", async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc.setQueryData(["viewer"], "me");
+    qc.setQueryData<PrDetail>(["pr-detail", "o/r", 7], BEFORE);
+
+    const { result } = renderHook(() => useReviewPr(), { wrapper: wrap(qc) });
+    await result.current("id", "o/r", 7, "approve", "");
+
+    const after = qc.getQueryData<PrDetail>(["pr-detail", "o/r", 7]);
+    expect(after?.in_merge_queue, "the queue button would offer an action GitHub refuses").toBe(
+      true,
+    );
+  });
+
+  /// The other reported symptom, on a repository with no merge queue:
+  /// the Merge button never activated, and the work had to be finished
+  /// on github.com.
+  it("re-reads mergeability so the merge button can activate", async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc.setQueryData(["viewer"], "me");
+    qc.setQueryData<PrDetail>(["pr-detail", "o/r", 7], BEFORE);
+
+    const { result } = renderHook(() => useReviewPr(), { wrapper: wrap(qc) });
+    await result.current("id", "o/r", 7, "approve", "");
+
+    expect(qc.getQueryData<PrDetail>(["pr-detail", "o/r", 7])?.merge_status).toBe("clean");
+  });
+
+  /// The trap this fix had to avoid: the merge fields and the review
+  /// verdict lag in OPPOSITE directions. `latestReviews` lags behind
+  /// the approval, so re-reading it reverts the button; mergeability
+  /// lags ahead of the cache, so NOT re-reading it strands the button.
+  /// Copying only the merge fields is what serves both.
+  it("does not let the re-read undo the seeded verdict", async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc.setQueryData(["viewer"], "me");
+    qc.setQueryData<PrDetail>(["pr-detail", "o/r", 7], BEFORE);
+
+    const { result } = renderHook(() => useReviewPr(), { wrapper: wrap(qc) });
+    await result.current("id", "o/r", 7, "approve", "");
+
+    const after = qc.getQueryData<PrDetail>(["pr-detail", "o/r", 7]);
+    expect(
+      after?.latest_reviews,
+      "the merge re-read overwrote the verdict, which is #440 all over again",
+    ).toContainEqual({ author: "me", state: "APPROVED" });
+  });
+
+  /// The review already succeeded. A failed follow-up read must not
+  /// report it as failed -- the poll loop catches up regardless.
+  it("does not fail the review when the follow-up read fails", async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc.setQueryData(["viewer"], "me");
+    qc.setQueryData<PrDetail>(["pr-detail", "o/r", 7], BEFORE);
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "get_pr_detail" ? Promise.reject(new Error("offline")) : Promise.resolve(),
+    );
+
+    const { result } = renderHook(() => useReviewPr(), { wrapper: wrap(qc) });
+    await expect(result.current("id", "o/r", 7, "approve", "")).resolves.toBeUndefined();
+    // The seed still landed, so the approval is still visible.
+    expect(
+      qc.getQueryData<PrDetail>(["pr-detail", "o/r", 7])?.latest_reviews,
+    ).toContainEqual({ author: "me", state: "APPROVED" });
+  });
+});
