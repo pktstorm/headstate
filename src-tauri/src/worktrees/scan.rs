@@ -319,18 +319,30 @@ pub fn worktree_safety(
 /// "did commits ever exist HERE", which is a question about history, not
 /// about where two refs currently sit.
 ///
-/// An unreadable reflog is NOT empty. A missing reflog is the absence of
-/// evidence, not evidence of absence -- `gc` can expire one, and a ref
-/// packed by other tooling may have none -- and guessing `Empty` there
-/// would be a confidently wrong answer about a directory the user is
-/// deciding whether to delete. A detached HEAD has no branch to ask
-/// about at all and falls through to the checks below.
+/// EXACTLY one entry, not "one or fewer". A branch whose reflog is
+/// MISSING reports zero entries and exits 0 -- git treats an absent
+/// reflog as an empty one, not as an error -- so `<= 1` would call a
+/// branch full of real commits empty. Verified: delete
+/// `.git/logs/refs/heads/<branch>` from a branch with two commits and
+/// `reflog show` prints nothing and succeeds.
+///
+/// That is the same "absence of evidence is not evidence of absence"
+/// mistake as trusting a failed call, arriving through a success. `gc`
+/// expires reflogs, `clone` creates none for branches it did not check
+/// out, and some tooling packs refs without logs -- all of which would
+/// have silently reported "nothing to lose" over work that exists.
+///
+/// So zero entries and an outright error are treated alike: NOT empty.
+/// Both mean the reflog cannot answer, and guessing `Empty` there would
+/// be a confidently wrong answer about a directory the user is deciding
+/// whether to delete. A detached HEAD has no branch to ask about at all
+/// and falls through to the checks below.
 fn branch_is_empty(dir: &Path, branch: &str) -> bool {
     if branch.is_empty() {
         return false;
     }
     match git(dir, &["reflog", "show", "--format=%H", branch]) {
-        Ok(s) => s.lines().filter(|l| !l.trim().is_empty()).count() <= 1,
+        Ok(s) => s.lines().filter(|l| !l.trim().is_empty()).count() == 1,
         Err(_) => false,
     }
 }
@@ -1475,6 +1487,39 @@ HEAD 8ed50a741e1696d1a0c9506f2e033cf2887bb144
             "the false never-pushed claim is the bug: {err}"
         );
         assert!(wt.is_dir(), "the worktree must still exist");
+    }
+
+    /// A branch with commits but NO reflog must not read as empty.
+    ///
+    /// Caught while writing this change, and it is the trap the whole
+    /// approach turns on: `reflog show` for a missing reflog prints
+    /// nothing and exits **0**. Git treats an absent reflog as an empty
+    /// one, not as an error, so an `Err` guard never sees it and a
+    /// `<= 1` count calls a branch full of real work empty. `gc`
+    /// expires reflogs and `clone` writes none for branches it did not
+    /// check out, so this is an ordinary state, not a contrived one.
+    ///
+    /// The branch here has two commits that exist nowhere else. Getting
+    /// this wrong reports "nothing to lose" over them.
+    #[test]
+    fn a_branch_with_commits_but_no_reflog_is_not_empty() {
+        let (_t, repo, wt) = repo_with_worktree("feature");
+        commit_in(&wt, "work that must not be called nothing");
+
+        // Exactly what `gc` leaves behind: the ref, without its log.
+        let log = repo.join(".git/logs/refs/heads/feature");
+        assert!(log.exists(), "the fixture must start with a reflog");
+        std::fs::remove_file(&log).unwrap();
+        assert_eq!(
+            git(&wt, &["reflog", "show", "--format=%H", "feature"]),
+            Ok(String::new()),
+            "a missing reflog must SUCCEED with no output -- the premise of this test"
+        );
+
+        assert!(
+            !branch_is_empty(&wt, "feature"),
+            "an unreadable reflog is the absence of evidence, not evidence of absence"
+        );
     }
 
     /// Uncommitted work outranks emptiness.
