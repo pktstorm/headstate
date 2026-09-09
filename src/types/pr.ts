@@ -224,6 +224,18 @@ export interface WorktreeRepo {
   name: string;
   path: string;
   worktrees: Worktree[];
+  /// When this repository's remote refs were last fetched, RFC 3339, or
+  /// null if never fetched or unreadable.
+  ///
+  /// Every merge and upstream verdict below is computed against refs
+  /// already on disk -- the scan never goes to the network on purpose.
+  /// This is what lets the view say how old those answers are (#702).
+  ///
+  /// Optional in the TYPE so a fixture need not enumerate it, and
+  /// `undefined` reads the same as `null` at every use: both mean the
+  /// age is unknown, which is what the UI must say. The Rust side
+  /// always sends the key.
+  fetched_at?: string | null;
 }
 
 /// Everything the detail view renders.

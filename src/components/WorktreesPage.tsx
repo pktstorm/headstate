@@ -36,6 +36,7 @@ import {
   upstreamReason,
   upstreamShort,
   upstreamTone,
+  refAge,
 } from "../lib/worktrees";
 import { HelpButton } from "./HelpButton";
 import { WorktreeKebab } from "./WorktreeKebab";
@@ -880,6 +881,21 @@ export function WorktreesPage() {
         <span className="text-[#8b949e]">
           {shown.length} worktree{shown.length === 1 ? "" : "s"}
         </span>
+        {/* How old these answers are.
+            
+            Every verdict on the rows below is computed against refs on
+            disk; the scan never fetches, on purpose. Saying nothing
+            made a fortnight-old answer read like the present tense
+            (#702). Silent under a day, because a caveat shown always is
+            a caveat nobody reads. */}
+        {refAge(selected?.fetched_at ?? null) === null ? null : (
+          <span
+            className="text-xs text-[#d29922]"
+            title="Merge and upstream verdicts are computed from the refs on disk, which are only as current as the last fetch."
+          >
+            {refAge(selected?.fetched_at ?? null)}
+          </span>
+        )}
         {/* The count is withheld, not shown as a growing number: a
             "3 safe to remove" that climbs to 122 as rows resolve invites
             acting on a figure that was never the answer. */}

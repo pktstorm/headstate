@@ -105,6 +105,25 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
 /// attach an authoritative-looking answer to the wrong directory.
 ///
 /// Returns None for anything unrecognisable rather than guessing.
+/// When this repository's remote refs were last fetched.
+///
+/// `FETCH_HEAD`'s mtime, which git rewrites on every fetch. One `stat`
+/// against a file the scan is already beside -- deliberately not a
+/// `git` invocation, because this runs per repository and the whole
+/// point is that it costs nothing next to the scan it annotates.
+///
+/// `None` for never fetched, an unreadable time, or a repository
+/// without the file. All three are "we do not know", which is what the
+/// UI must say; a fabricated timestamp here would be worse than the
+/// silence it replaced (#702).
+fn fetched_at(dir: &Path) -> Option<String> {
+    let meta = std::fs::metadata(dir.join(".git").join("FETCH_HEAD"))
+        .or_else(|_| std::fs::metadata(dir.join("FETCH_HEAD")))
+        .ok()?;
+    let t: chrono::DateTime<chrono::Utc> = meta.modified().ok()?.into();
+    Some(t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
 pub fn parse_owner_repo(url: &str) -> Option<String> {
     let url = url.trim().trim_end_matches('/');
     let url = url.strip_suffix(".git").unwrap_or(url);
@@ -868,6 +887,7 @@ fn collect_inner(dir: &Path, depth: usize, out: &mut Vec<Repo>, with_safety: boo
                     .unwrap_or_default(),
                 path: dir.to_string_lossy().into_owned(),
                 identity: None,
+                fetched_at: fetched_at(dir),
                 worktrees: vec![Worktree {
                     path: dir.to_string_lossy().into_owned(),
                     branch: String::new(),
@@ -903,6 +923,7 @@ fn collect_inner(dir: &Path, depth: usize, out: &mut Vec<Repo>, with_safety: boo
                 .collect();
             out.push(Repo {
                 identity: repo_identity(&dir.to_string_lossy()),
+                fetched_at: fetched_at(dir),
                 name: dir
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
@@ -1017,6 +1038,31 @@ HEAD 8ed50a741e1696d1a0c9506f2e033cf2887bb144
         let w = parse_porcelain(SAMPLE);
         assert_eq!(w[2].branch, "");
         assert_eq!(w[2].head, "8ed50a741e1696d1a0c9506f2e033cf2887bb144");
+    }
+
+    /// #702: the verdicts are computed against refs on disk, and the
+    /// user was never told how old those refs are. Measured on this
+    /// machine, one repository's were 12 days stale while its rows read
+    /// like the present tense.
+    #[test]
+    fn a_fetched_repository_reports_when() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let git_dir = tmp.path().join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(git_dir.join("FETCH_HEAD"), "").unwrap();
+        let at = fetched_at(tmp.path()).expect("a fetched repository has a time");
+        assert!(at.ends_with('Z'), "RFC 3339 UTC, got {at}");
+    }
+
+    /// Never fetched is not "just now". A repository with no
+    /// `FETCH_HEAD` must report nothing rather than a fabricated time,
+    /// which would be a confident wrong answer about how current the
+    /// verdicts are.
+    #[test]
+    fn a_never_fetched_repository_reports_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        assert_eq!(fetched_at(tmp.path()), None);
     }
 
     #[test]
@@ -1392,6 +1438,7 @@ HEAD 8ed50a741e1696d1a0c9506f2e033cf2887bb144
     #[test]
     fn repos_sort_by_worktree_count_not_name() {
         let mk = |name: &str, n: usize| Repo {
+            fetched_at: None,
             identity: None,
             name: name.into(),
             path: format!("/tmp/{name}"),
@@ -1410,6 +1457,7 @@ HEAD 8ed50a741e1696d1a0c9506f2e033cf2887bb144
     #[test]
     fn equal_counts_break_ties_by_name() {
         let mk = |name: &str, n: usize| Repo {
+            fetched_at: None,
             identity: None,
             name: name.into(),
             path: format!("/tmp/{name}"),
@@ -1427,6 +1475,7 @@ HEAD 8ed50a741e1696d1a0c9506f2e033cf2887bb144
     #[test]
     fn sorting_uses_the_count_the_sidebar_displays() {
         let mk = |name: &str, n: usize| Repo {
+            fetched_at: None,
             identity: None,
             name: name.into(),
             path: format!("/tmp/{name}"),
