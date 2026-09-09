@@ -1,0 +1,20 @@
+# The highest mobile build number that has ever reached a store.
+#
+# BUILD_NUMBER is github.run_number, counted per workflow FILE. Renaming
+# mobile-release.yml restarts it at 1, and every upload after that is
+# refused as a duplicate -- recoverable only by burning version numbers
+# until the count climbs back past this line. Preflight compares against
+# this file so that failure happens in the first job with the cause
+# named, rather than at the store with a message that says only that the
+# number has been seen before.
+#
+# Why a committed file rather than the previous release's assets: the
+# publish job only runs when BOTH platform jobs succeed, and it has never
+# run -- the Android release secrets are not configured (#673), so
+# android-release fails Preflight and publish is skipped. There are 38
+# mobile-v tags and zero GitHub releases, so asset names cannot be the
+# record. This file does not depend on any job downstream of the upload.
+#
+# Raise it when a build reaches TestFlight or Play. Non-contiguous is
+# correct: a rejected upload still consumes its number.
+20
