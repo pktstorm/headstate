@@ -260,6 +260,14 @@ fn platform() -> Vec<Gpu> {
             let n = n.to_string_lossy();
             // "card0", not "card0-DP-1": the connector nodes are
             // outputs, not devices, and carry none of these files.
+            //
+            // `n[4..]` cannot panic despite being a byte index into a
+            // string that may hold anything the filesystem allows:
+            // `&&` short-circuits, so the slice is only reached once
+            // the name starts with four ASCII bytes, which makes byte 4
+            // a char boundary. A bare "card" would pass the digit test
+            // vacuously, but no such node exists and it would find no
+            // files if it did.
             n.starts_with("card") && n[4..].chars().all(|c| c.is_ascii_digit())
         })
         .collect();
