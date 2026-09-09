@@ -31,6 +31,7 @@ import {
   worktreeSignal,
   isOrphaned,
   ORPHAN_FILTER,
+  forceWarning,
   safetyReason,
   safetyTone,
   upstreamReason,
@@ -1054,10 +1055,18 @@ export function WorktreesPage() {
                 : ""}
               {forcing.last_commit ? ` · last commit ${relativeTime(forcing.last_commit)}` : ""}
             </p>
-            <p className="mt-2 text-sm text-[#f85149]">
-              {forcing.safety.kind === "never_pushed"
-                ? "These commits are not pushed anywhere. This cannot be undone."
-                : "Headstate does not consider this safe to remove. This cannot be undone."}
+            {/* An empty branch is the one case here where nothing is at
+                risk, so it gets neither the red nor the warning. Saying
+                "these commits are not pushed anywhere" over a branch
+                with no commits is the exact misreport of #701, and
+                repeating it in the confirmation is worse than in the
+                row: this is the moment the user decides. */}
+            <p
+              className={`mt-2 text-sm ${
+                forcing.safety.kind === "empty" ? "text-[#8b949e]" : "text-[#f85149]"
+              }`}
+            >
+              {forceWarning(forcing.safety)}
             </p>
             <div className="mt-5 flex justify-end gap-2">
               <button

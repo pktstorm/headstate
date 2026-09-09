@@ -42,6 +42,11 @@ export function safetyReason(s: Safety): string {
       return `${s.detail} unpushed commit${s.detail === 1 ? "" : "s"}`;
     case "never_pushed":
       return "never pushed — commits exist only here";
+    case "empty":
+      // Says what is TRUE of the branch, not what the app will let you
+      // do about it: the Remove button stays disabled, deliberately,
+      // but the row must stop claiming commits that do not exist.
+      return "no commits of its own — nothing to lose";
     case "unmerged":
       return "branch not merged";
     case "pending":
@@ -53,6 +58,30 @@ export function safetyReason(s: Safety): string {
       return "its repository is gone — nothing here can be checked";
     default:
       return `could not determine: ${s.detail}`;
+  }
+}
+
+/// What the force-removal confirmation warns about, for one safety
+/// state.
+///
+/// Three cases, not two, because #701 showed what the missing one
+/// costs. `never_pushed` names the specific loss -- commits that exist
+/// nowhere else. `empty` has no loss to name, so it says so plainly
+/// rather than inheriting a warning about commits it does not have;
+/// that sentence is the whole reason this state exists. Everything else
+/// gets the general form, which is honest about the app's uncertainty
+/// without inventing a danger.
+///
+/// Every branch still ends in "this cannot be undone": the directory
+/// goes either way, and the user is one click from it.
+export function forceWarning(s: Safety): string {
+  switch (s.kind) {
+    case "never_pushed":
+      return "These commits are not pushed anywhere. This cannot be undone.";
+    case "empty":
+      return "This branch has no commits of its own, so nothing on it would be lost. Removing the directory cannot be undone.";
+    default:
+      return "Headstate does not consider this safe to remove. This cannot be undone.";
   }
 }
 
@@ -91,7 +120,14 @@ export function canClaudify(s: Safety): boolean {
     s.kind === "unmerged" ||
     s.kind === "never_pushed" ||
     s.kind === "unpushed" ||
-    s.kind === "dirty"
+    s.kind === "dirty" ||
+    // Included, because the rule above is "not removable and not the
+    // main checkout" and `empty` is both. It is a weaker case than the
+    // others -- there is nothing on the branch to assess -- but the
+    // gate keeps `empty` un-removable, so withholding the assess action
+    // too would leave the row with no action at all, which is precisely
+    // the dead end this list exists to avoid.
+    s.kind === "empty"
   );
 }
 
@@ -202,6 +238,14 @@ export function safetyTone(s: Safety): string {
       return "text-[#8b949e]";
     case "never_pushed":
       return "text-[#f85149]";
+    case "empty":
+      // Grey, and explicitly so rather than by falling through to the
+      // default. This is the one colour on the row that separates
+      // "nothing here" from the red beside it -- an empty branch put in
+      // red would repeat #701's mistake in a different medium, telling
+      // the user work is at risk when there is no work. Not green
+      // either: green means one-click removable, and it is not.
+      return "text-[#8b949e]";
     case "dirty":
     case "unpushed":
       return "text-[#d29922]";

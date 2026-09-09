@@ -88,11 +88,24 @@ Anything else is reported with what would change it:
 | dirty | uncommitted files | commit or discard them |
 | unpushed | commits not on the remote | push the branch |
 | never pushed | no upstream at all | push it, or accept losing the work |
+| empty | the branch was never committed to | nothing to save — remove it when you like |
 | unmerged | the branch has not landed | merge its pull request |
+
+**empty** and **never pushed** look alike and are not. Both branches
+have no upstream, but an empty one has no commits of its own either, so
+there is nothing that could be lost. It is the scratch worktree you
+made to look at something and then worked elsewhere. The row says so
+outright rather than leaving you to prove it by hand.
+
+Empty is still not one-click removable, for the same reason the others
+are not: the button is reserved for merged, pushed work. Use **Remove
+anyway** — the confirmation will tell you plainly that nothing on the
+branch would be lost.
 
 Every one of these is re-checked **at the moment you remove it**, not
 from the scan. A worktree that went dirty since the page loaded is
-refused rather than deleted.
+refused rather than deleted — and that applies to an empty branch too,
+which can still have uncommitted files sitting in its directory.
 
 ### When this disagrees with git
 

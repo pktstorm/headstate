@@ -177,6 +177,11 @@ export type Safety =
   | { kind: "dirty"; detail: number }
   | { kind: "unpushed"; detail: number }
   | { kind: "never_pushed" }
+  /// The branch was created and never committed to -- a scratch
+  /// worktree. Distinct from `never_pushed`, which claims commits exist
+  /// only here: for a branch with none, that claim is false, and the
+  /// row said it beside "0 commits ahead".
+  | { kind: "empty" }
   | { kind: "unmerged" }
   /// The repository that owned this worktree is gone, so nothing about
   /// the checkout can be classified -- there is no git to run in it.

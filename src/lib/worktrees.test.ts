@@ -1,6 +1,16 @@
 import { describe, expect, it } from "vitest";
 import type { Safety } from "@/types/pr";
-import { formatSize, isSafe, pathBasename, prForWorktree, safetyReason, safetyTone, totalSize } from "./worktrees";
+import {
+  canClaudify,
+  forceWarning,
+  formatSize,
+  isSafe,
+  pathBasename,
+  prForWorktree,
+  safetyReason,
+  safetyTone,
+  totalSize,
+} from "./worktrees";
 
 describe("isSafe", () => {
   // Only `safe` is deletable. Everything else is disabled rather than
@@ -13,6 +23,12 @@ describe("isSafe", () => {
       { kind: "dirty", detail: 3 },
       { kind: "unpushed", detail: 2 },
       { kind: "never_pushed" },
+      // `empty` included deliberately. Nothing on the branch could be
+      // lost, and it is still not one-click removable: #701 reported
+      // that the WORDING was wrong, and quietly widening the app's only
+      // unrecoverable action on the back of a copy fix is not what was
+      // asked for. The forced path stays available.
+      { kind: "empty" },
       { kind: "unmerged" },
       { kind: "unknown", detail: "x" },
     ] as Safety[]) {
@@ -33,6 +49,16 @@ describe("safetyReason", () => {
   it("says plainly when commits exist nowhere else", () => {
     expect(safetyReason({ kind: "never_pushed" })).toContain("only here");
   });
+
+  // The bug in #701: a scratch branch was described as holding commits
+  // that exist only here, beside "0 commits ahead". Both cannot be
+  // true, and the user believed the scarier one.
+  it("does not claim an empty branch holds commits", () => {
+    const reason = safetyReason({ kind: "empty" });
+    expect(reason).toContain("no commits of its own");
+    expect(reason).not.toContain("only here");
+    expect(reason).not.toBe(safetyReason({ kind: "never_pushed" }));
+  });
 });
 
 describe("safetyTone", () => {
@@ -45,6 +71,48 @@ describe("safetyTone", () => {
   // The main checkout is not a problem, so it must not look like one.
   it("does not alarm about the main checkout", () => {
     expect(safetyTone({ kind: "main_checkout" })).toContain("8b949e");
+  });
+
+  // Grey, not red. An empty branch holds no work, so painting it the
+  // same colour as "commits exist only here" would repeat #701 in a
+  // medium the user reads before the words.
+  it("does not alarm about an empty branch", () => {
+    expect(safetyTone({ kind: "empty" })).toContain("8b949e");
+    expect(safetyTone({ kind: "empty" })).not.toBe(safetyTone({ kind: "never_pushed" }));
+  });
+});
+
+describe("forceWarning", () => {
+  // The confirmation is the moment the user decides, so a false claim
+  // there is worse than one on the row.
+  it("does not warn about commits an empty branch does not have", () => {
+    const warning = forceWarning({ kind: "empty" });
+    expect(warning).toContain("nothing on it would be lost");
+    expect(warning).not.toContain("not pushed anywhere");
+    expect(warning).toContain("cannot be undone");
+  });
+
+  it("still names the specific loss for a never-pushed branch", () => {
+    expect(forceWarning({ kind: "never_pushed" })).toContain("not pushed anywhere");
+  });
+
+  it("falls back to the general form for everything else", () => {
+    expect(forceWarning({ kind: "unmerged" })).toContain("does not consider this safe");
+  });
+});
+
+describe("canClaudify", () => {
+  // The rule is "not removable and not the main checkout". `empty` is
+  // both, and the gate keeps it un-removable -- so withholding the
+  // assess action too would leave the row with no action at all.
+  it("offers assessment for an empty branch", () => {
+    expect(canClaudify({ kind: "empty" })).toBe(true);
+  });
+
+  it("still refuses the states with no question to ask", () => {
+    expect(canClaudify({ kind: "safe" })).toBe(false);
+    expect(canClaudify({ kind: "main_checkout" })).toBe(false);
+    expect(canClaudify({ kind: "pending" })).toBe(false);
   });
 });
 

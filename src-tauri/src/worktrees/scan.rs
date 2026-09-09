@@ -231,6 +231,22 @@ pub fn worktree_safety(
         Err(e) => return Safety::Unknown(e),
     }
 
+    // A branch that was never committed to holds nothing, pushed or
+    // not. Checked here -- AFTER dirty, BEFORE `has_upstream` -- and the
+    // order is load-bearing in both directions:
+    //
+    // - After `Dirty`, because an empty branch can still have
+    //   uncommitted work in its working tree, and that work is exactly
+    //   what `Dirty` exists to protect. Reversing these would report
+    //   "nothing to lose" over a tree full of unsaved edits.
+    // - Before `NeverPushed`, which is the bug in #701: a scratch branch
+    //   has no upstream either, so it was reported as "commits exist
+    //   only here" -- a claim about commits that do not exist -- beside
+    //   "0 commits ahead".
+    if branch_is_empty(dir, &wt.branch) {
+        return Safety::Empty;
+    }
+
     // No upstream means nothing was ever pushed: these commits exist only
     // here. Checked BEFORE merge status, because a branch name that looks
     // merged tells you nothing about commits that never left the machine.
@@ -274,6 +290,49 @@ pub fn worktree_safety(
         return Safety::Safe;
     }
     squash_merged(dir, default_branch)
+}
+
+/// Whether this branch was created and never committed to.
+///
+/// Reads the BRANCH's reflog, which records every time the ref itself
+/// moved. Creating a branch writes exactly one entry; the first commit
+/// writes a second. So `<= 1` entry means the ref has never moved from
+/// where it was created -- no commits of its own, whatever the branch
+/// points at now. Verified across all three ways a branch here gets
+/// made: `worktree add -b`, `branch` then `worktree add`, and
+/// `checkout -b` inside a detached worktree. All give exactly 1.
+///
+/// Three approaches were tried and rejected first, each of which looked
+/// right:
+///
+/// - `rev-list --count <default>..HEAD == 0`. WRONG: a branch whose real
+///   commits were merged is also 0 ahead, so every genuinely-merged
+///   worktree became `Empty` and stopped being removable.
+/// - `merge-base --is-ancestor HEAD <default>`. Same flaw, same reason:
+///   it asks "is this reachable from the default branch", which is true
+///   of merged work as well as of no work.
+/// - HEAD reflog length `<= 1`. WRONG: `git worktree add -b` writes TWO
+///   HEAD entries, one for the checkout and one for the branch creation,
+///   so no scratch worktree ever matched.
+///
+/// The distinction the branch reflog gets right and the others miss is
+/// "did commits ever exist HERE", which is a question about history, not
+/// about where two refs currently sit.
+///
+/// An unreadable reflog is NOT empty. A missing reflog is the absence of
+/// evidence, not evidence of absence -- `gc` can expire one, and a ref
+/// packed by other tooling may have none -- and guessing `Empty` there
+/// would be a confidently wrong answer about a directory the user is
+/// deciding whether to delete. A detached HEAD has no branch to ask
+/// about at all and falls through to the checks below.
+fn branch_is_empty(dir: &Path, branch: &str) -> bool {
+    if branch.is_empty() {
+        return false;
+    }
+    match git(dir, &["reflog", "show", "--format=%H", branch]) {
+        Ok(s) => s.lines().filter(|l| !l.trim().is_empty()).count() <= 1,
+        Err(_) => false,
+    }
 }
 
 /// Whether every commit on this branch already exists upstream as an
@@ -1348,15 +1407,97 @@ HEAD 8ed50a741e1696d1a0c9506f2e033cf2887bb144
         (tmp, repo, wt)
     }
 
+    /// Put one real commit on whatever branch `dir` has checked out.
+    ///
+    /// The fixtures above hand back a branch that has never been
+    /// committed to, which is now a state of its own -- so any test
+    /// about a branch that HOLDS work has to say so explicitly rather
+    /// than inherit it.
+    fn commit_in(dir: &Path, message: &str) {
+        let ident = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["commit", "-q", "--allow-empty", "-m", message])
+            .envs(ident)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git commit: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     /// A worktree with no upstream is NEVER safe, even when its branch
     /// points at the same commit as the default branch. 52 of 296
     /// worktrees on this machine are in exactly this state.
+    ///
+    /// This is the case the doc above is really about, and it needs a
+    /// branch that has COMMITTED work with nowhere else to live -- so
+    /// the fixture commits before asking. It did not used to: it took
+    /// `repo_with_worktree`'s bare branch, which was never committed
+    /// to, and passed only because `NeverPushed` swallowed the empty
+    /// case. That is exactly the misreport #701 is about, so the test
+    /// was asserting the bug.
     #[test]
     fn refuses_a_worktree_that_was_never_pushed() {
         let (_t, repo, wt) = repo_with_worktree("feature");
+        commit_in(&wt, "work only on this branch");
         let err = remove_worktree(repo.to_str().unwrap(), wt.to_str().unwrap()).unwrap_err();
         assert!(err.contains("never pushed"), "{err}");
         assert!(wt.is_dir(), "the worktree must still exist");
+    }
+
+    /// The other half of that split: an EMPTY branch is reported as
+    /// empty, and is still not one-click removable.
+    ///
+    /// Two assertions, deliberately, because #701 could be "fixed" in a
+    /// way that regresses either one. The prose must stop claiming
+    /// commits exist only here -- there are none -- and the gate must
+    /// not move, because widening the app's only unrecoverable action
+    /// is not something a wording fix gets to do as a side effect.
+    #[test]
+    fn refuses_but_correctly_describes_a_branch_with_no_commits() {
+        let (_t, repo, wt) = repo_with_worktree("scratch");
+        let err = remove_worktree(repo.to_str().unwrap(), wt.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.contains("no commits of its own"),
+            "an empty branch must not be described as holding commits: {err}"
+        );
+        assert!(
+            !err.contains("only here"),
+            "the false never-pushed claim is the bug: {err}"
+        );
+        assert!(wt.is_dir(), "the worktree must still exist");
+    }
+
+    /// Uncommitted work outranks emptiness.
+    ///
+    /// The empty check sits between `Dirty` and `NeverPushed`, and this
+    /// pins the first half of that ordering: a scratch branch with
+    /// unsaved edits in its tree must report the edits. Reversing the
+    /// two would tell the user there is "nothing to lose" while a file
+    /// they have not committed sits in the directory.
+    #[test]
+    fn uncommitted_work_outranks_an_empty_branch() {
+        let (_t, repo, wt) = repo_with_worktree("scratch");
+        std::fs::write(wt.join("wip.txt"), "not committed yet\n").unwrap();
+        let branch = default_branch(&repo);
+        let listed = parse_porcelain(&git(&repo, &["worktree", "list", "--porcelain"]).unwrap());
+        let target = listed
+            .iter()
+            .find(|w| !w.is_main && w.branch == "scratch")
+            .expect("the scratch worktree must be listed");
+        assert_eq!(
+            worktree_safety(target, &branch, false, Some(0)),
+            Safety::Dirty(1)
+        );
     }
 
     /// The other half of the gate: a genuinely safe worktree MUST be
@@ -1364,6 +1505,16 @@ HEAD 8ed50a741e1696d1a0c9506f2e033cf2887bb144
     ///
     /// Builds a real remote so the branch has an upstream and is merged,
     /// which is what "safe" actually requires.
+    ///
+    /// The fixture used to create the branch, push it, and never commit
+    /// -- justified by the comment "a branch that IS main: merged by
+    /// definition". True, but it made the test about the wrong thing:
+    /// under #701's fix that branch is `Empty`, and an empty branch
+    /// proves nothing about whether real merged work can be removed.
+    /// So it now commits, fast-forwards `main` onto the branch, and
+    /// pushes both. That is the shape the test is NAMED for -- merged
+    /// work, clean tree, upstream present -- and it is the shape the
+    /// user actually has when the Remove button should light up.
     #[test]
     fn removes_a_worktree_that_is_merged_clean_and_pushed() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1403,7 +1554,10 @@ HEAD 8ed50a741e1696d1a0c9506f2e033cf2887bb144
         );
         run_in(&repo, &["push", "-q", "-u", "origin", "main"]);
 
-        // A worktree on a branch that IS main: merged by definition.
+        // A worktree that did real work, pushed it, and had it land on
+        // main. Every clause of "merged, clean, pushed" is established
+        // by an actual git operation rather than by a branch that
+        // happens to sit where main sits.
         let wt = tmp.path().join("proj-done");
         run_in(
             &repo,
@@ -1418,7 +1572,16 @@ HEAD 8ed50a741e1696d1a0c9506f2e033cf2887bb144
                 "main",
             ],
         );
+        std::fs::write(wt.join("done.txt"), "the work\n").unwrap();
+        run_in(&wt, &["add", "-A"]);
+        run_in(&wt, &["commit", "-q", "-m", "do the work"]);
         run_in(&wt, &["push", "-q", "-u", "origin", "done"]);
+
+        // main takes the work: a fast-forward, so the branch tip is a
+        // genuine ancestor of main and the ancestry check has something
+        // real to find.
+        run_in(&repo, &["merge", "-q", "--ff-only", "done"]);
+        run_in(&repo, &["push", "-q", "origin", "main"]);
 
         assert!(wt.is_dir());
         remove_worktree(repo.to_str().unwrap(), wt.to_str().unwrap())
@@ -2279,6 +2442,11 @@ HEAD 8ed50a741e1696d1a0c9506f2e033cf2887bb144
         assert_eq!(Safety::Dirty(3).reason(), "3 uncommitted files");
         assert_eq!(Safety::Unpushed(1).reason(), "1 unpushed commit");
         assert!(Safety::NeverPushed.reason().contains("only here"));
+        // The two must not read alike: one says work is at risk, the
+        // other says there is no work. #701 is what happens when a row
+        // shows the first for the second.
+        assert!(Safety::Empty.reason().contains("nothing to lose"));
+        assert_ne!(Safety::Empty.reason(), Safety::NeverPushed.reason());
     }
 }
 
@@ -2318,6 +2486,7 @@ mod live {
                 Safety::Dirty(_) => "dirty",
                 Safety::Unpushed(_) => "unpushed",
                 Safety::NeverPushed => "never_pushed",
+                Safety::Empty => "empty",
                 Safety::Unmerged => "unmerged",
                 Safety::Pending => "pending",
                 Safety::Orphaned => "orphaned",
