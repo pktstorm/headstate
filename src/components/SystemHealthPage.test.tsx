@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-quer
 import { render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { HealthSample } from "@/types/pr";
+import { stubViewport } from "@/test-utils";
 
 const liveFn = vi.hoisted(() => vi.fn<() => Promise<HealthSample>>());
 const historyFn = vi.hoisted(() => vi.fn<() => Promise<HealthSample[]>>());
@@ -20,6 +21,30 @@ vi.mock("../api/hooks", () => ({
       enabled,
       retry: false,
     }),
+}));
+
+// The build target, as a mock: `IS_MOBILE_BUILD` is read at module
+// scope, so re-importing the component to flip it would lose every
+// other mock in this file. Same shape as `WorktreesPage.test.tsx`.
+const mobileBuild = vi.hoisted(() => ({ current: false }));
+vi.mock("@/lib/target", () => ({
+  get IS_MOBILE_BUILD() {
+    return mobileBuild.current;
+  },
+  get IS_DESKTOP_BUILD() {
+    return !mobileBuild.current;
+  },
+}));
+
+// The connection state drives the desktop's NAME and the unreachable
+// wording. Defaults to `local`, which is what the desktop build always
+// has, so every pre-existing test in this file keeps its old meaning.
+const connection = vi.hoisted(() => ({
+  current: { kind: "local" } as { kind: string; desktop?: string; lastPoll?: string | null },
+}));
+vi.mock("@/api/connection", () => ({
+  useConnectionState: () => connection.current,
+  isStale: () => false,
 }));
 
 import { SystemHealthPage } from "./SystemHealthPage";
@@ -220,6 +245,10 @@ describe("SystemHealthPage", () => {
     vi.clearAllMocks();
     liveFn.mockResolvedValue(sample());
     historyFn.mockResolvedValue([]);
+    // Back to the desktop build on a local machine, so a mobile test
+    // that flips these cannot leak into the one after it.
+    mobileBuild.current = false;
+    connection.current = { kind: "local" };
   });
 
   it("shows the live readings once they arrive", async () => {
@@ -456,5 +485,107 @@ describe("the panels are laid out for a desktop", () => {
     const grid = container.querySelector(".md\\:grid-cols-2");
     expect(grid).not.toBeNull();
     expect(within(grid as HTMLElement).getAllByRole("heading").length).toBe(5);
+  });
+});
+
+/// #666: the same view on the phone, describing the DESKTOP.
+///
+/// Every test here flips `mobileBuild.current` explicitly. A test that
+/// forgets renders the desktop build whatever its name says -- the same
+/// trap `stubViewport` sets for viewport-gated code, and the reason
+/// #655 shipped a component with no mobile coverage at all.
+describe("SystemHealthPage on the phone", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    liveFn.mockResolvedValue(sample());
+    historyFn.mockResolvedValue([]);
+    mobileBuild.current = true;
+    connection.current = { kind: "connected", desktop: "studio", lastPoll: null };
+  });
+
+  it("says whose machine it is describing", async () => {
+    show();
+    // The distinction the whole issue is about: this page is full of
+    // CPU and battery readings, rendered on a device that has its own.
+    expect(await screen.findByText(/not this phone/i)).toBeTruthy();
+    expect(screen.getByText("studio")).toBeTruthy();
+  });
+
+  it("says the desktop is unreachable rather than showing zeros", async () => {
+    connection.current = { kind: "unreachable", desktop: "studio", lastPoll: null };
+    liveFn.mockRejectedValue(new Error("unreachable"));
+    show();
+    expect(await screen.findByText(/cannot reach studio/i)).toBeTruthy();
+    // The failure this codebase avoids everywhere else: a zero that
+    // means "not measured". No reading may be on screen.
+    expect(screen.queryByText("0%")).toBeNull();
+    expect(screen.queryByText("18%")).toBeNull();
+  });
+
+  it("does not blame the desktop for a gap the phone may have caused", async () => {
+    historyFn.mockResolvedValue([sample()]);
+    show();
+    // On the phone a hole has two causes, and naming only the first
+    // would assert the desktop was off during a period it may have
+    // been running perfectly well.
+    const note = await screen.findAllByText(/could not reach it/i);
+    expect(note.length).toBeGreaterThan(0);
+  });
+
+  it("names the desktop when its battery is absent", async () => {
+    liveFn.mockResolvedValue(sample({ battery: null }));
+    show();
+    expect(await screen.findByText(/that desktop has no battery/i)).toBeTruthy();
+  });
+
+  it("falls back to a neutral name before the desktop is known", async () => {
+    connection.current = { kind: "unknown" };
+    show();
+    // No hostname yet is not the same as no pairing; the page still
+    // has to say it is not describing the phone.
+    expect(await screen.findByText(/the paired desktop/i)).toBeTruthy();
+  });
+});
+
+/// The other half of the same requirement: the desktop rendering is
+/// unchanged. Asserted at a real desktop width rather than by
+/// inspection, because that is what the issue asks for.
+describe("SystemHealthPage on the desktop is untouched by the mobile work", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    liveFn.mockResolvedValue(sample());
+    historyFn.mockResolvedValue([]);
+    mobileBuild.current = false;
+    connection.current = { kind: "local" };
+  });
+
+  it("never mentions a phone or a paired desktop at 1400px", async () => {
+    const viewport = stubViewport(1400);
+    try {
+      show();
+      await screen.findByText("18%");
+      expect(screen.queryByText(/not this phone/i)).toBeNull();
+      expect(screen.queryByText(/paired desktop/i)).toBeNull();
+      expect(screen.queryByText(/could not reach it/i)).toBeNull();
+    } finally {
+      viewport.resize(1400);
+    }
+  });
+
+  it("still says a gap means Headstate was not running", async () => {
+    historyFn.mockResolvedValue([sample()]);
+    show();
+    const note = await screen.findAllByText(/Headstate was not running/i);
+    expect(note.length).toBeGreaterThan(0);
+    // The phone's second cause must not leak on to the desktop, where
+    // there is no phone and the claim would be false.
+    expect(screen.queryByText(/could not reach it/i)).toBeNull();
+  });
+
+  it("keeps its own wording when a local reading fails", async () => {
+    liveFn.mockRejectedValue(new Error("boom"));
+    show();
+    expect(await screen.findByText(/could not read this machine's health/i)).toBeTruthy();
+    expect(screen.queryByText(/cannot reach/i)).toBeNull();
   });
 });
