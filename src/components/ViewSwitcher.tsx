@@ -3,7 +3,14 @@ import { useEffect, useRef, useState } from "react";
 import { type View, useFilters } from "../store/filters";
 import { useUiPrefs } from "../api/hooks";
 
-const VIEWS: { id: View; label: string; Icon: typeof GitPullRequest }[] = [
+/// Every view, in sidebar order, with the label and icon each needs.
+///
+/// Exported because `SettingsDialog` offers these as hide/show
+/// checkboxes and previously kept its OWN hand-written list. That list
+/// carried four of the nine, so five views could not be hidden at all
+/// and nothing said so -- the section simply looked complete (#675).
+/// One array, one order, one set of labels.
+export const VIEWS: { id: View; label: string; Icon: typeof GitPullRequest }[] = [
   { id: "my-prs", label: "My pull requests", Icon: GitPullRequest },
   { id: "to-review", label: "To review", Icon: Eye },
   { id: "worktrees", label: "Worktrees", Icon: FolderGit2 },
@@ -17,6 +24,19 @@ const VIEWS: { id: View; label: string; Icon: typeof GitPullRequest }[] = [
   // would imply it takes a repository, which it does not.
   { id: "system-health", label: "System health", Icon: Activity },
 ];
+
+/// Views that are offered whatever `hidden_views` says.
+///
+/// Only "my-prs": it is the default view and the app's whole premise,
+/// so hiding it would leave someone with no way back to what they
+/// installed this for. The CURRENT view is also always offered, but
+/// that is a function of where the user happens to be rather than a
+/// property of the view, so it stays a separate check below.
+///
+/// Exported so `SettingsDialog` does not offer a checkbox that cannot
+/// do anything: unhideable here means no toggle there, rather than a
+/// control that appears to work and silently does not.
+export const ALWAYS_OFFERED: ReadonlySet<View> = new Set<View>(["my-prs"]);
 
 /// The top-level view control, at the head of the sidebar.
 ///
@@ -43,7 +63,7 @@ export function ViewSwitcher({ counts }: { counts?: Partial<Record<View, number>
   //   its own switcher says does not exist -- with no way off it.
   const hidden = new Set(prefs?.hidden_views ?? []);
   const offered = VIEWS.filter(
-    ({ id }) => id === "my-prs" || id === view || !hidden.has(id),
+    ({ id }) => ALWAYS_OFFERED.has(id) || id === view || !hidden.has(id),
   );
 
   // Dismiss on Escape and on a click elsewhere. Without both, the menu

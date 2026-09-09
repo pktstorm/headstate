@@ -54,6 +54,8 @@ vi.mock("../api/hooks", () => ({
 }));
 
 import { SettingsDialog } from "./SettingsDialog";
+import { ALWAYS_OFFERED, VIEWS } from "./ViewSwitcher";
+import { ALL_VIEWS } from "@/store/filters";
 
 function open() {
   return render(<SettingsDialog open onOpenChange={() => {}} />);
@@ -265,6 +267,59 @@ describe("the ready-for-review notification", () => {
     render(<SettingsDialog open onOpenChange={() => {}} />);
     expect(screen.queryByText(/newly breaks/)).toBeNull();
     expect(screen.getByText(/never on first launch/)).toBeTruthy();
+  });
+});
+
+/// #675: the Views section carried a hand-written list of FOUR views
+/// while nine existed, so `my-prs`, `branches`, `artifacts`, `packages`
+/// and `claude-md` could not be hidden at all -- and nothing said so,
+/// because a partial list looks exactly like a complete one.
+///
+/// These tests are the reason it cannot happen again: adding a view to
+/// `ALL_VIEWS` without it reaching this section now fails here.
+describe("the Views section", () => {
+  it("offers every view that can actually be hidden", () => {
+    open();
+    const panel = screen.getByText("Views", { selector: "span" }).parentElement;
+    expect(panel).toBeTruthy();
+
+    // Derived from ALL_VIEWS rather than a literal: a list written out
+    // here would be a THIRD copy, and would drift exactly as the one
+    // in the component did.
+    const expected = ALL_VIEWS.filter((id) => !ALWAYS_OFFERED.has(id));
+    for (const id of expected) {
+      const label = VIEWS.find((v) => v.id === id)?.label;
+      expect(label, `no label for view "${id}"`).toBeTruthy();
+      expect(
+        within(panel as HTMLElement).getByText(label as string),
+        `the Views section is missing "${label}"`,
+      ).toBeTruthy();
+    }
+  });
+
+  /// The count is asserted separately from the names above. Without it
+  /// the test passes on a section that contains every expected view
+  /// AND extras -- a stale entry for a deleted view, say, which would
+  /// write an id into `hidden_views` that nothing reads.
+  it("offers no view that does not exist", () => {
+    open();
+    const panel = screen.getByText("Views", { selector: "span" })
+      .parentElement as HTMLElement;
+    const boxes = within(panel).getAllByRole("checkbox");
+    expect(boxes.length).toBe(ALL_VIEWS.filter((id) => !ALWAYS_OFFERED.has(id)).length);
+  });
+
+  /// `ViewSwitcher` offers `my-prs` whatever `hidden_views` says, so a
+  /// checkbox for it would be a control that appears to work and
+  /// silently does nothing. Absent is the honest rendering.
+  it("does not offer a toggle for a view that is always shown", () => {
+    open();
+    const panel = screen.getByText("Views", { selector: "span" })
+      .parentElement as HTMLElement;
+    for (const id of ALWAYS_OFFERED) {
+      const label = VIEWS.find((v) => v.id === id)?.label as string;
+      expect(within(panel).queryByText(label), `"${label}" should not be togglable`).toBeNull();
+    }
   });
 });
 
