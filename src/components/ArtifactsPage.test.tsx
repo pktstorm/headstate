@@ -457,7 +457,7 @@ describe("selection during removal", () => {
   /// anywhere inside the tree, which is the more useful of the two --
   /// asserted here so a future edit cannot quietly relabel it.
   it("says the date is the last write, not the creation", () => {
-    state.artifacts = [art("/code/repo/a")];
+    state.artifacts = [art({ path: "/code/repo/a" })];
     state.ages = new Map([["/code/repo/a", 7200]]);
     state.pending = 0;
 
@@ -470,7 +470,7 @@ describe("selection during removal", () => {
   /// "Oldest" invited exactly the wrong reading. The ordering is by last
   /// write, and the label now says so.
   it("names the sort by what it actually orders on", () => {
-    state.artifacts = [art("/code/repo/a")];
+    state.artifacts = [art({ path: "/code/repo/a" })];
     state.pending = 0;
     render(<ArtifactsPage />);
     expect(screen.getByRole("option", { name: /Least recently written/i })).toBeTruthy();
