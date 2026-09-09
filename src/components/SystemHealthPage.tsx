@@ -674,6 +674,78 @@ function LiveFootprint() {
   );
 }
 
+/// One at-a-glance pressure reading, above the panels.
+///
+/// # Why a number AND a bar
+///
+/// The bar answers "roughly how full" at a glance, which is the whole
+/// point of this row; the digits answer "how full", which is what
+/// someone reaches for the moment the bar looks interesting. Showing
+/// only the bar makes the second question require scrolling to a panel,
+/// and showing only the number makes the first question require
+/// reading. They cost the same together.
+///
+/// # Colour is never the only cue
+///
+/// `barColor`'s three bands are the same ones the panels below use, so
+/// the row and the detail cannot disagree about what counts as
+/// trouble. But the percentage is always rendered as text, so a reader
+/// who cannot distinguish the bands loses nothing -- which is what
+/// #581/#582 ask for generally, applied here because this row is the
+/// most prominent thing on the page.
+///
+/// # A missing reading is not a zero
+///
+/// `percent` is `null` when the platform did not report the underlying
+/// figure, and this renders "Not measured" with no bar at all. The
+/// alternative -- a confident green 0% -- would be the page's own rule
+/// broken in the place people look first.
+function PressureCard({
+  label,
+  percent,
+  detail,
+}: {
+  label: string;
+  /// `null` when the platform did not report it. Never coerced to 0.
+  percent: number | null;
+  /// The absolute figures behind the percentage, e.g. "12.4 GB of 16 GB".
+  /// A percentage alone cannot distinguish a nearly-full small disk
+  /// from a nearly-full large one.
+  detail?: string;
+}) {
+  return (
+    <div className="flex flex-col gap-1.5 rounded-md border border-[#30363d] bg-[#0d1117] px-3 py-2.5">
+      <span className="text-xs text-[#8b949e]">{label}</span>
+      {percent === null ? (
+        <>
+          <span className="text-lg font-semibold text-[#8b949e]">Not measured</span>
+          <div className="h-1.5" />
+        </>
+      ) : (
+        <>
+          <span className="text-lg font-semibold tabular-nums text-[#e6edf3]">
+            {percent.toFixed(0)}%
+          </span>
+          <div
+            className="h-1.5 overflow-hidden rounded-full bg-[#21262d]"
+            role="img"
+            aria-label={`${label}: ${percent.toFixed(0)} percent`}
+          >
+            <div
+              className="h-full rounded-full"
+              style={{
+                width: `${Math.min(100, Math.max(0, percent))}%`,
+                backgroundColor: barColor(percent),
+              }}
+            />
+          </div>
+        </>
+      )}
+      {detail ? <span className="text-[11px] text-[#8b949e]">{detail}</span> : null}
+    </div>
+  );
+}
+
 export function SystemHealthPage() {
   // Both queries are enabled unconditionally HERE, because this
   // component only mounts while the view is open -- `App` renders it
@@ -760,6 +832,18 @@ export function SystemHealthPage() {
   // every few seconds, this advances on its own anyway.
   const sampledAt = Date.parse(s.sampled_at);
 
+  // The root volume for the pressure card. The Disk panel below still
+  // lists every mount -- this row answers "is the machine about to run
+  // out", and on every platform we support that question is about the
+  // volume the OS is on. `find` rather than a sum across mounts: adding
+  // an almost-full external drive to a roomy boot disk would produce a
+  // percentage describing no actual volume.
+  const rootDisk = s.disks.find((d) => d.is_root) ?? s.disks[0];
+  const rootUsed =
+    rootDisk === undefined
+      ? null
+      : percentOf(rootDisk.total - rootDisk.available, rootDisk.total);
+
   return (
     <div className="flex flex-col gap-4">
       {/* Whose machine, said once, at the top, on the phone only.
@@ -779,6 +863,41 @@ export function SystemHealthPage() {
           this phone.
         </p>
       ) : null}
+      {/* The question people open this page with, answered before
+          anything has to be read. Everything below is unchanged; this
+          is an addition, not a reorganisation (#683).
+
+          Three across on a phone as well as a desktop: these are short
+          numbers, and stacking them would push the panels below the
+          fold on exactly the device where a glance matters most. The
+          grid handles both widths without a media query, as the panels
+          below already do. */}
+      <div
+        className="grid grid-cols-3 gap-2 sm:gap-4"
+        role="group"
+        aria-label="System pressure at a glance"
+      >
+        <PressureCard
+          label="CPU"
+          percent={s.cpu_percent}
+          detail={s.load ? `Load ${s.load[0].toFixed(2)}` : undefined}
+        />
+        <PressureCard
+          label="Memory"
+          percent={memUsedPct}
+          detail={`${formatSize(s.memory.used)} of ${formatSize(s.memory.total)}`}
+        />
+        <PressureCard
+          label="Disk"
+          percent={rootUsed}
+          detail={
+            rootDisk === undefined
+              ? undefined
+              : `${formatSize(rootDisk.available)} free of ${formatSize(rootDisk.total)}`
+          }
+        />
+      </div>
+
       {/* Two columns on a desktop, one on a phone. No media query
           needed: the grid does it, and every panel below is written
           to survive either width. */}
