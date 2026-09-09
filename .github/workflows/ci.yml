@@ -8,12 +8,31 @@ on:
     # published a build that nothing had linted, type-checked, or tested.
     tags: ["v*"]
   pull_request:
+  # The merge queue builds a temporary ref containing this pull request
+  # ON TOP OF everything ahead of it, and waits for these same checks
+  # against THAT tree. Without this trigger the queue would wait
+  # forever for checks that never run, and every merge would hang.
+  #
+  # This is what makes the queue worth having: `strict` status checks
+  # guarantee a PR was tested against main as it was, and the queue
+  # guarantees it was tested against main as it WILL BE -- including
+  # alongside the other PRs merging with it. Two green PRs that have
+  # never been compiled together is the failure neither a rebase nor a
+  # clean git merge can catch.
+  merge_group:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   # Never cancel a tag run: `release.yml` waits on it, and a cancelled
   # check would either block the release forever or wave it through.
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  #
+  # Merge-group runs are exempt for the same reason, one step removed:
+  # the QUEUE waits on them, so a cancelled run leaves the entry stuck
+  # until it times out and gets ejected -- which reads as a flaky merge
+  # rather than a cancelled check.
+  cancel-in-progress: >-
+    ${{ !startsWith(github.ref, 'refs/tags/')
+        && github.event_name != 'merge_group' }}
 
 # Least privilege by default; jobs needing more say so themselves.
 permissions:
