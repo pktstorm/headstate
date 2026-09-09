@@ -116,6 +116,49 @@ jobs:
             exit 1
           fi
 
+      # The build number must never go backwards, and the way it silently
+      # can is a rename.
+      #
+      # `BUILD_NUMBER` is `github.run_number`, counted per workflow FILE.
+      # Renaming this file restarts it at 1, and every upload after that
+      # is refused by the store as a duplicate -- recoverable only by
+      # burning version numbers until the count climbs back past the
+      # high-water mark. Nothing in the run says why, because from the
+      # store's side the number is simply one it has already seen.
+      #
+      # Non-contiguous numbers per version (0.1.7 -> 9, 0.1.12 -> 14) are
+      # this system working, not drift: a rejected upload still consumes
+      # its number, and re-tagging a version is routine. Only a DECREASE
+      # is a fault. See #635.
+      - name: The build number has not gone backwards
+        if: env.DRY_RUN != 'true'
+        run: |
+          set -euo pipefail
+          MARK_FILE=.github/mobile-build-high-water-mark
+          HIGH=$(grep -v '^#' "$MARK_FILE" | tr -d '[:space:]')
+          case "$HIGH" in
+            ''|*[!0-9]*)
+              echo "$MARK_FILE does not contain a build number: '$HIGH'" >&2
+              exit 1
+              ;;
+          esac
+          echo "Highest build number already shipped: $HIGH"
+          echo "This run: $BUILD_NUMBER"
+          if [ "$BUILD_NUMBER" -le "$HIGH" ]; then
+            echo >&2
+            echo "Build number $BUILD_NUMBER is not above $HIGH, which has already" >&2
+            echo "reached a store. Both stores refuse a build number they have seen," >&2
+            echo "so this upload would be rejected." >&2
+            echo >&2
+            echo "The usual cause is renaming this workflow file: BUILD_NUMBER is" >&2
+            echo "github.run_number, which counts per workflow FILE and restarts at 1" >&2
+            echo "when the file is renamed. If that is what happened, restore the" >&2
+            echo "previous filename rather than burning version numbers." >&2
+            echo >&2
+            echo "If $HIGH is simply stale, raise it in $MARK_FILE." >&2
+            exit 1
+          fi
+
       - uses: ./.github/actions/setup
         with:
           rust-components: clippy, rustfmt
