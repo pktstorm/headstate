@@ -2172,6 +2172,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "chrono",
+ "headstate-stepup",
  "hmac 0.13.0",
  "log",
  "mdns-sd",
@@ -2194,6 +2195,17 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-rustls",
+]
+
+[[package]]
+name = "headstate-stepup"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "ml-dsa",
+ "p256",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -5348,6 +5360,7 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
+ "headstate-stepup",
  "log",
  "ml-dsa",
  "p256",

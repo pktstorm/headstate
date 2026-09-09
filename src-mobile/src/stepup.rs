@@ -1,27 +1,26 @@
 //! The phone's side of the step-up: build the `X-Headstate-Signature`
 //! header a destructive command carries.
 //!
-//! The desktop's `remote/stepup.rs` defines the grammar and the signed
-//! bytes; this module produces exactly what its `verify` checks:
+//! The grammar and the signed bytes are not defined here and are not
+//! copied from anywhere. They live in the `headstate-stepup` crate,
+//! which the desktop depends on by the same path, so this module is just
+//! the wiring between the device's keys and that crate's
+//! [`build_header`]: a fresh nonce, [`canonical_bytes`] for the command
+//! and args, and whatever signatures the keystore can produce.
 //!
-//! ```text
-//! X-Headstate-Signature: v1;ts=<unix secs>;nonce=<b64url 16B>;ecdsa=<b64url 64B>[;mldsa=<b64url 3309B>]
-//! ```
+//! That crate is also what the tests below verify with. They call its
+//! `verify` -- the desktop's actual verifier, not a re-implementation of
+//! it -- so a change to the canonical form or the grammar that reaches
+//! only one side cannot leave both suites green. It used to be a
+//! re-implementation, whose own doc comment said "replicated"; #695 is
+//! the whole story.
 //!
-//! - `;`-separated, no whitespace, `v1` first, each key once.
-//! - Every value base64url WITHOUT padding.
-//! - Both signatures are over [`canonical_bytes`]: the JSON object
-//!   `{args, command, nonce, timestamp}` with keys sorted by their UTF-8
-//!   bytes at every level (inside `args` too), no whitespace, and
-//!   `serde_json`'s escaping. `timestamp` is an integer; `nonce` the
-//!   exact header string.
-//!
-//! Pinned by [`tests::canonical_bytes_test_vector`], the same 203-byte
-//! vector the desktop pins (SHA256 `ebd1a4f4…79ff`), so the two sides
-//! agree by construction. The desktop crate itself cannot be linked from
-//! here even as a dev-dependency: its lock would bring octocrab and
-//! rusqlite into this crate's, which `no_desktop_only_crates_in_lock`
-//! forbids for good reason. The vector is the bridge instead.
+//! Nothing about the two crates' separation changed to allow this. The
+//! desktop crate still cannot be linked from here even as a
+//! dev-dependency: its lock would bring octocrab and rusqlite into this
+//! crate's, which `no_desktop_only_crates_in_lock` forbids for good
+//! reason. `headstate-stepup` is a leaf crate over serde_json, base64,
+//! p256 and ml-dsa, all of which this crate already links.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -29,79 +28,9 @@ use serde_json::Value;
 
 use crate::keys::{random_bytes, DeviceKeys, KeyError, Signatures};
 
-/// The request header. HTTP header names are case-insensitive; this is
-/// the canonical spelling, matching the desktop's constant.
-pub const HEADER: &str = "X-Headstate-Signature";
-
-/// Nonce length in bytes.
-pub const NONCE_LEN: usize = 16;
-
-/// The bytes both signatures cover. See the module docs.
-pub fn canonical_bytes(command: &str, args: &Value, nonce: &str, timestamp: i64) -> Vec<u8> {
-    let mut out = Vec::new();
-    write_canonical(
-        &serde_json::json!({
-            "command": command,
-            "args": args,
-            "nonce": nonce,
-            "timestamp": timestamp,
-        }),
-        &mut out,
-    );
-    out
-}
-
-/// Object keys in byte order at every level, no whitespace, scalars
-/// through `serde_json` so the escaping is the crate's. The explicit walk
-/// exists because `serde_json::Map` keeps insertion order when the
-/// `preserve_order` feature is on anywhere in the build, and a signature
-/// must not depend on a dependency's feature flags.
-fn write_canonical(value: &Value, out: &mut Vec<u8>) {
-    match value {
-        Value::Array(items) => {
-            out.push(b'[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(b',');
-                }
-                write_canonical(item, out);
-            }
-            out.push(b']');
-        }
-        Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            out.push(b'{');
-            for (i, key) in keys.into_iter().enumerate() {
-                if i > 0 {
-                    out.push(b',');
-                }
-                write_scalar(&Value::String(key.clone()), out);
-                out.push(b':');
-                write_canonical(&map[key], out);
-            }
-            out.push(b'}');
-        }
-        scalar => write_scalar(scalar, out),
-    }
-}
-
-fn write_scalar(value: &Value, out: &mut Vec<u8>) {
-    serde_json::to_writer(&mut *out, value).expect("writing JSON scalars to a Vec cannot fail");
-}
-
-/// The header value from its parts.
-pub fn build_header(timestamp: i64, nonce: &str, sigs: &Signatures) -> String {
-    let mut h = format!(
-        "v1;ts={timestamp};nonce={nonce};ecdsa={}",
-        URL_SAFE_NO_PAD.encode(&sigs.ecdsa)
-    );
-    if let Some(mldsa) = &sigs.mldsa {
-        h.push_str(";mldsa=");
-        h.push_str(&URL_SAFE_NO_PAD.encode(mldsa));
-    }
-    h
-}
+// The protocol, re-exported so the client keeps spelling the header
+// name `stepup::HEADER`. One implementation, two names for it.
+pub use headstate_stepup::{build_header, canonical_bytes, HEADER, NONCE_LEN};
 
 /// Sign one destructive request: a fresh nonce, the canonical bytes for
 /// `command`/`args` at `now`, every signature the device can produce,
@@ -115,20 +44,23 @@ pub fn sign_request(
 ) -> Result<String, KeyError> {
     let nonce = URL_SAFE_NO_PAD.encode(random_bytes::<NONCE_LEN>()?);
     let msg = canonical_bytes(command, args, &nonce, now);
-    let sigs = keys.sign(&msg)?;
-    Ok(build_header(now, &nonce, &sigs))
+    let sigs: Signatures = keys.sign(&msg)?;
+    Ok(build_header(
+        now,
+        &nonce,
+        &sigs.ecdsa,
+        sigs.mldsa.as_deref(),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keys::{DeviceKeys, PublicKeys, SoftwareKeys, ECDSA_SIG_LEN, MLDSA_SIG_LEN};
-    use crate::store::MemoryStore;
+    use crate::keys::{DeviceKeys, PublicKeys, SoftwareKeys, ECDSA_SIG_LEN};
+    use headstate_stepup::{NoReplayCheck, PairedKeys, SignatureHeader, StepUpError};
     use serde_json::json;
-    use sha2::{Digest, Sha256};
     use std::sync::Arc;
 
-    const NONCE_B64: &str = "AAECAwQFBgcICQoLDA0ODw";
     const NOW: i64 = 1788566400;
     const CMD: &str = "remove_worktree";
 
@@ -139,121 +71,45 @@ mod tests {
         })
     }
 
-    /// The desktop's vector, byte for byte.
-    #[test]
-    fn canonical_bytes_test_vector() {
-        let bytes = canonical_bytes(CMD, &args(), NONCE_B64, NOW);
-        let expected = concat!(
-            r#"{"args":{"repoPath":"/home/octocat/src/hello-world","#,
-            r#""worktreePath":"/home/octocat/src/hello-world/.worktrees/feature"},"#,
-            r#""command":"remove_worktree","nonce":"AAECAwQFBgcICQoLDA0ODw","timestamp":1788566400}"#,
-        );
-        assert_eq!(std::str::from_utf8(&bytes).unwrap(), expected);
-        assert_eq!(bytes.len(), 203);
-        // Lowercase hex byte at a time: `sha2` 0.11 returns a
-        // `hybrid-array` `Array`, which has no `LowerHex`, so `{:x}` no
-        // longer formats a digest.
-        let digest = Sha256::digest(&bytes)
-            .iter()
-            .fold(String::with_capacity(64), |mut s, b| {
-                use std::fmt::Write;
-                let _ = write!(s, "{b:02x}");
-                s
-            });
-        assert_eq!(
-            digest,
-            "ebd1a4f4f78ff1f55f7bf642cc8d72262b6a77ab14164bbf4f95135a6e0f79ff"
-        );
-    }
-
-    #[test]
-    fn canonical_bytes_sorts_nested_keys_and_escapes_like_serde() {
-        let args = json!({
-            "b": [1, true, null, {"y": "x", "x": "y"}],
-            "a": {"z": "quote\" backslash\\ nl\n tab\t ctl\u{1}", "é": "ünïcode"},
-        });
-        let bytes = canonical_bytes("cmd", &args, "n", -5);
-        assert_eq!(
-            std::str::from_utf8(&bytes).unwrap(),
-            concat!(
-                r#"{"args":{"a":{"z":"quote\" backslash\\ nl\n tab\t ctl\u0001","é":"ünïcode"},"#,
-                r#""b":[1,true,null,{"x":"y","y":"x"}]},"command":"cmd","nonce":"n","timestamp":-5}"#,
-            )
-        );
-    }
-
-    /// A strict parser in the desktop's grammar, reduced to what the
-    /// tests need: the fields, in any order, each once, no unknowns.
-    /// `(timestamp, nonce, ecdsa, mldsa)`.
-    type ParsedHeader = (i64, String, Vec<u8>, Option<Vec<u8>>);
-
-    fn parse(header: &str) -> Result<ParsedHeader, String> {
-        let mut fields = header.split(';');
-        if fields.next() != Some("v1") {
-            return Err("version".into());
-        }
-        let (mut ts, mut nonce, mut ecdsa, mut mldsa) = (None, None, None, None);
-        for f in fields {
-            let (k, v) = f.split_once('=').ok_or("kv")?;
-            let slot = match k {
-                "ts" => &mut ts,
-                "nonce" => &mut nonce,
-                "ecdsa" => &mut ecdsa,
-                "mldsa" => &mut mldsa,
-                _ => return Err(format!("unknown {k}")),
-            };
-            if slot.replace(v).is_some() {
-                return Err(format!("twice {k}"));
-            }
-        }
-        let dec = |v: &str, n: usize| {
-            let b = URL_SAFE_NO_PAD.decode(v).map_err(|e| e.to_string())?;
-            (b.len() == n).then_some(b).ok_or(format!("len {n}"))
-        };
-        let nonce = nonce.ok_or("nonce")?;
-        dec(nonce, NONCE_LEN)?;
-        Ok((
-            ts.ok_or("ts")?.parse().map_err(|_| "ts")?,
-            nonce.to_string(),
-            dec(ecdsa.ok_or("ecdsa")?, ECDSA_SIG_LEN)?,
-            match mldsa {
-                None => None,
-                Some(v) => Some(dec(v, MLDSA_SIG_LEN)?),
-            },
-        ))
-    }
-
     fn keys() -> (SoftwareKeys, PublicKeys) {
         let keys = SoftwareKeys::new(Arc::new(MemoryStore::default()));
         let public = keys.generate().unwrap();
         (keys, public)
     }
 
-    /// The desktop's checks, replicated: parse the header, rebuild the
-    /// canonical bytes from the parsed nonce and timestamp, verify both
-    /// signatures against the keys the pair request carried.
-    fn verify_as_desktop(public: &PublicKeys, command: &str, args: &Value, header: &str) {
-        let (ts, nonce, ecdsa, mldsa) = parse(header).unwrap();
-        let msg = canonical_bytes(command, args, &nonce, ts);
+    use crate::store::MemoryStore;
 
-        use p256::ecdsa::signature::Verifier;
-        let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(&public.ecdsa_p256).unwrap();
-        vk.verify(&msg, &p256::ecdsa::Signature::from_slice(&ecdsa).unwrap())
-            .expect("ECDSA verifies");
-
-        match (&public.mldsa_65, mldsa) {
-            (Some(key), Some(sig)) => {
-                use ml_dsa::{EncodedVerifyingKey, MlDsa65, Signature, VerifyingKey};
-                let enc = EncodedVerifyingKey::<MlDsa65>::try_from(key.as_slice()).unwrap();
-                let vk = VerifyingKey::<MlDsa65>::decode(&enc);
-                let sig = Signature::<MlDsa65>::try_from(sig.as_slice()).unwrap();
-                assert!(vk.verify_with_context(&msg, b"", &sig), "ML-DSA verifies");
-            }
-            (None, None) => {}
-            _ => panic!("signature set must match the pairing's key set"),
-        }
+    /// The DESKTOP'S VERIFIER, called directly. Not a copy of its checks
+    /// -- `headstate_stepup::verify` is the same function
+    /// `src-tauri/src/remote/stepup.rs` calls on every destructive
+    /// request, reached here because both crates depend on the one crate
+    /// that defines it.
+    ///
+    /// The pairing's key set is what the phone registered, so
+    /// [`PairedKeys`] is built from `PublicKeys` the same way the
+    /// desktop builds it from a `PairedDevice` row. No replay window:
+    /// that is the listener's state, and a phone has none.
+    fn verify_as_desktop(
+        public: &PublicKeys,
+        command: &str,
+        args: &Value,
+        header: &str,
+    ) -> Result<(), StepUpError> {
+        headstate_stepup::verify(
+            &PairedKeys {
+                ecdsa: &public.ecdsa_p256,
+                mldsa: public.mldsa_65.as_deref(),
+            },
+            command,
+            args,
+            Some(header),
+            NOW,
+            &NoReplayCheck,
+        )
     }
 
+    /// A header this module built is one the desktop's verifier accepts,
+    /// in the shape the grammar demands.
     #[test]
     fn the_header_is_in_the_desktop_grammar_and_verifies() {
         let (keys, public) = keys();
@@ -264,7 +120,7 @@ mod tests {
             let (_, value) = field.split_once('=').unwrap();
             assert!(!value.contains('='), "no padding anywhere: {field}");
         }
-        verify_as_desktop(&public, CMD, &args(), &header);
+        verify_as_desktop(&public, CMD, &args(), &header).unwrap();
     }
 
     #[test]
@@ -277,7 +133,45 @@ mod tests {
             "repoPath": "/home/octocat/src/hello-world",
             "worktreePath": "/home/octocat/src/hello-world/.worktrees/feature",
         });
-        verify_as_desktop(&public, CMD, &reordered, &header);
+        verify_as_desktop(&public, CMD, &reordered, &header).unwrap();
+    }
+
+    /// The other direction, and the reason this test is worth having on
+    /// top of the one above: the desktop REFUSES what it should. A
+    /// verifier that accepted everything would pass every test here.
+    #[test]
+    fn the_desktop_refuses_a_tampered_request() {
+        let (keys, public) = keys();
+        let header = sign_request(&keys, CMD, &args(), NOW).unwrap();
+        let mut tampered = args();
+        tampered["worktreePath"] = json!("/home/octocat");
+        assert_eq!(
+            verify_as_desktop(&public, CMD, &tampered, &header).unwrap_err(),
+            StepUpError::BadEcdsa
+        );
+        assert_eq!(
+            verify_as_desktop(&public, "remove_worktree_forced", &args(), &header).unwrap_err(),
+            StepUpError::BadEcdsa
+        );
+        // Signed sixty-one seconds off the desktop's clock.
+        let stale = sign_request(&keys, CMD, &args(), NOW + 61).unwrap();
+        assert_eq!(
+            verify_as_desktop(&public, CMD, &args(), &stale).unwrap_err(),
+            StepUpError::StaleTimestamp { skew: 61 }
+        );
+    }
+
+    /// Another device's signature over the same request does not
+    /// verify against this pairing's keys.
+    #[test]
+    fn another_phones_signature_is_refused() {
+        let (_, public) = keys();
+        let (other_keys, _) = keys();
+        let header = sign_request(&other_keys, CMD, &args(), NOW).unwrap();
+        assert_eq!(
+            verify_as_desktop(&public, CMD, &args(), &header).unwrap_err(),
+            StepUpError::BadEcdsa
+        );
     }
 
     #[test]
@@ -285,24 +179,32 @@ mod tests {
         let (keys, _) = keys();
         let a = sign_request(&keys, CMD, &args(), NOW).unwrap();
         let b = sign_request(&keys, CMD, &args(), NOW).unwrap();
-        assert_ne!(parse(&a).unwrap().1, parse(&b).unwrap().1);
+        assert_ne!(
+            SignatureHeader::parse(&a).unwrap().nonce,
+            SignatureHeader::parse(&b).unwrap().nonce
+        );
     }
 
+    /// The software keys produce a hybrid signature, so the header
+    /// carries both halves and the desktop's key-set check is satisfied.
+    /// A pairing recorded WITHOUT an ML-DSA key refuses that same
+    /// header, which is what proves the `mldsa` field is really there.
     #[test]
-    fn build_header_omits_mldsa_when_the_device_has_none() {
-        let sigs = Signatures {
-            ecdsa: vec![1; ECDSA_SIG_LEN],
-            mldsa: None,
+    fn the_header_carries_every_signature_the_device_has() {
+        let (keys, public) = keys();
+        let header = sign_request(&keys, CMD, &args(), NOW).unwrap();
+        let parsed = SignatureHeader::parse(&header).unwrap();
+        assert_eq!(parsed.ecdsa.len(), ECDSA_SIG_LEN);
+        assert_eq!(public.mldsa_65.is_some(), parsed.mldsa.is_some());
+
+        let ecdsa_only_pairing = PublicKeys {
+            mldsa_65: None,
+            ..public.clone()
         };
-        let h = build_header(7, NONCE_B64, &sigs);
         assert_eq!(
-            h,
-            format!(
-                "v1;ts=7;nonce={NONCE_B64};ecdsa={}",
-                URL_SAFE_NO_PAD.encode([1u8; ECDSA_SIG_LEN])
-            )
+            verify_as_desktop(&ecdsa_only_pairing, CMD, &args(), &header).unwrap_err(),
+            StepUpError::UnexpectedMldsa
         );
-        assert_eq!(parse(&h).unwrap().3, None);
     }
 
     #[test]

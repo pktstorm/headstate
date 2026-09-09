@@ -383,25 +383,41 @@ mod tests {
         HeadstateKeys::new(Box::new(fake))
     }
 
-    /// `tests::canonical_bytes_test_vector` in the desktop's
-    /// `src-tauri/src/remote/stepup.rs`, byte for byte: the message a
-    /// phone signs for `remove_worktree` with nonce `00 01 .. 0f` at
-    /// timestamp 1788566400. 203 bytes.
-    const CANONICAL: &[u8] = concat!(
-        r#"{"args":{"repoPath":"/home/octocat/src/hello-world","#,
-        r#""worktreePath":"/home/octocat/src/hello-world/.worktrees/feature"},"#,
-        r#""command":"remove_worktree","nonce":"AAECAwQFBgcICQoLDA0ODw","timestamp":1788566400}"#,
-    )
-    .as_bytes();
+    /// The message a phone signs for `remove_worktree` with nonce
+    /// `00 01 .. 0f` at timestamp 1788566400, BUILT by the crate that
+    /// defines the canonical form rather than transcribed from it.
+    ///
+    /// This used to be a 203-byte string literal copied out of the
+    /// desktop's test, which meant a change to the canonical form left
+    /// this suite signing the old bytes and still green -- the drift in
+    /// #695, one layer down. Nothing to transcribe now.
+    fn canonical() -> Vec<u8> {
+        headstate_stepup::canonical_bytes(
+            "remove_worktree",
+            &serde_json::json!({
+                "worktreePath": "/home/octocat/src/hello-world/.worktrees/feature",
+                "repoPath": "/home/octocat/src/hello-world",
+            }),
+            "AAECAwQFBgcICQoLDA0ODw",
+            1788566400,
+        )
+    }
+
     const CANONICAL_SHA256: &str =
         "ebd1a4f4f78ff1f55f7bf642cc8d72262b6a77ab14164bbf4f95135a6e0f79ff";
 
+    /// The vector is still the one the design pinned. Kept as a literal
+    /// digest deliberately: `canonical()` above cannot drift from the
+    /// desktop any more, but it CAN change in step with it, and the
+    /// wire format is not supposed to move without a version bump. This
+    /// is the assertion that says so out loud.
     #[test]
     fn the_test_vector_is_the_desktops() {
-        assert_eq!(CANONICAL.len(), 203);
+        let canonical = canonical();
+        assert_eq!(canonical.len(), 203);
         // `sha2` 0.11 returns a `hybrid-array` `Array`, which has no
         // `LowerHex`, so `{:x}` no longer formats a digest.
-        let hex = Sha256::digest(CANONICAL)
+        let hex = Sha256::digest(&canonical)
             .iter()
             .fold(String::with_capacity(64), |mut s, b| {
                 use std::fmt::Write;
@@ -416,7 +432,7 @@ mod tests {
         let k = keys(Fake::new(true));
         assert_eq!(k.public_keys().unwrap_err(), Error::NotGenerated);
         assert_eq!(k.session_identity().unwrap_err(), Error::NotGenerated);
-        assert_eq!(k.sign(CANONICAL).unwrap_err(), Error::NotGenerated);
+        assert_eq!(k.sign(&canonical()).unwrap_err(), Error::NotGenerated);
         k.destroy().expect("destroy is idempotent");
     }
 
@@ -435,36 +451,74 @@ mod tests {
         let k = keys(Fake::new(false));
         let public = k.generate().unwrap();
         assert_eq!(public.mldsa_65, None);
-        let sigs = k.sign(CANONICAL).unwrap();
+        let sigs = k.sign(&canonical()).unwrap();
         assert_eq!(sigs.ecdsa.len(), ECDSA_SIG_LEN);
         assert_eq!(sigs.mldsa, None);
     }
 
     /// The signatures verify the way `stepup.rs` verifies them:
     /// P-256 from the SEC1 key over the SHA256 prehash, raw `r || s`,
-    /// and ML-DSA-65 pure with the empty context.
+    /// and ML-DSA-65 pure with the empty context -- asserted by handing
+    /// what this plugin produced to the desktop's ACTUAL verifier, not
+    /// by re-stating its checks here.
+    ///
+    /// The header goes through `build_header`, so the encodings this
+    /// plugin returns (raw `r || s`, an encoded ML-DSA signature) are
+    /// checked against the grammar as well as the signature. Both halves
+    /// come from `headstate-stepup`, which `src-tauri` verifies with.
     #[test]
     fn signatures_over_the_test_vector_verify_as_the_desktop_checks_them() {
+        use headstate_stepup::{
+            build_header, verify, NoReplayCheck, PairedKeys, StepUpError, ECDSA_SIG_LEN as SIG_LEN,
+            MLDSA_SIG_LEN as ML_LEN,
+        };
+
         let k = keys(Fake::new(true));
         let public = k.generate().unwrap();
-        let sigs = k.sign(CANONICAL).unwrap();
+        let sigs = k.sign(&canonical()).unwrap();
         assert_eq!(sigs.ecdsa.len(), ECDSA_SIG_LEN);
         assert_eq!(sigs.mldsa.as_ref().map(Vec::len), Some(MLDSA_SIG_LEN));
+        // The plugin's own length constants are the protocol's.
+        assert_eq!((ECDSA_SIG_LEN, MLDSA_SIG_LEN), (SIG_LEN, ML_LEN));
 
-        use p256::ecdsa::signature::Verifier;
-        let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(&public.ecdsa_p256).unwrap();
-        let sig = p256::ecdsa::Signature::from_slice(&sigs.ecdsa).unwrap();
-        vk.verify(CANONICAL, &sig).unwrap();
-        assert!(vk.verify(b"{\"args\":{}}", &sig).is_err());
+        let header = build_header(
+            1788566400,
+            "AAECAwQFBgcICQoLDA0ODw",
+            &sigs.ecdsa,
+            sigs.mldsa.as_deref(),
+        );
+        let paired = PairedKeys {
+            ecdsa: &public.ecdsa_p256,
+            mldsa: public.mldsa_65.as_deref(),
+        };
+        let args = serde_json::json!({
+            "worktreePath": "/home/octocat/src/hello-world/.worktrees/feature",
+            "repoPath": "/home/octocat/src/hello-world",
+        });
+        verify(
+            &paired,
+            "remove_worktree",
+            &args,
+            Some(&header),
+            1788566400,
+            &NoReplayCheck,
+        )
+        .expect("the desktop accepts what this plugin signed");
 
-        use ml_dsa::{EncodedVerifyingKey, MlDsa65, Signature, VerifyingKey};
-        let enc =
-            EncodedVerifyingKey::<MlDsa65>::try_from(public.mldsa_65.unwrap().as_slice()).unwrap();
-        let vk = VerifyingKey::<MlDsa65>::decode(&enc);
-        let sig = Signature::<MlDsa65>::try_from(sigs.mldsa.unwrap().as_slice()).unwrap();
-        assert!(vk.verify_with_context(CANONICAL, b"", &sig));
-        assert!(!vk.verify_with_context(CANONICAL, b"headstate", &sig));
-        assert!(!vk.verify_with_context(b"{\"args\":{}}", b"", &sig));
+        // And refuses a different request under the same signatures, so
+        // the acceptance above is not a verifier that accepts anything.
+        assert_eq!(
+            verify(
+                &paired,
+                "remove_worktree",
+                &serde_json::json!({}),
+                Some(&header),
+                1788566400,
+                &NoReplayCheck,
+            )
+            .unwrap_err(),
+            StepUpError::BadEcdsa
+        );
     }
 
     #[test]
@@ -483,7 +537,7 @@ mod tests {
         k.destroy().unwrap();
         assert_eq!(k.public_keys().unwrap_err(), Error::NotGenerated);
         assert_eq!(k.session_identity().unwrap_err(), Error::NotGenerated);
-        assert_eq!(k.sign(CANONICAL).unwrap_err(), Error::NotGenerated);
+        assert_eq!(k.sign(&canonical()).unwrap_err(), Error::NotGenerated);
     }
 
     /// rustls accepts the identity: the key loads through the aws-lc-rs
@@ -584,9 +638,9 @@ mod tests {
     fn a_dismissed_prompt_is_cancelled_not_a_signature() {
         let k = keys(Fake::new(true).cancel_next_sign());
         k.generate().unwrap();
-        assert_eq!(k.sign(CANONICAL).unwrap_err(), Error::Cancelled);
+        assert_eq!(k.sign(&canonical()).unwrap_err(), Error::Cancelled);
         // The keys are still there; only that one prompt was refused.
-        assert!(k.sign(CANONICAL).is_ok());
+        assert!(k.sign(&canonical()).is_ok());
     }
 
     #[test]
@@ -613,7 +667,7 @@ mod tests {
             let k = keys(Fake::new(true).tamper(tamper));
             let result = match tamper {
                 Tamper::CompressedEcdsaKey | Tamper::ShortMldsaKey => k.generate().map(|_| ()),
-                _ => k.generate().and_then(|_| k.sign(CANONICAL)).map(|_| ()),
+                _ => k.generate().and_then(|_| k.sign(&canonical())).map(|_| ()),
             };
             match result {
                 Err(Error::Malformed(msg)) => {

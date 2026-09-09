@@ -378,7 +378,8 @@ later. This design therefore:
   mostly protects a signer's secrets, and the only ML-DSA signer is the
   phone's secure hardware. The header grammar, canonical bytes, and a
   byte-exact test vector for the phone to match live in
-  `src-tauri/src/remote/stepup.rs`. aws-lc-rs also ships ML-DSA, but its
+  `crates/headstate-stepup`, the crate both ends link (#695).
+  aws-lc-rs also ships ML-DSA, but its
   API has moved between the unstable and stable modules across recent
   releases, so it was not considered.
 - The desktop's own identity key stayed P256 in 5.0, for the same reason
@@ -644,7 +645,16 @@ compatibility*).
   name), `true` to replace that device, or `false` to keep both. The
   desktop denies on its own after 120 seconds (`DECISION_TIMEOUT`).
 
-### Step-up (`remote/stepup.rs`)
+### Step-up (`crates/headstate-stepup`, mounted by `remote/stepup.rs`)
+
+The protocol below -- the canonical bytes, the header grammar and the
+verification -- lives in `crates/headstate-stepup`, which the desktop,
+the companion and the companion's keys plugin all depend on by path. It
+used to live in `src-tauri/src/remote/stepup.rs` with a hand-written
+copy of the checks in the companion's tests, so both suites could be
+green while each agreed only with its own copy of the rules (#695).
+`remote/stepup.rs` is now the desktop's mounting of it: the replay
+window, the `PairedDevice` adapter, and the notification.
 
 ```
 X-Headstate-Signature: v1;ts=<unix seconds>;nonce=<b64url 16 bytes>;ecdsa=<b64url 64 bytes>[;mldsa=<b64url 3309 bytes>]

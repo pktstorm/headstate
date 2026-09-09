@@ -56,14 +56,26 @@ aws-lc-rs = { version = "1.18", default-features = false }
 tauri = { version = "2.11", default-features = false, features = ["wry"] }
 
 [dev-dependencies]
+# The canonical bytes the fake signs, from the crate that DEFINES them
+# rather than a copy pasted into a test. This plugin is the third
+# manifest under the step-up contract -- #585 named only two -- and it
+# carried its own hardcoded 203-byte vector and SHA256, which is the same
+# drift #695 is about, one layer down: the desktop could change the
+# canonical form and this test would keep signing the old bytes and keep
+# passing. Now it calls `canonical_bytes` and there is nothing to drift
+# from.
+#
+# A dev-dependency only. The plugin itself never canonicalises anything:
+# it is handed a message to sign and signs it.
+headstate-stepup = { version = "0.1.0", path = "../../../crates/headstate-stepup" }
 # The fake backend the tests run against signs in software with the same
 # crates, versions and features the desktop verifier (src-tauri
 # remote/stepup.rs) uses, so "the fake's signature verifies here" means
 # "a signature in this encoding verifies there". That equivalence is the
 # whole point of these three lines, so they move when the desktop's do --
-# p256 0.14 and sha2 0.11 on `digest` 0.11. Neither crate is linked into
-# the phone: on a device the signer is the Secure Enclave or the Android
-# Keystore.
+# p256 0.14 and sha2 0.11 on `digest` 0.11, the versions the shared crate
+# above declares for itself. Neither crate is linked into the phone: on a
+# device the signer is the Secure Enclave or the Android Keystore.
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
 ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc"] }
 # SHA256 of the canonical-bytes test vector, pinned to the desktop's.

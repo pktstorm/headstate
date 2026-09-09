@@ -129,6 +129,21 @@ base64 = "0.23"
 # and that is the only difference between the two lines.
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
 ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc"] }
+# The step-up signature contract: canonical bytes, the header grammar,
+# and the desktop's `verify`. The SAME in-repo crate `src-tauri` depends
+# on, which is the only reason this crate's tests can check a signature
+# against the real verifier instead of a copy of it (#695).
+#
+# Its dependencies are a strict subset of what this crate already links
+# -- serde_json, base64, p256, ml-dsa, thiserror -- so it adds no code to
+# the phone binary, and `no_desktop_only_crates_in_lock` in src/lib.rs
+# still holds: it is a leaf crate with no tauri, no rusqlite, no HTTP.
+#
+# It is also what makes the lockstep above a compiler rule rather than a
+# comment: the shared crate declares p256 0.14 and ml-dsa 0.1.1 itself,
+# so bumping one here alone fails to resolve. The version is stated so
+# the path dependency is not a wildcard for `cargo deny`.
+headstate-stepup = { version = "0.1.0", path = "../crates/headstate-stepup" }
 # Pairing records, the cached snapshot and the software keys' seeds
 # (store.rs). Used through its Rust `stronghold` module directly: the
 # phone's Rust owns the store, so the plugin's JS commands are never

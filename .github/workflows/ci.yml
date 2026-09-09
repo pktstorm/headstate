@@ -72,9 +72,14 @@ jobs:
           python3 scripts/check-tauri-versions.test.py
           python3 scripts/check-tauri-versions.py
           python3 scripts/android-release-signing.test.py
+      # Both crates. `crates/headstate-stepup` is a PATH DEPENDENCY of
+      # src-tauri rather than a workspace member, so a run from src-tauri
+      # never looks at it -- and it is the one place the step-up
+      # canonical bytes, header grammar and verifier now live (#695).
       - name: Rust formatting
-        working-directory: src-tauri
-        run: cargo fmt --check
+        run: |
+          (cd crates/headstate-stepup && cargo fmt --check)
+          (cd src-tauri && cargo fmt --check)
       - name: Typecheck
         run: yarn tsc -b --force
       - name: ESLint
@@ -83,18 +88,23 @@ jobs:
         run: yarn knip
       - name: Clippy
         shell: bash
-        working-directory: src-tauri
-        run: cargo clippy --all-targets -- -D warnings
+        run: |
+          (cd crates/headstate-stepup && cargo clippy --all-targets -- -D warnings)
+          (cd src-tauri && cargo clippy --all-targets -- -D warnings)
 
   test-rust:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup
+      # The shared step-up crate first: it is a path dependency, so
+      # src-tauri's `cargo test` compiles it and runs none of its tests,
+      # and everything below is meaningless if the protocol is broken.
       - name: Rust tests
         shell: bash
-        working-directory: src-tauri
-        run: cargo test
+        run: |
+          (cd crates/headstate-stepup && cargo test)
+          (cd src-tauri && cargo test)
       # Tests share a process, so state-touching changes can fail
       # intermittently. One green run does not prove a race is absent, but
       # ten full re-runs on every push stopped being free once real tests
@@ -315,8 +325,9 @@ jobs:
 
       - name: Rust tests
         shell: bash
-        working-directory: src-tauri
-        run: cargo test
+        run: |
+          (cd crates/headstate-stepup && cargo test)
+          (cd src-tauri && cargo test)
 
       - name: Frontend tests
         shell: bash
@@ -324,8 +335,9 @@ jobs:
 
       - name: Clippy
         shell: bash
-        working-directory: src-tauri
-        run: cargo clippy --all-targets -- -D warnings
+        run: |
+          (cd crates/headstate-stepup && cargo clippy --all-targets -- -D warnings)
+          (cd src-tauri && cargo clippy --all-targets -- -D warnings)
 
       - name: Build the app
         shell: bash
