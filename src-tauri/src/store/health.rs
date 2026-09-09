@@ -161,6 +161,11 @@ mod tests {
             memory_used: Some(1_202_913_280),
             memory_total: None,
             unified_memory: true,
+            // The pipeline stages (#717): one present, one absent, so
+            // the round trip is asserted for both cases of the pair the
+            // GPU detail page reads.
+            renderer_percent: Some(91.0),
+            tiler_percent: None,
         }];
         record(&c, &s).unwrap();
         let got = history(&c).unwrap();
@@ -169,6 +174,8 @@ mod tests {
         assert_eq!(got[0].gpus[0].utilization_percent, Some(7.0));
         assert_eq!(got[0].gpus[0].memory_total, None, "absent stays absent");
         assert!(got[0].gpus[0].unified_memory);
+        assert_eq!(got[0].gpus[0].renderer_percent, Some(91.0));
+        assert_eq!(got[0].gpus[0].tiler_percent, None, "absent stays absent");
     }
 
     /// Anything older than the window is gone, so the table cannot grow

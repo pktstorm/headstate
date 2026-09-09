@@ -833,6 +833,31 @@ export interface HealthGpu {
   /// and a reader would reasonably add the GPU's gigabytes to the
   /// system's and conclude the machine has more RAM than it does.
   unified_memory: boolean;
+  /// The RENDERER stage's own utilization, 0-100, where the platform
+  /// splits the pipeline (#717).
+  ///
+  /// macOS reports `Renderer Utilization %` and `Tiler Utilization %`
+  /// beside the device figure. `utilization_percent` is the device
+  /// number and is the one the overview shows; these two are on the GPU
+  /// detail page, because a GPU pinned by geometry setup and one pinned
+  /// by shading are the same row on the overview and different problems
+  /// underneath.
+  ///
+  /// `null` on every platform that does not split them, which is every
+  /// platform but macOS — and deliberately not filled in from the
+  /// device figure, which would report a measurement nobody took.
+  ///
+  /// OPTIONAL as well as nullable, for the same version-skew reason as
+  /// `Footprint.top_cpu`: a stored sample from before this shipped, or
+  /// a desktop released before it, carries no such key at all.
+  renderer_percent?: number | null;
+  /// The TILER stage's utilization, on the same terms.
+  ///
+  /// Apple's GPUs are tile-based deferred renderers: the tiler bins
+  /// geometry into screen tiles and the renderer shades them. They are
+  /// separate hardware stages that saturate independently, which is why
+  /// one device number cannot stand for both.
+  tiler_percent?: number | null;
 }
 
 interface HealthVolume {
@@ -952,6 +977,61 @@ export interface Footprint {
   /// total -- a count that does not exist must not be rendered as one
   /// that does.
   process_count?: number;
+  /// The same two questions, asked of processes SUMMED BY NAME (#721).
+  ///
+  /// Computed on the Rust side over the full process list, and that is
+  /// the point rather than an implementation detail. The UI only ever
+  /// receives eight rows, so grouping them here could only merge names
+  /// that already ranked individually -- which is exactly the case
+  /// where grouping changes nothing. Measured on the reporting machine:
+  /// 26 processes of one name held 13.0% of CPU and 6.6% of memory
+  /// between them while the largest single one was 1.2%, so not one of
+  /// them was in the individual top eight.
+  ///
+  /// Optional for the same version-skew reason as `top_cpu`: a desktop
+  /// released before this feature answers a `system_footprint` read
+  /// without these fields, and the UI must render that as "this desktop
+  /// cannot group" rather than as "nothing grouped".
+  top_cpu_grouped?: FootprintProcessGroup[];
+  /// The same, by summed resident size. Separate from
+  /// `top_cpu_grouped` for the same reason `top_memory` is separate
+  /// from `top_cpu`.
+  top_memory_grouped?: FootprintProcessGroup[];
+}
+
+/// Every process of one name, summed — one row of the Grouped view
+/// (#721).
+///
+/// Grouped by NAME rather than by process ancestry. The reasoning is
+/// recorded in full on the Rust `ProcessGroup`; the short version is
+/// that the name is what a user recognises, that most macOS processes
+/// reparent to `launchd` so a tree root names nothing, and that this
+/// heuristic's error is visible in the output because the row carries
+/// its count.
+export interface FootprintProcessGroup {
+  /// The shared process name, exactly as the OS reported it.
+  name: string;
+  /// How many processes carry this name — at least 1. Rendered beside
+  /// the name (`acme-agent (26)`) so a grouped row can never be
+  /// mistaken for a single process.
+  count: number;
+  /// Summed CPU as a percentage of ONE core, so a group of twenty-six
+  /// busy processes legitimately reads far above 100. The UI must not
+  /// clamp it, for the same reason it does not clamp a single process.
+  cpu_percent: number;
+  /// Summed resident set in bytes. Over-counts shared pages exactly as
+  /// the individual rows do — a library mapped into all 26 is counted
+  /// 26 times — which is why the "resident sets do not add up" note
+  /// matters more under grouping, not less.
+  memory: number;
+  /// How many members reported an unusable CPU figure and were left
+  /// OUT of `cpu_percent`.
+  ///
+  /// Zero on an ordinary machine. Non-zero means the sum covers fewer
+  /// processes than `count` claims, which the UI says rather than
+  /// presenting a partial total as a complete one — the "absent is not
+  /// zero" rule, applied inside a sum.
+  cpu_unmeasured: number;
 }
 
 /// One process in a `Footprint`.

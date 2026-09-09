@@ -6,6 +6,8 @@ import type {
   DockerDiskUsage,
   Footprint,
   FootprintProcess,
+  FootprintProcessGroup,
+  HealthGpu,
   HealthSample,
   Venv,
   WorktreeRepo,
@@ -132,7 +134,7 @@ vi.mock("@/api/connection", () => ({
 }));
 
 import { SystemHealthPage } from "./SystemHealthPage";
-import { HEALTH_PAGES, SystemHealthSidebar } from "./SystemHealthSidebar";
+import { HEALTH_PAGES, SystemHealthSidebar, healthPagesFor } from "./SystemHealthSidebar";
 import { ALL_HEALTH_PAGES, useFilters } from "@/store/filters";
 
 const sample = (over: Partial<HealthSample> = {}): HealthSample => ({
@@ -147,9 +149,11 @@ const sample = (over: Partial<HealthSample> = {}): HealthSample => ({
     swap_total: 2 * 1024 ** 3,
     swap_used: 512 * 1024 ** 2,
   },
-  // Empty: GPU (#705) has its own panel on the overview and no detail
-  // page here -- that is the obvious follow-up to this issue, not part
-  // of it. Empty rather than absent because that is what an
+  // Empty by DEFAULT, which is the majority platform: Windows, and
+  // Intel or NVIDIA on Linux, report no readable GPU at all. The GPU
+  // page (#717) must not exist on such a machine, and every test in
+  // this file that does not opt into `gpu()` is asserting against that
+  // machine. Empty rather than absent because that is what an
   // unreadable-GPU platform actually reports.
   gpus: [],
   disks: [
@@ -175,6 +179,34 @@ const proc = (
   memoryMb: number,
 ): FootprintProcess => ({ pid, name, cpu_percent, memory: memoryMb * 1024 ** 2 });
 
+/// One GPU, as macOS reports it: a device figure plus the two pipeline
+/// stages, and unified memory.
+const gpu = (over: Partial<HealthGpu> = {}): HealthGpu => ({
+  name: "Acme Graphics 900",
+  utilization_percent: 62,
+  memory_used: 3 * 1024 ** 3,
+  memory_total: 10 * 1024 ** 3,
+  unified_memory: true,
+  renderer_percent: 71,
+  tiler_percent: 14,
+  ...over,
+});
+
+/// A grouped row. Invented names, like every other fixture here.
+const group = (
+  name: string,
+  count: number,
+  cpu_percent: number,
+  memoryMb: number,
+  cpu_unmeasured = 0,
+): FootprintProcessGroup => ({
+  name,
+  count,
+  cpu_percent,
+  memory: memoryMb * 1024 ** 2,
+  cpu_unmeasured,
+});
+
 const footprint = (over: Partial<Footprint> = {}): Footprint => ({
   sampled_at: new Date().toISOString(),
   app: proc(4242, "headstate", 3, 220),
@@ -189,6 +221,20 @@ const footprint = (over: Partial<Footprint> = {}): Footprint => ({
     proc(701, "acme-render", 412, 900),
     proc(4242, "headstate", 3, 220),
     proc(703, "cache-keeper", 0, 480),
+  ],
+  // Grouped (#721), shaped like the measurement on the issue: an
+  // application running as many processes outranks, when summed, the
+  // individually-larger single processes above -- and none of its
+  // members appear in `top_cpu` at all.
+  top_cpu_grouped: [
+    group("acme-agent", 26, 13, 1690),
+    group("acme-render", 1, 412, 900),
+    group("widget-daemon", 2, 96, 240),
+  ],
+  top_memory_grouped: [
+    group("acme-agent", 26, 13, 1690),
+    group("acme-render", 1, 412, 900),
+    group("cache-keeper", 1, 0, 480),
   ],
   process_count: 1436,
   ...over,
@@ -458,6 +504,425 @@ describe("the Power page", () => {
   });
 });
 
+describe("the GPU page (#717)", () => {
+  // Every test here needs a machine with a readable GPU: on one
+  // without, there is deliberately no page, which is the block below.
+  beforeEach(() => {
+    liveFn.mockResolvedValue(sample({ gpus: [gpu()] }));
+    useFilters.setState({ healthPage: "gpu" });
+  });
+
+  it("shows utilization over 24 hours, with gaps drawn as gaps", async () => {
+    // The same treatment CPU and memory get, which is what #717 asks
+    // for: two measured runs either side of a closure must be two
+    // polylines, not one line drawn across the hours nobody measured.
+    const now = Date.now();
+    const at = (minsAgo: number, util: number) =>
+      sample({
+        sampled_at: new Date(now - minsAgo * 60_000).toISOString(),
+        gpus: [gpu({ utilization_percent: util })],
+      });
+    historyFn.mockResolvedValue([
+      at(600, 20),
+      at(599, 22),
+      // A six-hour hole: the app was not running.
+      at(240, 40),
+      at(239, 44),
+    ]);
+    renderPage();
+    const chart = await screen.findByTestId("sparkline-GPU");
+    expect(chart.getAttribute("data-runs")).toBe("2");
+  });
+
+  it("breaks the line where a sample carried no GPU reading", async () => {
+    // Absent is not zero, in the chart: a sample taken while the app
+    // was running but could not read the device must not be joined
+    // through as if it were an idle GPU.
+    const now = Date.now();
+    const at = (minsAgo: number, util: number | null) =>
+      sample({
+        sampled_at: new Date(now - minsAgo * 60_000).toISOString(),
+        gpus: [gpu({ utilization_percent: util })],
+      });
+    historyFn.mockResolvedValue([at(5, 30), at(4, null), at(3, 35)]);
+    renderPage();
+    const chart = await screen.findByTestId("sparkline-GPU");
+    expect(chart.getAttribute("data-runs")).toBe("2");
+  });
+
+  it("reports the renderer and tiler separately from the device figure", async () => {
+    // The whole reason the page carries a Pipeline stages panel: the
+    // overview collapses these three into one number, and a GPU pinned
+    // by its tiler is a different problem from one pinned by its
+    // renderer.
+    renderPage();
+    const panel = (await screen.findByText("Pipeline stages"))
+      .closest("section") as HTMLElement;
+    // `getAllByText`: each stage figure appears twice in this panel --
+    // once as a Stat and once beside its bar -- which is deliberate and
+    // is why the assertion counts rather than demanding one.
+    expect(within(panel).getAllByText("71%").length).toBeGreaterThan(0);
+    expect(within(panel).getAllByText("14%").length).toBeGreaterThan(0);
+    // And the device figure beside them, labelled as the one the
+    // overview shows -- so the three are legible as three stages
+    // rather than as a breakdown that fails to add up.
+    expect(within(panel).getByText("62%")).toBeTruthy();
+    // The bars are separately labelled, so a reader who cannot see the
+    // two rows apart still hears which stage each belongs to.
+    expect(
+      within(panel).getByRole("meter", { name: /renderer utilization/i }),
+    ).toBeTruthy();
+    expect(within(panel).getByRole("meter", { name: /tiler utilization/i })).toBeTruthy();
+    await screen.findByText(/tile-based deferred renderer/i);
+  });
+
+  it("says the platform does not split the stages rather than showing them as zero", async () => {
+    // Linux/AMD: `gpu_busy_percent` is one figure with no breakdown.
+    // Rows of "Not measured" would claim we tried to read two stages
+    // that this hardware does not report at all, and a 0% renderer
+    // would be a measurement nobody took.
+    liveFn.mockResolvedValue(
+      sample({
+        gpus: [
+          gpu({
+            name: "card0",
+            unified_memory: false,
+            renderer_percent: null,
+            tiler_percent: null,
+          }),
+        ],
+      }),
+    );
+    renderPage();
+    const panel = (await screen.findByText("Pipeline stages"))
+      .closest("section") as HTMLElement;
+    await waitFor(() =>
+      expect(
+        within(panel).getByText(/does not break it down by pipeline stage/i),
+      ).toBeTruthy(),
+    );
+    expect(within(panel).queryByText(/^Renderer$/)).toBeNull();
+  });
+
+  it("treats a stage key the desktop never sent as absent, not as zero", async () => {
+    // The fields are OPTIONAL on the wire as well as nullable -- a
+    // desktop released before #717, or a sample stored before it,
+    // carries no such key. `undefined` and `null` must render alike.
+    liveFn.mockResolvedValue(
+      sample({
+        gpus: [
+          {
+            name: "Acme Graphics 900",
+            utilization_percent: 62,
+            memory_used: null,
+            memory_total: null,
+            unified_memory: true,
+          } as HealthGpu,
+        ],
+      }),
+    );
+    renderPage();
+    const panel = (await screen.findByText("Pipeline stages"))
+      .closest("section") as HTMLElement;
+    await waitFor(() =>
+      expect(
+        within(panel).getByText(/does not break it down by pipeline stage/i),
+      ).toBeTruthy(),
+    );
+    // And no fabricated 0% anywhere in that panel.
+    expect(within(panel).queryByText("0%")).toBeNull();
+  });
+
+  it("states the unified-memory caveat rather than implying the pools add up", async () => {
+    // #705's caveat, at the depth a page allows. A reader comparing
+    // this panel with the Memory page must not conclude the machine
+    // has more RAM than it does.
+    renderPage();
+    await screen.findByText(/not additional memory/i);
+    await screen.findByText(/more RAM than this one has/i);
+  });
+
+  it("says a discrete GPU's VRAM IS additional, which is the opposite claim", async () => {
+    liveFn.mockResolvedValue(
+      sample({ gpus: [gpu({ name: "card0", unified_memory: false })] }),
+    );
+    renderPage();
+    await screen.findByText(/its own VRAM, separate from system memory/i);
+    expect(screen.queryByText(/not additional memory/i)).toBeNull();
+  });
+
+  it("keeps an unreported memory figure absent rather than zero", async () => {
+    liveFn.mockResolvedValue(
+      sample({ gpus: [gpu({ memory_used: null, memory_total: null })] }),
+    );
+    renderPage();
+    const panel = (await screen.findByText("Memory")).closest("section") as HTMLElement;
+    await waitFor(() =>
+      expect(within(panel).getAllByText(/not measured/i).length).toBeGreaterThan(0),
+    );
+    expect(within(panel).queryByText("0 B")).toBeNull();
+  });
+
+  it("gives each of two GPUs its own panels and its own history", async () => {
+    // An Intel Mac reports integrated and discrete graphics. The
+    // overview charts only the first; the page must not, or the second
+    // device has a panel and no line.
+    const two = sample({
+      gpus: [gpu({ name: "Acme Integrated" }), gpu({ name: "Acme Discrete" })],
+    });
+    liveFn.mockResolvedValue(two);
+    // History too: with no points a chart renders the "no history yet"
+    // placeholder, and this test is about the SECOND device getting a
+    // line of its own rather than about the placeholder appearing
+    // twice. The second GPU's series differs, which is what proves the
+    // charts are per-device rather than the first one drawn twice.
+    const now = Date.now();
+    historyFn.mockResolvedValue(
+      [3, 2, 1].map((minsAgo) =>
+        sample({
+          sampled_at: new Date(now - minsAgo * 60_000).toISOString(),
+          gpus: [
+            gpu({ name: "Acme Integrated", utilization_percent: 10 }),
+            gpu({ name: "Acme Discrete", utilization_percent: 90 }),
+          ],
+        }),
+      ),
+    );
+    renderPage();
+    await screen.findByText(/Acme Integrated — utilization/);
+    await screen.findByText(/Acme Discrete — utilization/);
+    await waitFor(() => expect(screen.getByTestId("sparkline-GPU 1")).toBeTruthy());
+    expect(screen.getByTestId("sparkline-GPU 2")).toBeTruthy();
+    // Two separate lines, each from its own device's series: a single
+    // chart reused would give both the same run count AND the same
+    // points, and the second device would be charting the first.
+    const points = (id: string) =>
+      screen.getByTestId(id).querySelector("polyline")?.getAttribute("points");
+    expect(points("sparkline-GPU 1")).not.toBe(points("sparkline-GPU 2"));
+  });
+
+  it("explains why there is no list of what is using the GPU", async () => {
+    // The CPU and Memory pages name the processes responsible, so a
+    // reader expects it here. Saying why it is absent beats letting
+    // them conclude the panel failed to load.
+    renderPage();
+    await screen.findByText(/does not attribute graphics work to individual processes/i);
+  });
+});
+
+describe("a machine with no discoverable GPU gets no GPU page at all", () => {
+  // #717's central rule, and #705's before it: an empty GPU page would
+  // claim a device was found and could not be read, which on Windows
+  // and on Intel or NVIDIA Linux is not what happened -- we did not
+  // look, because there is no unprivileged way to.
+
+  it("does not offer the row in the sidebar", async () => {
+    renderSidebar();
+    // The other pages are all there, so this is not a sidebar that
+    // failed to render.
+    await waitFor(() => expect(screen.getByRole("button", { name: "CPU" })).toBeTruthy());
+    expect(screen.queryByRole("button", { name: "GPU" })).toBeNull();
+  });
+
+  it("offers the row once the machine reports one", async () => {
+    liveFn.mockResolvedValue(sample({ gpus: [gpu()] }));
+    // The sidebar reads the cache the page fills, so both are rendered
+    // -- which is also how they sit in `App`.
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <SystemHealthSidebar />
+        <SystemHealthPage />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(screen.getByRole("button", { name: "GPU" })).toBeTruthy());
+  });
+
+  it("renders the overview rather than an empty page if the page is opened anyway", async () => {
+    // Reachable: the GPU can leave the sample after the page was
+    // opened. Falling through to the overview is the honest answer --
+    // there is nothing truthful to put on the page.
+    useFilters.setState({ healthPage: "gpu" });
+    renderPage();
+    await screen.findByRole("group", { name: /system pressure at a glance/i });
+    expect(screen.queryByText("Pipeline stages")).toBeNull();
+  });
+
+  it("hides the card from the phone's class list too", async () => {
+    // NOTE: `stubViewport` is what makes this the phone layout --
+    // jsdom has no `matchMedia`, so without it this renders desktop.
+    stubViewport(400);
+    renderPage();
+    const nav = await screen.findByRole("navigation", { name: /system health sections/i });
+    expect(within(nav).getByRole("button", { name: /CPU/ })).toBeTruthy();
+    expect(within(nav).queryByRole("button", { name: /^GPU/ })).toBeNull();
+  });
+
+  it("shows the card on the phone once there is a GPU", async () => {
+    stubViewport(400);
+    liveFn.mockResolvedValue(sample({ gpus: [gpu()] }));
+    renderPage();
+    const nav = await screen.findByRole("navigation", { name: /system health sections/i });
+    await waitFor(() =>
+      expect(within(nav).getByRole("button", { name: /^GPU/ })).toBeTruthy(),
+    );
+  });
+
+  it("filters the same list for both surfaces, from one helper", () => {
+    // The sidebar and the phone's cards must not drift into offering
+    // different pages -- the failure one shared `HEALTH_PAGES` array
+    // exists to prevent, which a second copy of the GPU rule would
+    // undo.
+    expect(healthPagesFor(0).map((p) => p.id)).not.toContain("gpu");
+    expect(healthPagesFor(1).map((p) => p.id)).toContain("gpu");
+    expect(healthPagesFor(1).length).toBe(HEALTH_PAGES.length);
+  });
+});
+
+describe("grouping processes by name (#721)", () => {
+  beforeEach(() => useFilters.setState({ healthPage: "cpu" }));
+
+  it("lists individual processes by default", async () => {
+    // Individual is the view that makes no inference: each row is one
+    // process the kernel reported. Grouping is a heuristic, and a
+    // heuristic on by default is one nobody chose.
+    renderPage();
+    const table = await screen.findByRole("table");
+    expect(within(table).getByText("acme-render")).toBeTruthy();
+    expect(within(table).queryByText("acme-agent")).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Individual" }).getAttribute("aria-pressed"),
+    ).toBe("true");
+  });
+
+  it("sums by name with the count when Grouped is chosen", async () => {
+    // The measured case on the issue: an application running as many
+    // processes is invisible individually and dominates when summed.
+    renderPage();
+    await screen.findByRole("table");
+    fireEvent.click(screen.getByRole("button", { name: "Grouped" }));
+
+    const table = screen.getByRole("table");
+    const rows = within(table).getAllByRole("row").slice(1);
+    expect(rows[0].textContent).toContain("acme-agent");
+    // The count is what stops a summed row being read as one process.
+    expect(rows[0].textContent).toContain("(26)");
+    expect(rows[0].textContent).toContain("13%");
+  });
+
+  it("keeps the count of what is NOT listed truthful under grouping", async () => {
+    // The subtle one. "1436 total minus 3 rows" reads perfectly and is
+    // wrong by however many siblings each group holds: three grouped
+    // rows here cover 26 + 1 + 2 = 29 processes, so 1407 are not
+    // listed, not 1433.
+    renderPage();
+    await screen.findByText(/other 1433 are not listed/i);
+    fireEvent.click(screen.getByRole("button", { name: "Grouped" }));
+    await screen.findByText(/covering 29 of 1436 processes running/i);
+    await screen.findByText(/other 1407 are not listed/i);
+  });
+
+  it("drops the PID column under grouping rather than naming one member", async () => {
+    // A group has no PID. Printing one of the twenty-six would name a
+    // process the row is not about, and it is the column a reader
+    // copies into `ps`.
+    renderPage();
+    const table = await screen.findByRole("table");
+    expect(within(table).getByText("PID")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Grouped" }));
+    expect(within(screen.getByRole("table")).queryByText("PID")).toBeNull();
+  });
+
+  it("says grouping is by name and not by ancestry", async () => {
+    // The heuristic's error stated where it is in effect: two unrelated
+    // programs that share a name are one row here, and the app cannot
+    // establish otherwise without walking ancestry it deliberately does
+    // not walk.
+    renderPage();
+    await screen.findByRole("table");
+    fireEvent.click(screen.getByRole("button", { name: "Grouped" }));
+    await screen.findByText(/groups by/i);
+    await screen.findByText(/not by which process started which/i);
+  });
+
+  it("does not count an unreadable CPU figure as zero inside a sum", async () => {
+    // Absent is not zero, inside a sum -- and a partial total presented
+    // as a complete one is the same class of lie as a fabricated zero.
+    footprintFn.mockResolvedValue(
+      footprint({
+        top_cpu_grouped: [group("acme-agent", 26, 12.5, 1690, 1)],
+      }),
+    );
+    renderPage();
+    await screen.findByRole("table");
+    fireEvent.click(screen.getByRole("button", { name: "Grouped" }));
+    await screen.findByText(/did not report/i);
+    await screen.findByText(/left out of the total rather than counted as zero/i);
+  });
+
+  it("says nothing about partial sums when every process was measured", async () => {
+    // The note must not appear on an ordinary machine, or it stops
+    // being read on the rare one where it matters.
+    renderPage();
+    await screen.findByRole("table");
+    fireEvent.click(screen.getByRole("button", { name: "Grouped" }));
+    expect(screen.queryByText(/left out of the total/i)).toBeNull();
+  });
+
+  it("offers no toggle at all when the desktop did not send grouped rows", async () => {
+    // A control that switches to an empty view is worse than no
+    // control: the user would read it as a machine on which nothing
+    // groups. Reachable via version skew, exactly like `top_cpu`.
+    footprintFn.mockResolvedValue(
+      footprint({ top_cpu_grouped: undefined, top_memory_grouped: undefined }),
+    );
+    renderPage();
+    await screen.findByRole("table");
+    expect(screen.queryByRole("button", { name: "Grouped" })).toBeNull();
+    // And the individual list is unaffected -- the page still answers
+    // its question.
+    expect(screen.getByText("acme-render")).toBeTruthy();
+  });
+
+  it("groups the Memory page by summed memory, not by re-sorting the CPU groups", async () => {
+    // The two lists answer different questions, and the fixture is
+    // built so re-sorting one by the other measure would drop a row:
+    // `cache-keeper` is in the memory groups and not in the CPU ones.
+    useFilters.setState({ healthPage: "memory" });
+    renderPage();
+    await screen.findByRole("table");
+    fireEvent.click(screen.getByRole("button", { name: "Grouped" }));
+    const table = screen.getByRole("table");
+    expect(within(table).getByText("cache-keeper")).toBeTruthy();
+    expect(within(table).queryByText("widget-daemon")).toBeNull();
+  });
+
+  it("does not persist the mode across a remount", async () => {
+    // A view mode that changes what a ROW MEANS should not silently
+    // follow you between sessions: `acme-agent (26)` at 13% read as one
+    // process at 13% is a wrong number with no visible cause. Local
+    // state, so leaving the page resets it.
+    renderPage();
+    await screen.findByRole("table");
+    fireEvent.click(screen.getByRole("button", { name: "Grouped" }));
+    await screen.findByText(/covering 29 of 1436/i);
+
+    // Away and back, the way the sidebar moves you.
+    useFilters.setState({ healthPage: "memory" });
+    useFilters.setState({ healthPage: "cpu" });
+    const again = renderPage();
+    await waitFor(() =>
+      expect(
+        within(again.container).getByRole("button", { name: "Individual" }).getAttribute(
+          "aria-pressed",
+        ),
+      ).toBe("true"),
+    );
+  });
+});
+
 describe("the page list stays complete", () => {
   /// Every page in the union is offered, and nothing is offered that
   /// is not in it.
@@ -484,15 +949,22 @@ describe("the page list stays complete", () => {
       cpu: /what is using the cpu/i,
       memory: /what is holding the memory/i,
       disk: /^volumes$/i,
+      // GPU (#717) needs a machine that HAS one -- on the default
+      // fixture the page correctly does not exist, which is its own
+      // test below.
+      gpu: /^pipeline stages$/i,
       network: /^since boot$/i,
       power: /^battery$/i,
     };
+    // Every page needs a machine that can offer it. Only GPU is
+    // conditional, so only GPU needs the sample swapped.
+    liveFn.mockResolvedValue(sample({ gpus: [gpu()] }));
     for (const page of ALL_HEALTH_PAGES) {
       if (page === "overview") continue;
       useFilters.setState({ healthPage: page });
       const { unmount } = renderPage();
       // Awaited: the live sample has to land before any page has a
-      // body, so a synchronous assertion would fail on all five.
+      // body, so a synchronous assertion would fail on all of them.
       await screen.findByText(expected[page]);
       unmount();
     }

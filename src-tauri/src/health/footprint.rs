@@ -72,6 +72,22 @@
 //! [`TOP_N`] adds two bounded partial passes over a list already in
 //! memory; it is not another read of anything.
 //!
+//! # Grouping by name (#721)
+//!
+//! [`Footprint::top_cpu_grouped`] and [`Footprint::top_memory_grouped`]
+//! are the same two questions asked of processes SUMMED BY NAME. They
+//! are computed here, over the full process list, rather than in the
+//! view, and that placement is the point of the feature: the view only
+//! ever receives [`TOP_N`] rows, so a client grouping its own copy
+//! could only merge names that already ranked individually.
+//!
+//! Measured on the reporting machine: 26 processes of one name held
+//! 13.0% of CPU and 6.6% of memory between them, while the largest
+//! single one was 1.2%. Not one of the 26 was in the individual top
+//! eight, so grouping after the cut would have found nothing to sum.
+//!
+//! Why NAME and not process ancestry is argued at [`ProcessGroup`].
+//!
 //! # Absent is not zero
 //!
 //! A tool that is not running is `None`, never a zero. `git` at 0% and
@@ -128,6 +144,29 @@ pub struct Footprint {
     /// set that was chosen by the wrong measure -- the eighth-hungriest
     /// process would be missing simply because it was not also busy.
     pub top_memory: Vec<Process>,
+    /// The [`TOP_N`] biggest CPU consumers once processes SHARING A
+    /// NAME are summed into one row (#721).
+    ///
+    /// Computed here rather than in the UI, and that is the whole point
+    /// of the field. The view only ever receives [`TOP_N`] rows, so a
+    /// client grouping what it was sent could only ever merge the few
+    /// of a name that already made the individual cut -- which is
+    /// exactly the case where grouping changes nothing. Measured on the
+    /// reporting machine: 26 processes of one name summed to 13.0% of
+    /// CPU while the largest single one was 1.2%, so not one of them
+    /// was in the individual top eight and a client-side group would
+    /// have found nothing to add up.
+    ///
+    /// Grouping therefore happens where the full list is: here.
+    pub top_cpu_grouped: Vec<ProcessGroup>,
+    /// The [`TOP_N`] biggest resident sets, grouped by name.
+    ///
+    /// A separate list from `top_cpu_grouped` for the same reason
+    /// `top_memory` is separate from `top_cpu`: the group that pins the
+    /// cores is rarely the group holding the memory, and re-sorting one
+    /// by the other measure would show the top of a set chosen by the
+    /// wrong one.
+    pub top_memory_grouped: Vec<ProcessGroup>,
     /// How many processes were running in total when the two lists
     /// above were taken.
     ///
@@ -163,6 +202,75 @@ pub struct Process {
     /// now. Not virtual size, which on any process linking a webview is
     /// a large number that means nothing to a user.
     pub memory: u64,
+}
+
+/// Every process of one name, summed (#721).
+///
+/// # Why a name and not a process tree
+///
+/// The alternative was true ancestry: walk `parent()` up to a root and
+/// sum each tree. It is more correct -- two unrelated programs that
+/// happen to share a name really are two things -- and it is more work
+/// in both senses.
+///
+/// Name won, deliberately, for three reasons:
+///
+/// - **It is the question people ask.** "What is `claude` using" is a
+///   question about an application, and the name is what the user
+///   recognises. A tree root is a PID, which names nothing to anyone.
+/// - **A tree root is not the application.** On macOS a great many
+///   user processes reparent to `launchd` (PID 1) when their spawner
+///   exits, so "sum by tree root" collapses most of the machine into
+///   one enormous `launchd` row. Getting the useful answer back would
+///   mean heuristics about which ancestor is "the app", which is a
+///   guess wearing the costume of a fact.
+/// - **The error it makes is visible.** Grouping by name over-merges,
+///   and the row says so: it carries the count, so `python (14)` is
+///   self-evidently a claim about fourteen processes that share a name
+///   rather than about one program. A tree walk's errors -- a
+///   reparented child silently split off into its own row -- are
+///   invisible in the output.
+///
+/// The over-merge is real and is why grouping is not the default: the
+/// individual view is the one that makes no inference at all.
+///
+/// # Absent is not zero, in a sum
+///
+/// [`Process::cpu_percent`] and [`Process::memory`] are non-optional on
+/// the wire, so nothing here can be summed in as a substituted zero.
+/// What CAN happen is a NaN: `sysinfo` yields one where a platform's
+/// accounting failed, and a single NaN added into a group would make
+/// the whole sum NaN -- one unreadable process erasing twenty-five
+/// readable ones. So the sum skips NaN members and counts how many it
+/// skipped, and the view says so rather than presenting a partial total
+/// as a complete one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProcessGroup {
+    /// The shared process name, exactly as the OS reported it.
+    pub name: String,
+    /// How many processes carry this name. Always at least 1, and it is
+    /// what the view prints beside the name -- `claude (26)` -- so a
+    /// grouped row can never be mistaken for a single process.
+    pub count: usize,
+    /// The summed CPU, as a percentage of ONE core -- so a group of
+    /// twenty-six busy processes legitimately reads far above 100 and
+    /// the view must not clamp it.
+    pub cpu_percent: f64,
+    /// The summed resident set, in bytes.
+    ///
+    /// Over-counts shared pages exactly as the individual rows do: a
+    /// library mapped into all 26 is counted 26 times. The view already
+    /// says resident sets do not add up to the total in use, and that
+    /// sentence is more load-bearing under grouping, not less.
+    pub memory: u64,
+    /// How many of the `count` members reported an unusable CPU figure
+    /// and were left OUT of `cpu_percent`.
+    ///
+    /// Zero on any ordinary machine. Non-zero means the sum is over
+    /// fewer processes than the count claims, which the view has to say
+    /// -- a partial total presented as a complete one is the same class
+    /// of lie as a zero standing in for a missing reading.
+    pub cpu_unmeasured: usize,
 }
 
 /// The subprocesses whose cost we attribute to ourselves.
@@ -396,6 +504,18 @@ impl Footprints {
         });
         let top_memory = top_by(&all, |p| std::cmp::Reverse(p.memory));
 
+        // Grouped over the FULL list, before any top-N cut. Grouping
+        // after the cut would sum at most the handful of a name that
+        // already ranked individually, which is precisely the case
+        // where grouping tells you nothing new -- see `ProcessGroup`.
+        //
+        // One pass builds the groups; the two selections below are the
+        // same bounded partial passes `top_by` does, over a list that
+        // is far shorter than `all` (names, not processes).
+        let groups = group_by_name(&all);
+        let top_cpu_grouped = top_groups(&groups, |g| std::cmp::Reverse(ordered(g.cpu_percent)));
+        let top_memory_grouped = top_groups(&groups, |g| std::cmp::Reverse(g.memory));
+
         Footprint {
             sampled_at: now.to_string(),
             app,
@@ -403,6 +523,8 @@ impl Footprints {
             docker_daemon,
             top_cpu,
             top_memory,
+            top_cpu_grouped,
+            top_memory_grouped,
             process_count,
         }
     }
@@ -483,6 +605,75 @@ fn top_by<K: Ord>(all: &[Process], key: impl Fn(&Process) -> K) -> Vec<Process> 
     }
     idx.sort_by(cmp);
     idx.into_iter().map(|i| all[i].clone()).collect()
+}
+
+/// Sum every process into one row per NAME.
+///
+/// Deterministic output order: the map's iteration order is a hash
+/// order that differs between runs, and the selection below breaks ties
+/// on it, so an unsorted result would make two equal groups swap places
+/// between five-second polls. Sorted by name here, which costs one sort
+/// over the distinct names (a few hundred at most, against 1436
+/// processes) and makes the whole pipeline reproducible.
+fn group_by_name(all: &[Process]) -> Vec<ProcessGroup> {
+    let mut by_name: std::collections::HashMap<&str, ProcessGroup> =
+        std::collections::HashMap::new();
+    for p in all {
+        let g = by_name
+            .entry(p.name.as_str())
+            .or_insert_with(|| ProcessGroup {
+                name: p.name.clone(),
+                count: 0,
+                cpu_percent: 0.0,
+                memory: 0,
+                cpu_unmeasured: 0,
+            });
+        g.count += 1;
+        // A NaN is a FAILED reading, not a zero, and adding one would
+        // turn the whole group's total into NaN -- one unreadable
+        // process erasing every readable one beside it. Counted as
+        // unmeasured instead, so the view can say the sum is over
+        // fewer processes than the count.
+        if p.cpu_percent.is_nan() {
+            g.cpu_unmeasured += 1;
+        } else {
+            g.cpu_percent += p.cpu_percent;
+        }
+        // `saturating_add` rather than `+`: resident sets are u64 and a
+        // sum over a thousand processes cannot realistically overflow,
+        // but a panic inside the five-second sampler is not a risk
+        // worth carrying for an arithmetic op that has a total answer.
+        g.memory = g.memory.saturating_add(p.memory);
+    }
+    let mut groups: Vec<ProcessGroup> = by_name.into_values().collect();
+    groups.sort_by(|a, b| a.name.cmp(&b.name));
+    groups
+}
+
+/// The [`TOP_N`] groups by `key`, biggest first, ties by name.
+///
+/// The same shape as [`top_by`], and separate rather than generic
+/// because the tie-breaker differs and is the reason either function
+/// exists: processes break ties on PID, groups have no PID and break on
+/// the name. A shared generic would have to take the tie-breaker as
+/// another closure, which is more machinery than the eight lines it
+/// would save.
+fn top_groups<K: Ord>(
+    groups: &[ProcessGroup],
+    key: impl Fn(&ProcessGroup) -> K,
+) -> Vec<ProcessGroup> {
+    let mut idx: Vec<usize> = (0..groups.len()).collect();
+    let cmp = |&a: &usize, &b: &usize| {
+        key(&groups[a])
+            .cmp(&key(&groups[b]))
+            .then_with(|| groups[a].name.cmp(&groups[b].name))
+    };
+    if idx.len() > TOP_N {
+        idx.select_nth_unstable_by(TOP_N - 1, cmp);
+        idx.truncate(TOP_N);
+    }
+    idx.sort_by(cmp);
+    idx.into_iter().map(|i| groups[i].clone()).collect()
 }
 
 #[cfg(test)]
@@ -821,6 +1012,240 @@ mod tests {
         let top = top_by(&all, |p| std::cmp::Reverse(ordered(p.cpu_percent)));
         assert_eq!(top[0].name, "real", "a real reading outranks a NaN");
         assert_eq!(top[1].name, "nan");
+    }
+
+    /// The measured case #721 was filed for.
+    ///
+    /// 26 processes of one name, none of them individually large
+    /// enough to reach the top eight, holding 13.0% of CPU and 6.6% of
+    /// memory between them. The fixture reproduces that shape: 26 small
+    /// siblings plus eight decoys each individually bigger than any one
+    /// sibling. Grouped, the 26 must WIN; individually, not one of them
+    /// appears at all.
+    ///
+    /// That contrast is the whole feature. A test that only checked
+    /// "the sums are right" would pass against a grouping done after
+    /// the top-eight cut, which is the implementation this field
+    /// exists to avoid -- so the individual list is asserted to exclude
+    /// them in the same test.
+    ///
+    /// Names are invented; this repo is public and a fixture must never
+    /// carry a captured process list.
+    #[test]
+    fn many_small_siblings_outrank_the_decoys_only_once_grouped() {
+        let mut all: Vec<Process> = Vec::new();
+        // The application: 26 processes at 0.5% and 40 MB each.
+        for i in 0..26u32 {
+            all.push(Process {
+                pid: 9000 + i,
+                name: "acme-agent".into(),
+                cpu_percent: 0.5,
+                memory: 40 * 1024 * 1024,
+            });
+        }
+        // Eight decoys, each individually larger than any single
+        // sibling and smaller than the sibling group's sum.
+        for i in 0..8u32 {
+            all.push(Process {
+                pid: 100 + i,
+                name: format!("decoy-{i}"),
+                cpu_percent: 2.0,
+                memory: 100 * 1024 * 1024,
+            });
+        }
+
+        // Individually: every row is a decoy. The 26 are invisible,
+        // which is the misleading-but-true answer the issue describes.
+        let individual = top_by(&all, |p| std::cmp::Reverse(ordered(p.cpu_percent)));
+        assert_eq!(individual.len(), TOP_N);
+        assert!(
+            individual.iter().all(|p| p.name.starts_with("decoy-")),
+            "the siblings must not reach the individual list, or the fixture proves nothing"
+        );
+
+        let groups = group_by_name(&all);
+        let grouped = top_groups(&groups, |g| std::cmp::Reverse(ordered(g.cpu_percent)));
+        let top = &grouped[0];
+        assert_eq!(
+            top.name, "acme-agent",
+            "the summed group outranks the decoys"
+        );
+        assert_eq!(top.count, 26);
+        assert!((top.cpu_percent - 13.0).abs() < 1e-9, "{}", top.cpu_percent);
+        assert_eq!(top.memory, 26 * 40 * 1024 * 1024);
+        assert_eq!(top.cpu_unmeasured, 0);
+
+        // And by memory, the same reversal.
+        let by_mem = top_groups(&groups, |g| std::cmp::Reverse(g.memory));
+        assert_eq!(by_mem[0].name, "acme-agent");
+    }
+
+    /// A group is capped at [`TOP_N`] rows like the individual list.
+    ///
+    /// Grouping changes what a row MEANS, not how many rows there are
+    /// -- which is what keeps the UI's "of N processes running" line
+    /// answerable in both modes.
+    #[test]
+    fn grouping_does_not_change_how_many_rows_come_back() {
+        let all: Vec<Process> = (0..50u32)
+            .map(|i| Process {
+                pid: 1000 + i,
+                name: format!("proc-{i}"),
+                cpu_percent: f64::from(i),
+                memory: u64::from(i) * 1_000_000,
+            })
+            .collect();
+        let groups = group_by_name(&all);
+        // Every name distinct, so grouping is the identity on the data
+        // and must still be the identity on the row count.
+        assert_eq!(groups.len(), 50);
+        let grouped = top_groups(&groups, |g| std::cmp::Reverse(ordered(g.cpu_percent)));
+        assert_eq!(grouped.len(), TOP_N);
+        assert!(grouped.iter().all(|g| g.count == 1));
+    }
+
+    /// A process whose CPU the platform could not read is NOT summed in
+    /// as a zero, and does not poison the group either.
+    ///
+    /// Two failures in one assertion, and they pull in opposite
+    /// directions. Adding a NaN makes the entire group's total NaN --
+    /// one unreadable process erasing twenty-five readable ones. Coercing
+    /// it to 0.0 instead would silently claim a measurement nobody took.
+    /// The answer is neither: sum what was measured, and report how many
+    /// were not, so the view can say the total is over fewer processes
+    /// than the count.
+    #[test]
+    fn an_unreadable_cpu_reading_is_excluded_from_the_sum_and_counted() {
+        let all = vec![
+            Process {
+                pid: 1,
+                name: "acme-agent".into(),
+                cpu_percent: 4.0,
+                memory: 10,
+            },
+            Process {
+                pid: 2,
+                name: "acme-agent".into(),
+                cpu_percent: f64::NAN,
+                memory: 20,
+            },
+            Process {
+                pid: 3,
+                name: "acme-agent".into(),
+                cpu_percent: 6.0,
+                memory: 30,
+            },
+        ];
+        let groups = group_by_name(&all);
+        assert_eq!(groups.len(), 1);
+        let g = &groups[0];
+        assert_eq!(g.count, 3, "the unreadable process still exists");
+        assert!(
+            (g.cpu_percent - 10.0).abs() < 1e-9,
+            "the NaN must neither poison the sum nor be added as 0: {}",
+            g.cpu_percent
+        );
+        assert_eq!(g.cpu_unmeasured, 1, "and the view has to be told");
+        // Memory was reported for all three, so that sum is complete.
+        assert_eq!(g.memory, 60);
+    }
+
+    /// The grouped order does not depend on the process map's hash
+    /// order.
+    ///
+    /// `group_by_name` builds a `HashMap`, whose iteration order
+    /// differs between runs. Without the sort inside it, two equal
+    /// groups would break their tie on whatever order the map yielded
+    /// and the table would reshuffle every five-second poll for no
+    /// reason the user caused -- the same flicker the PID tie-break
+    /// prevents for individual rows.
+    #[test]
+    fn grouped_ties_are_broken_by_name_so_the_order_is_stable() {
+        let make = |names: &[&str]| -> Vec<Process> {
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| Process {
+                    pid: 500 + i as u32,
+                    name: (*n).to_string(),
+                    cpu_percent: 1.0,
+                    memory: 1024,
+                })
+                .collect()
+        };
+        let forward = make(&["alpha", "bravo", "charlie", "delta"]);
+        let backward = make(&["delta", "charlie", "bravo", "alpha"]);
+
+        let names = |v: &[Process]| {
+            top_groups(&group_by_name(v), |g| {
+                std::cmp::Reverse(ordered(g.cpu_percent))
+            })
+            .into_iter()
+            .map(|g| g.name)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&forward), names(&backward));
+        assert_eq!(names(&forward), ["alpha", "bravo", "charlie", "delta"]);
+    }
+
+    /// A real reading groups into something coherent with itself.
+    ///
+    /// Not asserting WHAT is running -- that is whatever the CI runner
+    /// happens to be doing -- but the invariants that must hold on any
+    /// machine: the counts add up to the process total, and no group
+    /// claims more members than there are processes.
+    #[test]
+    fn a_real_grouped_reading_is_consistent_with_its_own_process_count() {
+        let f = Footprints::new();
+        let _warm = f.sample("2026-01-01T00:00:00Z");
+        let fp = f.sample("2026-01-01T00:01:00Z");
+
+        assert!(fp.top_cpu_grouped.len() <= TOP_N);
+        assert!(fp.top_memory_grouped.len() <= TOP_N);
+        for g in fp.top_cpu_grouped.iter().chain(&fp.top_memory_grouped) {
+            assert!(!g.name.is_empty(), "a group is named");
+            assert!(g.count >= 1, "a group has at least one member");
+            assert!(
+                g.count <= fp.process_count,
+                "a group of {} cannot exceed the {} processes running",
+                g.count,
+                fp.process_count
+            );
+            assert!(
+                g.cpu_unmeasured <= g.count,
+                "more unreadable members than members"
+            );
+            assert!(!g.cpu_percent.is_nan(), "a NaN must never reach the view");
+        }
+        // Grouping can only ever shrink the row set, never grow it.
+        assert!(fp.top_cpu_grouped.len() <= fp.process_count.min(TOP_N));
+
+        // The grouped rows were summed over the WHOLE machine, not over
+        // the individual top eight.
+        //
+        // This is the property the feature exists for, and it is the
+        // one a unit test over `group_by_name` cannot reach: that
+        // function is correct either way, and the bug lives in WHICH
+        // list `sample` hands it. Grouping the already-cut `top_cpu`
+        // would compile, pass every other test here, and produce
+        // grouped rows whose counts sum to at most TOP_N -- so that is
+        // exactly what is asserted against.
+        //
+        // Safe on any real machine: a booted system always runs several
+        // processes of some shared name, so the members covered by
+        // eight grouped rows exceed eight. Guarded on there being more
+        // than TOP_N processes at all, since a machine with fewer has
+        // nothing to cut and the property would be vacuous.
+        if fp.process_count > TOP_N {
+            let covered: usize = fp.top_memory_grouped.iter().map(|g| g.count).sum();
+            assert!(
+                covered > TOP_N,
+                "{covered} processes covered by {} grouped rows: grouping was done \
+                 over an already-truncated list, which is the bug this field exists \
+                 to avoid",
+                fp.top_memory_grouped.len()
+            );
+        }
     }
 
     /// The sample must stay cheap enough for the once-a-minute sampler.

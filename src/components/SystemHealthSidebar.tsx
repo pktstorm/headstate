@@ -1,6 +1,16 @@
-import { Activity, BatteryCharging, Cpu, Gauge, HardDrive, MemoryStick, Network } from "lucide-react";
+import {
+  Activity,
+  BatteryCharging,
+  Cpu,
+  Gauge,
+  HardDrive,
+  MemoryStick,
+  MonitorCog,
+  Network,
+} from "lucide-react";
 import { type HealthPage, type View, useFilters } from "../store/filters";
 import { ViewSwitcher } from "./ViewSwitcher";
+import { useSystemHealth } from "@/api/hooks";
 
 /// Every System Health page, in sidebar order, with its label and icon.
 ///
@@ -38,6 +48,12 @@ export const HEALTH_PAGES: {
     Icon: MemoryStick,
   },
   { id: "disk", label: "Disk", blurb: "Every volume, and Headstate's share", Icon: HardDrive },
+  {
+    id: "gpu",
+    label: "GPU",
+    blurb: "Utilization, memory, and the pipeline stages",
+    Icon: MonitorCog,
+  },
   { id: "network", label: "Network", blurb: "Every interface, since boot", Icon: Network },
   {
     id: "power",
@@ -46,6 +62,31 @@ export const HEALTH_PAGES: {
     Icon: BatteryCharging,
   },
 ];
+
+/// The pages worth offering on THIS machine.
+///
+/// Every page in `HEALTH_PAGES` but GPU is offered unconditionally: a
+/// machine always has a CPU, memory, volumes, interfaces and an uptime,
+/// and where one of those cannot be read the page says "Not measured",
+/// which is informative.
+///
+/// GPU is the exception, and it is the same rule #705 set for the
+/// overview panel. An empty GPU page would claim we found a graphics
+/// device and could not read it -- which on Windows and on Intel or
+/// NVIDIA Linux is not what happened: we did not look, because there is
+/// no unprivileged way to. So a machine with no discoverable GPU is
+/// offered no GPU page at all, exactly as #717 asks.
+///
+/// Derived from the live sample rather than from a capability flag, for
+/// the same reason the panel is: `gpus` being empty IS the fact, and a
+/// second source for it could disagree with the first.
+///
+/// Exported so the phone's card list and the sidebar cannot drift into
+/// offering different pages -- the failure `HEALTH_PAGES` itself exists
+/// to prevent.
+export function healthPagesFor(gpuCount: number) {
+  return HEALTH_PAGES.filter((p) => p.id !== "gpu" || gpuCount > 0);
+}
 
 /// The System Health view's own sidebar (#687).
 ///
@@ -75,6 +116,14 @@ export function SystemHealthSidebar({
   viewCounts?: Partial<Record<View, number>>;
 }) {
   const { healthPage, setHealthPage } = useFilters();
+  // `false`: this reads the cache that `SystemHealthPage` -- always
+  // mounted beside this column -- is already filling. A second enabled
+  // observer here would be a second poller on the same key, and the
+  // sidebar has no reason to drive a measurement of its own. Before the
+  // first sample lands there is no GPU to offer, which is correct: the
+  // row appears when the machine has answered, not before.
+  const gpuCount = useSystemHealth(false).data?.gpus.length ?? 0;
+  const pages = healthPagesFor(gpuCount);
 
   return (
     <nav className="flex w-64 shrink-0 flex-col border-r border-[#30363d] p-3">
@@ -90,7 +139,7 @@ export function SystemHealthSidebar({
           This machine
         </div>
         <ul className="flex flex-col">
-          {HEALTH_PAGES.map(({ id, label, Icon }) => (
+          {pages.map(({ id, label, Icon }) => (
             <li key={id}>
               <button
                 type="button"
