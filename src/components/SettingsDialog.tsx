@@ -6,6 +6,7 @@ import { useIsMobile } from "@/lib/useIsMobile";
 import { HelpButton } from "./HelpButton";
 import { PairPhonePanel } from "./PairPhonePanel";
 import { PairedDesktopPanel } from "./PairedDesktopPanel";
+import { ALWAYS_OFFERED, VIEWS } from "./ViewSwitcher";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { PairedDevicesList } from "./PairedDevicesList";
 import {
@@ -676,12 +677,18 @@ export function SettingsDialog({
             <div className={section === "views" ? "" : "hidden"}>
         <div className="mt-5 flex flex-col gap-2">
           <span className="text-sm font-medium">Views</span>
-          {[
-            { id: "to-review", label: "To review" },
-            { id: "worktrees", label: "Worktrees" },
-            { id: "docker", label: "Docker" },
-            { id: "system-health", label: "System health" },
-          ].map(({ id, label }) => (
+          {/* Derived from `VIEWS`, not a second list. The hand-written
+              one here carried four of the nine views, so `my-prs`,
+              `branches`, `artifacts`, `packages` and `claude-md` could
+              not be hidden at all -- and nothing said so, because a
+              partial list looks exactly like a complete one (#675).
+
+              `ALWAYS_OFFERED` is filtered out rather than rendered
+              disabled: `ViewSwitcher` shows those whatever is stored,
+              so a checkbox for one would be a control that appears to
+              work and silently does nothing. A toggle that cannot
+              change anything is worse than no toggle. */}
+          {VIEWS.filter(({ id }) => !ALWAYS_OFFERED.has(id)).map(({ id, label }) => (
             <label key={id} className="flex items-center gap-2 text-sm">
               <input
                 type="checkbox"
