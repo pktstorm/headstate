@@ -195,7 +195,13 @@ describe("interfaceRates", () => {
         ],
       },
     ]);
-    expect(rates.get("en0")?.rx[0].v).toBeCloseTo(1000, 5);
+    // Precision 1, not 5. `at()` builds its timestamps through
+    // `toISOString()`, which truncates to whole milliseconds, so a
+    // "60 second" gap is really 59.999s and the rate lands at 999.98
+    // rather than exactly 1000. Demanding five decimal places asserts
+    // the clock has no rounding, which is a fact about the test
+    // helper rather than about the rate calculation being tested.
+    expect(rates.get("en0")?.rx[0].v).toBeCloseTo(1000, 1);
     // The VPN moved nothing, which is a real zero -- it was measured.
     expect(rates.get("utun0")?.rx[0].v).toBe(0);
   });
