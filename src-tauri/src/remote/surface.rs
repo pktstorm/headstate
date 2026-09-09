@@ -91,6 +91,11 @@ pub const SURFACE: &[(&str, Class)] = &[
     // signature and neither can reach the nonce path (#656).
     ("system_health", Class::Read),
     ("system_health_history", Class::Read),
+    // What Headstate is costing the DESKTOP (#665). Exposed because
+    // that is the whole point on the phone: the companion drives a
+    // desktop, and this answers "is the app I am driving why that
+    // machine is busy". Reads the process table and nothing else.
+    ("system_footprint", Class::Read),
     ("docker_disk_usage", Class::Read),
     ("docker_dangling_volumes", Class::Read),
     ("docker_running_containers", Class::Read),
@@ -364,6 +369,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "docker_images" => res(commands::docker_images(app.clone()).await),
         "system_health" => res(commands::system_health(app.state()).await),
         "system_health_history" => res(commands::system_health_history(app.clone()).await),
+        "system_footprint" => res(commands::system_footprint(app.state()).await),
         "docker_disk_usage" => res(commands::docker_disk_usage().await),
         // The sync Docker commands shell out. Inline they would stall the
         // listener's worker for every other request (#496 was this bug

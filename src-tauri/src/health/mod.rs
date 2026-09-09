@@ -21,10 +21,23 @@
 //! measurement, which is the failure `packages::run::missing_tool`
 //! exists to avoid on the other side of the app: "no updates" and "the
 //! check did not run" are opposite answers.
+//!
+//! # The two halves of "what Headstate costs"
+//!
+//! [`Sample`] is the machine. [`Footprint`] (`footprint`) is this app's
+//! own share of it -- our process, the `git`/`gh`/Docker subprocesses we
+//! spawn, and the Docker daemon we keep resident. That is the LIVE half
+//! only: the disk half of the same panel is `size_worktrees`,
+//! `size_artifacts`, `size_venvs` and `docker_disk_usage`, which already
+//! exist and are slow enough (~13s, #661) that they must stay behind an
+//! explicit "Measure" and out of the sampler.
 
 use serde::{Deserialize, Serialize};
 
 pub mod collect;
+pub mod footprint;
+
+pub use footprint::Footprint;
 
 /// One moment, as the UI consumes it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
