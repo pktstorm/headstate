@@ -2391,15 +2391,126 @@ pub async fn list_branches(
     .map_err(|e| e.to_string())?
 }
 
+/// The event name a branch DELETION reports its progress under.
+///
+/// Separate from [`BRANCH_SCAN_PROGRESS`] even though the deletion's
+/// first phase is a scan. They describe different operations to the
+/// user -- one fills a list in, the other is destroying refs -- and a
+/// page that folded them together would show a deletion's re-check as
+/// the listing reclassifying itself. On the allowlists in
+/// `remote/events.rs` and `src-mobile/src/events.rs`, so the phone
+/// receives it too.
+pub const BRANCH_DELETE_PROGRESS: &str = "branch-delete-progress";
+
+/// One frame of a running branch deletion.
+///
+/// Two shapes because a deletion has two phases with genuinely
+/// different meanings, and reporting them as one counter is the bug
+/// (#724): the safety re-check is a full uncached scan at ~64ms per
+/// branch, so on the reported 562-branch batch a single counter sat at
+/// 0/562 for minutes before the first ref came off. `Checking` names
+/// that wait; `Deleting` counts what is actually being destroyed.
+///
+/// `repo` is on every frame for the reason the scan's frames carry it:
+/// the events are app-global while the work is per-repository.
+///
+/// No paths beyond the repository the caller itself named -- the rule
+/// `worktree-removal-progress` follows. Branch names are absent from
+/// the payload entirely: unlike the scan, which is filling a list of
+/// them in, nothing here needs a join key. Counts are enough.
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum BranchDeleteFrame {
+    /// The safety re-check has classified `done` of `total` branches.
+    ///
+    /// `total` is every branch in the repository, not the batch: the
+    /// gate scans the whole repository once. Nothing has been deleted
+    /// while these arrive, which is precisely what the phase label has
+    /// to convey.
+    #[serde(rename_all = "camelCase")]
+    Checking {
+        repo: String,
+        done: usize,
+        total: usize,
+    },
+    /// `done` of `total` selected branches attempted, `failed` refused.
+    ///
+    /// `failed` rides along on every frame rather than waiting for the
+    /// summary: a batch losing thirty branches to refusals is
+    /// something the user wants while the run is still going.
+    #[serde(rename_all = "camelCase")]
+    Deleting {
+        repo: String,
+        done: usize,
+        total: usize,
+        failed: usize,
+    },
+}
+
+/// Emits [`BranchDeleteFrame`]s as a deletion proceeds.
+struct BranchDeleteEmitter {
+    app: AppHandle,
+    repo: String,
+}
+
+impl crate::branches::DeleteProgress for BranchDeleteEmitter {
+    fn checking(&self, done: usize, total: usize) {
+        // Called from the scan's eight classification threads. `emit`
+        // takes `&self` and Tauri's handle is `Sync`, so no lock --
+        // and one here would serialise the workers behind the
+        // reporting.
+        let _ = self.app.emit(
+            BRANCH_DELETE_PROGRESS,
+            BranchDeleteFrame::Checking {
+                repo: self.repo.clone(),
+                done,
+                total,
+            },
+        );
+    }
+
+    fn deleted(&self, done: usize, total: usize, failed: usize) {
+        let _ = self.app.emit(
+            BRANCH_DELETE_PROGRESS,
+            BranchDeleteFrame::Deleting {
+                repo: self.repo.clone(),
+                done,
+                total,
+                failed,
+            },
+        );
+    }
+}
+
 /// Delete local branches, re-checking each one at delete time.
+///
+/// # Why it reports progress
+///
+/// It ran for over ten minutes on a 562-branch selection with nothing
+/// on screen, and the user could not tell a slow batch from a hung one
+/// (#724). The re-check is the slow half and it happens BEFORE any
+/// deletion, so the two are reported as separate phases: a counter
+/// that sits at 0 through the longest part of the wait is the failure
+/// being fixed, not the fix.
+///
+/// The gate itself does not move. This still re-checks against a fresh
+/// uncached scan; the frames observe that scan, they do not replace or
+/// shorten it.
 #[tauri::command]
 pub async fn delete_branches(
+    app: AppHandle,
     repo_path: String,
     names: Vec<String>,
 ) -> Result<Vec<crate::branches::DeleteOutcome>, String> {
-    tauri::async_runtime::spawn_blocking(move || crate::branches::delete_local(&repo_path, &names))
-        .await
-        .map_err(|e| e.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        let emitter = BranchDeleteEmitter {
+            app,
+            repo: repo_path.clone(),
+        };
+        crate::branches::delete_local_with_progress(&repo_path, &names, &emitter)
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Delete branches ON THE REMOTE.
@@ -2408,14 +2519,24 @@ pub async fn delete_branches(
 /// shared state, and there is no reflog on the other side to recover a
 /// mistake from. Keeping it distinct means the UI cannot reach it by
 /// the same control.
+///
+/// Reports the same two phases (#724), and the second phase matters
+/// more here: every deletion is a network round trip.
 #[tauri::command]
 pub async fn delete_remote_branches(
+    app: AppHandle,
     repo_path: String,
     names: Vec<String>,
 ) -> Result<Vec<crate::branches::DeleteOutcome>, String> {
-    tauri::async_runtime::spawn_blocking(move || crate::branches::delete_remote(&repo_path, &names))
-        .await
-        .map_err(|e| e.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        let emitter = BranchDeleteEmitter {
+            app,
+            repo: repo_path.clone(),
+        };
+        crate::branches::delete_remote_with_progress(&repo_path, &names, &emitter)
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Apply updates, open a pull request, and report when it is up.

@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import { Questionnaire } from "@shadcn/react/questionnaire";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { useBranchScan, useBranches } from "@/api/hooks";
+import { useBranchDeleteProgress, useBranchScan, useBranches } from "@/api/hooks";
 import { deleteBranches, deleteRemoteBranches } from "@/api/tauri";
 import { useActiveFilters } from "@/store/filters";
 import type { Branch, Deletable } from "@/types/pr";
@@ -52,6 +52,7 @@ export function BranchesPage() {
   // authority — `data` replaces these rows the moment it resolves, and
   // nothing streamed ever reaches the delete path.
   const scan = useBranchScan(repo ?? undefined);
+  const deleting = useBranchDeleteProgress(repo ?? undefined);
   const qc = useQueryClient();
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
@@ -204,12 +205,39 @@ export function BranchesPage() {
       ) : null}
 
       <div className="flex flex-wrap items-center gap-2">
-        {/* Visible while it runs, not just a disabled button. The
-            re-check is seconds of git per batch, and a toolbar that
-            merely greys out is indistinguishable from a hang. */}
+        {/* Visible while it runs, not just a disabled button, and it
+            says WHICH PHASE (#724).
+
+            A deletion re-checks every branch against a fresh scan
+            before touching anything, and that re-check is the slow
+            half — ~64ms per branch, so a 562-branch batch spent
+            minutes there before the first ref came off. This chip
+            previously read "Deleting…" throughout, which was a lie for
+            most of the wait and, worse, unchanging: the report was ten
+            minutes with no way to tell a slow batch from a hung one.
+
+            So the checking phase says it is checking and counts the
+            SCAN's branches, and the deleting phase counts the batch
+            and shows refusals as they happen. `busy` alone is the
+            fallback for the gap before the first frame arrives. */}
         {busy ? (
-          <span className="rounded border border-[#30363d] bg-[#161b22] px-2 py-1 text-xs text-[#8b949e]">
-            Deleting…
+          <span
+            role="status"
+            className="rounded border border-[#30363d] bg-[#161b22] px-2 py-1 text-xs text-[#8b949e]"
+          >
+            {deleting === null
+              ? "Deleting…"
+              : deleting.phase === "checking"
+                ? // Nothing has been deleted yet, and the wording has
+                  // to say so: a user who reads "deleting" here and
+                  // cancels believes refs are already gone.
+                  `Checking ${deleting.total} branch${deleting.total === 1 ? "" : "es"} before deleting — ${deleting.done} checked`
+                : `Deleting ${deleting.done} of ${deleting.total}${
+                    // Named while it runs, not saved for the summary. A
+                    // batch losing thirty branches to refusals is worth
+                    // knowing before the other five hundred go by.
+                    deleting.failed > 0 ? ` — ${deleting.failed} refused` : ""
+                  }`}
           </span>
         ) : null}
         {/* Selects exactly what ticking every deletable row by hand
