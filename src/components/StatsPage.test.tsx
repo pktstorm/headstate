@@ -56,7 +56,11 @@ describe("StatsPage", () => {
   it("renders nothing but placeholders before any query lands", () => {
     setup(pending, pending, pending);
     const { container } = render(<StatsPage />);
-    expect(container.querySelectorAll(".animate-pulse").length).toBeGreaterThan(0);
+    // `motion-safe:` prefixed, so the pulse stops under
+    // prefers-reduced-motion rather than animating regardless.
+    expect(
+      container.querySelectorAll('[class*="motion-safe:animate-pulse"]').length,
+    ).toBeGreaterThan(0);
     expect(screen.queryByText("183")).toBeNull();
   });
 

@@ -167,13 +167,22 @@ function FileEntry({
               full. Position carries what a truncated absolute path
               destroys. */}
           {dir ? (
-            <span className={`shrink-0 font-mono text-xs ${active ? "text-white/70" : "text-[#8b949e]"}`}>
+            <span className={`shrink-0 font-mono text-xs ${active ? "text-white" : "text-[#8b949e]"}`}>
               {dir}/
             </span>
           ) : null}
           <span className="min-w-0 flex-1 truncate font-mono text-xs">{name}</span>
         </span>
-        <span className={`text-xs ${active ? "text-white/80" : "text-[#8b949e]"}`}>
+        {/* Full white, not `white/70` and `white/80`.
+
+            These are 12px body text on the selected row's #1f6feb, where
+            the dimmed variants measure 3.07:1 and 3.53:1 -- both under the
+            4.5:1 normal-text threshold. No opacity clears it: white/90 is
+            still only 4.07:1, so the de-emphasis and the requirement
+            cannot both be had against this blue. The row is already
+            distinguished from its neighbours by the blue itself, so the
+            secondary text does not need to be dimmed on top of that. */}
+        <span className={`text-xs ${active ? "text-white" : "text-[#8b949e]"}`}>
           {formatSize(file.bytes)} · {tokenLabel(file.tokens)}
           {treeAdds ? ` · ${tokenLabel(file.total_tokens)} with imports` : ""}
         </span>

@@ -132,6 +132,20 @@ describe("PrRow branch pair", () => {
     expect(target?.className).toContain("#a371f7");
   });
 
+  // The tint above is the same test read through colour. It cannot be the
+  // only signal: the base ref renders identically either way, so without
+  // a word beside it a reader who does not separate purple from grey sees
+  // no difference between a stacked PR and an ordinary one.
+  it("says 'stacked' in text, not only in the tint", () => {
+    render(<PrRow pr={pr({ head_ref: "ci_fix_2", base_ref: "ci_fix_1" })} />);
+    expect(screen.getByText("(stacked)")).toBeTruthy();
+  });
+
+  it("does not call a PR targeting main stacked", () => {
+    render(<PrRow pr={pr({ head_ref: "feature/x", base_ref: "main" })} />);
+    expect(screen.queryByText("(stacked)")).toBeNull();
+  });
+
   it("does not tint a PR targeting main or master", () => {
     for (const base of ["main", "master"]) {
       const { container, unmount } = render(

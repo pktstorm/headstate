@@ -15,6 +15,19 @@ const config = {
   opened: { label: "Opened", color: "var(--chart-opened)" },
 };
 
+/// The two series, in draw order, each with the stroke dash that tells it
+/// apart without relying on its colour.
+///
+/// #3fb950 and #58a6ff measure 1.01:1 against EACH OTHER, so the two
+/// lines are effectively the same shade wherever hue is not perceived --
+/// the one pairing in the app where colour carried the whole distinction.
+/// `undefined` leaves the line solid rather than emitting
+/// `strokeDasharray="none"`, which recharts would animate against.
+const SERIES = [
+  { key: "opened", dash: undefined },
+  { key: "merged", dash: "4 3" },
+] as const;
+
 /// Daily opened and merged counts as overlaid gradient areas.
 ///
 /// Deliberately NOT stacked. The two series measure overlapping
@@ -54,6 +67,36 @@ export function ActivityChart({
               separately. */}
           <div className="text-xs text-[#8b949e]">
             Opened and merged per day (UTC)
+          </div>
+          {/* A static key, because hue was the only thing telling the two
+              series apart. The tooltip names them, but a tooltip is a
+              HOVER affordance -- unavailable to a keyboard, to touch, and
+              to anyone reading the chart rather than pointing at it.
+              "Opened and merged per day" above names both series without
+              saying which is which.
+
+              Each swatch repeats its series' stroke dash, so the key is
+              legible when the two blues and greens are not separable:
+              opened is solid, merged is dashed, and that difference
+              survives greyscale printing and every form of colour
+              blindness. */}
+          <div className="mt-1 flex items-center gap-3 text-xs text-[#8b949e]">
+            {SERIES.map(({ key, dash }) => (
+              <span key={key} className="inline-flex items-center gap-1.5">
+                <svg width="16" height="2" aria-hidden="true" className="shrink-0">
+                  <line
+                    x1="0"
+                    y1="1"
+                    x2="16"
+                    y2="1"
+                    stroke={config[key].color}
+                    strokeWidth="2"
+                    strokeDasharray={dash}
+                  />
+                </svg>
+                {config[key].label}
+              </span>
+            ))}
           </div>
         </div>
         <div className="flex gap-1">
@@ -109,20 +152,17 @@ export function ActivityChart({
               allowDecimals={false}
             />
             <ChartTooltip content={<ChartTooltipContent indicator="dot" />} />
-            <Area
-              dataKey="opened"
-              type="monotone"
-              stroke={config.opened.color}
-              fill="url(#fill-opened)"
-              strokeWidth={2}
-            />
-            <Area
-              dataKey="merged"
-              type="monotone"
-              stroke={config.merged.color}
-              fill="url(#fill-merged)"
-              strokeWidth={2}
-            />
+            {SERIES.map(({ key, dash }) => (
+              <Area
+                key={key}
+                dataKey={key}
+                type="monotone"
+                stroke={config[key].color}
+                fill={`url(#fill-${key})`}
+                strokeWidth={2}
+                strokeDasharray={dash}
+              />
+            ))}
           </AreaChart>
         </ChartContainer>
       )}
