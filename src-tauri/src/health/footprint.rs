@@ -245,11 +245,18 @@ impl Footprints {
             } else if matches(&name, WATCHED) {
                 children.push(out());
             } else if matches(&name, DAEMONS) {
-                // First match wins. Docker Desktop runs several
-                // `com.docker.backend` processes (three on the machine
-                // this was written on) and they are not equal shares of
-                // one daemon; picking the largest resident one is the
-                // honest single answer, so the fold below re-picks.
+                // The LARGEST match wins, not the first. Docker Desktop
+                // runs several `com.docker.backend` processes (three on
+                // the machine this was written on) and they are not
+                // equal shares of one daemon -- one holds the engine and
+                // the rest are small. Taking whichever the process map
+                // happened to yield first would report a number that
+                // changed between samples for no reason the user did.
+                //
+                // A single figure rather than a sum, because the sum is
+                // the wrong answer to a different question: the panel
+                // asks "what is the daemon costing", and adding three
+                // helpers to the engine inflates it.
                 let candidate = out();
                 if docker_daemon
                     .as_ref()
