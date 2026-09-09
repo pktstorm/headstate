@@ -388,15 +388,13 @@ impl Footprints {
         // places on every tick and the table would flicker for no
         // reason the user did anything to cause.
         let process_count = all.len();
-        let top_cpu = top_by(all.clone(), |p| {
-            // A total order on f64, which does not have one natively.
-            // `total_cmp` rather than `partial_cmp().unwrap()`: a NaN
-            // from a platform's CPU accounting would panic the sampler
-            // there, and a process reporting nonsense should sort last,
-            // not take the app down.
+        let top_cpu = top_by(&all, |p| {
+            // `Reverse` so the biggest sorts first. The `f64` needs a
+            // total order it does not have natively -- see `ordered`,
+            // which also keeps a NaN from panicking the sampler.
             std::cmp::Reverse(ordered(p.cpu_percent))
         });
-        let top_memory = top_by(all, |p| std::cmp::Reverse(p.memory));
+        let top_memory = top_by(&all, |p| std::cmp::Reverse(p.memory));
 
         Footprint {
             sampled_at: now.to_string(),
@@ -450,20 +448,41 @@ impl Ord for Ordered {
 
 /// The [`TOP_N`] processes by `key`, biggest first, ties by PID.
 ///
-/// Takes the vector by value and partitions it in place. The partial
-/// selection is the point: a full sort of 1436 rows to read eight of
-/// them is work thrown away, and this path runs on the five-second
-/// poll.
-fn top_by<K: Ord>(mut all: Vec<Process>, key: impl Fn(&Process) -> K) -> Vec<Process> {
-    if all.len() > TOP_N {
-        // Everything at or before index TOP_N-1 is >= everything after
-        // it. The relative order WITHIN the first TOP_N is unspecified,
+/// # Two things this avoids, both on the five-second poll
+///
+/// It selects rather than sorts. A full sort of 1436 rows to read eight
+/// of them orders 1428 rows nobody reads.
+///
+/// And it borrows rather than takes ownership, cloning only the eight
+/// that survive. Called twice per sample, so taking `Vec<Process>` by
+/// value meant the caller cloning the whole list for the first call --
+/// ~1436 heap-allocated names per poll, to keep sixteen. Indices are
+/// partitioned instead, and `Process` is cloned once it is known to be
+/// in the answer.
+fn top_by<K: Ord>(all: &[Process], key: impl Fn(&Process) -> K) -> Vec<Process> {
+    let mut idx: Vec<usize> = (0..all.len()).collect();
+    // One comparator for both the partition and the sort, and it breaks
+    // ties by PID. That matters twice over: without it the partition
+    // could put either of two equal processes on the cut line, so WHICH
+    // eight came back would shift between five-second polls with
+    // nothing on the machine having changed -- and the surviving eight
+    // would then reorder among themselves as well. Both show up as a
+    // table that flickers for no reason the user did anything to cause.
+    let cmp = |&a: &usize, &b: &usize| {
+        key(&all[a])
+            .cmp(&key(&all[b]))
+            .then_with(|| all[a].pid.cmp(&all[b].pid))
+    };
+    if idx.len() > TOP_N {
+        // Everything at or before index TOP_N-1 is <= everything after
+        // it under `cmp` (which the callers reverse, so: biggest
+        // first). The order WITHIN the first TOP_N is unspecified,
         // which is why the sort below is not redundant.
-        all.select_nth_unstable_by(TOP_N - 1, |a, b| key(a).cmp(&key(b)));
-        all.truncate(TOP_N);
+        idx.select_nth_unstable_by(TOP_N - 1, cmp);
+        idx.truncate(TOP_N);
     }
-    all.sort_by(|a, b| key(a).cmp(&key(b)).then_with(|| a.pid.cmp(&b.pid)));
-    all
+    idx.sort_by(cmp);
+    idx.into_iter().map(|i| all[i].clone()).collect()
 }
 
 #[cfg(test)]
@@ -701,8 +720,8 @@ mod tests {
             })
             .collect();
 
-        let top_cpu = top_by(all.clone(), |p| std::cmp::Reverse(ordered(p.cpu_percent)));
-        let top_mem = top_by(all.clone(), |p| std::cmp::Reverse(p.memory));
+        let top_cpu = top_by(&all, |p| std::cmp::Reverse(ordered(p.cpu_percent)));
+        let top_mem = top_by(&all, |p| std::cmp::Reverse(p.memory));
 
         assert_eq!(top_cpu.len(), TOP_N);
         let kept: std::collections::HashSet<u32> = top_cpu.iter().map(|p| p.pid).collect();
@@ -736,6 +755,47 @@ mod tests {
         assert_ne!(kept, kept_mem, "the synthetic set was built to differ");
     }
 
+    /// Equal processes are ordered by PID, so the table does not
+    /// flicker between polls.
+    ///
+    /// The realistic case, not an exotic one: on an idle machine most
+    /// processes report exactly 0.0%, so far more than TOP_N are tied
+    /// at the cut line. Without the PID tie-break, `select_nth_unstable`
+    /// is free to return a different eight each time -- and the eight
+    /// it keeps are free to reorder -- which the user sees as a table
+    /// reshuffling every five seconds for no reason they caused.
+    ///
+    /// Asserted by running the selection twice over inputs that differ
+    /// only in their ORDER, which is exactly what the process map's
+    /// hash iteration varies between samples.
+    #[test]
+    fn ties_are_broken_by_pid_so_the_order_is_stable_between_polls() {
+        let idle: Vec<Process> = (0..40)
+            .map(|i| Process {
+                pid: 3000 + i,
+                name: format!("proc-{i}"),
+                // All identical: the idle-machine case.
+                cpu_percent: 0.0,
+                memory: 1024,
+            })
+            .collect();
+        let mut shuffled = idle.clone();
+        shuffled.reverse();
+
+        let a = top_by(&idle, |p| std::cmp::Reverse(ordered(p.cpu_percent)));
+        let b = top_by(&shuffled, |p| std::cmp::Reverse(ordered(p.cpu_percent)));
+
+        let pids = |v: &[Process]| v.iter().map(|p| p.pid).collect::<Vec<_>>();
+        assert_eq!(
+            pids(&a),
+            pids(&b),
+            "the same tied processes in a different order must select the same eight, in the same order"
+        );
+        // And that order is by PID, ascending -- a defined answer
+        // rather than merely a repeatable one.
+        assert_eq!(pids(&a), (3000..3000 + TOP_N as u32).collect::<Vec<_>>());
+    }
+
     /// A NaN CPU reading sorts last instead of panicking.
     ///
     /// `partial_cmp().unwrap()` in the comparator would take down the
@@ -758,7 +818,7 @@ mod tests {
                 memory: 2,
             },
         ];
-        let top = top_by(all, |p| std::cmp::Reverse(ordered(p.cpu_percent)));
+        let top = top_by(&all, |p| std::cmp::Reverse(ordered(p.cpu_percent)));
         assert_eq!(top[0].name, "real", "a real reading outranks a NaN");
         assert_eq!(top[1].name, "nan");
     }
