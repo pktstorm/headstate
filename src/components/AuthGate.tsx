@@ -3,6 +3,7 @@ import { useEffect, type ReactNode } from "react";
 import { clearPollError, usePollError, useStoreError } from "../api/hooks";
 import { ReportLink } from "./ReportLink";
 import { getAuthState } from "../api/tauri";
+import { useConnectionState } from "@/api/connection";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { dismissSplash } from "../splash";
 
@@ -15,14 +16,69 @@ import { dismissSplash } from "../splash";
 /// distinct from the failure screen below: returning `null` while loading
 /// avoids flashing the "install gh" message for authenticated users before
 /// the first render settles.
+///
+/// On the PHONE there is a third case, and it is the ordinary one: the
+/// desktop is not reachable. `get_auth_state` is a `Class::Read` command
+/// forwarded over `remote_call`, and the companion serves only
+/// `get_cached` from its stored snapshot -- every other read rejects with
+/// "<desktop> is unreachable". So a phone away from its desktop, which is
+/// a phone on cellular, which is most of the time, failed this check on
+/// launch. See `offline` below for what that produced and why the answer
+/// is to let the app through rather than to gate on it.
 export function AuthGate({ children }: { children: ReactNode }) {
   const { data, isLoading } = useQuery({
     queryKey: ["auth"],
     queryFn: getAuthState,
     staleTime: Infinity,
+    // Off-network the retries are the black page (#684). TanStack's
+    // default is three with exponential backoff -- about seven seconds
+    // of `isLoading`, during which the branch below renders `null`
+    // while `PairingGate` has already taken the splash down at its 3s
+    // floor. The result is a `#0d1117` window with nothing in it, which
+    // is indistinguishable from a crash and is the FIRST thing a user
+    // sees when they open the app away from their desk.
+    //
+    // Retrying is also pointless here: `connection_state` already
+    // knows the desktop is away, and the auth query refetches on its
+    // own when the app returns to the foreground (`focusManager` in
+    // `main.tsx`) and when the connection comes back. Three doomed
+    // round-trips only buy a longer blank.
+    //
+    // Kept for the DESKTOP, where a rejection is a genuinely transient
+    // IPC failure worth a second attempt and there is no connection
+    // state to consult.
+    //
+    // SPREAD, not `retry: IS_MOBILE_BUILD ? false : undefined`. That
+    // reads the same and is not: an explicit `undefined` is still a
+    // present key, and TanStack takes a present key over the client's
+    // `defaultOptions.queries.retry`. Written that way it silently
+    // turned retries back ON for every desktop test that had switched
+    // them off, which is a thing this file's own test caught only
+    // because it asserts on the desktop path too.
+    ...(IS_MOBILE_BUILD ? { retry: false } : {}),
   });
   const pollError = usePollError();
   const storeError = useStoreError();
+  // `local` on the desktop build by construction, so `offline` below is
+  // always false there and every branch after it renders exactly what it
+  // rendered before.
+  const connection = useConnectionState();
+  // The states in which the desktop cannot answer for its own GitHub
+  // auth. Named positively rather than as `!== "connected"` so that
+  // `unknown` is a deliberate omission: `PairingGate` sits ABOVE this
+  // component and holds the splash on `unknown`, so this never renders
+  // in that state, and treating it as offline here would be a second,
+  // silently disagreeing copy of that rule.
+  //
+  // `connecting` belongs with `unreachable`: the answer is not in yet,
+  // and there is a cached list to show while it arrives.
+  //
+  // On `IS_MOBILE_BUILD`, not `useIsMobile()`: whether this app can
+  // reach a desktop at all is a capability of the build, and a desktop
+  // window dragged under 768px still has `gh` and must still be gated
+  // (#598).
+  const offline =
+    IS_MOBILE_BUILD && (connection.kind === "unreachable" || connection.kind === "connecting");
 
   // Dismissal belongs HERE, not in `App`, and keys off the auth check
   // having SETTLED rather than succeeded.
@@ -33,9 +89,37 @@ export function AuthGate({ children }: { children: ReactNode }) {
   // inset-0, z-index-9999 overlay that hides it. Anything that leaves the
   // app on a non-App branch must still uncover the window; the only state
   // that should hold the splash is "we do not know yet".
+  //
+  // `offline` joins `!isLoading` for the same reason `PairingGate`
+  // dismisses on every terminal state: an offline phone is about to
+  // render a real screen -- the cached list -- and a fixed inset-0
+  // z-index-9999 overlay left over it would hide that screen. Without
+  // this the mobile fix would have swapped a blank window for a blank
+  // window with the app behind it.
   useEffect(() => {
-    if (!isLoading) dismissSplash();
-  }, [isLoading]);
+    if (!isLoading || offline) dismissSplash();
+  }, [isLoading, offline]);
+
+  // Offline FIRST, ahead of the loading branch. Waiting out an auth
+  // check that cannot be answered is the black page: `isLoading` stays
+  // true across the retries, this returned `null`, and `PairingGate`
+  // had already lifted the splash -- so the launch screen for a phone
+  // away from its desk was an empty `#0d1117` window (#684).
+  //
+  // Letting the children through is not a guess that the desktop is
+  // signed in. It is that the desktop's auth is unknowable from here
+  // and NOT what the user needs told: `ConnectionBanner` already names
+  // the desktop and when it was last seen, `StaleRibbon` already marks
+  // the cached rows as a saved copy, and `useWritesPaused` already
+  // disables the actions that would need the desktop. Those three are
+  // the honest, proportionate report, and they are already built. The
+  // rule from #602 -- cached data is MARKED, not hidden -- is the same
+  // rule one layer up: unreachable must not mean blank.
+  //
+  // `get_cached` is the one read the companion serves from its stored
+  // snapshot, so there is genuinely something to show. Where there is
+  // not, `PrList` renders its own empty state, which is honest too.
+  if (offline) return <>{children}</>;
 
   if (isLoading) return null;
   if (data?.ok) {
@@ -118,6 +202,22 @@ export function AuthGate({ children }: { children: ReactNode }) {
   // `useIsMobile()`: a narrow desktop window still has `gh`, and telling
   // its user to fix it elsewhere would be the same bug mirrored.
   if (IS_MOBILE_BUILD) {
+    // The desktop must have ANSWERED for the screen below to be true.
+    //
+    // This guard is the accusation half of #684. Without it a rejected
+    // query landed here as well -- `data` at its undefined default,
+    // `data?.ok` falsy -- and the phone covered the whole app with
+    // "your desktop is not signed in to GitHub" on the strength of
+    // never having managed to ask it. Off-network that was the reported
+    // full-screen error; the `offline` branch above now takes that case
+    // first, and this catches the remainder.
+    //
+    // What remains is a desktop the connection says is THERE whose auth
+    // call did not come back: a transient forwarding failure, not a
+    // verdict on anybody's GitHub login. So the phone degrades the same
+    // way it does offline -- the app over its cached snapshot, with the
+    // shell's own banners carrying the failure.
+    if (data === undefined) return <>{children}</>;
     return (
       <div className="flex min-h-dvh items-center justify-center bg-[#0d1117] px-6 text-[#e6edf3]">
         <div className="max-w-md space-y-4">
