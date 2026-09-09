@@ -2283,10 +2283,17 @@ pub async fn system_footprint(
 ///
 /// Blocking git work -- measured at ~9s on a 675-branch repository --
 /// so it goes to a blocking thread rather than an async worker.
+///
+/// `scan_cached`, not `scan`: this is the read-only listing, and the
+/// page refetches on a deliberately short `staleTime`, so an unchanged
+/// repository was paying the full scan every ten seconds. The cache is
+/// keyed on the ref state, so it returns only when nothing that could
+/// change an answer has moved (#657). Deletion still calls `scan`
+/// directly and is unaffected.
 #[tauri::command]
 pub async fn list_branches(repo_path: String) -> Result<Vec<crate::branches::Branch>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        crate::branches::scan(std::path::Path::new(&repo_path))
+        crate::branches::scan_cached(std::path::Path::new(&repo_path))
     })
     .await
     .map_err(|e| e.to_string())?

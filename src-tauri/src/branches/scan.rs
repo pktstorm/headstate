@@ -368,6 +368,20 @@ fn classify(
 
 /// Every branch in a repository, classified.
 pub fn scan(dir: &Path) -> Result<Vec<Branch>, String> {
+    // Deliberately NOT cached.
+    //
+    // `delete_local` calls this to re-check the merge gate immediately
+    // before deleting, and its doc comment states the property that
+    // makes the gate trustworthy: the check runs "against the
+    // repository as it stands, never against what the UI last
+    // displayed". A cached answer IS what the UI last displayed, so
+    // serving one here would quietly convert the strongest safety
+    // property in this module into the exact thing it rules out.
+    //
+    // The cache is one layer up, in `scan_cached`, which only the
+    // read-only listing path uses. See #657.
+    let key = super::cache::ref_state(dir);
+
     let default = default_branch(dir).map_err(|e| e.to_string())?;
 
     let locals = git(dir, &["for-each-ref", "--format", REF_FORMAT, "refs/heads"])?;
@@ -480,7 +494,44 @@ pub fn scan(dir: &Path) -> Result<Vec<Branch>, String> {
     });
 
     out.sort_by(|a, b| b.committed.cmp(&a.committed));
+
+    // Stored against the refs as they were when the scan STARTED. If
+    // something moved while it ran, the next call's key will not match
+    // this one and the answer is recomputed -- which is the safe
+    // direction. Re-reading the refs here to store a fresher key would
+    // stamp a just-computed answer as describing a repository state it
+    // was not computed from.
+    if let Some(k) = key {
+        super::cache::put(dir, k, &out);
+    }
     Ok(out)
+}
+
+/// `scan`, served from the cache when the refs have not moved.
+///
+/// For the LISTING path only. The scan costs ~64ms per branch --
+/// 10-13s on a 512-branch repository -- and every visit after the
+/// query's 10s `staleTime` paid it again, with a blank page throughout
+/// (#657).
+///
+/// The 10s `staleTime` is deliberately short because a stale "safe to
+/// delete" is the expensive wrong answer, and that reasoning survives
+/// here untouched: the page still refetches on the same schedule. What
+/// changes is that a refetch against unmoved refs costs one
+/// `for-each-ref` instead of a full rescan. If ANY ref moved -- a new
+/// branch, a fetch, a force-push -- the key differs and the work is
+/// redone.
+///
+/// Deletion does not come through here, by design. `delete_local`
+/// re-checks against `scan` directly, so the gate still runs against
+/// the repository as it stands.
+pub fn scan_cached(dir: &Path) -> Result<Vec<Branch>, String> {
+    if let Some(k) = super::cache::ref_state(dir) {
+        if let Some(hit) = super::cache::get(dir, &k) {
+            return Ok(hit);
+        }
+    }
+    scan(dir)
 }
 
 #[cfg(test)]
