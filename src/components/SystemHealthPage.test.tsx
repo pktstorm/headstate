@@ -426,7 +426,11 @@ describe("SystemHealthPage", () => {
     expect(await screen.findByText("1.25")).toBeTruthy();
     expect(screen.getByText("0.94")).toBeTruthy();
     expect(screen.getByText("0.71")).toBeTruthy();
-    expect(screen.getByText("18%")).toBeTruthy();
+    // `getAllBy`: the CPU figure is deliberately in two places now --
+    // the pressure row above and the CPU panel here (#683). Both
+    // render the same sample, so asserting it appears is still the
+    // point; asserting it appears exactly once never was.
+    expect(screen.getAllByText("18%").length).toBeGreaterThan(0);
     expect(screen.getByText("3d 4h")).toBeTruthy();
   });
 
@@ -497,7 +501,10 @@ describe("SystemHealthPage", () => {
     show();
     await screen.findByText("1.25");
     expect(screen.getByText("/")).toBeTruthy();
-    expect(screen.getByText(/100 GB free of 500 GB/)).toBeTruthy();
+    // Also in the Disk pressure card (#683), same sample, so the
+    // question is whether the panel says it -- not whether the page
+    // says it once.
+    expect(screen.getAllByText(/100 GB free of 500 GB/).length).toBeGreaterThan(0);
     // The volume the app lives on is called out rather than left to be
     // guessed from the mount point.
     expect(screen.getByText("system")).toBeTruthy();
@@ -851,6 +858,74 @@ describe("what Headstate is costing", () => {
   });
 });
 
+/// #683: the pressure row, above everything else.
+describe("the at-a-glance pressure cards", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    liveFn.mockResolvedValue(sample());
+    historyFn.mockResolvedValue([]);
+    footprintFn.mockResolvedValue(footprint());
+    primeDisk();
+    mobileBuild.current = false;
+    connection.current = { kind: "local" };
+  });
+
+  it("answers CPU, memory and disk without scrolling", async () => {
+    show();
+    // Scoped to the row: the same figures also appear in the panels
+    // below, which is correct -- they are one source of truth read
+    // twice -- but makes a page-wide query ambiguous.
+    const row = await screen.findByRole("group", { name: /pressure at a glance/i });
+    // The fixture is 8 of 16 GB used, and a 500 GB root with 100 GB
+    // free -- so 50% and 80%.
+    expect(within(row).getByText("50%")).toBeTruthy();
+    expect(within(row).getByText("80%")).toBeTruthy();
+    expect(within(row).getByText("18%")).toBeTruthy();
+  });
+
+  /// A percentage alone cannot tell a nearly-full small disk from a
+  /// nearly-full large one, which is the difference between "ignore
+  /// this" and "act today".
+  it("shows the absolute figures behind each percentage", async () => {
+    show();
+    const row = await screen.findByRole("group", { name: /pressure at a glance/i });
+    expect(within(row).getByText(/of 16 GB/)).toBeTruthy();
+    expect(within(row).getByText(/free of 500 GB/)).toBeTruthy();
+  });
+
+  /// The page's central rule, applied where people look first. A
+  /// confident 0% for something never measured is the one thing this
+  /// view exists not to do.
+  it("says a missing reading is not measured, never zero", async () => {
+    liveFn.mockResolvedValue(sample({ cpu_percent: null }));
+    show();
+    const row = await screen.findByRole("group", { name: /pressure at a glance/i });
+    expect(within(row).getByText("Not measured")).toBeTruthy();
+    expect(within(row).queryByText("0%")).toBeNull();
+  });
+
+  /// Colour is a second cue, never the only one: the bar carries the
+  /// band, the digits carry the value, and a reader who cannot
+  /// distinguish the bands still gets the answer.
+  it("labels each bar for a reader who cannot see its colour", async () => {
+    show();
+    expect(await screen.findByLabelText(/Memory: 50 percent/i)).toBeTruthy();
+    expect(screen.getByLabelText(/Disk: 80 percent/i)).toBeTruthy();
+  });
+
+  /// The row must not become a second source of truth: the panels
+  /// below stay exactly as they were.
+  it("leaves the panels below untouched", async () => {
+    show();
+    await screen.findByRole("group", { name: /pressure at a glance/i });
+    // The panel headings, which the row must not have replaced.
+    for (const title of ["Load averages, per-core use, and the last 24 hours",
+                         "Every mounted volume"]) {
+      expect(screen.getByText(title)).toBeTruthy();
+    }
+  });
+});
+
 /// #666: the same view on the phone, describing the DESKTOP.
 ///
 /// Every test here flips `mobileBuild.current` explicitly. A test that
@@ -934,7 +1009,7 @@ describe("SystemHealthPage on the desktop is untouched by the mobile work", () =
     const viewport = stubViewport(1400);
     try {
       show();
-      await screen.findByText("18%");
+      await screen.findAllByText("18%");
       expect(screen.queryByText(/not this phone/i)).toBeNull();
       expect(screen.queryByText(/paired desktop/i)).toBeNull();
       expect(screen.queryByText(/could not reach it/i)).toBeNull();
