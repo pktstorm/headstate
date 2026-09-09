@@ -9,6 +9,7 @@ import type {
   Artifact,
   CleanupPrefs,
   DockerImage,
+  HealthSample,
   PrDetail,
   PullRequest,
   Venv,
@@ -38,6 +39,8 @@ import {
   getWorktreeDirs,
   classifyWorktrees,
   listBranches,
+  systemHealth,
+  systemHealthHistory,
   type UpdateRunDone,
   listWorktrees,
   removeWorktree,
@@ -2046,4 +2049,52 @@ export function prFromUrl(url: string): { repo: string; number: number } | null 
   if (!m) return null;
   const number = Number(m[2]);
   return Number.isFinite(number) ? { repo: m[1], number } : null;
+}
+
+/// How often the System Health view re-reads the current sample.
+///
+/// Five seconds, not one: what this drives is load averages and memory
+/// pressure, neither of which changes meaningfully faster, and each
+/// call does real work on a blocking thread reading the kernel.
+const HEALTH_POLL_MS = 5_000;
+
+/// The machine's health right now, polled only while the view is open.
+///
+/// `enabled` is the whole point of the signature. This is the one query
+/// in the app that would otherwise keep sampling the CPU for a page
+/// nobody is looking at, which the issue explicitly rules out. A
+/// disabled query has its `refetchInterval` suspended by TanStack, so
+/// passing `false` genuinely stops the timer rather than merely
+/// discarding the result.
+///
+/// `refetchIntervalInBackground` is left at its default of false on
+/// purpose: a minimised window stops polling too, and the Rust
+/// collector's own once-a-minute sampler is what keeps the history
+/// complete while nobody is watching.
+export function useSystemHealth(enabled: boolean) {
+  return useQuery<HealthSample>({
+    queryKey: ["system-health"],
+    queryFn: systemHealth,
+    enabled,
+    refetchInterval: enabled ? HEALTH_POLL_MS : false,
+    // Just under the poll interval, so a remount within one tick paints
+    // from cache instead of firing an extra sample.
+    staleTime: HEALTH_POLL_MS - 1_000,
+  });
+}
+
+/// The last 24 hours, for the charts.
+///
+/// Refetched far more slowly than the live sample: the series gains at
+/// most one point a minute, so anything faster re-fetches 120 samples
+/// to draw the identical line. On the phone that payload crosses the
+/// LAN, which is the cost #661 was about.
+export function useSystemHealthHistory(enabled: boolean) {
+  return useQuery<HealthSample[]>({
+    queryKey: ["system-health-history"],
+    queryFn: systemHealthHistory,
+    enabled,
+    refetchInterval: enabled ? 60_000 : false,
+    staleTime: 30_000,
+  });
 }

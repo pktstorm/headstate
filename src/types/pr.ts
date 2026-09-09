@@ -712,3 +712,73 @@ export interface DeleteOutcome {
   /// `null` on success; the reason otherwise.
   error: string | null;
 }
+
+/// One moment of the machine's health, mirroring the Rust
+/// `health::Sample` in `src-tauri/src/health/mod.rs`.
+///
+/// # Absent is not zero
+///
+/// Every optional field here is `null` when the platform does not
+/// expose it, never `0`. The UI must render those as "not measured":
+/// a zero that means "we could not look" reads as a real reading, and
+/// "0% CPU" and "we did not measure the CPU" are opposite claims. This
+/// is the same rule the Rust side states in its module docs.
+export interface HealthSample {
+  /// RFC 3339, matching every other timestamp this app stores.
+  sampled_at: string;
+  /// 1, 5 and 15 minute load averages, or `null` on a platform with no
+  /// equivalent (Windows).
+  load: [number, number, number] | null;
+  /// Whole-machine CPU use, 0-100.
+  cpu_percent: number | null;
+  /// Per-core, 0-100, in the platform's own core order. Empty rather
+  /// than null when unavailable, matching the Rust `Vec`.
+  cpu_per_core: number[];
+  memory: HealthMemory;
+  disks: HealthVolume[];
+  battery: HealthBattery | null;
+  /// `nominal` / `fair` / `serious` / `critical`.
+  ///
+  /// NOT a temperature. The SMC needs elevated privileges on macOS, so
+  /// what is actually readable is the platform's thermal PRESSURE --
+  /// a coarse label. The UI says so; see `SystemHealthPage`.
+  thermal: string | null;
+  networks: HealthInterface[];
+  /// Seconds since boot.
+  uptime_secs: number;
+}
+
+/// The four types below are NOT exported, matching `DockerOrigin` and
+/// `UpdateOutcome` above: nothing outside this file names them, since
+/// every consumer reaches them through `HealthSample`. Exporting a name
+/// no one imports is a name that has to be kept correct for no reader.
+interface HealthMemory {
+  total: number;
+  used: number;
+  /// What the OS believes is reclaimable, which is NOT `total - used`
+  /// on any modern platform: cache counts as used and is available.
+  available: number;
+  swap_total: number;
+  swap_used: number;
+}
+
+interface HealthVolume {
+  mount: string;
+  total: number;
+  available: number;
+  /// True for the volume the app itself lives on, which is the one a
+  /// user filling their disk cares about first.
+  is_root: boolean;
+}
+
+interface HealthBattery {
+  percent: number;
+  on_ac: boolean;
+}
+
+interface HealthInterface {
+  name: string;
+  /// Cumulative since boot, not since the last sample.
+  rx_bytes: number;
+  tx_bytes: number;
+}

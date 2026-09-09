@@ -32,6 +32,7 @@ import type {
   DockerDiskUsage,
   DockerImage,
   DockerState,
+  HealthSample,
   History,
   ImageRemovalOutcome,
   MergedDetail,
@@ -644,3 +645,32 @@ export const listPairedDevices = () =>
 /// click on an already-revoked device resolves rather than rejects.
 export const revokePairedDevice = (id: number) =>
   call<void>("revoke_paired_device", { id });
+
+/// The machine's health right now, sampled on demand.
+///
+/// A fresh reading each call rather than the newest stored row: the
+/// panel's headline numbers are "what is happening", and reading them
+/// out of the minute-resolution history would show a value up to a
+/// minute stale beside a chart that is honest about its resolution.
+///
+/// `Class::Read`, so the phone can ask a paired desktop for this and
+/// get the DESKTOP's health -- which is the point of the companion's
+/// version of the view.
+export const systemHealth = () => call<HealthSample>("system_health");
+
+/// The last 24 hours, downsampled server-side.
+///
+/// Bounded at `store::health::MAX_POINTS` (120) inside the SQL, so this
+/// cannot return the raw ~1440-row series however long the app has been
+/// running. The bound lives on the Rust side deliberately: the phone
+/// reads this over the LAN, and an unbounded payload there is the
+/// mistake that made `size_worktrees` time out (#661).
+///
+/// The result is oldest-first and is NOT evenly spaced in time. Rows
+/// are bucketed by position, not by clock, so a stretch when the app
+/// was closed comes back as two adjacent samples hours apart rather
+/// than as a run of empty buckets. Consumers must therefore look at
+/// `sampled_at` to find the gaps -- see `splitOnGaps` in
+/// `SystemHealthPage`.
+export const systemHealthHistory = () =>
+  call<HealthSample[]>("system_health_history");

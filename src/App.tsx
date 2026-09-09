@@ -37,10 +37,12 @@ import { RepoPickerSidebar } from "./components/RepoPickerSidebar";
 import { DockerPage } from "./components/DockerPage";
 import { DockerSidebar } from "./components/DockerSidebar";
 import { BranchesPage } from "./components/BranchesPage";
+import { SystemHealthPage } from "./components/SystemHealthPage";
 import { WorktreesPage } from "./components/WorktreesPage";
 import { QueryError, errorMessage } from "./components/QueryError";
 import { RepoSidebar } from "./components/RepoSidebar";
 import { StatusBar } from "./components/StatusBar";
+import { ViewSwitcher } from "./components/ViewSwitcher";
 import { StatsPage } from "./components/StatsPage";
 import { ConnectionBanner } from "./components/ConnectionBanner";
 import { StaleRibbon } from "./components/StaleRibbon";
@@ -272,7 +274,18 @@ export default function App() {
   // that survive whatever filter is already active, which would make some
   // combinations unreachable.
   const sidebar =
-    view === "packages" || view === "claude-md" ? (
+    view === "system-health" ? (
+      // The ONLY view with no repository axis: it describes the
+      // machine, so there is nothing for a repo list to pick between.
+      // Rendering one of the repo sidebars here would show a column of
+      // repositories whose every row is inert, or -- on a machine with
+      // no scanned checkouts -- an empty picker under a heading,
+      // which reads as a page that failed to load. The switcher alone
+      // keeps navigation where it always is.
+      <nav className="flex w-64 shrink-0 flex-col border-r border-[#30363d] p-3">
+        <ViewSwitcher counts={{ "to-review": reviewingCount }} />
+      </nav>
+    ) : view === "packages" || view === "claude-md" ? (
       <RepoPickerSidebar reviewingCount={reviewingCount} />
     ) : view === "artifacts" ? (
       <ArtifactSidebar reviewingCount={reviewingCount} />
@@ -352,6 +365,8 @@ export default function App() {
           <h1 className="text-sm font-semibold">
             {view === "to-review"
               ? "Pull requests to review"
+              : view === "system-health"
+                ? "System health"
               : view === "claude-md"
                 ? "CLAUDE.md"
               : view === "packages"
@@ -384,9 +399,14 @@ export default function App() {
 
         {/* Local-state views never render a PR detail: a pull request
             selected earlier in My PRs would otherwise take over the
-            page, and neither Worktrees nor Branches has any notion of
-            a selected PR to go back to. */}
-        {selectedPr && view !== "worktrees" && view !== "branches" ? (
+            page, and none of Worktrees, Branches or System health has
+            any notion of a selected PR to go back to. System health
+            least of all -- it is about the machine, and nothing on it
+            can be reached from a pull request. */}
+        {selectedPr &&
+        view !== "worktrees" &&
+        view !== "branches" &&
+        view !== "system-health" ? (
           <div className="p-4">
             <PrDetailView
               repo={selectedPr.repo}
@@ -413,6 +433,14 @@ export default function App() {
         ) : view === "branches" ? (
           <div className="p-4">
             <BranchesPage />
+          </div>
+        ) : view === "system-health" ? (
+          // No `FilterBar` and no strips, deliberately. Every control in
+          // that bar narrows a list of pull requests, and this page has
+          // none: rendering it here would put a search box, a sort menu
+          // and two label pickers above a description of the CPU.
+          <div className="p-4">
+            <SystemHealthPage />
           </div>
         ) : panel === "stats" ? (
           <div className="p-4">

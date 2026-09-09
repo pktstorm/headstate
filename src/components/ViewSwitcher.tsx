@@ -1,4 +1,4 @@
-import { ChevronDown, Container, Eye, FileText, FolderGit2, GitBranch, GitPullRequest, HardDrive, Package } from "lucide-react";
+import { Activity, ChevronDown, Container, Eye, FileText, FolderGit2, GitBranch, GitPullRequest, HardDrive, Package } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { type View, useFilters } from "../store/filters";
 import { useUiPrefs } from "../api/hooks";
@@ -12,6 +12,10 @@ const VIEWS: { id: View; label: string; Icon: typeof GitPullRequest }[] = [
   { id: "artifacts", label: "Artifacts", Icon: HardDrive },
   { id: "packages", label: "Package updates", Icon: Package },
   { id: "claude-md", label: "CLAUDE.md", Icon: FileText },
+  // Last, and deliberately so: it is the only entry that is not about
+  // the user's code at all. Grouping it with the repo-scoped views
+  // would imply it takes a repository, which it does not.
+  { id: "system-health", label: "System health", Icon: Activity },
 ];
 
 /// The top-level view control, at the head of the sidebar.
