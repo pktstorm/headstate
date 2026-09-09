@@ -25,6 +25,7 @@ export const ALL_VIEWS = [
   "artifacts",
   "packages",
   "claude-md",
+  "system-health",
 ] as const;
 
 export type View = (typeof ALL_VIEWS)[number];
@@ -98,6 +99,12 @@ const EMPTY_FILTERS: Record<View, Filters> = {
   artifacts: {},
   packages: {},
   "claude-md": {},
+  // System Health has an entry like every other view even though it
+  // has no filters to hold. `filtersByView` must be TOTAL over `View`
+  // -- `useActiveFilters` reads `[view]` and every consumer reads
+  // `.repo`/`.sort` off the result -- so a view omitted here is the
+  // undefined-crash this record exists to prevent, not a saving.
+  "system-health": {},
 };
 
 /// Filters and view survive a relaunch.

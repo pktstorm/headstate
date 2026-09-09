@@ -680,6 +680,7 @@ export function SettingsDialog({
             { id: "to-review", label: "To review" },
             { id: "worktrees", label: "Worktrees" },
             { id: "docker", label: "Docker" },
+            { id: "system-health", label: "System health" },
           ].map(({ id, label }) => (
             <label key={id} className="flex items-center gap-2 text-sm">
               <input

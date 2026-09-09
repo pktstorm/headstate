@@ -63,7 +63,7 @@ beforeEach(() => {
   repos.mockReturnValue([]);
   useFilters.setState({
     filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {} },
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "system-health": {} },
     view: "worktrees",
   } as never);
 });

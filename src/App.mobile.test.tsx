@@ -112,7 +112,7 @@ const EMPTY = {
   docker: {},
   artifacts: {},
   packages: {},
-  "claude-md": {},
+  "claude-md": {}, "system-health": {},
 };
 
 beforeEach(() => {
