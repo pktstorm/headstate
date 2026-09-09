@@ -56,6 +56,10 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("docker_state", Class::Read),
     ("docker_builds", Class::Read),
     ("docker_images", Class::Read),
+    // System Health (#663). Reads, so neither carries a step-up
+    // signature and neither can reach the nonce path (#656).
+    ("system_health", Class::Read),
+    ("system_health_history", Class::Read),
     ("docker_disk_usage", Class::Read),
     ("docker_dangling_volumes", Class::Read),
     ("docker_running_containers", Class::Read),
