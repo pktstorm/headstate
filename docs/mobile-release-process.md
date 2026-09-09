@@ -172,10 +172,10 @@ run from a `mobile-v*` tag with the release enabled.
 
 ## Enabling the release (the first release gate)
 
-Both build jobs are gated on the repository variable
-`MOBILE_RELEASE_ENABLED`. Until it is `true`, a `mobile-v*` tag does
-nothing (the jobs show as skipped). The spec keeps store builds manual until
-the pairing walkthrough has passed **twice with no findings**; when it has:
+Build jobs are gated on the repository variable `MOBILE_RELEASE_ENABLED`.
+Until it is `true`, a `mobile-v*` tag does nothing (the jobs show as
+skipped). The spec keeps store builds manual until the pairing walkthrough
+has passed **twice with no findings**; when it has:
 
 1. Settings > Secrets and variables > Actions > **Variables** > New
    repository variable.
@@ -183,6 +183,47 @@ the pairing walkthrough has passed **twice with no findings**; when it has:
 
 Set it to anything else (or delete it) to disable again. No workflow edit is
 needed in either direction.
+
+### Android has a second gate
+
+`ANDROID_RELEASE_ENABLED` gates the Android job **on its own**, because the
+two platforms are provisioned independently: Apple's certificates and
+Google's Play account are separate pieces of work, and one variable meaning
+"mobile releases are on" cannot express that only one of them is done.
+
+Leave it unset and Android is **skipped**, not failed, and iOS ships alone.
+Set it to `true` once all five Android secrets below exist.
+
+This distinction is not cosmetic. Before it existed, every `mobile-v*` tag
+ran an Android job whose secrets did not exist; it failed Preflight, and
+because `publish` needed both platforms, `publish` was skipped with it. The
+result was **38 mobile tags and zero GitHub releases** — no artifacts, no
+checksums, no changelog — while iOS was reaching TestFlight perfectly well
+the whole time. The pipeline was red for a reason unrelated to the thing it
+was successfully doing, which is exactly how it went unnoticed (#673).
+
+A dry run is exempt from `MOBILE_RELEASE_ENABLED` but **not** from this one:
+rehearsing a build whose signing secrets do not exist only reproduces the
+failure the gate exists to prevent.
+
+## The build number never goes backwards
+
+`BUILD_NUMBER` is `github.run_number`, which becomes `CFBundleVersion` on
+iOS and `versionCode` on Android. Both stores refuse a build number they
+have already seen.
+
+`run_number` is counted per workflow **file**, so renaming
+`mobile-release.yml` restarts it at 1 and every upload after that is
+rejected as a duplicate — recoverable only by burning version numbers until
+the count climbs back past the highest already shipped.
+
+Preflight compares against `.github/mobile-build-high-water-mark` and fails
+in the first job with the cause named. **Raise that file whenever a build
+reaches TestFlight or Play.**
+
+Numbers being non-contiguous per version (0.1.7 → 9, 0.1.12 → 14) is this
+system working, not drift: a rejected upload still consumes its number, and
+re-tagging the same version is routine. Only a decrease is a fault (#635).
 
 ## Secrets
 
