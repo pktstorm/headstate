@@ -124,6 +124,9 @@ pub struct Process {
 /// one subprocess per worktree across 296 of them. If that ever changes
 /// back, this already covers it; until then it is simply never present,
 /// which is a `None` and not a zero.
+///
+/// Written WITHOUT the executable suffix; [`matches`] adds it. See there
+/// for why that is not cosmetic.
 const WATCHED: &[&str] = &["git", "gh", "du", "docker"];
 
 /// Process names for the Docker daemon.
@@ -134,6 +137,31 @@ const WATCHED: &[&str] = &["git", "gh", "du", "docker"];
 /// it is a GUI the user chose to open, not the daemon whose memory
 /// Headstate's `docker` calls are keeping resident.
 const DAEMONS: &[&str] = &["com.docker.backend", "dockerd"];
+
+/// Whether an OS-reported process name is one of `list`.
+///
+/// Exists because a plain equality check is silently wrong on Windows,
+/// which is one of the three platforms this ships to. `sysinfo` reports
+/// the name the OS gives it, and on Windows that carries the extension:
+/// the process is `git.exe`, not `git`. An exact match against `"git"`
+/// would therefore find nothing on Windows and report an empty
+/// `children` -- an absence that looks exactly like "no tools running"
+/// and would never be investigated, because an empty list is this
+/// panel's normal state between refreshes.
+///
+/// So the suffix is stripped rather than baked into the lists, using
+/// `EXE_SUFFIX` for the same reason `docker::cli` does: it is empty on
+/// Unix, so the comparison is unchanged there.
+///
+/// Case-insensitive on the stem as well, because Windows paths are, and
+/// a `GIT.EXE` is the same cost as a `git.exe`.
+fn matches(name: &str, list: &[&str]) -> bool {
+    let stem = name
+        .strip_suffix(std::env::consts::EXE_SUFFIX)
+        .filter(|_| !std::env::consts::EXE_SUFFIX.is_empty())
+        .unwrap_or(name);
+    list.iter().any(|w| stem.eq_ignore_ascii_case(w))
+}
 
 /// The live reader for [`Footprint`].
 ///
@@ -214,9 +242,9 @@ impl Footprints {
 
             if Some(*pid) == own {
                 app = Some(out());
-            } else if WATCHED.contains(&name.as_ref()) {
+            } else if matches(&name, WATCHED) {
                 children.push(out());
-            } else if DAEMONS.contains(&name.as_ref()) {
+            } else if matches(&name, DAEMONS) {
                 // First match wins. Docker Desktop runs several
                 // `com.docker.backend` processes (three on the machine
                 // this was written on) and they are not equal shares of
@@ -299,7 +327,7 @@ mod tests {
         for c in &fp.children {
             assert!(c.pid > 0, "{} has no pid", c.name);
             assert!(
-                WATCHED.contains(&c.name.as_str()),
+                matches(&c.name, WATCHED),
                 "{} is not a tool we spawn",
                 c.name
             );
@@ -316,7 +344,7 @@ mod tests {
 
         if let Some(d) = fp.docker_daemon {
             assert!(
-                DAEMONS.contains(&d.name.as_str()),
+                matches(&d.name, DAEMONS),
                 "reported {} as the daemon",
                 d.name
             );
@@ -370,6 +398,45 @@ mod tests {
                 pair[0],
                 pair[1]
             );
+        }
+    }
+
+    /// The name match must survive Windows' `.exe`.
+    ///
+    /// The failure this guards is silent, which is why it is worth a
+    /// test of its own: an exact match against `"git"` finds nothing on
+    /// Windows, where the process is `git.exe`, and the result is an
+    /// empty `children` -- indistinguishable from the ordinary "no tools
+    /// running right now", so nobody would ever look.
+    ///
+    /// Written to run on every platform rather than only Windows: the
+    /// suffixed spellings are asserted only where the suffix exists,
+    /// but the unsuffixed ones and the non-matches must hold everywhere.
+    #[test]
+    fn the_name_match_survives_the_platform_executable_suffix() {
+        assert!(matches("git", WATCHED));
+        assert!(matches("gh", WATCHED));
+        assert!(matches("dockerd", DAEMONS));
+
+        // Near misses are misses. `github-desktop` is not our `gh`, and
+        // partial matching here would attribute a whole other app's
+        // memory to Headstate.
+        assert!(!matches("github-desktop", WATCHED));
+        assert!(!matches("digit", WATCHED));
+        assert!(!matches("", WATCHED));
+        assert!(!matches("git", DAEMONS));
+
+        if !std::env::consts::EXE_SUFFIX.is_empty() {
+            let exe = |n: &str| format!("{n}{}", std::env::consts::EXE_SUFFIX);
+            assert!(matches(&exe("git"), WATCHED));
+            assert!(matches(&exe("docker"), WATCHED));
+            assert!(matches(&exe("GIT"), WATCHED), "windows paths fold case");
+            assert!(matches(&exe("dockerd"), DAEMONS));
+            assert!(!matches(&exe("github-desktop"), WATCHED));
+        } else {
+            // On Unix the suffix is empty, so a literal ".exe" is just
+            // part of the name and must NOT be stripped into a match.
+            assert!(!matches("git.exe", WATCHED));
         }
     }
 
