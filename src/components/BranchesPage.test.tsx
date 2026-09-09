@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Branch, Deletable } from "@/types/pr";
 
@@ -29,6 +29,20 @@ const scanState = vi.hoisted(() => ({
   current: { branches: [] as Branch[], total: null as number | null, classified: 0 },
 }));
 
+/// What `useBranchDeleteProgress` reports, per test.
+///
+/// A value rather than the real hook for the same reason as
+/// `scanState`: the hook itself is exercised end to end in
+/// `hooks.branchDelete.test.tsx`, and what a page test pins is which
+/// PHASE the page renders — a page that showed "Deleting…" during the
+/// re-check would be the reported bug with a nicer counter (#724).
+const deleteState = vi.hoisted(() => ({
+  current: null as
+    | null
+    | { phase: "checking"; done: number; total: number }
+    | { phase: "deleting"; done: number; total: number; failed: number },
+}));
+
 // The hooks, not the whole tauri module: `api/hooks` pulls in the rest
 // of the app's commands, and mocking that module wholesale would make
 // this test depend on every one of them.
@@ -43,6 +57,7 @@ vi.mock("../api/hooks", () => ({
     return q;
   },
   useBranchScan: () => scanState.current,
+  useBranchDeleteProgress: () => deleteState.current,
 }));
 vi.mock("../api/tauri", () => ({
   listBranches: listFn,
@@ -112,6 +127,7 @@ describe("BranchesPage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     scanState.current = { branches: [], total: null, classified: 0 };
+    deleteState.current = null;
     useFilters.getState().setView("branches");
     useFilters.getState().setFilter("repo", "/code/app");
     listFn.mockResolvedValue([
@@ -466,5 +482,112 @@ describe("BranchesPage", () => {
     expect(await screen.findByText(/no origin\/HEAD/i)).toBeTruthy();
     expect(screen.queryByText("half")).toBeNull();
     expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  // ---- deletion progress, two phases (#724) --------------------------
+
+  /// Start a deletion and leave it in flight, so the progress chip is
+  /// on screen with whatever phase `deleteState` was set to.
+  ///
+  /// The backend promise never resolves, deliberately: the reported
+  /// failure is what the page shows DURING the run, and a test that
+  /// let the deletion settle would be testing the toasts instead.
+  ///
+  /// The phase is set BEFORE this runs rather than after, because the
+  /// hook is a value here — the click that starts the deletion is the
+  /// render that reads it.
+  const deletionInFlight = async () => {
+    delLocal.mockReturnValue(new Promise(() => {}));
+    show();
+    await screen.findByText("done");
+    fireEvent.click(screen.getByLabelText("done"));
+    fireEvent.click(screen.getByRole("button", { name: /^delete 1…/i }));
+    await screen.findByText(/where should these be deleted/i);
+    fireEvent.click(screen.getByRole("button", { name: /delete 1 branch locally/i }));
+    // The LAST status region, not the only one: the incomplete-scan
+    // banner is a `status` too, and a deletion started while a scan is
+    // still streaming would put both on the page. Pinning the wrong
+    // one would make these tests pass on the scan's text.
+    return (await screen.findAllByRole("status")).at(-1)!;
+  };
+
+  /// THE reported bug. The safety re-check is a full uncached scan and
+  /// it runs before anything is deleted — ~64ms a branch, so minutes on
+  /// the 562-branch batch that was reported. A page saying "Deleting…"
+  /// throughout tells the user refs are coming off when none are, and a
+  /// counter at 0/562 for that whole time reads as a hang.
+  it("says it is CHECKING, not deleting, while the safety gate runs", async () => {
+    deleteState.current = { phase: "checking", done: 128, total: 562 };
+    const status = await deletionInFlight();
+
+    expect(status.textContent).toMatch(/checking 562 branches/i);
+    expect(status.textContent).toMatch(/128 checked/i);
+    // It must not claim deletion. This is the assertion that fails if
+    // the phases are collapsed back into one counter.
+    expect(status.textContent).not.toMatch(/deleting \d/i);
+  });
+
+  /// The count in the checking phase must MOVE. A phase label over a
+  /// number frozen at zero is the same hang with a caption — and 0/562
+  /// held for minutes is precisely what was reported.
+  it("advances the checking count rather than sitting at zero", async () => {
+    deleteState.current = { phase: "checking", done: 0, total: 562 };
+    const first = await deletionInFlight();
+    expect(first.textContent).toMatch(/0 checked/i);
+    cleanup();
+
+    deleteState.current = { phase: "checking", done: 301, total: 562 };
+    const later = await deletionInFlight();
+    expect(later.textContent).toMatch(/301 checked/i);
+  });
+
+  /// Once refs are actually coming off, the count is of the BATCH, not
+  /// of the repository the gate scanned. Two different totals, and
+  /// showing the wrong one misreports how much is left.
+  it("counts the batch once it is really deleting", async () => {
+    deleteState.current = { phase: "deleting", done: 47, total: 562, failed: 0 };
+    const status = await deletionInFlight();
+
+    expect(status.textContent).toMatch(/deleting 47 of 562/i);
+    expect(status.textContent).not.toMatch(/checking/i);
+  });
+
+  /// Failures visible AS THEY HAPPEN, not only in the summary at the
+  /// end. A batch that has already refused thirty branches with five
+  /// hundred still to go should say so while there is a run to abandon.
+  it("shows refusals while the batch is still running", async () => {
+    deleteState.current = { phase: "deleting", done: 100, total: 562, failed: 30 };
+    const status = await deletionInFlight();
+
+    expect(status.textContent).toMatch(/30 refused/i);
+  });
+
+  /// A clean batch must not carry an empty failure clause: "0 refused"
+  /// on every frame trains the user to stop reading the line that
+  /// matters when it is not zero.
+  it("says nothing about refusals when there are none", async () => {
+    deleteState.current = { phase: "deleting", done: 100, total: 562, failed: 0 };
+    const status = await deletionInFlight();
+
+    expect(status.textContent).not.toMatch(/refused/i);
+  });
+
+  /// The gap before the first frame arrives still says something. It is
+  /// short, but silence in it would be the original complaint in
+  /// miniature.
+  it("still names the work before the first progress frame", async () => {
+    deleteState.current = null;
+    const status = await deletionInFlight();
+
+    expect(status.textContent).toMatch(/deleting/i);
+  });
+
+  /// Progress belongs to a run in flight. A chip left up after the
+  /// deletion settled would report work that is over.
+  it("shows no progress chip when nothing is being deleted", async () => {
+    deleteState.current = { phase: "deleting", done: 3, total: 10, failed: 0 };
+    show();
+    await screen.findByText("done");
+    expect(screen.queryByText(/deleting 3 of 10/i)).toBeNull();
   });
 });

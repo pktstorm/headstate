@@ -534,10 +534,13 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         )
         .await),
         "delete_branches" => {
-            res(commands::delete_branches(a.get("repoPath")?, a.get("names")?).await)
+            res(commands::delete_branches(app.clone(), a.get("repoPath")?, a.get("names")?).await)
         }
         "delete_remote_branches" => {
-            res(commands::delete_remote_branches(a.get("repoPath")?, a.get("names")?).await)
+            res(
+                commands::delete_remote_branches(app.clone(), a.get("repoPath")?, a.get("names")?)
+                    .await,
+            )
         }
         "remove_worktree" => {
             res(commands::remove_worktree(a.get("repoPath")?, a.get("worktreePath")?).await)

@@ -243,6 +243,10 @@ const POLL_EVENTS: [string, () => unknown][] = [
   // imported Tauri's `listen` directly would work on the desktop and
   // silently never fire on the phone.
   ["branch-scan-progress", () => hooks.useBranchScan("/code/app")],
+  // The eleventh (#724). Same seam, same reason — and the phone is the
+  // client that needs it most: it has no window to leave open and
+  // watch a ten-minute deletion in.
+  ["branch-delete-progress", () => hooks.useBranchDeleteProgress("/code/app")],
 ];
 
 function wrapper({ children }: { children: ReactNode }) {

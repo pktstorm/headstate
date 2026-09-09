@@ -67,6 +67,10 @@ pub const EVENT_NAMES: &[&str] = &[
     // It carries branch names and deletability verdicts -- what the
     // page is about to render anyway -- and no filesystem paths.
     "branch-scan-progress",
+    // Also deliberate (#724): a bulk deletion showed nothing for over
+    // ten minutes, and a phone feels that hardest -- it has no window
+    // to leave open and watch. Counts only: no branch names, no paths.
+    "branch-delete-progress",
 ];
 
 /// The event whose payload is the PR list, cached as the snapshot.

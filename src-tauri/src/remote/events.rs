@@ -89,6 +89,10 @@ pub const EVENT_NAMES: &[&str] = &[
     // a blank page for ten seconds; it carries branch names and
     // verdicts the phone is about to be shown anyway, and no paths.
     "branch-scan-progress",
+    // Also deliberate (#724): a bulk deletion ran for ten minutes with
+    // nothing on screen. Counts only -- no branch names and no paths,
+    // the `worktree-removal-progress` rule.
+    "branch-delete-progress",
 ];
 
 /// The event name the opening snapshot frame is sent under, so the
