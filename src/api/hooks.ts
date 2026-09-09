@@ -9,6 +9,7 @@ import type {
   Artifact,
   CleanupPrefs,
   DockerImage,
+  Footprint,
   HealthSample,
   PrDetail,
   PullRequest,
@@ -41,6 +42,7 @@ import {
   listBranches,
   systemHealth,
   systemHealthHistory,
+  systemFootprint,
   type UpdateRunDone,
   listWorktrees,
   removeWorktree,
@@ -984,10 +986,21 @@ export function usePrDetail(repo: string | undefined, number: number | undefined
 /// `staleTime` is short but non-zero: the set changes when the user
 /// creates or removes a worktree, not on a timer, so refetching on every
 /// mount would spend a second of subprocess work for nothing.
-export function useWorktrees() {
+/// Every repository and its worktrees.
+///
+/// `enabled` defaults to true because the three callers that discover
+/// repositories -- the sidebar, the picker, the Worktrees page -- exist
+/// to show this and would only ever pass true. The parameter is for the
+/// System Health footprint panel, which must not scan until the user
+/// asks: its disk figures are gated behind an explicit action, and
+/// discovery is part of what that gate has to cover. `list_worktrees`
+/// is not free, and a scan that runs on view open is the beginning of
+/// the #661 shape even when the sizing behind it is deferred.
+export function useWorktrees(enabled = true) {
   return useQuery({
     queryKey: ["worktrees"],
     queryFn: listWorktrees,
+    enabled,
     staleTime: 30_000,
   });
 }
@@ -2096,5 +2109,33 @@ export function useSystemHealthHistory(enabled: boolean) {
     enabled,
     refetchInterval: enabled ? 60_000 : false,
     staleTime: 30_000,
+  });
+}
+
+/// What Headstate itself is costing, polled with the rest of the view.
+///
+/// Shares `HEALTH_POLL_MS` with `useSystemHealth` deliberately. The two
+/// answer halves of one question -- "is the machine busy" and "are we
+/// why" -- and a reader compares them; on different cadences the pair
+/// would be describing two different instants, so a `git` fan-out could
+/// appear beside a CPU figure taken before it started.
+///
+/// Safe on that cadence because the Rust side is a kernel read of the
+/// already-open process table: no subprocess, no directory walk. The
+/// DISK half of the same panel is not here and must never be -- those
+/// four commands take seconds, and the whole point of #661 is that a
+/// slow command on a timer is the failure. The panel drives them from
+/// its own explicit action instead.
+///
+/// `enabled` for the same reason as its two neighbours: a disabled
+/// query has its `refetchInterval` suspended by TanStack, so passing
+/// `false` genuinely stops the timer rather than discarding results.
+export function useSystemFootprint(enabled: boolean) {
+  return useQuery<Footprint>({
+    queryKey: ["system-footprint"],
+    queryFn: systemFootprint,
+    enabled,
+    refetchInterval: enabled ? HEALTH_POLL_MS : false,
+    staleTime: HEALTH_POLL_MS - 1_000,
   });
 }
