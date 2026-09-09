@@ -14,6 +14,15 @@
 //! [`Sample::thermal`] carries. The UI says so rather than letting a
 //! label that looks like a temperature imply one.
 //!
+//! **The GPU, on most platforms.** macOS answers through IOKit and
+//! Linux answers for AMD cards through sysfs. Intel on Linux genuinely
+//! cannot be read without `CAP_PERFMON`; Windows and NVIDIA-on-Linux
+//! could be, but each needs machinery (a PDH loop, a hand-declared NVML
+//! ABI) that `sysinfo` is about to provide for free. [`Sample::gpus`]
+//! is empty on all of them and the view draws no panel, which is the
+//! same rule as everything else here. [`gpu`] carries the evidence
+//! behind each verdict.
+//!
 //! # Absent is not zero
 //!
 //! Every optional field is `None` when the platform does not expose it,
@@ -36,8 +45,10 @@ use serde::{Deserialize, Serialize};
 
 pub mod collect;
 pub mod footprint;
+pub mod gpu;
 
 pub use footprint::Footprint;
+pub use gpu::Gpu;
 
 /// One moment, as the UI consumes it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -52,6 +63,16 @@ pub struct Sample {
     /// Per-core, 0-100, in the platform's own core order.
     pub cpu_per_core: Vec<f64>,
     pub memory: Memory,
+    /// Every GPU the platform will describe, which on several is none.
+    ///
+    /// Empty is "nothing discoverable", and the view draws no panel for
+    /// it rather than a panel of zeroes -- see `health::gpu` for which
+    /// platforms can be read unprivileged and which cannot.
+    ///
+    /// A `Vec` rather than an `Option<Gpu>` because a machine can have
+    /// two (an Intel Mac with integrated and discrete graphics), and
+    /// collapsing them would have to pick one and hide the other.
+    pub gpus: Vec<Gpu>,
     pub disks: Vec<Volume>,
     pub battery: Option<Battery>,
     /// `nominal`, `fair`, `serious`, `critical` -- NOT degrees. See the

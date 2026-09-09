@@ -173,6 +173,15 @@ const sample = (over: Partial<HealthSample> = {}): HealthSample => ({
     swap_total: 2 * 1024 ** 3,
     swap_used: 512 * 1024 ** 2,
   },
+  gpus: [
+    {
+      name: "Apple M2 Max",
+      utilization_percent: 7,
+      memory_used: 1.5 * 1024 ** 3,
+      memory_total: 10 * 1024 ** 3,
+      unified_memory: true,
+    },
+  ],
   disks: [
     { mount: "/", total: 500 * 1024 ** 3, available: 100 * 1024 ** 3, is_root: true },
   ],
@@ -597,6 +606,121 @@ describe("SystemHealthPage", () => {
     expect(core1.getAttribute("aria-valuenow")).toBe("26");
   });
 
+  /// The GPU's utilization is a meter, like every other bar here, so
+  /// its value is readable without inferring it from a pixel width.
+  it("renders the GPU's utilization and the memory it holds", async () => {
+    show();
+    await screen.findByText("1.25");
+    expect(screen.getByText("Apple M2 Max")).toBeTruthy();
+    const bar = screen.getByLabelText("Apple M2 Max utilization");
+    expect(bar.getAttribute("aria-valuenow")).toBe("7");
+  });
+
+  /// **The unified-memory rule (#686).** The Memory panel reports the
+  /// same physical pool, so without this sentence a reader would add
+  /// the GPU's gigabytes to the system's and conclude the machine has
+  /// more RAM than it does -- the two panels would look like they
+  /// disagreed about the size of the machine.
+  it("says the GPU shares one pool with the system, not a second one", async () => {
+    show();
+    await screen.findByText("1.25");
+    expect(screen.getByText(/unified memory/)).toBeTruthy();
+    expect(screen.getByText(/should not be added to it/)).toBeTruthy();
+  });
+
+  /// A discrete GPU has its own VRAM, so the unified-memory note would
+  /// be false there and must not appear.
+  it("does not claim unified memory for a card with its own VRAM", async () => {
+    liveFn.mockResolvedValue(
+      sample({
+        gpus: [
+          {
+            name: "card0",
+            utilization_percent: 42,
+            memory_used: 2 * 1024 ** 3,
+            memory_total: 8 * 1024 ** 3,
+            unified_memory: false,
+          },
+        ],
+      }),
+    );
+    show();
+    await screen.findByText("1.25");
+    expect(screen.getByText("card0")).toBeTruthy();
+    expect(screen.queryByText(/unified memory/)).toBeNull();
+    expect(screen.getByText("Total VRAM")).toBeTruthy();
+  });
+
+  /// **No panel at all, rather than a panel of absences.**
+  ///
+  /// This is the rule #686 states explicitly, and it is where this
+  /// page's usual "Not measured" would be the WRONG answer: a GPU
+  /// panel full of dashes claims a GPU was found and could not be
+  /// read. On Windows, and on Intel/NVIDIA Linux, nothing was found
+  /// because there is no unprivileged way to look.
+  it("renders no GPU panel when the platform reported none", async () => {
+    liveFn.mockResolvedValue(sample({ gpus: [] }));
+    show();
+    await screen.findByText("1.25");
+    expect(screen.queryByText("GPU")).toBeNull();
+    expect(screen.queryByText("Utilization")).toBeNull();
+  });
+
+  /// A GPU that reported utilization but no memory figures shows the
+  /// one it has and says nothing about the ones it does not -- never a
+  /// confident 0 bytes.
+  it("keeps a GPU's unreported memory absent rather than zero", async () => {
+    liveFn.mockResolvedValue(
+      sample({
+        gpus: [
+          {
+            name: "card0",
+            utilization_percent: 55,
+            memory_used: null,
+            memory_total: null,
+            unified_memory: false,
+          },
+        ],
+      }),
+    );
+    show();
+    await screen.findByText("1.25");
+    expect(screen.getByLabelText("card0 utilization").getAttribute("aria-valuenow")).toBe(
+      "55",
+    );
+    expect(screen.queryByText("0 B")).toBeNull();
+    expect(screen.getAllByText(/Not measured/).length).toBeGreaterThan(0);
+  });
+
+  /// Two GPUs are two cards, not one picked arbitrarily -- an Intel Mac
+  /// with integrated and discrete graphics reports both.
+  it("renders every GPU the machine reported", async () => {
+    liveFn.mockResolvedValue(
+      sample({
+        gpus: [
+          {
+            name: "Intel Iris",
+            utilization_percent: 3,
+            memory_used: null,
+            memory_total: null,
+            unified_memory: false,
+          },
+          {
+            name: "Radeon Pro",
+            utilization_percent: 61,
+            memory_used: null,
+            memory_total: null,
+            unified_memory: false,
+          },
+        ],
+      }),
+    );
+    show();
+    await screen.findByText("1.25");
+    expect(screen.getByText("Intel Iris")).toBeTruthy();
+    expect(screen.getByText("Radeon Pro")).toBeTruthy();
+  });
+
   /// A machine that reported no per-core figures gets the absent
   /// treatment too -- not a row of empty bars, which would read as a
   /// perfectly idle CPU.
@@ -619,11 +743,23 @@ describe("SystemHealthPage", () => {
 
   /// Each chart carries the explanation beside it. An explanation two
   /// panels away is one nobody reads at the moment they need it.
+  ///
+  /// Three charts on this fixture: CPU, memory, and the GPU (#686),
+  /// which the default sample reports.
   it("explains the breaks beside each chart", async () => {
     show();
     await screen.findByText("1.25");
     const notes = screen.getAllByText(/Headstate was not running/);
-    expect(notes.length).toBe(2);
+    expect(notes.length).toBe(3);
+  });
+
+  /// The GPU chart goes away with the GPU panel, so a machine with no
+  /// discoverable GPU is back to two.
+  it("drops the GPU chart along with its panel", async () => {
+    liveFn.mockResolvedValue(sample({ gpus: [] }));
+    show();
+    await screen.findByText("1.25");
+    expect(screen.getAllByText(/Headstate was not running/).length).toBe(2);
   });
 });
 
@@ -661,16 +797,35 @@ describe("the panels are laid out for a desktop", () => {
     await screen.findByText("1.25");
     const grid = container.querySelector(".md\\:grid-cols-2");
     expect(grid).not.toBeNull();
-    // Six panel headings, plus the "Disk" subheading inside the
-    // footprint panel. Counted rather than asserted loosely because a
-    // panel silently disappearing from the layout is exactly the kind
+    // Seven panel headings -- the original six plus GPU (#686), which
+    // the default sample reports -- plus the "Disk" subheading inside
+    // the footprint panel. Counted rather than asserted loosely because
+    // a panel silently disappearing from the layout is exactly the kind
     // of regression this catches -- #665 shipped once with its whole
     // panel missing.
     const headings = within(grid as HTMLElement).getAllByRole("heading");
-    expect(headings.filter((h) => h.tagName === "H2").length).toBe(6);
+    expect(headings.filter((h) => h.tagName === "H2").length).toBe(7);
     expect(headings.map((h) => h.textContent)).toContain(
       "What Headstate is costing",
     );
+    expect(headings.map((h) => h.textContent)).toContain("GPU");
+  });
+
+  /// And the GPU panel is the one that comes and goes: a machine that
+  /// reported none is back to six, with nothing left behind.
+  ///
+  /// The counterpart to the count above. Between them they pin both
+  /// halves of the #686 rule -- the panel appears when there is
+  /// something truthful in it, and vanishes entirely when there is not.
+  it("drops to six panels on a machine with no discoverable GPU", async () => {
+    liveFn.mockResolvedValue(sample({ gpus: [] }));
+    historyFn.mockResolvedValue([]);
+    const { container } = show();
+    await screen.findByText("1.25");
+    const grid = container.querySelector(".md\\:grid-cols-2");
+    const headings = within(grid as HTMLElement).getAllByRole("heading");
+    expect(headings.filter((h) => h.tagName === "H2").length).toBe(6);
+    expect(headings.map((h) => h.textContent)).not.toContain("GPU");
   });
 });
 

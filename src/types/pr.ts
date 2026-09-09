@@ -735,6 +735,14 @@ export interface HealthSample {
   /// than null when unavailable, matching the Rust `Vec`.
   cpu_per_core: number[];
   memory: HealthMemory;
+  /// Every GPU the platform would describe, which on several is none.
+  ///
+  /// Empty is "nothing discoverable" -- a platform Headstate cannot
+  /// read unprivileged (Windows, and Intel/NVIDIA on Linux), or a
+  /// machine with no GPU. The UI draws NO PANEL for an empty list
+  /// rather than a panel of zeroes: a 0% GPU is a claim about an idle
+  /// GPU, and "we did not look" is the opposite claim.
+  gpus: HealthGpu[];
   disks: HealthVolume[];
   battery: HealthBattery | null;
   /// `nominal` / `fair` / `serious` / `critical`.
@@ -748,7 +756,7 @@ export interface HealthSample {
   uptime_secs: number;
 }
 
-/// The four types below are NOT exported, matching `DockerOrigin` and
+/// The four unexported types below match `DockerOrigin` and
 /// `UpdateOutcome` above: nothing outside this file names them, since
 /// every consumer reaches them through `HealthSample`. Exporting a name
 /// no one imports is a name that has to be kept correct for no reader.
@@ -760,6 +768,39 @@ interface HealthMemory {
   available: number;
   swap_total: number;
   swap_used: number;
+}
+
+/// One GPU, mirroring the Rust `health::Gpu` in
+/// `src-tauri/src/health/gpu.rs`.
+///
+/// Exported, unlike the other `HealthSample` helpers, for the same
+/// reason as `FootprintProcess`: `SystemHealthPage` renders a component
+/// per GPU and therefore has to name the type.
+///
+/// Every field but `name` is nullable, because the platforms disagree
+/// about which they answer. macOS reports all of them; AMD on Linux
+/// reports all of them; a machine that reports only utilization leaves
+/// the memory pair null, and the UI renders that as "Not measured"
+/// rather than as 0 bytes.
+export interface HealthGpu {
+  /// The adapter as the platform names it -- "Apple M2 Max", or the
+  /// DRM card on Linux. Never a path.
+  name: string;
+  /// Whole-device utilization, 0-100.
+  utilization_percent: number | null;
+  memory_used: number | null;
+  /// On a unified-memory machine this is the share currently allocated
+  /// to the GPU, NOT a dedicated pool. See `unified_memory`.
+  memory_total: number | null;
+  /// True when the GPU shares the system's memory rather than having
+  /// its own, which is every Apple Silicon Mac.
+  ///
+  /// The UI MUST say so where this is true. The Memory panel reports
+  /// the same physical pool, so without that sentence the two panels
+  /// look like they disagree about how much memory the machine has --
+  /// and a reader would reasonably add the GPU's gigabytes to the
+  /// system's and conclude the machine has more RAM than it does.
+  unified_memory: boolean;
 }
 
 interface HealthVolume {

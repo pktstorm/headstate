@@ -112,6 +112,11 @@ impl Collector {
             cpu_percent,
             cpu_per_core,
             memory,
+            // Measured before being put here: ~30 ms on macOS, the same
+            // order as the two `pmset` calls below that this sample
+            // already spawns, and a few file reads on Linux. The
+            // arithmetic against both cadences is in `health::gpu`.
+            gpus: super::gpu::read(),
             disks: volumes,
             battery: battery(),
             thermal: thermal(),
@@ -243,6 +248,46 @@ mod tests {
         // answer. What matters is that the field is populated at all.
         assert!(second.cpu_percent.is_some());
         assert_eq!(second.cpu_per_core.len(), _first.cpu_per_core.len());
+    }
+
+    /// A sample carries whatever GPUs the platform would describe.
+    ///
+    /// Not asserting that any were FOUND -- a headless CI runner
+    /// legitimately has none, and an empty list is the honest answer
+    /// there. What is asserted is that nothing in the list is a
+    /// fabricated zero, which is the property `gpu::read` exists to
+    /// keep.
+    #[test]
+    fn a_sample_carries_the_gpus_the_platform_admits_to() {
+        let c = Collector::new();
+        let s = c.sample("2026-01-01T00:00:00Z");
+        for g in &s.gpus {
+            assert!(!g.name.is_empty());
+            if let Some(u) = g.utilization_percent {
+                assert!((0.0..=100.0).contains(&u), "gpu utilization {u}");
+            }
+        }
+    }
+
+    /// The GPU read is cheap enough for the cadence it is on.
+    ///
+    /// This is the #661 guard in executable form. The live view polls
+    /// `system_health` every five seconds, so a GPU read that took a
+    /// meaningful slice of that would be the "slow command on a timer"
+    /// shape that belongs behind a button instead. Measured at ~30 ms
+    /// on an M2 Max (`ioreg`); the assertion is deliberately loose --
+    /// a slow CI runner must not fail the build for being slow -- but
+    /// it still catches a regression that made this seconds rather
+    /// than milliseconds.
+    #[test]
+    fn reading_the_gpu_is_cheap_enough_for_the_sampler() {
+        let start = std::time::Instant::now();
+        let _ = super::super::gpu::read();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(1000),
+            "a GPU read took {elapsed:?}, which does not belong on a 5s poll"
+        );
     }
 
     /// Thermal is a LABEL, never a number, and never degrees.

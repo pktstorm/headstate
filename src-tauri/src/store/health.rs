@@ -120,6 +120,7 @@ mod tests {
                 swap_total: 0,
                 swap_used: 0,
             },
+            gpus: vec![],
             disks: vec![],
             battery: None,
             thermal: Some("nominal".into()),
@@ -139,6 +140,35 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].cpu_percent, Some(12.5));
         assert_eq!(got[0].thermal.as_deref(), Some("nominal"));
+    }
+
+    /// The GPU survives the round trip, absences included.
+    ///
+    /// GPUs live in the `detail` JSON rather than in a column, so this
+    /// is the only thing standing between a stored sample and a panel
+    /// that silently loses its readings. The `None`s matter as much as
+    /// the values: a field that came back as 0 instead of absent would
+    /// turn "not measured" into a measurement on every historical
+    /// sample at once.
+    #[test]
+    fn a_gpu_round_trips_with_its_absent_fields_still_absent() {
+        let c = conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut s = sample(&now);
+        s.gpus = vec![crate::health::Gpu {
+            name: "Apple M2 Max".into(),
+            utilization_percent: Some(7.0),
+            memory_used: Some(1_202_913_280),
+            memory_total: None,
+            unified_memory: true,
+        }];
+        record(&c, &s).unwrap();
+        let got = history(&c).unwrap();
+        assert_eq!(got[0].gpus.len(), 1);
+        assert_eq!(got[0].gpus[0].name, "Apple M2 Max");
+        assert_eq!(got[0].gpus[0].utilization_percent, Some(7.0));
+        assert_eq!(got[0].gpus[0].memory_total, None, "absent stays absent");
+        assert!(got[0].gpus[0].unified_memory);
     }
 
     /// Anything older than the window is gone, so the table cannot grow
