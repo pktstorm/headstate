@@ -2072,6 +2072,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "futures-util",
+ "headstate-stepup",
  "hmac",
  "hyper",
  "hyper-util",
@@ -2110,6 +2111,17 @@ dependencies = [
  "toml_edit 0.25.13+spec-1.1.0",
  "tower-service",
  "wiremock",
+]
+
+[[package]]
+name = "headstate-stepup"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "ml-dsa",
+ "p256",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

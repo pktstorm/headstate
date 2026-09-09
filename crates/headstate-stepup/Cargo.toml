@@ -1,0 +1,48 @@
+[package]
+name = "headstate-stepup"
+version = "0.1.0"
+license = "Apache-2.0"
+description = "The step-up signature protocol shared by the Headstate desktop and its phone companion: canonical bytes, header grammar, and verification."
+repository = "https://github.com/pktstorm/headstate"
+edition = "2021"
+# Never published. It exists so the desktop and the phone compile ONE
+# implementation of the signature contract rather than two that happen to
+# agree; a version on crates.io would only invite a third.
+publish = false
+
+[lib]
+name = "headstate_stepup"
+
+# DELIBERATELY tiny, and it has to stay that way. This crate is a path
+# dependency of `src-tauri`, of `src-mobile`, AND of
+# `src-mobile/plugins/headstate-keys` -- three manifests and two
+# lockfiles. Anything added here lands in the phone binary as well as the
+# desktop's, and `no_desktop_only_crates_in_lock` (src-mobile/src/lib.rs)
+# is what stops that going unnoticed. No tauri, no rusqlite, no HTTP: a
+# leaf crate over serde_json and the four crypto crates the two ends
+# already share.
+#
+# Every version here MUST match all three manifests, for the reason
+# recorded at length in src-tauri/Cargo.toml: p256 0.14, sha2 0.11 and
+# hmac 0.13 sit on `digest` 0.11, the same stack `ml-dsa` uses, so the
+# tree carries one digest stack rather than two. That coupling used to
+# rest on comments in the manifests -- #585 found two of them stating the
+# opposite of the truth. Here it is a fact the compiler enforces: a
+# version bumped on one side alone fails to resolve against this crate.
+[dependencies]
+serde_json = "1"
+base64 = "0.23"
+# Verification only. `std` is off: the desktop and the phone both bring
+# their own, and this crate needs nothing from it that `alloc` plus core
+# does not give. Signing lives on the phone's hardware, never here.
+p256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
+ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc"] }
+thiserror = "2"
+
+[dev-dependencies]
+# This crate's own tests stand in for BOTH ends: they sign with software
+# keys and verify with the real verifier, which is only possible because
+# the two halves finally live in one crate. `std` for signing, which the
+# non-dev dependency above deliberately leaves out.
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
+sha2 = "0.11"

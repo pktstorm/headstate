@@ -111,7 +111,14 @@ build:
 
 test: test-rust test-ui
 
+# The shared step-up crate is a PATH DEPENDENCY of src-tauri, not a
+# workspace member, so `cd src-tauri && cargo test` compiles it and runs
+# none of its tests. It has to be named, or the one place canonical
+# bytes, the header grammar and `verify` now live would be the one place
+# nothing tests (#695). It is listed first because everything downstream
+# of it is meaningless if the protocol itself is broken.
 test-rust:
+	cd crates/headstate-stepup && cargo test
 	cd src-tauri && cargo test
 
 test-ui:
@@ -130,7 +137,13 @@ lint-deps:
 	python3 scripts/check-tauri-versions.py
 	python3 scripts/android-release-signing.test.py
 
+# The shared step-up crate again: a path dependency is compiled by the
+# desktop's clippy but its own tests are not, and `cargo fmt --check`
+# from src-tauri never looks outside that package. Named for the same
+# reason it is named in test-rust.
 lint-rust:
+	cd crates/headstate-stepup && cargo fmt --check
+	cd crates/headstate-stepup && cargo clippy --all-targets -- -D warnings
 	cd src-tauri && cargo fmt --check
 	cd src-tauri && cargo clippy --all-targets -- -D warnings
 
@@ -145,6 +158,7 @@ lint-ui:
 	./scripts/check-focus-css.sh
 
 fmt:
+	cd crates/headstate-stepup && cargo fmt
 	cd src-tauri && cargo fmt
 
 # Requires Pillow: pip install -r scripts/requirements.txt

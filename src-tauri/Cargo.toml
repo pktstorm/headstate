@@ -269,6 +269,21 @@ p256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
 # ml-dsa 0.0.x on digest 0.10 predates the Wycheproof and use_hint fixes
 # in 0.1.0 and is not an option for a verifier.
 ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc"] }
+# The step-up signature contract itself: canonical bytes, the header
+# grammar, and `verify`. In-repo, and the ONLY place any of that exists
+# -- the phone (`src-mobile`) and its keys plugin depend on this same
+# crate by path, so a change to the signed bytes or the grammar changes
+# BOTH ends or neither. It used to exist twice, once here and once
+# hand-written in the companion's own tests, which is the drift #695
+# describes: two suites green, each agreeing only with its own copy of
+# the rules. The version is stated so the path dependency is not a
+# wildcard for `cargo deny`.
+#
+# This is also what turns the p256/ml-dsa/sha2/hmac lockstep argued
+# above into a rule the compiler enforces rather than a comment anyone
+# can contradict -- #585 found two that did. That crate declares the
+# same versions, so a bump on one side alone fails to resolve.
+headstate-stepup = { version = "0.1.0", path = "../crates/headstate-stepup" }
 # LAN discovery (remote/discovery.rs). Advertises `_headstate._tcp` while
 # the listener is up so a phone whose stored address went stale can still
 # find this desktop. Pure Rust over `socket2` and the `if-addrs` above --
