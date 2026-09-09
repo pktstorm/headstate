@@ -232,7 +232,25 @@ impl Companion {
 
     /// `connection_state`.
     pub fn connection_state(&self) -> Report {
-        self.conn.report()
+        let mut report = self.conn.report();
+        // Whether this phone signs with a post-quantum key, answered
+        // for the device the user is holding.
+        //
+        // The desktop has always shown this in its paired-devices list,
+        // but from the phone it was unanswerable -- and the phone is
+        // where someone is standing when they wonder what their own
+        // hardware does. #670.
+        //
+        // `None` on a key error rather than `Some(false)`: a Keychain
+        // that would not open is not evidence of a classical-only
+        // device, and reporting it as one would be exactly the
+        // absent-is-not-false mistake this codebase avoids elsewhere.
+        report.has_mldsa = self
+            .keys
+            .public_keys()
+            .ok()
+            .map(|k| k.mldsa_65.is_some());
+        report
     }
 
     /// `subscribe_events`: start the subscriber if it is not running,
@@ -443,6 +461,67 @@ mod tests {
                 tokio::spawn(f);
             }),
         )
+    }
+
+    /// The phone can say whether it holds a post-quantum key (#670).
+    ///
+    /// `SoftwareKeys` always generates ML-DSA, so a generated set
+    /// reports true. The desktop has always shown this in its
+    /// paired-devices list; this is the phone answering for itself,
+    /// which is the device someone is holding when they wonder.
+    #[tokio::test]
+    async fn the_report_says_whether_this_phone_has_a_post_quantum_key() {
+        let store = Arc::new(MemoryStore::default());
+        let c = companion(store.clone(), Arc::new(Recorder::default()));
+        SoftwareKeys::new(store).generate().unwrap();
+        assert_eq!(c.connection_state().has_mldsa, Some(true));
+    }
+
+    /// A keychain that will not open is NOT a classical-only device.
+    ///
+    /// Reporting `Some(false)` there would tell the user their hardware
+    /// lacks a capability it has -- the absent-is-not-false mistake
+    /// this codebase avoids everywhere else. It reports `None`, and the
+    /// UI renders nothing rather than a claim.
+    ///
+    /// A dedicated fixture rather than `LockedKeys`, which gates only
+    /// `session_identity` (it models a cold start on a locked device,
+    /// a different scenario) and would leave `public_keys` readable --
+    /// so the test would pass on the wrong path.
+    #[tokio::test]
+    async fn an_unreadable_keychain_is_unknown_not_a_no() {
+        struct Unreadable;
+        impl DeviceKeys for Unreadable {
+            fn generate(&self) -> Result<PublicKeys, KeyError> {
+                Err(KeyError::Unavailable("locked".into()))
+            }
+            fn destroy(&self) -> Result<(), KeyError> {
+                Ok(())
+            }
+            fn public_keys(&self) -> Result<PublicKeys, KeyError> {
+                Err(KeyError::Unavailable("the device is locked".into()))
+            }
+            fn sign(&self, _bytes: &[u8]) -> Result<Signatures, KeyError> {
+                Err(KeyError::Unavailable("locked".into()))
+            }
+            fn session_identity(&self) -> Result<SessionIdentity, KeyError> {
+                Err(KeyError::Unavailable("locked".into()))
+            }
+        }
+
+        let c = Companion::new(
+            Arc::new(MemoryStore::default()),
+            Arc::new(Unreadable),
+            Arc::new(Recorder::default()),
+            Arc::new(|f| {
+                tokio::spawn(f);
+            }),
+        );
+        assert_eq!(
+            c.connection_state().has_mldsa,
+            None,
+            "a locked keychain must not be reported as a device without ML-DSA"
+        );
     }
 
     /// Keys that refuse to be read until told otherwise, wrapping a

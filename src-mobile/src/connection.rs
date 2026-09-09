@@ -50,6 +50,17 @@ pub struct Report {
     /// refused: anything but `connected` to a desktop speaking at least
     /// this app's protocol. The UI's stale marker reads this.
     pub stale: bool,
+    /// Whether THIS phone holds a post-quantum step-up key.
+    ///
+    /// `None` when the phone has no device keys at all, which is not
+    /// the same as holding classical-only keys -- an unpaired phone has
+    /// not answered the question, a paired one has.
+    ///
+    /// The desktop has always known this (it is the `post-quantum` chip
+    /// in its paired-devices list), but the phone could not tell you
+    /// about itself, which is the device someone actually has in their
+    /// hand when they wonder. See #670.
+    pub has_mldsa: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -177,6 +188,10 @@ fn report_of(i: &Inner) -> Report {
             .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
         protocol_version: i.protocol_version,
         stale: blocked(i).is_some(),
+        // `Connection` tracks the link, not the keystore, so it cannot
+        // answer this. `Companion::connection_state` fills it in, which
+        // keeps the keys out of this module entirely.
+        has_mldsa: None,
     }
 }
 
@@ -236,7 +251,12 @@ pub(crate) mod tests {
                 "desktop": null,
                 "last_poll": null,
                 "protocol_version": null,
-                "stale": true
+                "stale": true,
+                // `Connection` never fills this in -- it tracks the
+                // link, not the keystore. `Companion::connection_state`
+                // sets it before the frontend sees it, so null here is
+                // the correct wire shape for this layer (#670).
+                "has_mldsa": null
             })
         );
         c.set_desktop(Some("octocat's laptop".into()), None);
@@ -249,7 +269,8 @@ pub(crate) mod tests {
                 "desktop": "octocat's laptop",
                 "last_poll": "2026-09-05T12:00:00Z",
                 "protocol_version": PROTOCOL_VERSION,
-                "stale": false
+                "stale": false,
+                "has_mldsa": null
             })
         );
     }
