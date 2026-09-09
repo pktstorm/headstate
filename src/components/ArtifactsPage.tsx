@@ -346,7 +346,7 @@ export function ArtifactsPage() {
                     },
                   );
                 }}
-                className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#f85149]"
+                className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#c93c37]"
               >
                 Remove
               </button>

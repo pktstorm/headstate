@@ -724,7 +724,7 @@ export function SettingsDialog({
           <button
             type="button"
             onClick={save}
-            className="rounded bg-[#238636] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#2ea043]"
+            className="rounded bg-[#238636] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#1a7f37]"
           >
             Save
           </button>

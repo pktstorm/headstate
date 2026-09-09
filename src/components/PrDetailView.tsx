@@ -210,7 +210,7 @@ export function PrDetailView({
           className={`rounded px-2.5 py-1 text-sm font-medium ${
             approvedByViewer || reviewing !== null
               ? "border border-[#30363d] text-[#8b949e] opacity-50"
-              : "bg-[#238636] text-white hover:bg-[#2ea043]"
+              : "bg-[#238636] text-white hover:bg-[#1a7f37]"
           }`}
         >
           {reviewing === "approve"

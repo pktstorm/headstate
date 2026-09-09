@@ -140,8 +140,8 @@ export function BulkBar({ prs }: { prs: PullRequest[] }) {
                 }}
                 className={`rounded px-3 py-1.5 text-sm font-medium text-white ${
                   pending === "close"
-                    ? "bg-[#da3633] hover:bg-[#f85149]"
-                    : "bg-[#1f6feb] hover:bg-[#388bfd]"
+                    ? "bg-[#da3633] hover:bg-[#c93c37]"
+                    : "bg-[#1f6feb] hover:bg-[#316dca]"
                 }`}
               >
                 {BULK.find((b) => b.action === pending)?.label} {selected.length} pull request

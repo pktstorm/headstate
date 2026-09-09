@@ -126,7 +126,7 @@ export function PairedDevicesList() {
                 type="button"
                 disabled={busy}
                 onClick={confirmRevoke}
-                className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#f85149] disabled:opacity-50"
+                className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#c93c37] disabled:opacity-50"
               >
                 {busy ? "Revoking…" : "Revoke"}
               </button>
