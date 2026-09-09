@@ -2218,6 +2218,40 @@ mod tests {
     }
 }
 
+/// The machine's current state.
+///
+/// Cheap -- single-digit milliseconds -- but it reads the kernel, so it
+/// goes to a blocking worker like every other read here.
+///
+/// The `Collector` is managed state rather than built per call: sysinfo
+/// reports CPU use SINCE THE LAST REFRESH, so a fresh instance every
+/// time would report an idle machine forever (`health::collect`).
+#[tauri::command]
+pub async fn system_health(
+    collector: State<'_, std::sync::Arc<crate::health::collect::Collector>>,
+) -> Result<crate::health::Sample, String> {
+    let collector = collector.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || collector.sample(&chrono::Utc::now().to_rfc3339()))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The last 24 hours, downsampled.
+///
+/// Bounded by `store::health::MAX_POINTS` inside the query, so a caller
+/// cannot ask for the raw series however long the app has been running.
+/// The phone reads this over the LAN, where an unbounded payload is the
+/// mistake that made `size_worktrees` time out (#661).
+#[tauri::command]
+pub async fn system_health_history(app: AppHandle) -> Result<Vec<crate::health::Sample>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
+        crate::store::health::history(&conn).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Every branch in a repository, classified.
 ///
 /// Blocking git work -- measured at ~9s on a 675-branch repository --

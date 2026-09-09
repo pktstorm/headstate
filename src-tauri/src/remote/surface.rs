@@ -87,6 +87,10 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("docker_state", Class::Read),
     ("docker_builds", Class::Read),
     ("docker_images", Class::Read),
+    // System Health (#663). Reads, so neither carries a step-up
+    // signature and neither can reach the nonce path (#656).
+    ("system_health", Class::Read),
+    ("system_health_history", Class::Read),
     ("docker_disk_usage", Class::Read),
     ("docker_dangling_volumes", Class::Read),
     ("docker_running_containers", Class::Read),
@@ -358,6 +362,8 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "docker_state" => ok(commands::docker_state().await),
         "docker_builds" => res(commands::docker_builds().await),
         "docker_images" => res(commands::docker_images(app.clone()).await),
+        "system_health" => res(commands::system_health(app.state()).await),
+        "system_health_history" => res(commands::system_health_history(app.clone()).await),
         "docker_disk_usage" => res(commands::docker_disk_usage().await),
         // The sync Docker commands shell out. Inline they would stall the
         // listener's worker for every other request (#496 was this bug
