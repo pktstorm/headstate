@@ -884,15 +884,36 @@ export interface Footprint {
   /// machine.
   ///
   /// OPTIONAL, and the optionality is load-bearing rather than
-  /// defensive. The phone reads this over the LAN from a desktop whose
-  /// version it does not negotiate (`remote::surface` has no protocol
-  /// version), so a companion updated ahead of its desktop genuinely
-  /// receives a `Footprint` without this field. That absence is a
-  /// different fact from an empty list -- "that desktop cannot tell us"
-  /// versus "nothing is running", the latter being impossible on a
-  /// booted machine -- and the UI renders the two differently. Typing
-  /// it as required would make the compiler certify a guarantee the
-  /// wire does not give.
+  /// defensive. This was challenged on review, checked against the
+  /// version machinery, and the answer is that the machinery does not
+  /// reach this case. Worth spelling out, because the two mechanisms
+  /// that look like they cover it are real -- they just bite elsewhere:
+  ///
+  /// - **The version gate is on WRITES.** `connection.rs`'s `blocked()`
+  ///   refuses a desktop below `PROTOCOL_VERSION`, but its one caller
+  ///   (`companion.rs`) guards it with `matches!(class, Class::Write |
+  ///   Class::Destructive)` and says why: reads go through whatever the
+  ///   state, because the attempt is how the phone learns the desktop
+  ///   is back. `system_footprint` is `Class::Read`.
+  /// - **Cert pinning refuses protocol 1, not "older".** ML-DSA-65
+  ///   certificates were the 1-to-2 change (#521), so a 5.0 desktop
+  ///   fails the handshake. A protocol-2 desktop from before this
+  ///   feature completes it normally.
+  ///
+  /// What remains is not a protocol mismatch at all. The companion
+  /// ships on its own tag, independent of the desktop's
+  /// (`docs/mobile-release-process.md`), and compatibility is the wire
+  /// protocol's integer -- which adding fields to a response does not
+  /// bump, because doing so is backward-compatible. So a phone carrying
+  /// this feature paired with a desktop released before it is a
+  /// protocol-2-to-protocol-2 pairing: allowed, unblocked, and missing
+  /// these fields. Two release pipelines make that ordering ordinary.
+  ///
+  /// The absence is a different fact from an empty list -- "that desktop
+  /// cannot tell us" versus "nothing is running", the latter impossible
+  /// on a booted machine -- and the UI renders the two differently.
+  /// `call<Footprint>` is an unchecked cast, so a required type here
+  /// would have the compiler certify a guarantee the wire does not give.
   top_cpu?: FootprintProcess[];
   /// The same, by resident size. A SEPARATE list rather than `top_cpu`
   /// re-sorted: the process pinning a core is rarely the one holding

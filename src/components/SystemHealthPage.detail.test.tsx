@@ -287,8 +287,14 @@ describe("the CPU page names the processes responsible", () => {
   it("renders an absent process list as not measured, never as an empty table", async () => {
     // A desktop too old to report this is not a machine with no
     // processes running -- which cannot happen on a booted machine.
-    // The phone reads this over the LAN with no version negotiation,
-    // so the field genuinely can be missing.
+    //
+    // Reachable, not hypothetical, and it was checked when review
+    // questioned it: the phone and desktop ship on independent tags and
+    // are compatible on the wire PROTOCOL_VERSION, which adding fields
+    // to a response does not bump. The version gate that would refuse
+    // an older desktop applies to writes only, and this is a read. See
+    // the note on `Footprint.top_cpu` in `types/pr.ts` for the full
+    // argument.
     footprintFn.mockResolvedValue(footprint({ top_cpu: undefined }));
     renderPage();
     const panel = (await screen.findByText("What is using the CPU"))
