@@ -25,6 +25,10 @@ import {
 import type { FootprintProcess, HealthGpu, HealthSample } from "@/types/pr";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { useConnectionState } from "@/api/connection";
+import { type HealthPage, useFilters } from "@/store/filters";
+import { HEALTH_PAGES } from "./SystemHealthSidebar";
+import { useIsMobile } from "@/lib/useIsMobile";
+import { ChevronLeft } from "lucide-react";
 
 /// The machine's health: what it is doing now, and the last 24 hours.
 ///
@@ -821,6 +825,13 @@ export function SystemHealthPage() {
   // leave the timer running whenever the caller forgot to pass false.
   const live = useSystemHealth(true);
   const history = useSystemHealthHistory(true);
+  // Which page of the view is open. Read HERE rather than in each
+  // detail component so the live sample, the history and the error and
+  // loading states are fetched once and shared: a drill-down that
+  // mounted its own `useSystemHealth` would be a second observer on the
+  // same query key, and switching pages would show a reading taken at a
+  // different instant from the one the overview just showed.
+  const healthPage = useFilters((f) => f.healthPage);
 
   // Who this page is about. On the desktop build it is always the
   // machine underfoot, so the connection state is not even consulted --
@@ -924,8 +935,31 @@ export function SystemHealthPage() {
       ? null
       : percentOf(rootDisk.total - rootDisk.available, rootDisk.total);
 
+  // The drill-downs (#687). Rendered INSTEAD of the overview, not
+  // beside it: each one is the same class the overview summarises, at
+  // the depth the overview cannot afford. Everything below this branch
+  // is the overview exactly as it was -- the landing page is unchanged
+  // by design, and these are additions reached from it.
+  if (healthPage !== "overview") {
+    return (
+      <DetailPage
+        page={healthPage}
+        sample={s}
+        samples={samples}
+        sampledAt={sampledAt}
+        historyFailed={history.isError}
+      />
+    );
+  }
+
   return (
     <div className="flex flex-col gap-4">
+      {/* On the phone, the class list itself -- there is no persistent
+          sidebar at this width, so the drill-downs need a door on the
+          page they drill down from. Above the pressure cards because
+          it is navigation: what the page can show, before what it is
+          showing. Desktop renders nothing here; the sidebar has it. */}
+      <HealthPageNav />
       {/* Whose machine, said once, at the top, on the phone only.
           `ConnectionBanner` already names the paired desktop, but it
           is chrome that sits above every view alike -- it says which
@@ -1361,5 +1395,773 @@ function GapNote() {
           "Breaks in the line are periods with no reading — either Headstate was not running on that desktop, or this phone could not reach it. Nothing is filled in across them."
         : "Breaks in the line are periods when Headstate was not running. Nothing is filled in across them."}
     </p>
+  );
+}
+
+/// The class list, on the phone, as cards on the overview (#687).
+///
+/// # Why the phone gets this and the desktop does not
+///
+/// The desktop keeps the class list in the sidebar, which is where
+/// navigation lives in every other view. The phone has no persistent
+/// sidebar -- `App` puts it in a sheet behind a hamburger -- and that
+/// sheet holds the VIEW switcher. Burying a second level of navigation
+/// one gesture deeper inside it would make the drill-downs something
+/// you have to already know are there.
+///
+/// So on the phone the classes are on the page itself, at the top of
+/// the overview, as tappable cards. The overview is the landing page
+/// either way; this just makes the doors visible on the device that
+/// cannot show a column of them.
+///
+/// # Viewport, not build
+///
+/// `useIsMobile()` rather than `IS_MOBILE_BUILD`, because this is a
+/// LAYOUT question: a desktop window dragged under 768px has no sidebar
+/// either -- `App` puts it in the same sheet -- so it needs the same
+/// door. Which machine is being DESCRIBED is the build question, and
+/// that is decided elsewhere on this page. Getting these two the wrong
+/// way round is the category error #598 fixed.
+function HealthPageNav() {
+  const isMobile = useIsMobile();
+  const setHealthPage = useFilters((f) => f.setHealthPage);
+  if (!isMobile) return null;
+
+  // "overview" is skipped: this row IS the overview, so a card leading
+  // to where you already are would be a control that does nothing.
+  const pages = HEALTH_PAGES.filter((p) => p.id !== "overview");
+
+  return (
+    <nav aria-label="System health sections">
+      <ul className="grid grid-cols-2 gap-2">
+        {pages.map(({ id, label, blurb, Icon }) => (
+          <li key={id}>
+            <button
+              type="button"
+              onClick={() => setHealthPage(id)}
+              // `tap-target` is the app's own minimum-size utility, the
+              // same one the header's nav button uses. A card this
+              // small is otherwise easy to miss with a thumb.
+              className="tap-target flex w-full flex-col items-start gap-0.5 rounded-md border border-[#30363d] bg-[#161b22] px-3 py-2.5 text-left hover:border-[#8b949e]"
+            >
+              <span className="flex items-center gap-1.5 text-sm font-medium text-[#e6edf3]">
+                <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                {label}
+              </span>
+              {/* The blurb, only here. A sidebar row is read beside the
+                  page it opens; a card is read before anything is open
+                  and has to say what is behind it. */}
+              <span className="text-xs leading-snug text-[#8b949e]">{blurb}</span>
+            </button>
+          </li>
+        ))}
+      </ul>
+    </nav>
+  );
+}
+
+/// One class's detail page: the header, and the right body under it.
+///
+/// A shell around a switch rather than five independent pages, because
+/// every one of them needs the same three things -- the title, the way
+/// back on a phone, and the same live sample -- and five copies of that
+/// header is five chances for one of them to lose the back link. Which
+/// is the failure that matters: on a phone the back link is the ONLY
+/// way off a detail page.
+function DetailPage({
+  page,
+  sample,
+  samples,
+  sampledAt,
+  historyFailed,
+}: {
+  page: Exclude<HealthPage, "overview">;
+  sample: HealthSample;
+  /// The 24-hour series, already fetched by the parent. Passed down
+  /// rather than re-queried so a drill-down does not open a second
+  /// observer on the same key.
+  samples: HealthSample[];
+  /// The live sample's own timestamp, which is "now" for everything
+  /// time-relative on this page -- see the overview's note on why the
+  /// wall clock is not read during render.
+  sampledAt: number;
+  historyFailed: boolean;
+}) {
+  const isMobile = useIsMobile();
+  const setHealthPage = useFilters((f) => f.setHealthPage);
+  const meta = HEALTH_PAGES.find((p) => p.id === page);
+
+  return (
+    <div className="flex flex-col gap-4">
+      {/* The way back, on the phone only. The desktop has the sidebar,
+          where the current page is highlighted and Overview is one
+          click away -- a back link there would be a second control for
+          something already on screen. On the phone it is the only one,
+          which is why it is a real control and not a gesture. */}
+      {isMobile ? (
+        <button
+          type="button"
+          onClick={() => setHealthPage("overview")}
+          className="tap-target -ml-1 flex items-center gap-1 self-start rounded px-1 text-sm text-[#58a6ff] hover:underline"
+        >
+          <ChevronLeft className="h-4 w-4" aria-hidden="true" />
+          System health overview
+        </button>
+      ) : null}
+
+      {/* An h1 rather than an h2: on a detail page this class IS the
+          subject, and the panels below it are its sections. */}
+      <h1 className="text-base font-semibold text-[#e6edf3]">{meta?.label ?? page}</h1>
+
+      {page === "cpu" ? (
+        <CpuDetail sample={sample} samples={samples} sampledAt={sampledAt} />
+      ) : page === "memory" ? (
+        <MemoryDetail sample={sample} samples={samples} sampledAt={sampledAt} />
+      ) : page === "disk" ? (
+        <DiskDetail sample={sample} />
+      ) : page === "network" ? (
+        <NetworkDetail sample={sample} />
+      ) : (
+        <PowerDetail sample={sample} sampledAt={sampledAt} />
+      )}
+
+      {historyFailed ? (
+        // Said here as well as on the overview, for the same reason the
+        // gap note is repeated beside each chart: an explanation on
+        // another page is one nobody reads at the moment they need it.
+        <p className="rounded-md border border-[#d29922]/40 bg-[#d29922]/5 px-4 py-2 text-xs text-[#d29922]">
+          The 24-hour history could not be loaded, so any chart here is empty.
+          The current readings are unaffected.
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+/// The machine's top processes by one measure — the answer to "why".
+///
+/// # This is the point of #687
+///
+/// "CPU is at 80%" is a symptom. This is the answer, and it is the one
+/// thing a panel of aggregates structurally cannot say.
+///
+/// # The top eight, and saying so
+///
+/// The Rust side returns at most `TOP_N` (eight) rows and the count of
+/// everything running. Both halves matter. Eight rows is an answer;
+/// 1400 rows is the filtering problem handed back to the reader. But
+/// eight rows presented as if they were the whole machine is a
+/// different lie, so the count of what is NOT shown is printed under
+/// the table. A reader who needs the rest then knows to reach for
+/// Activity Monitor rather than concluding this is everything.
+///
+/// # Not measured, not empty
+///
+/// An older desktop that has not been updated returns a `Footprint`
+/// with no `top_cpu` field at all, which arrives as `undefined` -- and
+/// that is not the same fact as "nothing is running", which cannot
+/// happen on a booted machine. The two are rendered differently for the
+/// same reason every other absence on this page is.
+function TopProcesses({
+  processes,
+  processCount,
+  /// Which column is the reason these rows were chosen. The other is
+  /// still shown -- a process is interesting for both -- but only one
+  /// of them explains the ordering, and a table sorted by a column the
+  /// reader is not looking at reads as a table sorted wrongly.
+  by,
+}: {
+  processes: FootprintProcess[] | undefined;
+  processCount: number | undefined;
+  by: "cpu" | "memory";
+}) {
+  if (processes === undefined) {
+    return (
+      <p className="text-sm">
+        <NotMeasured>
+          {IS_MOBILE_BUILD
+            ? "— that desktop is running a version of Headstate that does not report this."
+            : "— no process list came back."}
+        </NotMeasured>
+      </p>
+    );
+  }
+  if (processes.length === 0) {
+    // Not reachable on a booted machine -- something is always running,
+    // including us -- but rendered as a sentence rather than an empty
+    // table so that if it ever does happen it says so instead of
+    // looking like a table that failed to paint.
+    return <p className="text-sm text-[#8b949e]">No processes were reported.</p>;
+  }
+
+  const rest =
+    processCount === undefined ? null : Math.max(0, processCount - processes.length);
+
+  return (
+    <div>
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="text-left text-xs text-[#8b949e]">
+            <th className="font-normal">Process</th>
+            <th className="font-normal text-right">PID</th>
+            {/* Same heading as the footprint panel's, and for the same
+                reason: `cpu_percent` is a share of ONE core, so a
+                process using three legitimately reads 280%. Under a
+                bare "CPU" that looks like a bug. */}
+            <th
+              className={`font-normal text-right ${by === "cpu" ? "text-[#e6edf3]" : ""}`}
+            >
+              CPU (of one core)
+            </th>
+            <th
+              className={`font-normal text-right ${by === "memory" ? "text-[#e6edf3]" : ""}`}
+            >
+              Memory
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {/* Keyed on the PID, not the name: several processes of one
+              app share a name, and keying on it would make React reuse
+              one row's DOM for another process. */}
+          {processes.map((p) => (
+            <ProcessRow key={p.pid} p={p} />
+          ))}
+        </tbody>
+      </table>
+      {rest !== null && rest > 0 ? (
+        <p className="mt-2 text-xs leading-relaxed text-[#8b949e]">
+          The {processes.length} biggest by{" "}
+          {by === "cpu" ? "CPU" : "memory"}, of {processCount} processes running.
+          The other {rest} are not listed — on an ordinary machine almost all
+          of them are idle, and a list of every process is not an answer to
+          what is using this one.
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+/// The CPU page: load, every core, the 24-hour line, and who is why.
+function CpuDetail({
+  sample: s,
+  samples,
+  sampledAt,
+}: {
+  sample: HealthSample;
+  samples: HealthSample[];
+  sampledAt: number;
+}) {
+  // The footprint carries the machine-wide lists since #687. Enabled
+  // here for the same reason the overview enables it: this component
+  // only mounts while the page is open, so the poll stops when it
+  // unmounts. Cheap on the five-second cadence -- 19-24ms for 1436
+  // processes, measured; see the Rust module docs.
+  const fp = useSystemFootprint(true);
+  const series = useMemo(
+    () => samples.map((x) => ({ t: Date.parse(x.sampled_at), v: x.cpu_percent })),
+    [samples],
+  );
+
+  return (
+    <div className="flex flex-col gap-4">
+      {/* The processes FIRST, above the aggregates. The overview
+          already answered "how busy"; someone who clicked through to
+          this page did so because that number was interesting, and the
+          next thing they want is the name of what is doing it. Putting
+          per-core bars above it would make them scroll past the
+          symptom to reach the cause. */}
+      <Panel
+        title="What is using the CPU"
+        subtitle="The biggest consumers on this machine, right now"
+      >
+        {fp.isError && fp.data === undefined ? (
+          <p className="text-sm text-[#8b949e]">
+            Could not read the process list: {errorMessage(fp.error)}
+          </p>
+        ) : fp.data === undefined ? (
+          <p className="text-sm text-[#8b949e]">Reading…</p>
+        ) : (
+          <TopProcesses
+            processes={fp.data.top_cpu}
+            processCount={fp.data.process_count}
+            by="cpu"
+          />
+        )}
+      </Panel>
+
+      <Panel title="Load and use" subtitle="Now, and averaged over three windows">
+        <div className="flex flex-wrap gap-6">
+          <Stat
+            label="CPU"
+            value={s.cpu_percent === null ? null : `${s.cpu_percent.toFixed(0)}%`}
+          />
+          <Stat label="Load (1m)" value={s.load ? s.load[0].toFixed(2) : null} />
+          <Stat label="Load (5m)" value={s.load ? s.load[1].toFixed(2) : null} />
+          <Stat label="Load (15m)" value={s.load ? s.load[2].toFixed(2) : null} />
+          <Stat label="Cores" value={`${s.cpu_per_core.length}`} />
+        </div>
+        {s.load === null ? (
+          <p className="mt-2 text-xs text-[#8b949e]">
+            This platform does not report load averages.
+          </p>
+        ) : (
+          // What a load average MEANS, which the overview has no room
+          // for and which is the single most misread number on this
+          // page: it is a count of runnable work, not a percentage, so
+          // whether 4.0 is bad depends entirely on the core count.
+          <p className="mt-2 text-xs leading-relaxed text-[#8b949e]">
+            A load average is the number of processes wanting to run, not a
+            percentage. On this machine&apos;s {s.cpu_per_core.length} cores,
+            a load near {s.cpu_per_core.length} means it is busy but keeping
+            up; well above that means work is queuing.
+          </p>
+        )}
+      </Panel>
+
+      <Panel title="Per core" subtitle="In the platform's own core order">
+        {s.cpu_per_core.length === 0 ? (
+          <p className="text-sm">
+            <NotMeasured />
+          </p>
+        ) : (
+          <div className="flex flex-col gap-1">
+            {s.cpu_per_core.map((v, i) => (
+              <div key={i} className="flex items-center gap-2">
+                <span className="w-10 shrink-0 text-xs tabular-nums text-[#8b949e]">
+                  #{i}
+                </span>
+                <Bar percent={v} label={`Core ${i}`} />
+                <span className="w-10 shrink-0 text-right text-xs tabular-nums text-[#8b949e]">
+                  {v.toFixed(0)}%
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+        {/* Why one core at 100% beside seven idle ones is normal, and
+            why the average underneath it is not a reassurance. A
+            single-threaded build pins exactly one core, and the mean
+            of that on a 10-core machine is 10% -- which the overview
+            reports, correctly, and which reads as an idle machine to
+            someone whose editor is unresponsive. */}
+        {s.cpu_per_core.length > 1 ? (
+          <p className="mt-3 text-xs leading-relaxed text-[#8b949e]">
+            One core at 100% while the rest are idle is normal: most work is
+            single-threaded, and it pins one core. The whole-machine figure
+            averages across all {s.cpu_per_core.length}, so it can look calm
+            while something is entirely stuck.
+          </p>
+        ) : null}
+      </Panel>
+
+      <Panel title="The last 24 hours" subtitle="Whole-machine CPU use">
+        <Sparkline points={series} max={100} label="CPU" now={sampledAt} />
+        <GapNote />
+      </Panel>
+    </div>
+  );
+}
+
+/// The Memory page: pressure, swap, the 24-hour line, and who holds it.
+function MemoryDetail({
+  sample: s,
+  samples,
+  sampledAt,
+}: {
+  sample: HealthSample;
+  samples: HealthSample[];
+  sampledAt: number;
+}) {
+  const fp = useSystemFootprint(true);
+  const usedPct = percentOf(s.memory.used, s.memory.total);
+  const swapPct = percentOf(s.memory.swap_used, s.memory.swap_total);
+  const series = useMemo(
+    () =>
+      samples.map((x) => ({
+        t: Date.parse(x.sampled_at),
+        v: percentOf(x.memory.used, x.memory.total),
+      })),
+    [samples],
+  );
+
+  return (
+    <div className="flex flex-col gap-4">
+      {/* Processes first, for the same reason as the CPU page. */}
+      <Panel
+        title="What is holding the memory"
+        subtitle="The biggest resident sets on this machine, right now"
+      >
+        {fp.isError && fp.data === undefined ? (
+          <p className="text-sm text-[#8b949e]">
+            Could not read the process list: {errorMessage(fp.error)}
+          </p>
+        ) : fp.data === undefined ? (
+          <p className="text-sm text-[#8b949e]">Reading…</p>
+        ) : (
+          <>
+            <TopProcesses
+              processes={fp.data.top_memory}
+              processCount={fp.data.process_count}
+              by="memory"
+            />
+            {/* Why these figures do not add up to "used", which is the
+                first thing anyone tries with a list like this. Shared
+                libraries are counted in every process holding them, so
+                summing resident sets over-counts -- and someone who
+                sums eight rows and gets more than the machine has will
+                assume the numbers are wrong rather than the method. */}
+            <p className="mt-3 text-xs leading-relaxed text-[#8b949e]">
+              These are resident sets — physical memory each process holds
+              now. They do not add up to the total in use: memory shared
+              between processes, which is most of a system&apos;s libraries,
+              is counted once in every process holding it.
+            </p>
+          </>
+        )}
+      </Panel>
+
+      <Panel title="Pressure" subtitle="What is in use, and what can still be reclaimed">
+        <div className="flex flex-wrap gap-6">
+          <Stat label="Used" value={formatSize(s.memory.used)} />
+          <Stat
+            label="Available"
+            value={formatSize(s.memory.available)}
+            hint="Reclaimable, incl. cache"
+          />
+          <Stat label="Total" value={formatSize(s.memory.total)} />
+          <Stat
+            label="Pressure"
+            value={usedPct === null ? null : `${usedPct.toFixed(0)}%`}
+          />
+        </div>
+        <div className="mt-3">
+          <Bar percent={usedPct ?? 0} label="Memory used" />
+        </div>
+        {/* The same warning the overview's hint gives in four words,
+            with room here to say why it matters: a reader who subtracts
+            "used" from "total" and does not get "available" concludes
+            one of the three is wrong. */}
+        <p className="mt-3 text-xs leading-relaxed text-[#8b949e]">
+          Used and available do not add up to the total, and that is correct:
+          cached file data counts as used and is also reclaimable the moment
+          something needs it. A machine at 90% used is not a machine that is
+          nearly out.
+        </p>
+      </Panel>
+
+      <Panel title="Swap" subtitle="Memory the system has moved to disk">
+        <div className="flex flex-wrap gap-6">
+          <Stat
+            label="Swap used"
+            value={
+              s.memory.swap_total === 0
+                ? null
+                : `${formatSize(s.memory.swap_used)} of ${formatSize(s.memory.swap_total)}`
+            }
+            hint={s.memory.swap_total === 0 ? "No swap configured" : undefined}
+          />
+          <Stat label="Swap" value={swapPct === null ? null : `${swapPct.toFixed(0)}%`} />
+        </div>
+        {s.memory.swap_total === 0 ? (
+          // A machine with swap disabled reports a zero total, which is
+          // "there is no swap" and not "0% of it is used".
+          <p className="mt-2 text-xs text-[#8b949e]">
+            This machine has no swap configured, so nothing can be paged out.
+          </p>
+        ) : (
+          <div className="mt-3">
+            <Bar percent={swapPct ?? 0} label="Swap used" />
+          </div>
+        )}
+      </Panel>
+
+      <Panel title="The last 24 hours" subtitle="Memory used, as a share of total">
+        <Sparkline
+          points={series}
+          max={100}
+          label="Memory"
+          color="#3fb950"
+          now={sampledAt}
+        />
+        <GapNote />
+      </Panel>
+    </div>
+  );
+}
+
+/// The Disk page: every volume, and the footprint measurement folded in.
+///
+/// The issue asks for the existing footprint disk measurement to live
+/// here, and it does -- `DiskFootprint`, the same component, unchanged
+/// and still behind its own button. It is NOT removed from the overview:
+/// that panel is what the footprint issue (#665) asked for and the
+/// overview is explicitly unchanged. Rendering the same component twice
+/// is safe and cheap precisely because it measures nothing until
+/// clicked, and the two instances share the query cache -- so measuring
+/// on one page means the other is already filled in.
+function DiskDetail({ sample: s }: { sample: HealthSample }) {
+  return (
+    <div className="flex flex-col gap-4">
+      <Panel title="Volumes" subtitle="Every mounted volume on this machine">
+        {s.disks.length === 0 ? (
+          <p className="text-sm">
+            <NotMeasured />
+          </p>
+        ) : (
+          <div className="flex flex-col gap-3">
+            {s.disks.map((d) => {
+              const used = d.total - d.available;
+              const usedPct = percentOf(used, d.total);
+              return (
+                <div key={d.mount}>
+                  <div className="flex items-baseline justify-between gap-2">
+                    <span className="truncate text-sm text-[#e6edf3]">
+                      {d.mount}
+                      {d.is_root ? (
+                        <span className="ml-2 rounded bg-[#30363d] px-1.5 py-0.5 text-xs text-[#8b949e]">
+                          system
+                        </span>
+                      ) : null}
+                    </span>
+                    <span className="shrink-0 text-xs tabular-nums text-[#8b949e]">
+                      {formatSize(d.available)} free of {formatSize(d.total)}
+                    </span>
+                  </div>
+                  <div className="mt-1">
+                    <Bar percent={usedPct ?? 0} label={`${d.mount} used`} />
+                  </div>
+                  <div className="mt-1 text-xs tabular-nums text-[#8b949e]">
+                    {usedPct === null ? (
+                      <NotMeasured />
+                    ) : (
+                      `${formatSize(used)} used (${usedPct.toFixed(0)}%)`
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        {/* Why a Mac lists a dozen volumes that are not disks. Without
+            this, a reader counts nine read-only mounts and concludes
+            the page is broken. */}
+        <p className="mt-3 text-xs leading-relaxed text-[#8b949e]">
+          Everything the operating system has mounted, which on macOS includes
+          several read-only system volumes that share one physical disk. The
+          one marked <span className="text-[#c9d1d9]">system</span> is where
+          Headstate and the OS live.
+        </p>
+      </Panel>
+
+      {/* No process list here, deliberately. The kernel does not
+          attribute disk USE to a process the way it attributes CPU and
+          resident memory -- a file belongs to whoever wrote it, which
+          may be a process that exited months ago. Naming "the processes
+          using the disk" would mean per-process I/O rates, which is a
+          different measurement, needs elevated privileges on macOS, and
+          answers "who is writing" rather than "what is full". What
+          Headstate CAN honestly attribute is its own footprint, below. */}
+      <Panel
+        title="What Headstate is using"
+        subtitle="Its worktrees, build artifacts, virtualenvs and Docker images"
+      >
+        <DiskFootprint />
+      </Panel>
+    </div>
+  );
+}
+
+/// The Network page: every interface, with its share of the total.
+function NetworkDetail({ sample: s }: { sample: HealthSample }) {
+  // The busiest first, so the interface that carried the traffic is the
+  // first row rather than wherever the platform happened to list it.
+  // Sorted here rather than in Rust because, unlike the process lists,
+  // nothing is being dropped -- every interface is shown, so the order
+  // is presentation and not selection.
+  const interfaces = useMemo(
+    () => [...s.networks].sort((a, b) => b.rx_bytes + b.tx_bytes - (a.rx_bytes + a.tx_bytes)),
+    [s.networks],
+  );
+  const totalRx = interfaces.reduce((n, i) => n + i.rx_bytes, 0);
+  const totalTx = interfaces.reduce((n, i) => n + i.tx_bytes, 0);
+
+  return (
+    <div className="flex flex-col gap-4">
+      <Panel title="Since boot" subtitle="Across every interface">
+        <div className="flex flex-wrap gap-6">
+          <Stat label="Received" value={formatSize(totalRx)} />
+          <Stat label="Sent" value={formatSize(totalTx)} />
+          <Stat label="Interfaces" value={`${interfaces.length}`} />
+        </div>
+      </Panel>
+
+      <Panel title="Per interface" subtitle="Busiest first">
+        {interfaces.length === 0 ? (
+          <p className="text-sm">
+            <NotMeasured />
+          </p>
+        ) : (
+          <div className="flex flex-col gap-3">
+            {interfaces.map((n) => {
+              const total = n.rx_bytes + n.tx_bytes;
+              // A share of the machine's total traffic, which is what
+              // makes a list of a dozen interfaces readable: it says
+              // which one actually carried anything. `percentOf`
+              // returns null on a zero total rather than NaN -- a
+              // freshly booted machine really can have moved no bytes.
+              const share = percentOf(total, totalRx + totalTx);
+              return (
+                <div key={n.name}>
+                  <div className="flex items-baseline justify-between gap-2">
+                    <span className="truncate text-sm text-[#e6edf3]">{n.name}</span>
+                    <span className="shrink-0 text-xs tabular-nums text-[#8b949e]">
+                      {formatSize(n.rx_bytes)} in · {formatSize(n.tx_bytes)} out
+                    </span>
+                  </div>
+                  <div className="mt-1">
+                    <Bar
+                      percent={share ?? 0}
+                      label={`${n.name} share of total traffic`}
+                    />
+                  </div>
+                  <div className="mt-1 text-xs tabular-nums text-[#8b949e]">
+                    {share === null ? (
+                      <NotMeasured />
+                    ) : (
+                      `${formatSize(total)} total (${share.toFixed(0)}% of all traffic)`
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        {/* The bar here is a SHARE, not a utilisation. Everywhere else
+            on this page a bar means "how full", and using the same
+            shape for a different meaning without saying so is how a
+            reader concludes an interface is 80% saturated. */}
+        <p className="mt-3 text-xs leading-relaxed text-[#8b949e]">
+          Totals since the machine booted, not current speeds — Headstate
+          samples cumulative counters, so a rate would mean subtracting two
+          readings. The bars show each interface&apos;s share of all traffic,
+          not how saturated it is.
+        </p>
+      </Panel>
+    </div>
+  );
+}
+
+/// Battery, thermal pressure and uptime — the machine's condition.
+///
+/// # Why these three share a page
+///
+/// None of them has enough to carry one alone: battery is two numbers
+/// with no history behind them, thermal is a single coarse label, and
+/// uptime is one figure. The brief allowed omitting them, and the
+/// argument against that is that the sidebar is a list of what this
+/// view can tell you about the machine -- and a class silently missing
+/// from it is a question the reader assumes the app cannot answer.
+///
+/// What they share is real rather than convenient: all three describe
+/// the machine's CONDITION rather than its work. Battery and thermal
+/// are directly coupled -- a hot machine on battery is throttled and
+/// draining -- and uptime is the window every other reading on this
+/// page is measured within.
+///
+/// This page adds what the overview panel cannot: the coupling between
+/// the three, said once, where all three are on screen.
+function PowerDetail({
+  sample: s,
+  sampledAt,
+}: {
+  sample: HealthSample;
+  sampledAt: number;
+}) {
+  return (
+    <div className="flex flex-col gap-4">
+      <Panel title="Battery" subtitle="Charge and power source">
+        <div className="flex flex-wrap gap-6">
+          <Stat
+            label="Charge"
+            value={s.battery === null ? null : `${s.battery.percent.toFixed(0)}%`}
+            hint={
+              s.battery === null
+                ? IS_MOBILE_BUILD
+                  ? "That desktop has no battery"
+                  : "No battery on this machine"
+                : undefined
+            }
+          />
+          <Stat
+            label="Power"
+            value={s.battery === null ? null : s.battery.on_ac ? "On AC" : "On battery"}
+          />
+        </div>
+        {s.battery !== null ? (
+          <div className="mt-3">
+            <Bar percent={s.battery.percent} label="Battery charge" />
+          </div>
+        ) : (
+          // A desktop with no battery is not a flat battery, and this
+          // is the page where that distinction has room to be stated
+          // rather than left to a four-word hint.
+          <p className="mt-2 text-xs leading-relaxed text-[#8b949e]">
+            {IS_MOBILE_BUILD
+              ? "The desktop this is describing has no battery — a mains-powered machine, not one that is flat."
+              : "This machine has no battery — it is mains-powered, which is not the same as a battery at zero."}
+          </p>
+        )}
+      </Panel>
+
+      <Panel title="Thermal pressure" subtitle="The system's own verdict, not a temperature">
+        <div
+          className="text-sm font-medium capitalize"
+          style={{ color: s.thermal ? thermalColor(s.thermal) : undefined }}
+        >
+          {s.thermal ?? <NotMeasured />}
+        </div>
+        <p className="mt-2 text-xs leading-relaxed text-[#8b949e]">
+          {s.thermal && THERMAL_MEANING[s.thermal] ? `${THERMAL_MEANING[s.thermal]} ` : ""}
+          This is the system&apos;s own thermal <em>pressure</em> rating, not a
+          temperature. Headstate cannot read degrees: that needs elevated
+          privileges, so the app reports the label the operating system already
+          publishes instead.
+        </p>
+        {/* The coupling, which is the reason these three share a page.
+            Only stated when both facts are actually in hand -- an
+            invented warning about a battery that does not exist would
+            be the page's own rule broken. */}
+        {s.thermal && s.thermal !== "nominal" && s.battery !== null && !s.battery.on_ac ? (
+          <p className="mt-2 text-xs leading-relaxed text-[#d29922]">
+            Warm and on battery: a machine in this state is usually being
+            slowed on purpose to save both heat and charge, so the CPU page
+            may read lower than the work actually wants.
+          </p>
+        ) : null}
+      </Panel>
+
+      <Panel title="Uptime" subtitle="How long this machine has been running">
+        <div className="flex flex-wrap gap-6">
+          <Stat label="Uptime" value={formatUptime(s.uptime_secs)} />
+          {/* Derived from uptime and subtracted from the SAMPLE's own
+              timestamp, not the clock at render time -- a boot time
+              that slides forward on every repaint is obviously wrong
+              to anyone watching it. */}
+          <Stat
+            label="Booted"
+            value={new Date(sampledAt - s.uptime_secs * 1000).toLocaleString()}
+          />
+        </div>
+        {/* Why uptime is on this page at all: it bounds everything
+            else. A load average over fifteen minutes means nothing on a
+            machine that booted two minutes ago. */}
+        <p className="mt-3 text-xs leading-relaxed text-[#8b949e]">
+          Uptime is the window every other reading here sits inside: network
+          totals count from this moment, and a fifteen-minute load average
+          means little on a machine that has been up for less than that.
+        </p>
+      </Panel>
+    </div>
   );
 }

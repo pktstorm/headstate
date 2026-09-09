@@ -42,7 +42,7 @@ import { WorktreesPage } from "./components/WorktreesPage";
 import { QueryError, errorMessage } from "./components/QueryError";
 import { RepoSidebar } from "./components/RepoSidebar";
 import { StatusBar } from "./components/StatusBar";
-import { ViewSwitcher } from "./components/ViewSwitcher";
+import { SystemHealthSidebar } from "./components/SystemHealthSidebar";
 import { StatsPage } from "./components/StatsPage";
 import { ConnectionBanner } from "./components/ConnectionBanner";
 import { StaleRibbon } from "./components/StaleRibbon";
@@ -279,12 +279,15 @@ export default function App() {
       // machine, so there is nothing for a repo list to pick between.
       // Rendering one of the repo sidebars here would show a column of
       // repositories whose every row is inert, or -- on a machine with
-      // no scanned checkouts -- an empty picker under a heading,
-      // which reads as a page that failed to load. The switcher alone
-      // keeps navigation where it always is.
-      <nav className="flex w-64 shrink-0 flex-col border-r border-[#30363d] p-3">
-        <ViewSwitcher counts={{ "to-review": reviewingCount }} />
-      </nav>
+      // no scanned checkouts -- an empty picker under a heading, which
+      // reads as a page that failed to load.
+      //
+      // What the column holds instead is the machine's own classes
+      // (#687): CPU, Memory, Disk, Network, Power. Navigation within
+      // the thing the view is about, which is what every other sidebar
+      // in the app holds -- and the natural occupant of a column that
+      // was previously the view switcher alone.
+      <SystemHealthSidebar viewCounts={{ "to-review": reviewingCount }} />
     ) : view === "packages" || view === "claude-md" ? (
       <RepoPickerSidebar reviewingCount={reviewingCount} />
     ) : view === "artifacts" ? (

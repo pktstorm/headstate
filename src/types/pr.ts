@@ -870,6 +870,68 @@ export interface Footprint {
   /// The Docker daemon, or `null` when Docker is not running -- which
   /// is the common answer, and precisely why it must not be a zero.
   docker_daemon: FootprintProcess | null;
+  /// The biggest CPU consumers on the WHOLE machine, biggest first
+  /// (#687).
+  ///
+  /// Not Headstate's -- the three fields above are ours. This is what
+  /// the CPU detail page shows, because "CPU is at 80%" is a symptom
+  /// and "these are the processes" is the answer.
+  ///
+  /// A bounded TOP N (eight), never the full list: 1400-odd rows is not
+  /// an answer to "what is using my CPU", it is the same filtering
+  /// problem handed back to the reader. `process_count` says how many
+  /// there were, so a short list never has to be mistaken for the whole
+  /// machine.
+  ///
+  /// OPTIONAL, and the optionality is load-bearing rather than
+  /// defensive. This was challenged on review, checked against the
+  /// version machinery, and the answer is that the machinery does not
+  /// reach this case. Worth spelling out, because the two mechanisms
+  /// that look like they cover it are real -- they just bite elsewhere:
+  ///
+  /// - **The version gate is on WRITES.** `connection.rs`'s `blocked()`
+  ///   refuses a desktop below `PROTOCOL_VERSION`, but its one caller
+  ///   (`companion.rs`) guards it with `matches!(class, Class::Write |
+  ///   Class::Destructive)` and says why: reads go through whatever the
+  ///   state, because the attempt is how the phone learns the desktop
+  ///   is back. `system_footprint` is `Class::Read`.
+  /// - **Cert pinning refuses protocol 1, not "older".** ML-DSA-65
+  ///   certificates were the 1-to-2 change (#521), so a 5.0 desktop
+  ///   fails the handshake. A protocol-2 desktop from before this
+  ///   feature completes it normally.
+  ///
+  /// What remains is not a protocol mismatch at all. The companion
+  /// ships on its own tag, independent of the desktop's
+  /// (`docs/mobile-release-process.md`), and compatibility is the wire
+  /// protocol's integer -- which adding fields to a response does not
+  /// bump, because doing so is backward-compatible. So a phone carrying
+  /// this feature paired with a desktop released before it is a
+  /// protocol-2-to-protocol-2 pairing: allowed, unblocked, and missing
+  /// these fields. Two release pipelines make that ordering ordinary.
+  ///
+  /// The absence is a different fact from an empty list -- "that desktop
+  /// cannot tell us" versus "nothing is running", the latter impossible
+  /// on a booted machine -- and the UI renders the two differently.
+  /// `call<Footprint>` is an unchecked cast, so a required type here
+  /// would have the compiler certify a guarantee the wire does not give.
+  top_cpu?: FootprintProcess[];
+  /// The same, by resident size. A SEPARATE list rather than `top_cpu`
+  /// re-sorted: the process pinning a core is rarely the one holding
+  /// 8 GB, and re-sorting one list by the other metric would show the
+  /// top of a set that was chosen by the wrong measure.
+  ///
+  /// Optional for the same version-skew reason as `top_cpu`.
+  top_memory?: FootprintProcess[];
+  /// How many processes were running when the two lists were taken.
+  ///
+  /// So the UI can say what it is not showing. Eight of 1436 is a
+  /// defensible answer; eight presented as everything is not.
+  ///
+  /// Optional for the same reason as the two lists. When it is absent
+  /// the UI omits the "of N running" sentence rather than inventing a
+  /// total -- a count that does not exist must not be rendered as one
+  /// that does.
+  process_count?: number;
 }
 
 /// One process in a `Footprint`.
