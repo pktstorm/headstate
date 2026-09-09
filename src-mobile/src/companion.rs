@@ -245,11 +245,7 @@ impl Companion {
         // that would not open is not evidence of a classical-only
         // device, and reporting it as one would be exactly the
         // absent-is-not-false mistake this codebase avoids elsewhere.
-        report.has_mldsa = self
-            .keys
-            .public_keys()
-            .ok()
-            .map(|k| k.mldsa_65.is_some());
+        report.has_mldsa = self.keys.public_keys().ok().map(|k| k.mldsa_65.is_some());
         report
     }
 
