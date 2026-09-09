@@ -22,7 +22,7 @@ import {
   thermalColor,
   type Point,
 } from "@/lib/health";
-import type { FootprintProcess, HealthSample } from "@/types/pr";
+import type { FootprintProcess, HealthGpu, HealthSample } from "@/types/pr";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { useConnectionState } from "@/api/connection";
 
@@ -746,6 +746,72 @@ function PressureCard({
   );
 }
 
+/// One GPU's readings.
+///
+/// Split out because a machine can have two -- an Intel Mac with
+/// integrated and discrete graphics reports both -- and a panel that
+/// assumed one would hide whichever it did not pick.
+///
+/// # Unified memory is stated, not implied
+///
+/// On Apple Silicon the GPU has no memory of its own: `memory_used` is
+/// a share of the same physical pool the Memory panel above reports.
+/// Left unsaid, a reader comparing the two panels would add the GPU's
+/// gigabytes to the system's and conclude the machine has more RAM than
+/// it does -- so the hint on the figure and the note under it both say
+/// which pool this is. That is the specific misreading #686 asks to
+/// prevent.
+function GpuCard({ gpu }: { gpu: HealthGpu }) {
+  const memPct =
+    gpu.memory_used === null || gpu.memory_total === null
+      ? null
+      : percentOf(gpu.memory_used, gpu.memory_total);
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="text-sm font-medium text-[#e6edf3]">{gpu.name}</div>
+      <div className="flex flex-wrap gap-6">
+        {/* Null rather than 0 for a GPU that reported no utilization:
+            an idle GPU and an unreadable one are opposite answers, and
+            this is the field where they look most alike. */}
+        <Stat
+          label="Utilization"
+          value={
+            gpu.utilization_percent === null
+              ? null
+              : `${gpu.utilization_percent.toFixed(0)}%`
+          }
+        />
+        <Stat
+          label="Memory in use"
+          value={gpu.memory_used === null ? null : formatSize(gpu.memory_used)}
+          hint={gpu.unified_memory && gpu.memory_used !== null ? "Shared with system" : undefined}
+        />
+        <Stat
+          label={gpu.unified_memory ? "Allocated pool" : "Total VRAM"}
+          value={gpu.memory_total === null ? null : formatSize(gpu.memory_total)}
+        />
+      </div>
+      {gpu.utilization_percent !== null ? (
+        <Bar percent={gpu.utilization_percent} label={`${gpu.name} utilization`} />
+      ) : null}
+      {memPct !== null ? (
+        <div className="text-xs text-[#8b949e]">
+          {memPct.toFixed(0)}% of the pool currently allocated to the GPU
+        </div>
+      ) : null}
+      {gpu.unified_memory ? (
+        <p className="text-xs leading-relaxed text-[#8b949e]">
+          This GPU uses <em>unified memory</em>: it shares one physical pool with
+          the CPU rather than having its own. The figures above are a share of
+          the same memory the Memory panel reports — not additional memory, so
+          they should not be added to it.
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
 export function SystemHealthPage() {
   // Both queries are enabled unconditionally HERE, because this
   // component only mounts while the view is open -- `App` renders it
@@ -781,6 +847,20 @@ export function SystemHealthPage() {
     // comparable across machines and across a chart whose total never
     // changes anyway.
     () => toPoint((s) => percentOf(s.memory.used, s.memory.total)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [samples],
+  );
+  // The FIRST GPU only. A second one would need its own series, and a
+  // machine with two is rare enough that a chart per GPU is not worth
+  // the vertical space -- the live figures above already cover both.
+  //
+  // A sample taken before this shipped, or on a platform that reports
+  // no GPU, has no entry and contributes `null`, which `splitOnGaps`
+  // breaks the line across. That is the correct reading: the app was
+  // running and did not measure a GPU, which is not the same as a GPU
+  // that was idle.
+  const gpuSeries = useMemo(
+    () => toPoint((s) => s.gpus[0]?.utilization_percent ?? null),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [samples],
   );
@@ -1010,6 +1090,51 @@ export function SystemHealthPage() {
             <GapNote />
           </div>
         </Panel>
+
+        {/* No GPU panel at all when nothing was discoverable, rather
+            than a panel of "Not measured" rows.
+
+            This is the one place on the page where an empty panel
+            would be worse than no panel. Elsewhere an absent reading
+            sits beside present ones and "Not measured" is informative
+            -- this machine has no battery, that platform has no load
+            average. A GPU panel containing nothing but absences says
+            "we found a GPU and could not read it", which on Windows
+            and on Intel/NVIDIA Linux is not what happened: we did not
+            look, because there is no unprivileged way to. The issue
+            asks for exactly this ("must not render the panel at all if
+            there is nothing truthful to put in it").
+
+            On the phone this panel describes the DESKTOP's GPU like
+            every other panel here, and needs nothing extra to do so --
+            the sample it renders was taken on that machine. */}
+        {s.gpus.length > 0 ? (
+          <Panel
+            title={s.gpus.length === 1 ? "GPU" : "GPUs"}
+            subtitle="Utilization and the memory the graphics device is holding"
+          >
+            <div className="flex flex-col gap-5">
+              {s.gpus.map((g, i) => (
+                <GpuCard key={`${g.name}-${i}`} gpu={g} />
+              ))}
+            </div>
+            <div className="mt-4">
+              <div className="text-xs text-[#8b949e]">
+                {s.gpus.length === 1
+                  ? "GPU utilization over the last 24 hours"
+                  : `${s.gpus[0].name} utilization over the last 24 hours`}
+              </div>
+              <Sparkline
+                points={gpuSeries}
+                max={100}
+                label="GPU"
+                color="#a371f7"
+                now={sampledAt}
+              />
+              <GapNote />
+            </div>
+          </Panel>
+        ) : null}
 
         <Panel title="Disk" subtitle="Every mounted volume">
           {s.disks.length === 0 ? (

@@ -59,6 +59,7 @@ const health = () => ({
     swap_total: 0,
     swap_used: 0,
   },
+  gpus: [],
   disks: [],
   battery: null,
   thermal: "nominal",
