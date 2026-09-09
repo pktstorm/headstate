@@ -226,6 +226,113 @@ mod tests {
         run(repo, &["push", "-q", "origin", "main"]);
     }
 
+    /// A branch checked out in a worktree must stop reading as
+    /// deletable, even though checking it out moves no ref.
+    ///
+    /// This is the case the cache key was originally wrong about. The
+    /// first version keyed on `for-each-ref` alone, and `git worktree
+    /// add` leaves that output byte-identical -- so the cache called
+    /// the state unchanged and kept serving `Merged` for a branch git
+    /// would now refuse to delete. The listing would offer an action
+    /// that could only fail.
+    ///
+    /// The key now includes `worktree list --porcelain`, which is what
+    /// `checked_out` itself parses.
+    #[test]
+    fn checking_a_branch_out_invalidates_its_cached_verdict() {
+        let (tmp, repo) = fixture();
+        run(&repo, &["checkout", "-q", "-b", "feature"]);
+        commit(&repo, "work");
+        squash_merge(&repo, "feature");
+
+        let before = crate::branches::scan_cached(&repo).unwrap();
+        let f = before.iter().find(|b| b.name == "feature").unwrap();
+        assert!(
+            matches!(f.deletable, Deletable::Merged { .. }),
+            "fixture wrong: feature should read as merged first, got {:?}",
+            f.deletable
+        );
+
+        // Moves no ref, changes the answer.
+        let wt = tmp.path().join("live-wt");
+        run(
+            &repo,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "feature"],
+        );
+
+        let after = crate::branches::scan_cached(&repo).unwrap();
+        let f = after.iter().find(|b| b.name == "feature").unwrap();
+        assert!(
+            matches!(f.deletable, Deletable::CheckedOut { .. }),
+            "the cache served a stale merged verdict for a branch that is now checked out; got {:?}",
+            f.deletable
+        );
+    }
+
+    /// A new commit moves the tip, so the cached verdict must go.
+    ///
+    /// The plainer half of the same property, and the one a refs-only
+    /// key already got right -- kept so a future change to the key
+    /// cannot quietly lose it.
+    #[test]
+    fn the_listing_cache_notices_a_new_commit() {
+        let (_tmp, repo) = fixture();
+        run(&repo, &["checkout", "-q", "-b", "feature"]);
+        commit(&repo, "work");
+        squash_merge(&repo, "feature");
+
+        let before = crate::branches::scan_cached(&repo).unwrap();
+        assert!(before
+            .iter()
+            .any(|b| b.name == "feature" && matches!(b.deletable, Deletable::Merged { .. })));
+
+        run(&repo, &["checkout", "-q", "feature"]);
+        commit(&repo, "more work");
+        run(&repo, &["checkout", "-q", "main"]);
+
+        let after = crate::branches::scan_cached(&repo).unwrap();
+        let feature = after.iter().find(|b| b.name == "feature").unwrap();
+        assert!(
+            !matches!(feature.deletable, Deletable::Merged { .. }),
+            "the cache served a merged verdict after the branch tip moved"
+        );
+    }
+
+    /// Deletion re-checks against an UNCACHED scan.
+    ///
+    /// `delete_local`'s doc comment states the property that makes its
+    /// gate trustworthy: the check runs against the repository as it
+    /// stands, never against what the UI last displayed. A cached
+    /// answer is precisely what the UI last displayed, so this asserts
+    /// the delete path stays on `scan` even as the listing moves to
+    /// `scan_cached`.
+    #[test]
+    fn a_delete_refuses_work_that_landed_after_the_listing() {
+        let (_tmp, repo) = fixture();
+        run(&repo, &["checkout", "-q", "-b", "feature"]);
+        commit(&repo, "work");
+        squash_merge(&repo, "feature");
+
+        // The listing caches "deletable".
+        let _ = crate::branches::scan_cached(&repo).unwrap();
+
+        // New work lands.
+        run(&repo, &["checkout", "-q", "feature"]);
+        commit(&repo, "work that is not merged anywhere");
+        run(&repo, &["checkout", "-q", "main"]);
+
+        let out = delete_local(repo.to_str().unwrap(), &["feature".to_string()]);
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].error.is_some(),
+            "the delete was allowed after new work landed; that work would be gone"
+        );
+        assert!(
+            branch_exists(&repo, "feature"),
+            "the branch was deleted despite carrying unmerged work"
+        );
+    }
+
     fn branch_exists(repo: &Path, name: &str) -> bool {
         Command::new("git")
             .arg("-C")

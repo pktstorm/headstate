@@ -5,10 +5,11 @@
 //! ref whose only real question is whether its content already landed.
 //! They share the git helper and the patch-id technique, not the model.
 
+pub mod cache;
 pub mod delete;
 pub mod model;
 pub mod scan;
 
 pub use delete::{delete_local, delete_remote, DeleteOutcome};
 pub use model::{Branch, Deletable, Location, MergedHow};
-pub use scan::scan;
+pub use scan::{scan, scan_cached};
