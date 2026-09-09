@@ -308,7 +308,7 @@ export function PrKebab({ pr, canWrite = true }: { pr: PullRequest; canWrite?: b
                   setPending(null);
                   run("close");
                 }}
-                className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#f85149]"
+                className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#c93c37]"
               >
                 Close pull request
               </button>

@@ -578,7 +578,7 @@ export function DockerPage() {
                     },
                   );
                 }}
-                className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#f85149]"
+                className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#c93c37]"
               >
                 Delete
               </button>
@@ -635,7 +635,7 @@ export function DockerPage() {
                     },
                   );
                 }}
-                className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#f85149]"
+                className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#c93c37]"
               >
                 Remove
               </button>
@@ -721,7 +721,7 @@ export function DockerPage() {
                     },
                   );
                 }}
-                className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#f85149]"
+                className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#c93c37]"
               >
                 Remove {bulkSet.length} image{bulkSet.length === 1 ? "" : "s"}
               </button>
@@ -770,7 +770,7 @@ export function DockerPage() {
                     },
                   );
                 }}
-                className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#f85149]"
+                className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#c93c37]"
               >
                 Restart
               </button>

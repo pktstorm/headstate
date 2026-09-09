@@ -92,7 +92,7 @@ export function UpdateDialog({
                 setError(e instanceof Error ? e.message : String(e));
               });
             }}
-            className="rounded bg-[#238636] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#2ea043] disabled:opacity-50"
+            className="rounded bg-[#238636] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#1a7f37] disabled:opacity-50"
           >
             {busy ? "Installing…" : "Install"}
           </button>

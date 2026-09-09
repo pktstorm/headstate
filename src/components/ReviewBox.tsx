@@ -96,7 +96,7 @@ export function ReviewBox({
               onClick={() => onSubmit(v.name, body)}
               className={`rounded px-3 py-1.5 text-sm ${
                 v.name === "approve"
-                  ? "bg-[#238636] font-medium text-white hover:bg-[#2ea043] disabled:opacity-50"
+                  ? "bg-[#238636] font-medium text-white hover:bg-[#1a7f37] disabled:opacity-50"
                   : "border border-[#30363d] text-[#e6edf3] hover:bg-[#161b22] disabled:opacity-50"
               }`}
             >

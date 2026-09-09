@@ -190,7 +190,7 @@ export function PrActions({
               why
                 ? "border border-[#30363d] text-[#8b949e] opacity-50"
                 : primary
-                  ? "bg-[#238636] font-medium text-white hover:bg-[#2ea043]"
+                  ? "bg-[#238636] font-medium text-white hover:bg-[#1a7f37]"
                   : destructive
                     ? "border border-[#f85149]/40 text-[#f85149] hover:bg-[#f85149]/10"
                     : "border border-[#30363d] text-[#e6edf3] hover:bg-[#161b22]"
@@ -236,7 +236,7 @@ export function PrActions({
                   setPending(null);
                   run(a);
                 }}
-                className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#f85149]"
+                className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#c93c37]"
               >
                 Close pull request
               </button>

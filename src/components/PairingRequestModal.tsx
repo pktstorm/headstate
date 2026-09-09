@@ -124,7 +124,7 @@ export function PairingRequestDialog({
                 type="button"
                 disabled={locked}
                 onClick={() => answer(true)}
-                className="rounded bg-[#238636] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#2ea043] disabled:opacity-50"
+                className="rounded bg-[#238636] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#1a7f37] disabled:opacity-50"
               >
                 Approve
               </button>
@@ -151,7 +151,7 @@ export function PairingRequestDialog({
                 type="button"
                 disabled={locked}
                 onClick={() => answer(true, true)}
-                className="rounded bg-[#238636] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#2ea043] disabled:opacity-50"
+                className="rounded bg-[#238636] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#1a7f37] disabled:opacity-50"
               >
                 Replace
               </button>

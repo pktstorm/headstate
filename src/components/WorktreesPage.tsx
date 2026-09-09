@@ -454,7 +454,7 @@ function ConfirmRemove({
           <button
             type="button"
             onClick={onConfirm}
-            className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#f85149]"
+            className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#c93c37]"
           >
             Remove
           </button>
@@ -1071,7 +1071,7 @@ export function WorktreesPage() {
                     },
                   );
                 }}
-                className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#f85149]"
+                className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#c93c37]"
               >
                 I have reviewed this — remove it
               </button>
@@ -1177,7 +1177,7 @@ export function WorktreesPage() {
                   );
                 }}
                 disabled={bulkBusy}
-                className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#f85149] disabled:opacity-50"
+                className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#c93c37] disabled:opacity-50"
               >
                 {/* `bulkBusy` existed and nothing read it, so a slow
                     removal showed an unchanged button and a live count
