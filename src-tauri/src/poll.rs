@@ -261,6 +261,18 @@ pub struct UiPrefs {
     /// whole cache.
     #[serde(default)]
     pub stale_venv_days: u32,
+    /// Charge below which the battery alert fires, in percent (#720).
+    ///
+    /// Zero means "never set" and resolves to
+    /// `health::alerts::DEFAULT_LOW_PERCENT`, exactly like
+    /// `stale_venv_days` above -- a stored 0 from an upgrade must not
+    /// silently disable the alert, and `health::alerts::low_percent`
+    /// is where that is decided.
+    ///
+    /// This is CHARGE, not capacity. The two are different numbers and
+    /// the UI keeps them in separate panels; see `health::Battery`.
+    #[serde(default)]
+    pub battery_low_percent: u32,
 }
 
 /// Days idle before a virtualenv is called stale, honouring the setting.
@@ -297,6 +309,9 @@ impl Default for UiPrefs {
             // OFF: an upgrade must never widen what a click can delete.
             // 0 means "use the default", resolved by `stale_venv_days`.
             stale_venv_days: 0,
+            // 0 is "use the default", not "alert at 0%". See
+            // `health::alerts::low_percent`.
+            battery_low_percent: 0,
             // OFF. Verbose per-request logging is a cost every user
             // pays for a diagnosis almost none of them need -- it is
             // turned on when someone is chasing a problem.

@@ -512,6 +512,52 @@ export function SettingsDialog({
               A pull request becomes ready for your review
             </label>
           </div>
+          {/* The battery alerts (#720). Under the same master switch
+              because it is the same interruption from the user's side,
+              but NOT under `prefs` -- those three are pull-request
+              transitions, and adding a battery to that struct would
+              make a type that describes two unrelated things.
+
+              A number, not a checkbox, because the only question worth
+              asking is WHEN: everyone wants to know their laptop is
+              about to die, and they disagree only about how much
+              warning they want. The other two conditions -- draining
+              fast, draining while plugged in -- have no threshold to
+              set, because a plugged-in machine losing charge is worth
+              saying at any speed. */}
+          <label className="mt-1 flex items-center gap-2 text-sm">
+            <span>Warn when battery charge falls below</span>
+            <input
+              type="number"
+              min={5}
+              max={90}
+              className="w-16 rounded border border-[#30363d] bg-[#0d1117] px-2 py-1 text-sm tabular-nums"
+              disabled={!(prefs?.enabled ?? true)}
+              // `|| 25` renders the stored 0 as the default it actually
+              // resolves to in Rust, rather than showing a 0 that reads
+              // as "alert at zero percent" -- which is what a user
+              // seeing it would reasonably conclude the app will do.
+              value={ui?.battery_low_percent || 25}
+              onChange={(e) => {
+                const next = Number(e.target.value);
+                if (ui && Number.isFinite(next)) {
+                  void setUi({ ...ui, battery_low_percent: next });
+                }
+              }}
+              aria-label="Battery charge warning threshold, percent"
+            />
+            <span>%</span>
+          </label>
+          {/* Says which number this is. "Battery health" normally means
+              capacity relative to design -- a different figure entirely,
+              shown on the System Health page -- and a threshold labelled
+              only "battery" would be read as either. */}
+          <p className="text-xs text-[#8b949e]">
+            Charge, not capacity. Headstate also warns when the charge is
+            falling unusually fast, or falling while the machine is plugged
+            in — neither needs a threshold. Never computed across a period
+            the app was not running.
+          </p>
           {/* "newly breaks" was accurate while every notification was
               breakage. The ready-to-review one is good news, so the
               wording is about the TRANSITION rather than the direction. */}

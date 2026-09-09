@@ -73,6 +73,14 @@ export interface UiPrefs {
   diagnostic_logging: boolean;
   /// Days idle before a virtualenv counts as stale. 0 means the default.
   stale_venv_days: number;
+  /// Charge below which the battery alert fires, in percent (#720).
+  ///
+  /// 0 means "never set" and resolves to 25 in Rust
+  /// (`health::alerts::low_percent`), exactly like `stale_venv_days` --
+  /// a stored 0 from an upgrade must not silently disable the alert.
+  ///
+  /// This is CHARGE, not capacity. See `HealthBattery`.
+  battery_low_percent: number;
 }
 
 export const getUiPrefs = () => call<UiPrefs>("get_ui_prefs");

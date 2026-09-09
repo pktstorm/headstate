@@ -43,6 +43,34 @@ fn mark_focus(focused: &AtomicBool, is_focused: bool) {
     focused.store(is_focused, Ordering::Relaxed);
 }
 
+/// Show one battery alert (#720).
+///
+/// A sibling of `poll::notify_breakage` rather than a call into it:
+/// that one takes a `Breakage`, which is a pull request, and widening
+/// it to mean "or a battery" would make a type that describes two
+/// unrelated things. What IS shared is the part that must not drift --
+/// `poll::notification_allowed`, the ask-once permission gate.
+///
+/// Failure is logged and swallowed, exactly as it is there: a
+/// notification is an affordance, and losing one must never take down
+/// the sampler that fills the 24-hour series.
+fn notify_battery(app: &tauri::AppHandle, alert: &health::alerts::Alert) {
+    use tauri_plugin_notification::NotificationExt;
+
+    if !poll::notification_allowed(app) {
+        return;
+    }
+    if let Err(e) = app
+        .notification()
+        .builder()
+        .title(alert.title())
+        .body(alert.body())
+        .show()
+    {
+        log::warn!("failed to show a battery notification: {e}");
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Before anything builds a TLS config. Two rustls providers are
@@ -317,6 +345,13 @@ pub fn run() {
                     // recording the first would store a zero that reads
                     // as an idle machine.
                     let _ = collector.sample(&chrono::Utc::now().to_rfc3339());
+                    // What the battery alerts have already announced
+                    // (#720). In memory rather than in SQLite, matching
+                    // `poll`'s `previous`: a relaunch re-arming every
+                    // condition is correct, because the user has just
+                    // opened the app and a standing alert is worth one
+                    // restatement, not a permanent silence.
+                    let mut fired = health::alerts::Fired::default();
                     loop {
                         std::thread::sleep(std::time::Duration::from_secs(60));
                         let sample = collector.sample(&chrono::Utc::now().to_rfc3339());
@@ -327,9 +362,35 @@ pub fn run() {
                         match store::open_db(&commands::db_path(&app_handle))
                             .map_err(|e| e.to_string())
                             .and_then(|c| {
-                                store::health::record(&c, &sample).map_err(|e| e.to_string())
+                                store::health::record(&c, &sample).map_err(|e| e.to_string())?;
+                                // Read BACK rather than kept in memory:
+                                // `history` is already gap-preserving
+                                // and downsampled, so the alerts see
+                                // exactly the series the charts draw.
+                                // That is what keeps #720's rule --
+                                // never claim a rate the picture
+                                // refuses to draw -- true by
+                                // construction rather than by two
+                                // implementations agreeing.
+                                store::health::history(&c).map_err(|e| e.to_string())
                             }) {
-                            Ok(()) => {}
+                            Ok(history) => {
+                                let threshold = health::alerts::low_percent(
+                                    commands::read_ui_prefs(&app_handle).battery_low_percent,
+                                );
+                                let alerts = health::alerts::evaluate(&history, threshold);
+                                // `take_new` filters to transitions AND
+                                // re-arms cleared conditions, so a
+                                // battery sitting at 24% is announced
+                                // once rather than every sixty seconds.
+                                let charge = history
+                                    .last()
+                                    .and_then(|s| s.battery.as_ref())
+                                    .map(|b| b.percent);
+                                for alert in fired.take_new(&alerts, charge) {
+                                    notify_battery(&app_handle, &alert);
+                                }
+                            }
                             Err(e) => log::warn!("system health: could not record a sample: {e}"),
                         }
                     }

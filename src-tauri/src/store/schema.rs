@@ -172,6 +172,38 @@ const MIGRATIONS: &[&str] = &[
         uptime_secs  INTEGER,
         detail       TEXT NOT NULL
      );",
+    // 9: what the battery and network features of #719/#720 add.
+    //
+    // ONE migration for two features on purpose. Both extend the same
+    // `health_samples` row and both landed together; two numbered
+    // migrations touching one table would conflict on merge for no
+    // benefit, since neither can be applied without the other's code
+    // anyway.
+    //
+    // # What actually needed a column, and what did not
+    //
+    // `battery_capacity_percent` gets one because it is a
+    // whole-sample scalar, like `battery_percent` beside it, and
+    // because it is the figure a future "your battery has aged" query
+    // would filter on without parsing every `detail` blob.
+    //
+    // The NETWORK half of #719 adds NO column. Per-interface counters
+    // are already stored -- `Interface` is part of the `detail` JSON
+    // and always has been -- so the history needed for a rate was
+    // present all along; what was missing was a consumer that
+    // DIFFERENCES consecutive samples, and that is `interfaceRates` in
+    // `src/lib/health.ts`, not a schema change. Normalising the
+    // interfaces into their own table would buy a join and nothing
+    // else: the shape varies per machine and is only ever read back
+    // whole, which is the same reasoning migration 8 gives for putting
+    // them in `detail` in the first place.
+    //
+    // NULL, not 0, for the same reason as every other column here: a
+    // battery at 0% of its design capacity is a dead battery, and
+    // "we did not look" is the opposite claim. Rows written before
+    // this migration keep NULL, which is exactly right -- those
+    // samples genuinely did not measure it.
+    "ALTER TABLE health_samples ADD COLUMN battery_capacity_percent REAL;",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
@@ -332,6 +364,63 @@ mod tests {
         conn.execute(
             "INSERT INTO paired_devices (name, cert_fp, cert_der, ecdsa_pubkey, paired_at)
              VALUES ('a', 'cd', x'00', x'04', '2026-09-06T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// Migration 9 adds the capacity column to a v8 database -- every
+    /// install that has been collecting health samples since #663.
+    ///
+    /// Checked from a real v8 state WITH A ROW IN IT, because the
+    /// property that matters on upgrade is that existing samples
+    /// survive and keep NULL. A sample recorded before the column
+    /// existed genuinely did not measure capacity, and NULL is the only
+    /// honest value for it; backfilling a 0 or a 100 would invent a
+    /// measurement for every historical row at once.
+    #[test]
+    fn migration_nine_adds_capacity_without_touching_old_samples() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE health_samples (
+                sampled_at TEXT PRIMARY KEY, load_1 REAL, load_5 REAL, load_15 REAL,
+                cpu_percent REAL, mem_total INTEGER, mem_used INTEGER,
+                mem_available INTEGER, battery_percent REAL, on_ac INTEGER,
+                thermal TEXT, uptime_secs INTEGER, detail TEXT NOT NULL);
+             INSERT INTO health_samples (sampled_at, battery_percent, on_ac, detail)
+                VALUES ('2026-09-01T00:00:00Z', 71.0, 1, '{}');",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 8i64).unwrap();
+
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+
+        // The pre-existing sample is still there, with its CHARGE
+        // intact and its capacity absent.
+        let (charge, capacity): (Option<f64>, Option<f64>) = conn
+            .query_row(
+                "SELECT battery_percent, battery_capacity_percent FROM health_samples",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(charge, Some(71.0), "the existing sample survives");
+        assert_eq!(
+            capacity, None,
+            "a sample taken before the column existed measured no capacity"
+        );
+
+        // And a new row can carry both.
+        conn.execute(
+            "INSERT INTO health_samples
+               (sampled_at, battery_percent, battery_capacity_percent, detail)
+             VALUES ('2026-09-02T00:00:00Z', 62.0, 84.0, '{}')",
             [],
         )
         .unwrap();

@@ -175,3 +175,186 @@ export function percentOf(part: number, total: number): number | null {
   if (!total || !Number.isFinite(total)) return null;
   return (part / total) * 100;
 }
+
+/// # Network throughput: differencing a counter that can restart
+///
+/// `Interface.rx_bytes` / `tx_bytes` are CUMULATIVE since boot, so a
+/// rate is the difference between two consecutive samples divided by
+/// the time between them. Two things make that harder than it sounds,
+/// and both are why the code below is not a one-line `map`.
+///
+/// **Counters reset.** An interface that goes down, or a machine that
+/// reboots, restarts its byte count from zero. The naive difference is
+/// then a large NEGATIVE number. Clamping it to zero would be worse
+/// than useless: it draws a reset as a quiet moment, which is a claim
+/// about the traffic rather than an admission that the counter is no
+/// longer comparable. So a reset produces `null` -- and `null` is
+/// already the value `splitOnGaps` breaks a run on, so the chart draws
+/// the reset as a gap with no further arrangement.
+///
+/// **Gaps.** The same holes every other series has. They need no new
+/// machinery either: a differenced point carries the NEWER sample's
+/// timestamp, so a pair spanning a six-hour closure is a point six
+/// hours after its neighbour, and `splitOnGaps` cuts it exactly as it
+/// cuts a CPU series.
+///
+/// That is the whole design: emit `null` for anything not comparable,
+/// and let the one existing gap rule handle both cases.
+
+/// Bytes per second across one interval, or `null` where no rate can be
+/// computed from it.
+export interface RatePoint extends Point {
+  /// Why this point has no value, for a UI that wants to say which.
+  /// `undefined` on a point that HAS one.
+  ///
+  /// The distinction is worth carrying: "the app was not running" and
+  /// "this counter restarted" are different facts about the same blank
+  /// stretch, and a panel that can name which one saves the reader
+  /// guessing.
+  reason?: "gap" | "reset";
+}
+
+/// One sample's worth of one interface's counters.
+///
+/// Structural rather than importing `HealthSample`, keeping this module
+/// free of the API types the way the rest of it is.
+export interface CounterSample {
+  /// Epoch milliseconds.
+  t: number;
+  rx_bytes: number;
+  tx_bytes: number;
+}
+
+/// The smallest backwards step treated as a counter reset.
+///
+/// Exactly zero tolerance would be wrong: `sysinfo` reads the
+/// platform's counters, and a reading taken mid-update can come back a
+/// few bytes behind its predecessor without anything having restarted.
+/// A byte or two backwards is noise; a counter that genuinely reset
+/// drops by its whole accumulated value, which on any interface that
+/// has carried traffic is orders of magnitude more than this.
+///
+/// Deliberately small. The failure to avoid is treating a REAL reset as
+/// noise and emitting a plausible rate from it, so the tolerance stays
+/// far below any reset worth catching.
+const RESET_TOLERANCE_BYTES = 4096;
+
+/// Bytes per second between consecutive samples of one counter.
+///
+/// `samples` is oldest-first. The result has one fewer point than the
+/// input -- a rate belongs to an INTERVAL, not to an instant -- and each
+/// point carries the newer sample's time, so it sits where the traffic
+/// was measured rather than where the interval began.
+///
+/// Returns `null` values, never zeroes and never clamped negatives, for
+/// every interval that cannot honestly be turned into a rate.
+export function counterRates(
+  samples: CounterSample[],
+  pick: (s: CounterSample) => number,
+): RatePoint[] {
+  const out: RatePoint[] = [];
+  for (let i = 1; i < samples.length; i += 1) {
+    const prev = samples[i - 1];
+    const cur = samples[i];
+    const seconds = (cur.t - prev.t) / 1000;
+    const delta = pick(cur) - pick(prev);
+
+    if (delta < -RESET_TOLERANCE_BYTES) {
+      // The counter restarted. NOT clamped to zero: that would draw a
+      // reboot as an idle minute, a measurement nobody took.
+      out.push({ t: cur.t, v: null, reason: "reset" });
+      continue;
+    }
+    // Non-positive spacing means two rows share an instant or arrived
+    // out of order; dividing by it yields Infinity, which renders as a
+    // spike off the top of any chart.
+    if (seconds <= 0) {
+      out.push({ t: cur.t, v: null, reason: "gap" });
+      continue;
+    }
+    // A small backwards step inside the tolerance is noise, and zero is
+    // the honest reading for it -- the counter did not advance.
+    out.push({ t: cur.t, v: Math.max(0, delta) / seconds });
+  }
+  return out;
+}
+
+/// Every interface's received and sent rate over the series.
+///
+/// Keyed by interface name. An interface that appears partway through
+/// -- a VPN coming up, a cable being plugged in -- simply has no points
+/// before it existed, which is the truth: nothing was measured for it
+/// then.
+///
+/// Interfaces are NOT summed into a machine total. Two of them carrying
+/// the same traffic (a bridge and its member, a VPN and the physical
+/// link beneath it) would double-count, and #719 asks for per-interface
+/// history precisely because an aggregate hides which link did the
+/// work.
+export function interfaceRates(
+  samples: {
+    sampled_at: string;
+    networks: { name: string; rx_bytes: number; tx_bytes: number }[];
+  }[],
+): Map<string, { rx: RatePoint[]; tx: RatePoint[] }> {
+  // Per interface, only the samples that actually carried it. A sample
+  // in which an interface is absent is not a zero for that interface --
+  // it is a moment the interface did not exist, and pairing across it
+  // would difference two readings with an unmeasured stretch between.
+  const byName = new Map<string, CounterSample[]>();
+  for (const s of samples) {
+    const t = Date.parse(s.sampled_at);
+    if (!Number.isFinite(t)) continue;
+    for (const n of s.networks) {
+      const list = byName.get(n.name) ?? [];
+      list.push({ t, rx_bytes: n.rx_bytes, tx_bytes: n.tx_bytes });
+      byName.set(n.name, list);
+    }
+  }
+
+  const out = new Map<string, { rx: RatePoint[]; tx: RatePoint[] }>();
+  for (const [name, list] of byName) {
+    out.set(name, {
+      rx: counterRates(list, (s) => s.rx_bytes),
+      tx: counterRates(list, (s) => s.tx_bytes),
+    });
+  }
+  return out;
+}
+
+/// A bytes-per-second figure in words a person reads.
+///
+/// Separate from `formatSize` in `lib/worktrees` rather than wrapping
+/// it: this is a RATE, and the unit has to say so. A panel that renders
+/// throughput with the same helper as disk usage produces "4.2 MB"
+/// where it means "4.2 MB/s", and the two read very differently to
+/// anyone scanning the page.
+///
+/// Decimal rather than binary units: network throughput is quoted in
+/// decimal everywhere -- a 1 Gb link, an ISP's advertised megabits --
+/// and 1024 here would disagree with every figure a user compares this
+/// against.
+export function formatRate(bytesPerSecond: number): string {
+  const units = ["B/s", "kB/s", "MB/s", "GB/s"];
+  let v = bytesPerSecond;
+  let u = 0;
+  while (v >= 1000 && u < units.length - 1) {
+    v /= 1000;
+    u += 1;
+  }
+  return `${v < 10 && u > 0 ? v.toFixed(1) : Math.round(v)} ${units[u]}`;
+}
+
+/// The peak rate in a series, ignoring points that have no value.
+///
+/// Used as a chart's y-axis ceiling. `null` when nothing was measured,
+/// which the caller renders as "Not measured" rather than as a chart
+/// scaled to zero.
+export function peakRate(points: RatePoint[]): number | null {
+  let peak: number | null = null;
+  for (const p of points) {
+    if (p.v === null) continue;
+    if (peak === null || p.v > peak) peak = p.v;
+  }
+  return peak;
+}

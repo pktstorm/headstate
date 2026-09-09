@@ -43,6 +43,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod alerts;
 pub mod collect;
 pub mod footprint;
 pub mod gpu;
@@ -105,10 +106,46 @@ pub struct Volume {
     pub is_root: bool,
 }
 
+/// The battery, which carries TWO different percentages.
+///
+/// `percent` is CHARGE -- how full the cell is right now. It is what
+/// every "battery is low" alert is about, and it moves minute to
+/// minute.
+///
+/// `capacity_percent` is HEALTH -- how much the cell can still hold
+/// relative to the day it was made. It moves over years, and a battery
+/// at 100% charge and 71% capacity is completely normal for a
+/// three-year-old laptop.
+///
+/// They are stored as separate fields, and the UI renders them in
+/// separate panels with different words, because conflating them is the
+/// single most likely misreading of this struct: "battery health: 84%"
+/// beside a charge bar reads as a charge figure, and a user who sees it
+/// fall from 100 to 84 concludes their battery is draining when in fact
+/// it has aged.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Battery {
+    /// CHARGE, 0-100. How full the cell is at this instant.
     pub percent: f64,
     pub on_ac: bool,
+    /// CAPACITY relative to design, 0-100 -- the figure usually called
+    /// "battery health". `None` on every platform but macOS, and `None`
+    /// on macOS when `ioreg` does not publish the pair it is derived
+    /// from.
+    ///
+    /// Never 0 for "not measured": a battery at 0% of its design
+    /// capacity is a dead battery, which is the opposite claim from
+    /// "we did not look". See the module docs.
+    #[serde(default)]
+    pub capacity_percent: Option<f64>,
+    /// Charge cycles the cell has been through. `None` where the
+    /// platform does not publish it.
+    ///
+    /// Kept beside `capacity_percent` because it is the context that
+    /// makes it readable: 84% capacity after 400 cycles is ordinary
+    /// ageing, and after 40 it is a fault.
+    #[serde(default)]
+    pub cycle_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
