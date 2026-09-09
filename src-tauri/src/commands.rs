@@ -2252,6 +2252,33 @@ pub async fn system_health_history(app: AppHandle) -> Result<Vec<crate::health::
     .map_err(|e| e.to_string())?
 }
 
+/// What Headstate itself is costing, right now (#665).
+///
+/// The LIVE half of that panel only: our process, the `git`/`gh`/Docker
+/// subprocesses we spawn, and the Docker daemon if it is up. A kernel
+/// read of the process table -- no subprocess and no directory walk --
+/// so it is safe to call as often as the view refreshes.
+///
+/// The DISK half is deliberately not here. Worktree, artifact, venv and
+/// Docker sizes come from `size_worktrees`, `size_artifacts`,
+/// `size_venvs` and `docker_disk_usage`, which already exist and are
+/// what the Worktrees, Artifacts and Docker views show. There is no
+/// combined command on purpose: those four take seconds to tens of
+/// seconds (`size_worktrees` was the #661 timeout), so they belong
+/// behind an explicit "Measure" and must never share a call site with
+/// something this cheap.
+#[tauri::command]
+pub async fn system_footprint(
+    footprints: State<'_, std::sync::Arc<crate::health::footprint::Footprints>>,
+) -> Result<crate::health::Footprint, String> {
+    let footprints = footprints.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        footprints.sample(&chrono::Utc::now().to_rfc3339())
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// Every branch in a repository, classified.
 ///
 /// Blocking git work -- measured at ~9s on a 675-branch repository --

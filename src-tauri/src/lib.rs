@@ -161,6 +161,7 @@ pub fn run() {
             commands::list_branches,
             commands::system_health,
             commands::system_health_history,
+            commands::system_footprint,
             commands::delete_branches,
             commands::delete_remote_branches,
             commands::remove_worktree,
@@ -294,6 +295,18 @@ pub fn run() {
             // report an idle machine forever.
             let collector = Arc::new(health::collect::Collector::default());
             app.manage(collector.clone());
+
+            // What Headstate itself is costing (#665). Its own reader
+            // rather than a field on `Collector`, for the same reason it
+            // is a separate command: the machine sample and the process
+            // sample refresh different kernel state on different
+            // schedules, and one mutex across both would make each wait
+            // on the other's read for nothing.
+            //
+            // Not on the once-a-minute sampler and not written to
+            // SQLite: this is a live reading the view asks for, and
+            // there is no 24-hour series of it to keep.
+            app.manage(Arc::new(health::footprint::Footprints::default()));
             {
                 let app_handle = app.handle().clone();
                 // Blocking, not async: it reads the kernel and writes
