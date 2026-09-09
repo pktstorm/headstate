@@ -27,6 +27,13 @@ mobile-frontend:
 lint-mobile:
 	cd src-mobile && cargo fmt --check
 	cd src-mobile && cargo clippy --workspace --all-targets -- -D warnings
+	# No Kotlin is compiled anywhere -- not by this target, not in CI, which
+	# generates the Android Studio project and never runs Gradle. Tauri
+	# dispatches on the LITERAL @Command method name, so a name that does not
+	# match what Rust invokes fails on a device and nowhere else (#698).
+	# Not prefixed with `cd src-mobile`: each recipe line is its own shell,
+	# so this one starts at the repo root like the rest.
+	python3 scripts/check-plugin-commands.py
 
 test-mobile:
 	cd src-mobile && cargo test --workspace
@@ -131,6 +138,11 @@ lint-ui:
 	yarn tsc -b --force
 	yarn eslint .
 	yarn knip
+	# The focus ring is CSS the test suite structurally cannot see: jsdom
+	# applies no stylesheets, `?raw` on a .css file returns empty because
+	# @tailwindcss/vite claims it, and tests avoid node:fs. Deleting the
+	# rule un-fixes every button in the app with a green suite (#694).
+	./scripts/check-focus-css.sh
 
 fmt:
 	cd src-tauri && cargo fmt
