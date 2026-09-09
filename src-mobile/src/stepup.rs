@@ -150,8 +150,18 @@ mod tests {
         );
         assert_eq!(std::str::from_utf8(&bytes).unwrap(), expected);
         assert_eq!(bytes.len(), 203);
+        // Lowercase hex byte at a time: `sha2` 0.11 returns a
+        // `hybrid-array` `Array`, which has no `LowerHex`, so `{:x}` no
+        // longer formats a digest.
+        let digest = Sha256::digest(&bytes)
+            .iter()
+            .fold(String::with_capacity(64), |mut s, b| {
+                use std::fmt::Write;
+                let _ = write!(s, "{b:02x}");
+                s
+            });
         assert_eq!(
-            format!("{:x}", Sha256::digest(&bytes)),
+            digest,
             "ebd1a4f4f78ff1f55f7bf642cc8d72262b6a77ab14164bbf4f95135a6e0f79ff"
         );
     }

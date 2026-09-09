@@ -62,11 +62,24 @@ toml_edit = "0.25"
 tokio = { version = "1.53", features = ["full"] }
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
-# Both are ALREADY in the tree transitively, at these versions -- declaring
-# them adds no new code to the supply chain. Needed to reconstruct Poetry's
-# venv naming, which is base64(sha256(project path))[:8].
-sha2 = "0.10"
-base64 = "0.22"
+# Needed to reconstruct Poetry's venv naming, which is
+# base64(sha256(project path))[:8].
+#
+# `sha2` 0.11 is the version that matters: it is on `digest` 0.11, the
+# same stack `ml-dsa` already brings through `shake`, and moving it in
+# step with `p256` 0.14 and `hmac` 0.13 below leaves the tree with ONE
+# digest stack instead of the two it used to carry. See the `p256` note
+# for the whole argument -- the four move together or not at all, and
+# they move in `src-mobile/Cargo.toml` in the same change.
+#
+# `base64` 0.23 is the exception to that coupling: it is a plain encoder
+# with no digest underneath, so it is free to move on its own. Note it
+# does NOT replace the 0.22 in the tree -- hyper-util still pulls that
+# one, so this is a second copy rather than a shared one. It is here
+# because both apps should spell the same version, and because the phone
+# already resolves 0.23 transitively through rcgen's `pem`.
+sha2 = "0.11"
+base64 = "0.23"
 # ALSO already in the tree, pulled in by octocrab at this version.
 #
 # Needed by the two ecosystems whose "latest version" answer comes from
@@ -199,11 +212,13 @@ tauri-plugin-autostart = "2.5.1"
 # works in `tauri dev`, which is why nobody noticed.
 tauri-plugin-opener = "2"
 # Mobile pairing (remote/pairing.rs). The phone proves it holds the pairing
-# token with an HMAC-SHA256 over both certificate fingerprints. 0.12 rather
-# than 0.13 because it shares `digest` 0.10 with the `sha2` already above;
-# 0.13 would drag a second digest stack into the tree. Verification goes
-# through the crate's constant-time `verify_slice`, never a `==` on bytes.
-hmac = "0.12"
+# token with an HMAC-SHA256 over both certificate fingerprints. 0.13 to
+# share `digest` 0.11 with the `sha2` above and the `p256` below -- the
+# reason 0.12 was pinned here before was to share 0.10 with them, and it
+# is the same reason now that they have all moved together. Verification
+# goes through the crate's constant-time `verify_slice`, never a `==` on
+# bytes.
+hmac = "0.13"
 # Constant-time comparison of the presented pairing token against the
 # issued one. Already in the tree (hmac and rustls both use it).
 subtle = "2"
@@ -216,20 +231,43 @@ rand = "0.9"
 # only `libc` beneath it, which is already in the tree.
 if-addrs = "0.15"
 # Step-up signatures on destructive remote commands (remote/stepup.rs):
-# the classical half of the hybrid. 0.13 rather than 0.14 because it
-# shares `digest` 0.10, `sha2` 0.10 and `signature` 2.2 with the crates
-# already in the tree; 0.14 would bring a second copy of each. `ecdsa`
-# alone: the phone's key arrives as raw SEC1 bytes and its signature as
-# raw r||s, so there is no PEM or PKCS#8 to parse. Signing is compiled
-# in only so the tests can make keys; the desktop never signs.
-p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+# the classical half of the hybrid. `ecdsa` alone: the phone's key
+# arrives as raw SEC1 bytes and its signature as raw r||s, so there is no
+# PEM or PKCS#8 to parse. Signing is compiled in only so the tests can
+# make keys; the desktop never signs.
+#
+# 0.14 now, and the reason is the one that used to argue for 0.13. That
+# note said 0.14 "would bring a second copy" of `digest`, `sha2` and
+# `signature` -- true when it was written, but only because the rest of
+# the tree sat on the 0.10 stack. It does not any more: `ml-dsa` 0.1.1
+# pulls `digest` 0.11 through `shake` and `signature` 3.0 directly, so
+# 0.13 was the version costing a second copy, not 0.14.
+#
+# Measured on the resolved graph rather than assumed. p256 0.14 needs
+# ecdsa 0.17 -> digest 0.11 + signature 3.0, which is exactly what
+# ml-dsa already uses, and p256 depends on `sha2` itself -- 0.13 pins
+# sha2 0.10, which is what kept the old stack alive. With sha2 0.11 and
+# hmac 0.13 above, the whole tree resolves to ONE each of `digest`
+# 0.11, `signature` 3.0, `crypto-common` 0.2 and `block-buffer` 0.12.
+# So this collapses the two digest stacks; it does not entrench them.
+#
+# Nothing on the wire moves. A P-256 signature is still the fixed-width
+# 64-byte r||s of IEEE P1363 (`Signature::from_slice` in ecdsa 0.17 is
+# the same fixed-width parse), and the key is still SEC1 uncompressed,
+# so a phone signing with the old version and a desktop verifying with
+# the new one still agree. The version must still MATCH
+# `src-mobile/Cargo.toml`, not because the bytes would differ but
+# because these two ends are meant to be read as one decision.
+p256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
 # The post-quantum half: ML-DSA-65 verification, FIPS 204 final. Chosen
 # over `libcrux-ml-dsa` for reasons recorded in remote/stepup.rs. No
 # build script; `alloc` boxes the large intermediate matrices instead of
-# putting them on a tokio worker's stack. Brings its own `digest` 0.11
-# through `shake`, so this IS a second digest stack; ml-dsa 0.0.x on
-# digest 0.10 predates the Wycheproof and use_hint fixes in 0.1.0 and is
-# not an option for a verifier.
+# putting them on a tokio worker's stack. Its `digest` 0.11, through
+# `shake`, used to be a SECOND digest stack alongside the 0.10 that
+# `p256` 0.13 and `sha2` 0.10 sat on; since those moved to the 0.11 line
+# it is the only one, and this crate is what the rest now matches.
+# ml-dsa 0.0.x on digest 0.10 predates the Wycheproof and use_hint fixes
+# in 0.1.0 and is not an option for a verifier.
 ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc"] }
 # LAN discovery (remote/discovery.rs). Advertises `_headstate._tcp` while
 # the listener is up so a phone whose stored address went stale can still

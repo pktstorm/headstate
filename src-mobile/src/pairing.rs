@@ -24,6 +24,9 @@
 
 use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD as BASE64URL};
 use base64::Engine;
+// `KeyInit` alongside `Mac` since hmac 0.13: `new_from_slice` moved onto
+// that trait, while `update`/`finalize` stayed on `Mac`.
+use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;

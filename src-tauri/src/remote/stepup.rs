@@ -503,6 +503,18 @@ mod tests {
     use serde_json::json;
     use sha2::{Digest, Sha256};
 
+    /// Lowercase hex. `sha2` 0.11 returns a `hybrid-array` `Array`, which
+    /// -- unlike the 0.10 `GenericArray` -- has no `LowerHex`, so `{:x}`
+    /// no longer formats a digest. This is the same byte-at-a-time
+    /// formatting `identity::fingerprint_of` uses on the protocol path.
+    fn hex(bytes: &[u8]) -> String {
+        use std::fmt::Write;
+        bytes.iter().fold(String::with_capacity(64), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+    }
+
     const NOW: i64 = 1_788_566_400;
     const NONCE_B64: &str = "AAECAwQFBgcICQoLDA0ODw";
 
@@ -532,10 +544,13 @@ mod tests {
                 name: "Octocat's phone".into(),
                 cert_fp: self.fp.clone(),
                 cert_der: vec![0x30],
+                // `to_sec1_point` is `to_encoded_point` renamed in
+                // elliptic-curve 0.14; `false` is still "uncompressed",
+                // so this is the same 65 bytes starting 0x04.
                 ecdsa_pubkey: self
                     .ecdsa
                     .verifying_key()
-                    .to_encoded_point(false)
+                    .to_sec1_point(false)
                     .as_bytes()
                     .to_vec(),
                 mldsa_pubkey: self
@@ -595,7 +610,7 @@ mod tests {
         assert_eq!(std::str::from_utf8(&bytes).unwrap(), expected);
         assert_eq!(bytes.len(), 203);
         assert_eq!(
-            format!("{:x}", Sha256::digest(&bytes)),
+            hex(&Sha256::digest(&bytes)),
             "ebd1a4f4f78ff1f55f7bf642cc8d72262b6a77ab14164bbf4f95135a6e0f79ff"
         );
     }
@@ -980,11 +995,14 @@ mod tests {
     fn high_s_ecdsa_signature_accepted() {
         // CryptoKit does not normalise s; the verifier must not demand
         // low-S.
-        use p256::elliptic_curve::ops::Reduce;
+        // `Reduce` moved to crypto-bigint and `reduce_bytes` became
+        // `reduce` in the 0.14 line; still the `Reduce<FieldBytes>` impl,
+        // so this is the same reduction of the same bytes.
+        use p256::elliptic_curve::bigint::Reduce;
         let phone = Phone::new(false, 1);
         let msg = canonical_bytes(CMD, &args(), NONCE_B64, NOW);
         let sig: p256::ecdsa::Signature = phone.ecdsa.sign(&msg);
-        let s = p256::Scalar::reduce_bytes(&sig.s().to_bytes());
+        let s = <p256::Scalar as Reduce<p256::FieldBytes>>::reduce(&sig.s().to_bytes());
         let flipped =
             p256::ecdsa::Signature::from_scalars(sig.r().to_bytes(), (-s).to_bytes()).unwrap();
         assert_ne!(flipped, sig);

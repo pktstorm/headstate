@@ -102,22 +102,32 @@ tauri-plugin-headstate-keys = { version = "0.1.0", path = "plugins/headstate-key
 # runtime. `sync`, `time`, `macros` and nothing else.
 tokio = { version = "1", features = ["sync", "time", "macros"] }
 # The same crates at the same versions as the desktop's remote module,
-# for the reasons recorded in src-tauri/Cargo.toml: hmac 0.12 shares
-# `digest` 0.10 with sha2 0.10, so the pairing proof (HMAC-SHA256 over
+# for the reasons recorded in src-tauri/Cargo.toml: hmac 0.13 shares
+# `digest` 0.11 with sha2 0.11, so the pairing proof (HMAC-SHA256 over
 # both certificate fingerprints) and the fingerprints themselves (SHA256
-# of DER) sit on one digest stack. base64 0.22: standard with padding for
-# the public keys in the pair request, URL-safe unpadded for tokens,
-# nonces and signatures. All three already in the lock.
-sha2 = "0.10"
-hmac = "0.12"
-base64 = "0.22"
+# of DER) sit on one digest stack -- now the SAME stack `ml-dsa` and
+# `p256` 0.14 use, where it used to be one of two. These move only in
+# lockstep with the desktop: a version bumped here alone would split the
+# stack back apart under step-up signing.
+#
+# base64 0.23: standard with padding for the public keys in the pair
+# request, URL-safe unpadded for tokens, nonces and signatures. It has no
+# digest underneath, so it is not part of that coupling -- it matches the
+# desktop only so both apps spell one version. Already resolved here
+# anyway, through rcgen's `pem`.
+sha2 = "0.11"
+hmac = "0.13"
+base64 = "0.23"
 # The software fallback for the step-up keys (keys.rs `SoftwareKeys`) and
 # the verifying half the tests use to check what the desktop will check.
 # Same versions and features as the desktop's verifier so a signature
-# made here is exactly what its stepup.rs expects: p256 0.13 on digest
-# 0.10; ml-dsa 0.1.1 (FIPS 204 final) with `alloc` only -- signing is
+# made here is exactly what its stepup.rs expects: p256 0.14 on digest
+# 0.11; ml-dsa 0.1.1 (FIPS 204 final) with `alloc` only -- signing is
 # deterministic so no `getrandom`, and keys are raw bytes so no `pkcs8`.
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+#
+# `std` on top of the desktop's feature set, as before: this side SIGNS,
+# and that is the only difference between the two lines.
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
 ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc"] }
 # Pairing records, the cached snapshot and the software keys' seeds
 # (store.rs). Used through its Rust `stronghold` module directly: the
