@@ -295,6 +295,18 @@
       "type": "string",
       "oneOf": [
         {
+          "description": "Enables the acquire_multicast command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-acquire-multicast",
+          "markdownDescription": "Enables the acquire_multicast command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the acquire_multicast command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-acquire-multicast",
+          "markdownDescription": "Denies the acquire_multicast command without any pre-configured scope."
+        },
+        {
           "description": "Enables the complete command without any pre-configured scope.",
           "type": "string",
           "const": "allow-complete",
@@ -317,6 +329,18 @@
           "type": "string",
           "const": "deny-register",
           "markdownDescription": "Denies the register command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the release_multicast command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-release-multicast",
+          "markdownDescription": "Enables the release_multicast command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the release_multicast command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-release-multicast",
+          "markdownDescription": "Denies the release_multicast command without any pre-configured scope."
         }
       ]
     }

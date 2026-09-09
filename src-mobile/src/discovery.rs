@@ -43,7 +43,18 @@
 //!
 //! Android needs `CHANGE_WIFI_MULTICAST_STATE` and a held
 //! `WifiManager.MulticastLock` for the same reason, and fails the same
-//! silent way without them -- tracked in #610.
+//! silent way without either. Both are here (#610): the permission is
+//! declared in `plugins/headstate-refresh/android/.../AndroidManifest.xml`,
+//! which AGP merges into the app's, and [`browse`] takes the lock for
+//! the length of the browse through
+//! `tauri_plugin_headstate_refresh::multicast::hold`. That module's doc
+//! records why the lock lives in the refresh plugin rather than one of
+//! its own, and why it is held per browse rather than for the process.
+//!
+//! The lock is a no-op everywhere but Android, so nothing about the iOS
+//! or desktop-host path changes: `hold` returns an inert guard when no
+//! holder was installed, which is every platform where a multicast lock
+//! is not a thing that exists.
 
 use mdns_sd::{ServiceDaemon, ServiceEvent, TxtProperties};
 use std::net::IpAddr;
@@ -76,6 +87,19 @@ pub fn fp_prefix(fingerprint: &str) -> String {
 /// `None` when nothing matched in time or mDNS is unavailable here.
 /// Blocking; see the module doc for how the client calls it.
 pub fn browse(fp_prefix: &str, timeout: Duration) -> Option<(IpAddr, u16)> {
+    // BEFORE the daemon, not after: `ServiceDaemon::new` starts the
+    // receive thread and joins the multicast group straight away, and
+    // replies to the first query can arrive before this function gets
+    // its next line. Taking the lock second would let exactly the
+    // records we are here for be filtered.
+    //
+    // Held to the end of the function by the guard, and released by its
+    // `Drop` on every path out -- the `return None` when the daemon
+    // will not start, the ones inside `browse_with`, and an unwind.
+    // Declared FIRST so it drops LAST, after the daemon is shut down:
+    // the daemon's own teardown is still multicast traffic.
+    // Android-only in effect; an inert guard everywhere else.
+    let _multicast = tauri_plugin_headstate_refresh::multicast::hold();
     let daemon = match ServiceDaemon::new() {
         Ok(d) => d,
         Err(e) => {

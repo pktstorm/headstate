@@ -10,6 +10,32 @@
 <tr>
 <td>
 
+`headstate-refresh:allow-acquire-multicast`
+
+</td>
+<td>
+
+Enables the acquire_multicast command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`headstate-refresh:deny-acquire-multicast`
+
+</td>
+<td>
+
+Denies the acquire_multicast command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `headstate-refresh:allow-complete`
 
 </td>
@@ -55,6 +81,32 @@ Enables the register command without any pre-configured scope.
 <td>
 
 Denies the register command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`headstate-refresh:allow-release-multicast`
+
+</td>
+<td>
+
+Enables the release_multicast command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`headstate-refresh:deny-release-multicast`
+
+</td>
+<td>
+
+Denies the release_multicast command without any pre-configured scope.
 
 </td>
 </tr>

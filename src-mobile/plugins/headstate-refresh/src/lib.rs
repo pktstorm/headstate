@@ -35,6 +35,16 @@
 //!
 //! On a desktop host there is no native side: `init` manages nothing but
 //! an inert core, so the app compiles and tests there.
+//!
+//! # The other thing this plugin owns: the Android multicast lock
+//!
+//! [`multicast`] is a second, unrelated-looking responsibility that
+//! lives here for a concrete reason: the manifest that declares
+//! `CHANGE_WIFI_MULTICAST_STATE` is this plugin's, because this plugin
+//! is the one that already owns Android-side lifecycle. Without a held
+//! `WifiManager.MulticastLock` the Wi-Fi driver filters inbound
+//! multicast and `src-mobile/src/discovery.rs` browses into silence
+//! (#610). See that module's doc for why it is not a third plugin.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -49,6 +59,7 @@ use tauri::{
 };
 
 mod bridge;
+pub mod multicast;
 
 use bridge::Bridge;
 
@@ -270,13 +281,24 @@ impl Core {
 /// which registers the OS task and hands Rust the channel the windows
 /// arrive on; on a desktop host it manages an inert [`Scheduler`], so
 /// the app compiles and tests there.
+///
+/// On Android it also installs the [`multicast`] lock holder over the
+/// same plugin handle. That is done here, rather than where the browse
+/// happens, because this is the one place in the app that has a handle
+/// to this plugin at all -- see the `multicast` module doc.
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
     Builder::new("headstate-refresh")
         .setup(|app, _api| {
             #[cfg(target_os = "android")]
-            let bridge: Box<dyn Bridge> = Box::new(bridge::Native(
-                _api.register_android_plugin(PLUGIN_IDENTIFIER, "HeadstateRefreshPlugin")?,
-            ));
+            let bridge: Box<dyn Bridge> = {
+                let handle =
+                    _api.register_android_plugin(PLUGIN_IDENTIFIER, "HeadstateRefreshPlugin")?;
+                // The handle is `Clone` and is only a name plus an
+                // `AppHandle`, so a second one costs nothing and keeps
+                // the two concerns from having to share a `Box`.
+                multicast::install(Box::new(bridge::Native(handle.clone())));
+                Box::new(bridge::Native(handle))
+            };
             #[cfg(target_os = "ios")]
             let bridge: Box<dyn Bridge> = Box::new(bridge::Native(
                 _api.register_ios_plugin(init_plugin_headstate_refresh)?,

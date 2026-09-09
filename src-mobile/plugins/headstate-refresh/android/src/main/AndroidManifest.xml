@@ -13,8 +13,14 @@
          Declared here rather than in a new plugin of its own because
          AGP merges every dependency's manifest into the app's, and this
          plugin is already the one that owns Android-side lifecycle. The
-         lock itself is not yet acquired; see #610. The permission is
-         normal, not dangerous, so it is granted at install with no
-         runtime prompt and no Play Console declaration. -->
+         permission is normal, not dangerous, so it is granted at
+         install with no runtime prompt and no Play Console declaration.
+
+         The lock this permission authorises is taken and released in
+         HeadstateRefreshPlugin.kt (`acquireMulticast` /
+         `releaseMulticast`), driven from src/multicast.rs for the
+         length of one browse and no longer (#610). Keep the two
+         together: a permission with nothing acquiring it is what made
+         the browse fail silently in the first place. -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
 </manifest>

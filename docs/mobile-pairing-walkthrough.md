@@ -257,6 +257,33 @@ enforce and no CI job can.
       characters of the desktop fingerprint. Any other service type in the
       app's `NSBonjourServiceTypes` is a finding.
 
+## 8a. Android: the Wi-Fi multicast lock (Android phone only)
+
+Android's Wi-Fi driver filters inbound multicast unless the app holds a
+`WifiManager.MulticastLock`, so without one an mDNS browse returns
+nothing and looks exactly like "the desktop is not on this network"
+(#610). Nothing in CI can catch that: there is no Android
+instrumentation test, and a browse that finds nothing is a valid result.
+This section is the only check the lock gets.
+
+- [ ] 8a.1 With the desktop on the same wifi, change the desktop's LAN
+      address (reconnect wifi or toggle it) and reopen the app. The phone
+      finds the desktop again through mDNS rather than only the addresses
+      stored at pairing. This is step 8.3 for Android, and it is the
+      whole point of the lock: before the fix it failed here silently.
+- [ ] 8a.2 In `adb logcat` during that reconnect, confirm
+      `multicast lock acquired` is followed by `multicast lock released`.
+      A missing release is a finding: the lock is a battery drain the
+      user cannot see.
+- [ ] 8a.3 Negative: during a browse (the few seconds after a failed
+      reconnect), `adb shell dumpsys wifi | grep -i multicast` lists a
+      held lock tagged `headstate-mdns`. After the browse ends it is
+      gone. A lock still listed a minute later is a finding.
+- [ ] 8a.4 Confirm no line matching `could not take the Wi-Fi multicast
+      lock` appears in logcat. If one does, record it verbatim — that
+      warning exists so this failure can never again be silent, and it
+      names the reason.
+
 ## 9. Desktop closed: the unreachable banner
 
 - [ ] 9.1 With the phone connected, quit desktop Headstate.
