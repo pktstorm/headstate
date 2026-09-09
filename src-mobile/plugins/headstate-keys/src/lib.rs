@@ -399,7 +399,16 @@ mod tests {
     #[test]
     fn the_test_vector_is_the_desktops() {
         assert_eq!(CANONICAL.len(), 203);
-        assert_eq!(format!("{:x}", Sha256::digest(CANONICAL)), CANONICAL_SHA256);
+        // `sha2` 0.11 returns a `hybrid-array` `Array`, which has no
+        // `LowerHex`, so `{:x}` no longer formats a digest.
+        let hex = Sha256::digest(CANONICAL)
+            .iter()
+            .fold(String::with_capacity(64), |mut s, b| {
+                use std::fmt::Write;
+                let _ = write!(s, "{b:02x}");
+                s
+            });
+        assert_eq!(hex, CANONICAL_SHA256);
     }
 
     #[test]

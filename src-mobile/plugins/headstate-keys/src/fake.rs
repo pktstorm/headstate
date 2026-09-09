@@ -73,10 +73,13 @@ impl Fake {
 
     fn public_keys(held: &Held) -> PublicKeys {
         PublicKeys {
+            // `to_sec1_point` is `to_encoded_point` renamed in
+            // elliptic-curve 0.14; `false` still means uncompressed, so
+            // this is the same 65 bytes the desktop parses back.
             ecdsa_p256: held
                 .ecdsa
                 .verifying_key()
-                .to_encoded_point(false)
+                .to_sec1_point(false)
                 .as_bytes()
                 .to_vec(),
             mldsa_65: held
@@ -100,7 +103,7 @@ impl Fake {
         let mut wire = WirePublicKeys::from_public(&Self::public_keys(&held));
         match self.tamper {
             Some(Tamper::CompressedEcdsaKey) => {
-                let compressed = held.ecdsa.verifying_key().to_encoded_point(true);
+                let compressed = held.ecdsa.verifying_key().to_sec1_point(true);
                 wire.ecdsa_p256 = crate::wire::encode(compressed.as_bytes());
             }
             Some(Tamper::ShortMldsaKey) => {

@@ -164,7 +164,18 @@ impl SessionIdentity {
 /// SHA256 of a certificate's DER as 64 lowercase hex characters, the
 /// fingerprint convention shared with the desktop.
 pub fn fingerprint_of(der: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(der))
+    // Byte at a time rather than `{:x}`: `sha2` 0.11 returns a
+    // `hybrid-array` `Array`, which unlike the 0.10 `GenericArray` has no
+    // `LowerHex`. This is character for character what the desktop's
+    // `identity::fingerprint_of` produces -- the two have to agree, since
+    // this string is the `client_fp` inside the pairing proof.
+    Sha256::digest(der)
+        .iter()
+        .fold(String::with_capacity(64), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// Where the keys live. See the module docs for the two implementations.
@@ -273,10 +284,13 @@ fn decode(b64: &str, what: &str) -> Result<Vec<u8>, KeyError> {
 
 fn public_keys_of(pair: &StepUpPair) -> PublicKeys {
     let keys = PublicKeys {
+        // `to_sec1_point` is `to_encoded_point` renamed in
+        // elliptic-curve 0.14; `false` still means uncompressed, so the
+        // 65 bytes the desktop parses back are unchanged.
         ecdsa_p256: pair
             .ecdsa
             .verifying_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .to_vec(),
         mldsa_65: Some(pair.mldsa.expanded_key().verifying_key().encode().to_vec()),

@@ -61,12 +61,9 @@ impl Phone {
     /// The `signing_keys` object of the pair request.
     fn signing_keys(&self) -> SigningKeys {
         SigningKeys {
-            ecdsa_p256: BASE64.encode(
-                self.ecdsa
-                    .verifying_key()
-                    .to_encoded_point(false)
-                    .as_bytes(),
-            ),
+            // `to_sec1_point` since elliptic-curve 0.14; `false` still
+            // means uncompressed, so the encoding is unchanged.
+            ecdsa_p256: BASE64.encode(self.ecdsa.verifying_key().to_sec1_point(false).as_bytes()),
             mldsa_65: Some(BASE64.encode(self.mldsa.expanded_key().verifying_key().encode())),
         }
     }

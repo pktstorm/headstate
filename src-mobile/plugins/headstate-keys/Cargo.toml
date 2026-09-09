@@ -31,7 +31,10 @@ thiserror = "2"
 # The native sides speak JSON, and JSON has no bytes: every key,
 # signature and DER blob crosses the bridge as standard base64 with
 # padding, the same encoding the pair request uses for the public keys.
-base64 = "0.22"
+# 0.23 to match `src-mobile/Cargo.toml` and the desktop; the alphabet and
+# the `Engine` API are unchanged, so this is the version spelling
+# agreeing across the three manifests rather than a behaviour change.
+base64 = "0.23"
 # The session certificate. rustls needs the private key bytes to present
 # a client identity, so the session key is made here, not in the
 # keystore (see the crate docs). On aws-lc-rs like the rest of the
@@ -56,13 +59,15 @@ tauri = { version = "2.11", default-features = false, features = ["wry"] }
 # The fake backend the tests run against signs in software with the same
 # crates, versions and features the desktop verifier (src-tauri
 # remote/stepup.rs) uses, so "the fake's signature verifies here" means
-# "a signature in this encoding verifies there". Neither crate is linked
-# into the phone: on a device the signer is the Secure Enclave or the
-# Android Keystore.
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+# "a signature in this encoding verifies there". That equivalence is the
+# whole point of these three lines, so they move when the desktop's do --
+# p256 0.14 and sha2 0.11 on `digest` 0.11. Neither crate is linked into
+# the phone: on a device the signer is the Secure Enclave or the Android
+# Keystore.
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
 ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc"] }
 # SHA256 of the canonical-bytes test vector, pinned to the desktop's.
-sha2 = "0.10"
+sha2 = "0.11"
 # Proves the session identity is what rustls wants: the key loads and
 # matches the certificate. Already in the mobile crate's graph, and on
 # the same provider the client (src-mobile/src/client.rs) builds on --
