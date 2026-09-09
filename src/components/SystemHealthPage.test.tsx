@@ -1,16 +1,48 @@
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { HealthSample } from "@/types/pr";
+import type {
+  Artifact,
+  DockerDiskUsage,
+  Footprint,
+  HealthSample,
+  Venv,
+  WorktreeRepo,
+} from "@/types/pr";
 import { stubViewport } from "@/test-utils";
 
 const liveFn = vi.hoisted(() => vi.fn<() => Promise<HealthSample>>());
 const historyFn = vi.hoisted(() => vi.fn<() => Promise<HealthSample[]>>());
+const footprintFn = vi.hoisted(() => vi.fn<() => Promise<Footprint>>());
 
-// The two hooks, not the whole `api/hooks` module's transitive world:
-// that file imports every command the app has, and mocking it wholesale
-// would tie this test to all of them. The stand-ins keep the real
-// TanStack behaviour so loading and error states are the genuine ones.
+/// Every source the DISK half can reach, as one spy each.
+///
+/// Separate spies rather than one, because the assertion that matters
+/// is per-command: "nothing sized on mount" has to be provable about
+/// each of the four, and a single counter would pass while three of
+/// them fired. The DISCOVERY calls are spied too -- `scan_artifacts`
+/// and `scan_venvs` are seconds in their own right, so a panel that
+/// deferred only the sizing would still have paid most of the cost on
+/// view open.
+const disk = vi.hoisted(() => ({
+  worktrees: vi.fn<() => Promise<WorktreeRepo[]>>(),
+  worktreeSizes: vi.fn<(path: string) => Promise<Map<string, number>>>(),
+  artifacts: vi.fn<() => Promise<Artifact[]>>(),
+  artifactSizes: vi.fn<() => Promise<Map<string, number>>>(),
+  venvs: vi.fn<() => Promise<Venv[]>>(),
+  venvSizes: vi.fn<() => Promise<Map<string, number>>>(),
+  dockerDisk: vi.fn<() => Promise<DockerDiskUsage>>(),
+}));
+
+// The hooks this page uses, not the whole `api/hooks` module's
+// transitive world: that file imports every command the app has, and
+// mocking it wholesale would tie this test to all of them. The
+// stand-ins keep the real TanStack behaviour so loading and error
+// states are the genuine ones -- and, for the disk hooks, so that
+// `enabled` genuinely decides whether the query function runs. That is
+// the whole subject of the tests below: a stand-in that ignored
+// `enabled` would make them pass while the real thing walked 147
+// worktrees on view open.
 vi.mock("../api/hooks", () => ({
   useSystemHealth: (enabled: boolean) =>
     useQuery({ queryKey: ["system-health"], queryFn: liveFn, enabled, retry: false }),
@@ -18,6 +50,71 @@ vi.mock("../api/hooks", () => ({
     useQuery({
       queryKey: ["system-health-history"],
       queryFn: historyFn,
+      enabled,
+      retry: false,
+    }),
+  useSystemFootprint: (enabled: boolean) =>
+    useQuery({
+      queryKey: ["system-footprint"],
+      queryFn: footprintFn,
+      enabled,
+      retry: false,
+    }),
+  useWorktrees: (enabled = true) =>
+    useQuery({ queryKey: ["worktrees"], queryFn: disk.worktrees, enabled, retry: false }),
+  useArtifacts: (enabled: boolean) =>
+    useQuery({ queryKey: ["artifacts"], queryFn: disk.artifacts, enabled, retry: false }),
+  useVenvs: (enabled: boolean) =>
+    useQuery({ queryKey: ["venvs"], queryFn: disk.venvs, enabled, retry: false }),
+  // The three size hooks return the aggregate shapes their real
+  // counterparts do -- a map plus progress counters -- rather than a
+  // raw query, because that is the contract the panel reads.
+  useAllWorktreeSizes: (paths: string[], enabled: boolean) => {
+    const q = useQuery({
+      queryKey: ["worktree-sizes", paths.join()],
+      queryFn: () => disk.worktreeSizes(paths.join()),
+      enabled: enabled && paths.length > 0,
+      retry: false,
+    });
+    return {
+      sizes: q.data ?? new Map<string, number>(),
+      pending: q.isFetching ? 1 : 0,
+      total: paths.length,
+    };
+  },
+  useArtifactSizes: (artifacts: Artifact[], enabled: boolean) => {
+    const q = useQuery({
+      queryKey: ["artifact-sizes"],
+      queryFn: disk.artifactSizes,
+      enabled: enabled && artifacts.length > 0,
+      retry: false,
+    });
+    return {
+      sizes: q.data ?? new Map<string, number>(),
+      ages: new Map<string, number>(),
+      pending: q.isFetching ? 1 : 0,
+      total: 1,
+    };
+  },
+  useVenvSizes: (venvs: Venv[], enabled: boolean) => {
+    const q = useQuery({
+      queryKey: ["venv-sizes"],
+      queryFn: disk.venvSizes,
+      enabled: enabled && venvs.length > 0,
+      retry: false,
+    });
+    return {
+      sizes: q.data ?? new Map<string, number>(),
+      idle: new Map<string, number>(),
+      measuring: q.isFetching,
+      pending: q.isFetching ? 1 : 0,
+      total: 1,
+    };
+  },
+  useDockerDiskUsage: (enabled: boolean) =>
+    useQuery({
+      queryKey: ["docker-disk"],
+      queryFn: disk.dockerDisk,
       enabled,
       retry: false,
     }),
@@ -83,6 +180,26 @@ const sample = (over: Partial<HealthSample> = {}): HealthSample => ({
   thermal: "nominal",
   networks: [{ name: "en0", rx_bytes: 1024 ** 3, tx_bytes: 512 * 1024 ** 2 }],
   uptime_secs: 3 * 86_400 + 4 * 3600,
+  ...over,
+});
+
+/// A footprint with all three groups present, so a test asserting an
+/// ABSENT process has to say so explicitly -- the same discipline as
+/// `sample` above, and for the same reason: absence is the interesting
+/// case here and must never be the accidental default.
+const footprint = (over: Partial<Footprint> = {}): Footprint => ({
+  sampled_at: new Date().toISOString(),
+  app: { pid: 4242, name: "headstate", cpu_percent: 3, memory: 220 * 1024 ** 2 },
+  children: [
+    { pid: 5001, name: "git", cpu_percent: 180, memory: 64 * 1024 ** 2 },
+    { pid: 5002, name: "gh", cpu_percent: 4, memory: 32 * 1024 ** 2 },
+  ],
+  docker_daemon: {
+    pid: 900,
+    name: "com.docker.backend",
+    cpu_percent: 1,
+    memory: 4 * 1024 ** 3,
+  },
   ...over,
 });
 
@@ -240,11 +357,64 @@ describe("thermalColor", () => {
   });
 });
 
+/// Everything the disk half could reach, primed to resolve.
+///
+/// Primed deliberately, not left rejecting: a test that proves nothing
+/// fired is only worth something if the calls WOULD have succeeded had
+/// they been made. A spy that throws would pass the same assertion for
+/// the wrong reason.
+function primeDisk() {
+  disk.worktrees.mockResolvedValue([
+    { identity: "pktstorm/headstate", name: "headstate", path: "/code/hs", worktrees: [] },
+  ]);
+  disk.worktreeSizes.mockResolvedValue(new Map([["/code/hs/wt", 3 * 1024 ** 3]]));
+  disk.artifacts.mockResolvedValue([
+    {
+      path: "/code/hs/target",
+      kind: "cargo-target",
+      repo_path: "/code/hs",
+      size_bytes: null,
+      idle_secs: null,
+    } as unknown as Artifact,
+  ]);
+  disk.artifactSizes.mockResolvedValue(new Map([["/code/hs/target", 5 * 1024 ** 3]]));
+  disk.venvs.mockResolvedValue([
+    { path: "/venvs/a", project: "a", source: null, size_bytes: null, idle_secs: null } as
+      unknown as Venv,
+  ]);
+  disk.venvSizes.mockResolvedValue(new Map([["/venvs/a", 700 * 1024 ** 2]]));
+  disk.dockerDisk.mockResolvedValue({
+    images_bytes: 2 * 1024 ** 3,
+    images_reclaimable_bytes: 0,
+    build_cache_bytes: 1024 ** 3,
+    volumes_bytes: 0,
+    volumes_reclaimable_bytes: 0,
+  });
+}
+
+/// The footprint panel itself, so row assertions do not collect the
+/// network table's rows from the panel above it.
+const footprintPanel = () =>
+  screen.getByText("What Headstate is costing").closest("section") as HTMLElement;
+
+/// Every spy the disk half can reach, for the "nothing fired" assertion.
+const diskSpies = () => [
+  disk.worktrees,
+  disk.worktreeSizes,
+  disk.artifacts,
+  disk.artifactSizes,
+  disk.venvs,
+  disk.venvSizes,
+  disk.dockerDisk,
+];
+
 describe("SystemHealthPage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     liveFn.mockResolvedValue(sample());
     historyFn.mockResolvedValue([]);
+    footprintFn.mockResolvedValue(footprint());
+    primeDisk();
     // Back to the desktop build on a local machine, so a mobile test
     // that flips these cannot leak into the one after it.
     mobileBuild.current = false;
@@ -484,7 +654,200 @@ describe("the panels are laid out for a desktop", () => {
     await screen.findByText("1.25");
     const grid = container.querySelector(".md\\:grid-cols-2");
     expect(grid).not.toBeNull();
-    expect(within(grid as HTMLElement).getAllByRole("heading").length).toBe(5);
+    // Six panel headings, plus the "Disk" subheading inside the
+    // footprint panel. Counted rather than asserted loosely because a
+    // panel silently disappearing from the layout is exactly the kind
+    // of regression this catches -- #665 shipped once with its whole
+    // panel missing.
+    const headings = within(grid as HTMLElement).getAllByRole("heading");
+    expect(headings.filter((h) => h.tagName === "H2").length).toBe(6);
+    expect(headings.map((h) => h.textContent)).toContain(
+      "What Headstate is costing",
+    );
+  });
+});
+
+/// The panel #665 is actually about.
+///
+/// Two halves with opposite rules: the live half polls and must never
+/// print a zero for a process that is not running; the disk half is
+/// slow and must never run without being asked.
+describe("what Headstate is costing", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    liveFn.mockResolvedValue(sample());
+    historyFn.mockResolvedValue([]);
+    footprintFn.mockResolvedValue(footprint());
+    primeDisk();
+  });
+
+  /// THE test.
+  ///
+  /// `size_worktrees` is ~13s for 147 worktrees, and over the remote
+  /// surface a call that slow times out at 120s -- issue #661, exactly.
+  /// So nothing here may run because a view was opened. Every disk
+  /// source is asserted individually: a single counter would pass while
+  /// three of the four fired.
+  ///
+  /// Discovery is included on purpose. `scan_artifacts` and
+  /// `scan_venvs` take seconds themselves, so a panel that deferred
+  /// only the sizing would still have paid most of the cost on mount.
+  it("measures no disk at all until asked", async () => {
+    show();
+    // Waited for the page to be fully painted before asserting, so this
+    // is "nothing fired once everything settled" rather than "nothing
+    // had fired yet in the first tick", which would pass trivially.
+    await screen.findByText("1.25");
+    await screen.findByRole("button", { name: /Measure disk use/ });
+    await waitFor(() => expect(footprintFn).toHaveBeenCalled());
+
+    for (const spy of diskSpies()) expect(spy).not.toHaveBeenCalled();
+  });
+
+  /// The other half of the same requirement: deferring is only correct
+  /// if the action actually works. A gate that never opens is not a
+  /// safe panel, it is a missing feature -- which is how this issue got
+  /// reopened.
+  it("measures the disk once, and only once, the button is pressed", async () => {
+    show();
+    const button = await screen.findByRole("button", { name: /Measure disk use/ });
+    for (const spy of diskSpies()) expect(spy).not.toHaveBeenCalled();
+
+    fireEvent.click(button);
+
+    await waitFor(() => {
+      expect(disk.worktrees).toHaveBeenCalled();
+      expect(disk.artifacts).toHaveBeenCalled();
+      expect(disk.venvs).toHaveBeenCalled();
+      expect(disk.dockerDisk).toHaveBeenCalled();
+    });
+    // Sizing follows discovery, since it needs the paths discovery found.
+    await waitFor(() => {
+      expect(disk.worktreeSizes).toHaveBeenCalled();
+      expect(disk.artifactSizes).toHaveBeenCalled();
+      expect(disk.venvSizes).toHaveBeenCalled();
+    });
+  });
+
+  /// The figures must be the ones the other views show, summed from
+  /// the same commands -- not a second count that could disagree.
+  it("shows the sizes the other views measured", async () => {
+    show();
+    fireEvent.click(await screen.findByRole("button", { name: /Measure disk use/ }));
+
+    // Each row carries the figure its own source reported, summed but
+    // not recomputed: 3 GB of worktrees, 5 GB of artifacts, 700 MB of
+    // virtualenvs, and Docker's images + build cache + volumes (2 GB +
+    // 1 GB + 0) as the single 3 GB the Docker page shows.
+    expect(await screen.findByText("3.0 GB", { exact: false })).toBeTruthy();
+    await waitFor(() => {
+      expect(screen.getByText("5.0 GB", { exact: false })).toBeTruthy();
+      expect(screen.getByText("700 MB", { exact: false })).toBeTruthy();
+      // Two 3.0 GB figures: worktrees, and Docker's three lines added.
+      expect(screen.getAllByText("3.0 GB", { exact: false }).length).toBe(2);
+    });
+    expect(screen.getByText(/same figures the Worktrees, Artifacts and Docker/)).toBeTruthy();
+  });
+
+  /// The mirror of "absent is never zero", and the case that is easy to
+  /// get backwards: once the scan HAS run and found nothing, saying
+  /// "not measured" reports a completed look as a failure to look. A
+  /// machine with no virtualenvs is not an unmeasured machine.
+  it("says none found, not not-measured, when a scan came back empty", async () => {
+    disk.venvs.mockResolvedValue([]);
+    show();
+    fireEvent.click(await screen.findByRole("button", { name: /Measure disk use/ }));
+    await waitFor(() => expect(screen.getByText("None found")).toBeTruthy());
+    // The sizing command must not have run for a set with nothing in it.
+    expect(disk.venvSizes).not.toHaveBeenCalled();
+  });
+
+  /// The cost is stated before the click, not discovered after it. A
+  /// button that says only "Measure" and then appears to hang for
+  /// thirty seconds is how a user learns to distrust the view.
+  it("says what measuring will cost before it is asked to", async () => {
+    show();
+    await screen.findByRole("button", { name: /Measure disk use/ });
+    expect(screen.getByText(/takes tens of seconds/)).toBeTruthy();
+  });
+
+  /// ABSENT IS NEVER ZERO, on the live half.
+  ///
+  /// An empty `children` is the ORDINARY state -- `git` runs in bursts
+  /// and is gone between refreshes -- so it must read as "none right
+  /// now", never as a table of tools sitting at 0%. A zeroed row here
+  /// would tell a user their fan-out is idle when it never started.
+  it("renders tools that are not running as absent, never as zero", async () => {
+    footprintFn.mockResolvedValue(footprint({ children: [], docker_daemon: null }));
+    show();
+    await screen.findByText(/None running at this moment/);
+    // No fabricated ROWS: nothing claims a tool exists at no cost.
+    //
+    // Checked as rows rather than by name, because the sentence
+    // explaining the empty state names `git` and `gh` in prose -- and
+    // that copy is the point of this test, not a collision with it.
+    // What must not exist is a table row for a process that is not
+    // running. Two rows survive inside this panel: the header and the
+    // app itself, which IS running.
+    const rows = within(footprintPanel()).getAllByRole("row");
+    expect(rows).toHaveLength(2);
+    expect(rows[1].textContent).toContain("headstate");
+    expect(screen.queryByText("com.docker.backend")).toBeNull();
+    expect(screen.queryByText("0%")).toBeNull();
+    expect(screen.queryByText("0 B")).toBeNull();
+    // And Docker not running says so, rather than showing a zero-cost
+    // daemon -- which is the common case, not the exotic one.
+    expect(screen.getByText("Not running.")).toBeTruthy();
+  });
+
+  /// The same rule for our own process, whose absence would be a failed
+  /// lookup rather than an idle app.
+  it("says so when the platform will not report our own process", async () => {
+    footprintFn.mockResolvedValue(footprint({ app: null }));
+    show();
+    expect(
+      await screen.findByText(/did not report our own process/),
+    ).toBeTruthy();
+  });
+
+  /// The live half, when everything is running.
+  it("names each running process with its pid, cpu and memory", async () => {
+    show();
+    expect(await screen.findByText("headstate")).toBeTruthy();
+    // By ROW, since `git` and `gh` also appear in the prose beside the
+    // tables. A row is what proves the process was actually listed.
+    const rows = within(footprintPanel())
+      .getAllByRole("row")
+      .map((r) => r.textContent);
+    expect(rows.some((t) => t?.includes("git") && t.includes("5001"))).toBe(true);
+    expect(rows.some((t) => t?.includes("gh") && t.includes("5002"))).toBe(true);
+    expect(rows.some((t) => t?.includes("com.docker.backend"))).toBe(true);
+    // Memory as a size, not a byte count nobody can read.
+    expect(screen.getByText("64 MB")).toBeTruthy();
+  });
+
+  /// CPU here is a share of ONE core, so `git` on three of them reads
+  /// 280%. Clamping it to 100 -- which every other percentage on this
+  /// page legitimately does -- would report a busy process as a merely
+  /// saturated one and hide the fan-out the panel exists to show.
+  it("does not clamp a process using more than one core to 100%", async () => {
+    footprintFn.mockResolvedValue(
+      footprint({
+        children: [{ pid: 5001, name: "git", cpu_percent: 280, memory: 1024 ** 2 }],
+      }),
+    );
+    show();
+    expect(await screen.findByText("280%")).toBeTruthy();
+    expect(screen.getAllByText(/of one core/).length).toBeGreaterThan(0);
+  });
+
+  /// The daemon is not ours and not our child. Reporting it is right --
+  /// a 4 GB daemon is a cost the user attributes to this app -- but it
+  /// must be reported apart from the groups we do own.
+  it("keeps the Docker daemon separate from Headstate's own processes", async () => {
+    show();
+    await screen.findByText("com.docker.backend");
+    expect(screen.getByText(/Not started by Headstate/)).toBeTruthy();
   });
 });
 
@@ -499,6 +862,12 @@ describe("SystemHealthPage on the phone", () => {
     vi.clearAllMocks();
     liveFn.mockResolvedValue(sample());
     historyFn.mockResolvedValue([]);
+    // The footprint panel is part of this page too, so it is primed
+    // here as well -- otherwise these tests would assert against a
+    // page half of which never resolved, which is not the page a user
+    // sees.
+    footprintFn.mockResolvedValue(footprint());
+    primeDisk();
     mobileBuild.current = true;
     connection.current = { kind: "connected", desktop: "studio", lastPoll: null };
   });
@@ -555,6 +924,8 @@ describe("SystemHealthPage on the desktop is untouched by the mobile work", () =
     vi.clearAllMocks();
     liveFn.mockResolvedValue(sample());
     historyFn.mockResolvedValue([]);
+    footprintFn.mockResolvedValue(footprint());
+    primeDisk();
     mobileBuild.current = false;
     connection.current = { kind: "local" };
   });

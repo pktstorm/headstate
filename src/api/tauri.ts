@@ -32,6 +32,7 @@ import type {
   DockerDiskUsage,
   DockerImage,
   DockerState,
+  Footprint,
   HealthSample,
   History,
   ImageRemovalOutcome,
@@ -674,3 +675,25 @@ export const systemHealth = () => call<HealthSample>("system_health");
 /// `SystemHealthPage`.
 export const systemHealthHistory = () =>
   call<HealthSample[]>("system_health_history");
+
+/// What Headstate itself is costing, right now.
+///
+/// The LIVE half of that panel only: this process, the `git`/`gh`/
+/// Docker subprocesses we spawn, and the Docker daemon if it is up. A
+/// kernel read of the already-open process table -- no subprocess, no
+/// directory walk -- so it is as cheap as `systemHealth` and safe to
+/// poll beside it.
+///
+/// There is deliberately no companion wrapper for the DISK half. Those
+/// figures come from `sizeWorktrees`, `sizeArtifacts`, `sizeVenvs` and
+/// `dockerDiskUsage`, which already exist above and are what the
+/// Worktrees, Artifacts and Docker views show -- so the panel summarises
+/// the same commands rather than measuring anything a second time. They
+/// take seconds to tens of seconds (`size_worktrees` was the #661
+/// timeout at ~13s for 147 worktrees), which is why they stay behind an
+/// explicit action in `SystemHealthPage` and must never share a call
+/// site with something this cheap.
+///
+/// `Class::Read`, so the phone can ask a paired desktop for this and
+/// get the DESKTOP's cost -- the only reading that makes sense there.
+export const systemFootprint = () => call<Footprint>("system_footprint");

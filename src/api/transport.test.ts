@@ -198,6 +198,7 @@ const ROWS: Row[] = [
   // caller to scope or to ask for more of.
   row(api.systemHealth, [], "system_health"),
   row(api.systemHealthHistory, [], "system_health_history"),
+  row(api.systemFootprint, [], "system_footprint"),
 ];
 
 describe("tauri.ts wrappers through the transport", () => {

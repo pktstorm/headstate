@@ -782,3 +782,59 @@ interface HealthInterface {
   rx_bytes: number;
   tx_bytes: number;
 }
+
+/// What Headstate itself is costing at one instant, mirroring the Rust
+/// `health::Footprint` in `src-tauri/src/health/footprint.rs`.
+///
+/// # Absent is not zero, again
+///
+/// The same rule as `HealthSample`, and here it is easier to get wrong,
+/// because every field that can be missing is missing in the ORDINARY
+/// case rather than the exotic one. `git` is not running most of the
+/// time; most machines have no Docker daemon up. So a UI that defaults
+/// any of these to a zero does not merely mislead in an edge case -- it
+/// tells almost every user, almost always, that a tool is running and
+/// idle when it never started.
+export interface Footprint {
+  /// RFC 3339, stamped by the Rust side at the moment of the reading.
+  sampled_at: string;
+  /// The Tauri host process, or `null` if the platform would not report
+  /// our own PID. Not expected anywhere this ships, but a fabricated
+  /// zero for "we could not find ourselves" would read as an idle app.
+  app: FootprintProcess | null;
+  /// One entry per LIVE `git` / `gh` / `du` / `docker` process.
+  ///
+  /// Empty means none were running at that instant, which is the
+  /// ordinary state between refreshes -- NOT a row of zeroes. Several
+  /// entries may share a `name`: a worktree scan runs many `git` at
+  /// once, and the Rust side deliberately does not collapse them,
+  /// because that fan-out is the thing this panel exists to show.
+  ///
+  /// Already sorted biggest-first with ties broken by PID, so the
+  /// caller neither has to sort nor should: the stable order is what
+  /// stops the list reshuffling between five-second polls.
+  children: FootprintProcess[];
+  /// The Docker daemon, or `null` when Docker is not running -- which
+  /// is the common answer, and precisely why it must not be a zero.
+  docker_daemon: FootprintProcess | null;
+}
+
+/// One process in a `Footprint`.
+///
+/// Exported, unlike the four `HealthSample` helpers above, because
+/// `SystemHealthPage` renders a row component that takes one of these
+/// directly and therefore has to name the type.
+export interface FootprintProcess {
+  pid: number;
+  /// The executable's own name as the OS reports it -- `git`, or
+  /// `git.exe` on Windows. Never a full path.
+  name: string;
+  /// CPU use as a percentage of ONE core, so legitimately above 100 for
+  /// a process using more than one, which `git` does. The UI must not
+  /// clamp this the way it can clamp `HealthSample.cpu_percent`.
+  cpu_percent: number;
+  /// Resident set size in bytes: physical RAM held right now. Not
+  /// virtual size, which on anything linking a webview is a large
+  /// number that means nothing to a reader.
+  memory: number;
+}
