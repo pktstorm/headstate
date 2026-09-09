@@ -870,6 +870,47 @@ export interface Footprint {
   /// The Docker daemon, or `null` when Docker is not running -- which
   /// is the common answer, and precisely why it must not be a zero.
   docker_daemon: FootprintProcess | null;
+  /// The biggest CPU consumers on the WHOLE machine, biggest first
+  /// (#687).
+  ///
+  /// Not Headstate's -- the three fields above are ours. This is what
+  /// the CPU detail page shows, because "CPU is at 80%" is a symptom
+  /// and "these are the processes" is the answer.
+  ///
+  /// A bounded TOP N (eight), never the full list: 1400-odd rows is not
+  /// an answer to "what is using my CPU", it is the same filtering
+  /// problem handed back to the reader. `process_count` says how many
+  /// there were, so a short list never has to be mistaken for the whole
+  /// machine.
+  ///
+  /// OPTIONAL, and the optionality is load-bearing rather than
+  /// defensive. The phone reads this over the LAN from a desktop whose
+  /// version it does not negotiate (`remote::surface` has no protocol
+  /// version), so a companion updated ahead of its desktop genuinely
+  /// receives a `Footprint` without this field. That absence is a
+  /// different fact from an empty list -- "that desktop cannot tell us"
+  /// versus "nothing is running", the latter being impossible on a
+  /// booted machine -- and the UI renders the two differently. Typing
+  /// it as required would make the compiler certify a guarantee the
+  /// wire does not give.
+  top_cpu?: FootprintProcess[];
+  /// The same, by resident size. A SEPARATE list rather than `top_cpu`
+  /// re-sorted: the process pinning a core is rarely the one holding
+  /// 8 GB, and re-sorting one list by the other metric would show the
+  /// top of a set that was chosen by the wrong measure.
+  ///
+  /// Optional for the same version-skew reason as `top_cpu`.
+  top_memory?: FootprintProcess[];
+  /// How many processes were running when the two lists were taken.
+  ///
+  /// So the UI can say what it is not showing. Eight of 1436 is a
+  /// defensible answer; eight presented as everything is not.
+  ///
+  /// Optional for the same reason as the two lists. When it is absent
+  /// the UI omits the "of N running" sentence rather than inventing a
+  /// total -- a count that does not exist must not be rendered as one
+  /// that does.
+  process_count?: number;
 }
 
 /// One process in a `Footprint`.

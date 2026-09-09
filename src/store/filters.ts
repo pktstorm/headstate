@@ -30,6 +30,38 @@ export const ALL_VIEWS = [
 
 export type View = (typeof ALL_VIEWS)[number];
 
+/// The System Health sub-pages, in sidebar order (#687).
+///
+/// "overview" is the landing page and stays exactly what it was: the
+/// panels people open the view for. The rest are DRILL-DOWNS from it,
+/// each answering the "why" a panel can only raise -- a panel says
+/// memory is at 88%, the Memory page says which processes.
+///
+/// A separate axis from `panel` rather than three more values in it.
+/// `panel` is the My PRs list-versus-stats and Docker images-versus-
+/// builds switch; widening it would mean every consumer of `panel` had
+/// to know about pages that only exist inside one view, and a health
+/// page persisted there would decide what Docker shows. Views that do
+/// not have sub-pages should not have to name these.
+export const ALL_HEALTH_PAGES = [
+  "overview",
+  "cpu",
+  "memory",
+  "disk",
+  "network",
+  // Battery, thermal and uptime together, and last. None of the three
+  // has enough of its own to carry a page: battery is two numbers with
+  // no history behind them, thermal is a single coarse label the
+  // platform publishes, and uptime is one figure. What they share is
+  // that they describe the machine's CONDITION rather than its work,
+  // which is a real grouping and not a leftovers drawer -- and it is
+  // the drawer test that decided it, since a page per figure would be
+  // three sidebar rows leading to one stat each.
+  "power",
+] as const;
+
+export type HealthPage = (typeof ALL_HEALTH_PAGES)[number];
+
 interface FilterStore {
   /// Filters are PER VIEW: a repo selected in My PRs must not leak into
   /// Worktrees, which has an entirely different repo list.
@@ -47,6 +79,16 @@ interface FilterStore {
   applyPreset: (filters: Filters) => void;
   setView: (view: View) => void;
   setPanel: (panel: "list" | "stats" | "builds") => void;
+  /// Which System Health page is open (#687).
+  ///
+  /// Deliberately NOT persisted, unlike `view` and `panel`. Those
+  /// restore what you were working on; this is a drill-down taken to
+  /// answer one question, and relaunching straight onto "Memory" would
+  /// skip the overview -- the page that says whether there is anything
+  /// to drill into today. The landing page has to be the landing page
+  /// on launch, or it stops being one.
+  healthPage: HealthPage;
+  setHealthPage: (page: HealthPage) => void;
   /// How tightly PR rows pack.
   ///
   /// A global preference rather than per-view: it is about the user's
@@ -165,8 +207,22 @@ export const useFilters = create<FilterStore>()(
       // PRs means nothing on the review list, and carrying it across
       // would let a later batch act on rows the user cannot see.
       setView: (view) =>
-        set({ view, selectedPr: null, checked: [], anchor: null, cursor: null }),
+        set({
+          view,
+          selectedPr: null,
+          checked: [],
+          anchor: null,
+          cursor: null,
+          // Leaving System Health and coming back lands on the
+          // overview, for the same reason it is not persisted: the
+          // drill-down answered a question that is now behind you, and
+          // returning to a detail page skips the one that says whether
+          // there is a new question worth asking.
+          healthPage: "overview",
+        }),
       setPanel: (panel) => set({ panel }),
+      healthPage: "overview",
+      setHealthPage: (healthPage) => set({ healthPage }),
       selectedPr: null,
       selectPr: (selectedPr) => set({ selectedPr }),
       checked: [],
