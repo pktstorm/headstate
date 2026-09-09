@@ -281,3 +281,26 @@ export function totalSize(items: { size_bytes: number | null }[]): number | null
   if (measured.length === 0) return null;
   return measured.reduce((n, w) => n + (w.size_bytes ?? 0), 0);
 }
+
+/// How old the answers on a repository's rows are, as prose, or `null`
+/// when they are fresh enough not to mention.
+///
+/// Every merge and upstream verdict is computed against `origin/*` refs
+/// already on disk -- the scan never goes to the network, deliberately,
+/// because fetching every remote would turn a one-second view into a
+/// thirty-second one. What was missing is saying so: on one machine a
+/// repository's refs were 12 days old while its rows read like the
+/// present tense (#702).
+///
+/// Silent below a day. Under that the note is noise -- a fetch this
+/// morning is not a caveat -- and a caveat shown always is a caveat
+/// nobody reads. `null` fetch time is NOT silent: never fetched is the
+/// stalest state there is, not the freshest.
+export function refAge(fetchedAt: string | null, now = new Date()): string | null {
+  if (fetchedAt === null) return "never fetched";
+  const at = Date.parse(fetchedAt);
+  if (Number.isNaN(at)) return "never fetched";
+  const days = Math.floor((now.getTime() - at) / 86_400_000);
+  if (days < 1) return null;
+  return `as of a fetch ${days} day${days === 1 ? "" : "s"} ago`;
+}

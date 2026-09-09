@@ -16,6 +16,24 @@ pub struct Repo {
     /// Absolute path to the main checkout.
     pub path: String,
     pub worktrees: Vec<Worktree>,
+    /// When this repository's remote refs were last fetched, RFC 3339,
+    /// or `None` if it has never been fetched or the time is unreadable.
+    ///
+    /// Every merge and upstream verdict below is computed against
+    /// `origin/*` refs already on disk -- the scan deliberately never
+    /// goes to the network, because a view that opens in a second must
+    /// not become one that opens in thirty by fetching 37 remotes.
+    ///
+    /// That decision is right and stays. What was missing is telling
+    /// anyone about it: on this machine one repository's refs were 12
+    /// days old, so its rows were answering as of a fortnight ago while
+    /// reading like the present tense (#702). `Current` is the worst of
+    /// them, because "up to date" is exactly what it does NOT mean.
+    ///
+    /// `None` rather than a zero or a guess: never fetched and cannot
+    /// tell are both "we do not know", and neither is "just now".
+    #[serde(default)]
+    pub fetched_at: Option<String>,
 }
 
 /// Why a worktree can or cannot be removed.
