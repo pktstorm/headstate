@@ -18,6 +18,16 @@ function Stat({
 }) {
   const finite = trend && trend.pct !== null && Number.isFinite(trend.pct);
   const good = finite && (trend.lowerIsBetter ? trend.pct! < 0 : trend.pct! >= 0);
+  // Which way is good news is NOT recoverable from the number's sign
+  // here: `lowerIsBetter` inverts it per card, so "-12%" is an
+  // improvement on cycle time and a regression on merge count. Green
+  // and red were the only thing carrying that, which leaves a reader
+  // who cannot separate the two hues with a percentage and no verdict.
+  //
+  // `ArrowUp`/`ArrowDown` are wrong here for the same reason -- they
+  // report the DIRECTION the reader can already see. The word is the
+  // cue, because the verdict is what the colour was saying.
+  const verdict = !finite ? null : good ? "better" : "worse";
   return (
     <Card className="px-4">
       <div className="text-xs text-[#8b949e]">{label}</div>
@@ -27,6 +37,7 @@ function Stat({
         <div className="mt-1 text-xs">
           <span className={good ? "text-[#3fb950]" : finite ? "text-[#f85149]" : "text-[#8b949e]"}>
             {formatPct(trend.pct)}
+            {verdict ? ` ${verdict}` : ""}
           </span>{" "}
           <span className="text-[#8b949e]">vs last week · {trend.note}</span>
         </div>

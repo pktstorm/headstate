@@ -65,7 +65,7 @@ describe("InsightCards cycle-time trend", () => {
   // Lower is better here, unlike every other card on the page.
   it("paints a FALLING cycle time green", () => {
     const { container } = render(<InsightCards detail={detail} trend={trend} />);
-    expect(screen.getByText("-17%")).toBeTruthy();
+    expect(screen.getByText(/-17%/)).toBeTruthy();
     expect(container.innerHTML).toContain("#3fb950");
   });
 
@@ -76,8 +76,29 @@ describe("InsightCards cycle-time trend", () => {
         trend={{ ...trend, current_hours: 2.0, previous_hours: 1.0 }}
       />,
     );
-    expect(screen.getByText("+100%")).toBeTruthy();
+    expect(screen.getByText(/\+100%/)).toBeTruthy();
     expect(container.innerHTML).toContain("#f85149");
+  });
+
+  // The colour assertions above are only half the signal. `lowerIsBetter`
+  // inverts per card, so the SIGN does not say which way is good news --
+  // green and red were carrying that alone, which is exactly the case
+  // "differentiate without colour alone" exists for. The verdict word is
+  // what a reader who cannot separate the two hues has to go on.
+  it("names the verdict in text, not only in the colour", () => {
+    render(<InsightCards detail={detail} trend={trend} />);
+    // A cycle time that FELL is an improvement, even though it is negative.
+    expect(screen.getByText(/-17% better/)).toBeTruthy();
+  });
+
+  it("calls a rising cycle time worse, though the number went up", () => {
+    render(
+      <InsightCards
+        detail={detail}
+        trend={{ ...trend, current_hours: 2.0, previous_hours: 1.0 }}
+      />,
+    );
+    expect(screen.getByText(/\+100% worse/)).toBeTruthy();
   });
 
   // A week above 100 merges is a sample, and saying so is the difference

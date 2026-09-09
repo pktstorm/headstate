@@ -45,6 +45,27 @@ describe("ActivityChart", () => {
     expect(screen.getByText(/no activity/i)).toBeTruthy();
   });
 
+  // #3fb950 and #58a6ff measure 1.01:1 against each other, so with hue
+  // removed the two areas are the same shade. The tooltip does name them,
+  // but it is a hover affordance -- no use to a keyboard, to touch, or to
+  // anyone reading the chart rather than pointing at it.
+  it("names both series in a static key, not only in the tooltip", () => {
+    render(<ActivityChart points={points} days={30} onDaysChange={() => {}} />);
+    expect(screen.getByText("Opened")).toBeTruthy();
+    expect(screen.getByText("Merged")).toBeTruthy();
+  });
+
+  // The key is only honest if the swatches match the lines, and the dash
+  // is what tells the series apart once colour is gone.
+  it("distinguishes the series by stroke dash as well as colour", () => {
+    const { container } = render(
+      <ActivityChart points={points} days={30} onDaysChange={() => {}} />,
+    );
+    const dashed = container.querySelectorAll('[stroke-dasharray="4 3"]');
+    // One in the key's swatch, one on the series itself.
+    expect(dashed.length).toBeGreaterThanOrEqual(2);
+  });
+
   // The chart is the centrepiece; a silent render failure would leave an
   // empty card that still looks deliberate.
   it("actually draws the series", () => {

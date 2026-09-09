@@ -144,6 +144,30 @@
   body {
     @apply bg-background text-foreground;
     }
+
+  /* A visible focus ring for everything focusable.
+   *
+   * The `outline-ring/50` above sets an outline COLOUR and nothing else,
+   * so with no width or style the ring never paints. Tailwind's preflight
+   * has already removed the engine's own focus ring by then, which left
+   * roughly 150 raw `<button>` elements -- nearly every control outside
+   * `ui/` -- with no focus indicator at all. Keyboard focus was therefore
+   * invisible everywhere except the handful of shadcn primitives that
+   * carry their own `focus-visible:ring` utilities.
+   *
+   * `:focus-visible` rather than `:focus` so a pointer click does not
+   * leave a ring behind; the engine decides when the cue is wanted.
+   * Declared on the bare selector so anything focusable is covered --
+   * `role="button"` divs and `tabIndex` rows included, which a
+   * `button, a, input` list would miss.
+   *
+   * #58a6ff on the #0d1117 ground is 7.5:1, comfortably past the 3:1
+   * WCAG requires of a non-text UI indicator, and the offset keeps it
+   * clear of the control's own border rather than merging into it. */
+  :focus-visible {
+    outline: 2px solid #58a6ff;
+    outline-offset: 2px;
+    }
   html {
     @apply font-sans;
     /* Native form controls are painted by the ENGINE, not by the classes

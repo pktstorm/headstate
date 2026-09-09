@@ -60,11 +60,24 @@ function CiGlyph({ pr }: { pr: PullRequest }) {
 function BranchPair({ pr }: { pr: PullRequest }) {
   if (!pr.head_ref || !pr.base_ref) return null;
   const stacked = pr.base_ref !== "main" && pr.base_ref !== "master";
+  // The purple tint was the ONLY thing saying "this PR is stacked", and
+  // the base ref renders identically either way -- so a reader who does
+  // not separate purple from the surrounding grey sees no difference at
+  // all. The title said "Merges X into Y" for both states, so it did not
+  // disclose it either.
+  //
+  // A "stacked" suffix rather than a chip: this is the muted metadata
+  // line, and the tint was deliberately chosen over a chip to keep the
+  // row's layout. One word preserves that intent where a chip would not.
+  const title = stacked
+    ? `Merges ${pr.head_ref} into ${pr.base_ref} — stacked on another branch, so it cannot merge until its base does`
+    : `Merges ${pr.head_ref} into ${pr.base_ref}`;
   return (
-    <span className="ml-2" title={`Merges ${pr.head_ref} into ${pr.base_ref}`}>
+    <span className="ml-2" title={title}>
       • <span className="font-mono">{pr.head_ref}</span>
       <span className="mx-1">→</span>
       <span className={`font-mono ${stacked ? "text-[#a371f7]" : ""}`}>{pr.base_ref}</span>
+      {stacked ? <span className="ml-1 text-[#a371f7]">(stacked)</span> : null}
     </span>
   );
 }
