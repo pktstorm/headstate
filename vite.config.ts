@@ -54,6 +54,36 @@ export default defineConfig(({ mode }) => ({
     // `.worktrees` exclude was measured to change nothing and left out.
     include: ["src/**/*.{test,spec}.{ts,tsx}"],
     environment: "jsdom",
+    // One jsdom per WORKER, not one per test file.
+    //
+    // The default `forks` pool builds a fresh environment for each of
+    // the 141 test files, and that construction -- not the tests --
+    // was the majority of the run: 152-159s of tracked time, 56%,
+    // against a 27-28s wall-clock (environments overlap across
+    // workers, so the total exceeds the duration). `vmThreads` runs
+    // each file in its own V8 context inside a reused environment, so
+    // the jsdom cost is paid once per worker instead of 141 times.
+    // Measured locally: 27.9s -> 8.5s, and vitest's "jsdom was created
+    // 141 times" advisory stops firing. Same 1549 tests across the
+    // same 141 files, verified by diffing the full per-test JSON
+    // report between the two pools rather than trusting the totals --
+    // a config that quietly stopped collecting files would also look
+    // like a speedup.
+    //
+    // `isolate: false` is the other option vitest suggests and is
+    // faster still, but it shares ONE environment across files rather
+    // than giving each its own context. This suite mocks modules
+    // heavily (`vi.mock`, `vi.hoisted`) and several files mutate
+    // module-level state, so that sharing leaks: tried, and 481 tests
+    // failed, the Tauri IPC stub from one file bleeding into another's
+    // `window.__TAURI_INTERNALS__`. Rejected on that evidence, not on
+    // principle. `vmThreads` keeps the per-file isolation those mocks
+    // depend on, which is why it is the one that works here.
+    //
+    // See #677. This does not replace `testTimeout` below: this makes
+    // the runner faster, the timeout covers a runner that is slow
+    // anyway.
+    pool: "vmThreads",
     globals: true,
     // 15s, not vitest's default 5s.
     //
