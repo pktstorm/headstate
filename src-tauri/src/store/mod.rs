@@ -20,6 +20,7 @@
 
 mod cache;
 pub mod devices;
+pub mod health;
 mod schema;
 pub mod settings;
 

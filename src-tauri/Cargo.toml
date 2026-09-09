@@ -239,6 +239,7 @@ ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc"] }
 # daemon runs its own thread and the handful of calls we make are channel
 # sends, so pulling flume's async half in would buy nothing.
 mdns-sd = { version = "0.21", default-features = false, features = ["logging"] }
+sysinfo = { version = "0.39", default-features = false, features = ["system", "disk", "network", "component"] }
 
 [dev-dependencies]
 temp-env = "0.3"

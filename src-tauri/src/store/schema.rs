@@ -135,6 +135,43 @@ const MIGRATIONS: &[&str] = &[
     // re-pairing is the migration the design chose for a certificate
     // change. The table's shape is unchanged.
     "DELETE FROM paired_devices;",
+    // 8: the system-health series (#663).
+    //
+    // One row per sample, one sample a minute while the app runs, kept
+    // for 24 hours. About 1440 rows at steady state, which is small
+    // enough that the whole table is cheap to scan and there is no
+    // index beyond the primary key.
+    //
+    // `sampled_at` is RFC 3339, matching every other timestamp stored
+    // here. It is the PRIMARY KEY because two samples cannot share an
+    // instant and a duplicate would be a bug worth failing on rather
+    // than silently keeping both.
+    //
+    // Columns are nullable on purpose. A metric the platform does not
+    // expose is NULL, never 0: "not measured" and "measured as zero" are
+    // opposite answers, and rendering the first as the second is the
+    // failure this codebase avoids everywhere else (see `missing_tool`
+    // in packages/run.rs).
+    //
+    // The rest of a sample -- per-core CPU, per-volume disk, per-
+    // interface network -- is JSON in `detail` rather than its own
+    // tables. The shape varies per machine and is only ever read back
+    // whole, so normalising it would buy nothing and cost a join.
+    "CREATE TABLE IF NOT EXISTS health_samples (
+        sampled_at   TEXT PRIMARY KEY,
+        load_1       REAL,
+        load_5       REAL,
+        load_15      REAL,
+        cpu_percent  REAL,
+        mem_total    INTEGER,
+        mem_used     INTEGER,
+        mem_available INTEGER,
+        battery_percent REAL,
+        on_ac        INTEGER,
+        thermal      TEXT,
+        uptime_secs  INTEGER,
+        detail       TEXT NOT NULL
+     );",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
@@ -280,7 +317,12 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        // Derived from the list, not hardcoded: a literal here has to be
+        // edited by every migration that follows, and an assertion that
+        // must be updated to keep passing is one that stops checking
+        // anything. What matters is that migrating lands on the LATEST
+        // version, whatever that is.
+        assert_eq!(version, MIGRATIONS.len() as i64);
         assert!(has_table(&conn, "paired_devices"), "the table stays");
         let rows: i64 = conn
             .query_row("SELECT count(*) FROM paired_devices", [], |r| r.get(0))

@@ -8,6 +8,7 @@ pub mod commands;
 pub mod diag;
 pub mod docker;
 pub mod github;
+pub mod health;
 pub mod packages;
 pub mod poll;
 pub mod remote;
@@ -158,6 +159,8 @@ pub fn run() {
             commands::list_worktrees,
             commands::classify_worktrees,
             commands::list_branches,
+            commands::system_health,
+            commands::system_health_history,
             commands::delete_branches,
             commands::delete_remote_branches,
             commands::remove_worktree,
@@ -282,6 +285,43 @@ pub fn run() {
             // and how the last one ended. Default-constructed: it is
             // empty until someone starts a run.
             app.manage(packages::runs::UpdateRuns::default());
+
+            // The system-health reader, and the sampler that fills the
+            // 24-hour series behind the System Health view (#663).
+            //
+            // ONE collector for the process: sysinfo reports CPU use
+            // since the last refresh, so a fresh instance per call would
+            // report an idle machine forever.
+            let collector = Arc::new(health::collect::Collector::default());
+            app.manage(collector.clone());
+            {
+                let app_handle = app.handle().clone();
+                // Blocking, not async: it reads the kernel and writes
+                // SQLite, and both belong off the async workers.
+                std::thread::spawn(move || {
+                    // The first sample is discarded: sysinfo needs two
+                    // refreshes before CPU use means anything, so
+                    // recording the first would store a zero that reads
+                    // as an idle machine.
+                    let _ = collector.sample(&chrono::Utc::now().to_rfc3339());
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(60));
+                        let sample = collector.sample(&chrono::Utc::now().to_rfc3339());
+                        // A failed sample is logged and skipped, never
+                        // fatal: a gap in the chart is a far better
+                        // outcome than an app that stops because it
+                        // could not write a metric.
+                        match store::open_db(&commands::db_path(&app_handle))
+                            .map_err(|e| e.to_string())
+                            .and_then(|c| {
+                                store::health::record(&c, &sample).map_err(|e| e.to_string())
+                            }) {
+                            Ok(()) => {}
+                            Err(e) => log::warn!("system health: could not record a sample: {e}"),
+                        }
+                    }
+                });
+            }
 
             // Phone pairing. Managed whether or not the listener is on,
             // because Settings lists and revokes paired devices either
