@@ -162,8 +162,14 @@ fn parse_ioreg(text: &str) -> Vec<Gpu> {
     let mut stats: Option<String> = None;
 
     // A node is finished either by the next node's header or by the end
-    // of the text, so the push is a closure used in both places rather
-    // than duplicated.
+    // of the text, so the push lives in one function called from both
+    // rather than being duplicated.
+    //
+    // Both fields are `take`n on EVERY path out of here, including the
+    // two early returns. That is what stops one node's `model` being
+    // attached to the next node's statistics -- a mix-up that would
+    // report real numbers under the wrong GPU's name, which is worse
+    // than reporting nothing.
     fn finish(name: &mut Option<String>, stats: &mut Option<String>, out: &mut Vec<Gpu>) {
         let stats = stats.take();
         // A node with neither a name nor any statistics is not a GPU
@@ -437,6 +443,42 @@ mod tests {
         assert_eq!(gpus[0].utilization_percent, Some(3.0));
         assert_eq!(gpus[1].name, "Radeon Pro");
         assert_eq!(gpus[1].utilization_percent, Some(61.0));
+    }
+
+    /// A skipped node does not lend its name to the next one.
+    ///
+    /// The nodes are parsed as a stream, so a `model` read from a node
+    /// that carried no statistics has to be discarded when that node
+    /// ends. Left in place it would label the NEXT GPU's real numbers
+    /// with the previous node's name -- plausible-looking output
+    /// attributed to the wrong device, which is harder to notice than
+    /// a missing panel.
+    ///
+    /// The second node deliberately has NO `model` of its own. With
+    /// one, its `model` line would overwrite the stale name before the
+    /// node was pushed and the bug would be invisible -- so a fixture
+    /// where both nodes are named passes whether or not the discard
+    /// happens, and guards nothing. Verified by reintroducing the leak
+    /// and watching this fail.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_statless_node_does_not_lend_its_name_to_the_next() {
+        let text = r#"+-o Stub  <class Stub, id 0x1, registered>
+    {
+      "model" = "Not a GPU"
+    }
++-o Real  <class Real, id 0x2, registered>
+    {
+      "PerformanceStatistics" = {"Device Utilization %"=12,"In use system memory"=5,"Alloc system memory"=9}
+    }
+"#;
+        let gpus = parse_ioreg(text);
+        assert_eq!(gpus.len(), 1, "the stub is not a GPU");
+        assert_eq!(
+            gpus[0].name, "GPU",
+            "an unnamed node falls back, and must not inherit 'Not a GPU'"
+        );
+        assert_eq!(gpus[0].utilization_percent, Some(12.0));
     }
 
     /// A key the dictionary does not carry is absent, NOT zero.
