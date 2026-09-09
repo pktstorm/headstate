@@ -83,6 +83,12 @@ pub const EVENT_NAMES: &[&str] = &[
     "reviewing-short",
     "update-run-progress",
     "update-run-done",
+    // Widening this list widens a security boundary -- see the module
+    // docs on why only these names are re-emitted. Added deliberately
+    // (#657) so a phone sees branch rows as they classify rather than
+    // a blank page for ten seconds; it carries branch names and
+    // verdicts the phone is about to be shown anyway, and no paths.
+    "branch-scan-progress",
 ];
 
 /// The event name the opening snapshot frame is sent under, so the

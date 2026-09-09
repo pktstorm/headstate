@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import { Questionnaire } from "@shadcn/react/questionnaire";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { useBranches } from "@/api/hooks";
+import { useBranchScan, useBranches } from "@/api/hooks";
 import { deleteBranches, deleteRemoteBranches } from "@/api/tauri";
 import { useActiveFilters } from "@/store/filters";
 import type { Branch, Deletable } from "@/types/pr";
@@ -48,13 +48,27 @@ function ago(iso: string): string {
 export function BranchesPage() {
   const { repo } = useActiveFilters();
   const { data, isLoading, error } = useBranches(repo ?? undefined);
+  // The scan in flight, for the COLD visit. The query is still the
+  // authority — `data` replaces these rows the moment it resolves, and
+  // nothing streamed ever reaches the delete path.
+  const scan = useBranchScan(repo ?? undefined);
   const qc = useQueryClient();
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [asking, setAsking] = useState(false);
 
-  const branches = useMemo(() => data ?? [], [data]);
+  // Streamed rows are shown ONLY until the scan's own answer arrives,
+  // and `data` wins outright when it does. Merging the two would mean
+  // a row on screen whose verdict came from neither in full.
+  const branches = useMemo(() => data ?? scan.branches, [data, scan.branches]);
   const deletable = useMemo(() => branches.filter(isDeletable), [branches]);
+
+  // What is on screen is incomplete while the query has not resolved.
+  // Stated unconditionally rather than inferred from whether rows are
+  // still arriving: a stream that DIED stops arriving too, and #701
+  // was exactly this class of bug — a partial answer sitting there
+  // reading as a complete one.
+  const streaming = !data && scan.branches.length > 0;
 
   // The selected BRANCHES, not their names: deciding where a deletion
   // can happen needs each one's location and upstream, which a name
@@ -140,16 +154,21 @@ export function BranchesPage() {
   if (!repo) {
     return <p className="text-sm text-[#8b949e]">Select a repository to see its branches.</p>;
   }
-  if (isLoading) {
-    // Named as slow rather than shown as a bare spinner: silence reads
-    // as a hang. Measured at 10-13s on a 512-branch, 1784-commit
-    // repository -- ~5s building the default branch's patch-ids, then
-    // the per-branch comparison across eight threads -- so "a few
-    // seconds" undersold it and made the wait feel like a fault.
+  // Only while NOTHING has arrived. Once the listing frame lands the
+  // page renders every row instead, with the verdicts filling in — the
+  // listing is one `for-each-ref` and arrives in well under a second,
+  // where the classification it precedes takes ten (#657).
+  if (isLoading && scan.branches.length === 0) {
+    // Named rather than shown as a bare spinner: silence reads as a
+    // hang. The wording is now about THIS window, which is the one
+    // `for-each-ref` before the listing frame — measured at 257ms on a
+    // 582-branch repository, where the whole scan is 10.5s. Promising
+    // "around ten seconds" here would describe the wrong wait: the
+    // rows arrive almost at once and the verdicts are what take it.
     return (
       <p className="text-sm text-[#8b949e]">
-        Scanning branches… this compares every branch against the default one to find
-        squash merges, and takes around ten seconds on a large repository.
+        Reading branches… the list appears first, and each branch’s merge state fills in
+        after it. The full check takes around ten seconds on a large repository.
       </p>
     );
   }
@@ -167,6 +186,23 @@ export function BranchesPage() {
         {branches.length} branch{branches.length === 1 ? "" : "es"} · {deletable.length} merged
       </p>
 
+      {/* The count, and the whole reason the desktop sends a total up
+          front. A stream that dies at 47 stops here at "47 of 512" —
+          visibly short — where a page fed only verdicts would look
+          exactly like one that had received them all. It is a status
+          line, not a spinner: it says what is known, so a stalled scan
+          is legible rather than silent. */}
+      {streaming ? (
+        <p
+          role="status"
+          className="rounded border border-[#9e6a03] bg-[#9e6a03]/10 px-2 py-1 text-xs text-[#d29922]"
+        >
+          Still scanning — {scan.classified} of {scan.total ?? branches.length} branches
+          classified. Rows still marked “Checking…” have no verdict yet and cannot be
+          selected for deletion.
+        </p>
+      ) : null}
+
       <div className="flex flex-wrap items-center gap-2">
         {/* Visible while it runs, not just a disabled button. The
             re-check is seconds of git per batch, and a toolbar that
@@ -178,11 +214,19 @@ export function BranchesPage() {
         ) : null}
         {/* Selects exactly what ticking every deletable row by hand
             would select -- the same `merged` gate, not a second
-            definition that could drift from it. */}
+            definition that could drift from it.
+
+            Disabled while the scan is still running. "All" over a
+            partial list means "all of the ones that happen to have
+            arrived", and a control whose label says otherwise is how a
+            user ends up believing they have swept a repository they
+            have swept half of. Individual merged rows stay selectable
+            throughout: those verdicts are each complete. */}
         <button
           type="button"
-          disabled={busy || deletable.length === 0}
+          disabled={busy || streaming || deletable.length === 0}
           onClick={() => setPicked(new Set(deletable.map((b) => b.name)))}
+          title={streaming ? "Available once every branch has been classified" : undefined}
           className="rounded border border-[#30363d] px-2 py-1 text-xs text-[#e6edf3] hover:bg-[#21262d] disabled:opacity-40"
         >
           Select all {deletable.length} merged
@@ -247,8 +291,21 @@ export function BranchesPage() {
                 </div>
                 {/* The reason is shown for EVERY row, not only the
                     blocked ones: "Merged (squashed)" is the evidence
-                    that makes a bulk deletion safe to confirm. */}
-                <div className={`text-xs ${can ? "text-[#3fb950]" : "text-[#8b949e]"}`}>
+                    that makes a bulk deletion safe to confirm.
+
+                    A pending row is dimmed and italic, so an
+                    unanswered check reads as unfinished rather than as
+                    a finding. It sits in the same place a verdict will,
+                    which is what makes the fill-in legible. */}
+                <div
+                  className={`text-xs ${
+                    can
+                      ? "text-[#3fb950]"
+                      : b.deletable.kind === "pending"
+                        ? "italic text-[#6e7681]"
+                        : "text-[#8b949e]"
+                  }`}
+                >
                   {reason(b.deletable)}
                 </div>
               </div>

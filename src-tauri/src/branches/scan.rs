@@ -13,6 +13,21 @@
 //!   `--stdin`, and merge-bases are effectively unique (110 distinct
 //!   across 120 branches). Serial costs 18s; the existing 8-worker
 //!   pool brings it to 3.5s.
+//!
+//! # Streaming (#657)
+//!
+//! The metadata being one cheap call and the verdicts being expensive
+//! and independent is not just a performance note -- it is the shape
+//! the scan reports in. [`scan_with_progress`] hands a caller every
+//! row before any verdict exists, then verdicts as the threads settle
+//! them, so the page has a full list to render while it waits for the
+//! part that is slow.
+//!
+//! Measured on a 582-branch, 1784-commit repository: every row at
+//! **257ms**, every verdict at **10.5s**. The gap is the blank page
+//! the issue was about. Getting the first number required moving
+//! `mainline_patch_ids` BELOW the listing -- it is ~5s of work the
+//! listing does not depend on, and it used to run first.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -366,8 +381,63 @@ fn classify(
     }
 }
 
+/// What a caller wants told while a scan runs.
+///
+/// Two calls, in this order and never the other: `listed` once with
+/// every row as metadata alone, then `classified` repeatedly as
+/// verdicts settle. `listed` carries the TOTAL, which is what makes an
+/// interrupted stream legible -- a page told to expect 512 that has
+/// received 47 knows it is unfinished, where a page fed only verdicts
+/// cannot tell a dead stream from a finished one (#657).
+///
+/// A trait rather than two closures because the classification pass
+/// runs inside `std::thread::scope`, so the sink is shared across
+/// eight threads and must be `Sync`. Implementations must therefore
+/// tolerate `classified` arriving from several threads at once, in no
+/// particular order, and interleaved.
+pub trait Progress: Sync {
+    /// Every branch, metadata only, all verdicts `Pending`.
+    fn listed(&self, branches: &[Branch]);
+    /// A batch of settled verdicts, by branch name.
+    ///
+    /// Batched rather than one call per branch: the remote event hub
+    /// buffers 256 frames per subscriber and ends the stream of a phone
+    /// that falls further behind than that, so 512 single-verdict
+    /// frames would kill the connection this exists to serve.
+    fn classified(&self, verdicts: &[(String, Deletable)]);
+}
+
+/// The sink for callers that want only the answer -- `scan`, and the
+/// delete gate underneath it.
+struct Silent;
+
+impl Progress for Silent {
+    fn listed(&self, _: &[Branch]) {}
+    fn classified(&self, _: &[(String, Deletable)]) {}
+}
+
+/// How many verdicts a worker accumulates before reporting them.
+///
+/// Picked against the two failure modes rather than rounded off: at
+/// ~64ms per branch a worker fills eight verdicts in about half a
+/// second, which is often enough that the count on screen visibly
+/// moves, and 512 branches then cost ~64 frames against the hub's
+/// 256-frame budget instead of 512 against it.
+const BATCH: usize = 8;
+
 /// Every branch in a repository, classified.
 pub fn scan(dir: &Path) -> Result<Vec<Branch>, String> {
+    scan_with_progress(dir, &Silent)
+}
+
+/// `scan`, telling `progress` what it finds as it finds it.
+///
+/// The work is identical and so is the answer: this reports on the
+/// pass that was already there rather than adding one. Without it
+/// every result waits for the slowest branch before any of them
+/// render, though each is complete the moment its thread finishes
+/// (#657).
+pub fn scan_with_progress(dir: &Path, progress: &dyn Progress) -> Result<Vec<Branch>, String> {
     // Deliberately NOT cached.
     //
     // `delete_local` calls this to re-check the merge gate immediately
@@ -409,7 +479,6 @@ pub fn scan(dir: &Path) -> Result<Vec<Branch>, String> {
 
     let wt = checked_out(dir);
     let ab = ahead_behind(dir, &default);
-    let mainline = mainline_patch_ids(dir, &default);
 
     // Which local branches have a remote counterpart, so a local-only
     // branch is not reported as tracked just because a same-named
@@ -471,6 +540,32 @@ pub fn scan(dir: &Path) -> Result<Vec<Branch>, String> {
         });
     }
 
+    // Sorted BEFORE the classification pass, not after.
+    //
+    // This order is what the page renders in, and `listed` hands it
+    // the whole list up front -- so sorting afterwards would reshuffle
+    // every row under the user as verdicts arrived. The sort is on
+    // `committed`, which no classification touches, so moving it here
+    // cannot change the answer.
+    out.sort_by(|a, b| b.committed.cmp(&a.committed));
+
+    // Every row, in its final order, with nothing decided yet. This is
+    // the frame that turns a blank page into a full one, and it costs
+    // nothing: the metadata came from a `for-each-ref` that has
+    // already run.
+    progress.listed(&out);
+
+    // AFTER the listing, deliberately, and this is not cosmetic.
+    //
+    // `mainline_patch_ids` is the single most expensive step in the
+    // whole scan -- ~5s of `log -p` piped through `patch-id` on a
+    // 1784-commit history -- and only the classification below needs
+    // it. Built before the listing, as it was, it put its five seconds
+    // in front of a frame that depends on none of it: measured on a
+    // 603-branch repository, every row reached the page at 5.5s
+    // instead of 0.6s, for no reason but statement order.
+    let mainline = mainline_patch_ids(dir, &default);
+
     // The expensive pass, 8 ways. Measured 18.0s serial / 3.5s here.
     let chunk = out.len().div_ceil(WORKERS).max(1);
     std::thread::scope(|scope| {
@@ -478,6 +573,7 @@ pub fn scan(dir: &Path) -> Result<Vec<Branch>, String> {
             let (default, ancestors, wt, ab, mainline) =
                 (&default, &ancestors, &wt, &ab, &mainline);
             scope.spawn(move || {
+                let mut batch: Vec<(String, Deletable)> = Vec::with_capacity(BATCH);
                 for b in part {
                     b.deletable = classify(
                         dir,
@@ -488,12 +584,23 @@ pub fn scan(dir: &Path) -> Result<Vec<Branch>, String> {
                         ab.get(&b.name).copied(),
                         mainline,
                     );
+                    batch.push((b.name.clone(), b.deletable.clone()));
+                    if batch.len() >= BATCH {
+                        progress.classified(&batch);
+                        batch.clear();
+                    }
+                }
+                // The tail. Without it a worker whose share is not a
+                // multiple of BATCH keeps its last verdicts, and the
+                // page sits permanently short of its total -- the
+                // "stalled" state the count exists to make visible,
+                // reported for a scan that actually finished.
+                if !batch.is_empty() {
+                    progress.classified(&batch);
                 }
             });
         }
     });
-
-    out.sort_by(|a, b| b.committed.cmp(&a.committed));
 
     // Stored against the refs as they were when the scan STARTED. If
     // something moved while it ran, the next call's key will not match
@@ -526,12 +633,27 @@ pub fn scan(dir: &Path) -> Result<Vec<Branch>, String> {
 /// re-checks against `scan` directly, so the gate still runs against
 /// the repository as it stands.
 pub fn scan_cached(dir: &Path) -> Result<Vec<Branch>, String> {
+    scan_cached_with_progress(dir, &Silent)
+}
+
+/// `scan_cached`, streaming on a MISS only.
+///
+/// A hit emits nothing at all, and deliberately: the answer is already
+/// complete and returns in one `for-each-ref`, so there is no gap to
+/// fill. Emitting a `listed` frame there would put every row back to
+/// `Pending` on screen for the instant before the return value
+/// replaced them -- a flicker whose only content is a lie about what
+/// is known.
+pub fn scan_cached_with_progress(
+    dir: &Path,
+    progress: &dyn Progress,
+) -> Result<Vec<Branch>, String> {
     if let Some(k) = super::cache::ref_state(dir) {
         if let Some(hit) = super::cache::get(dir, &k) {
             return Ok(hit);
         }
     }
-    scan(dir)
+    scan_with_progress(dir, progress)
 }
 
 #[cfg(test)]
@@ -809,6 +931,164 @@ mod tests {
 
         assert!(scan(&repo).is_err());
     }
+
+    // ---- streaming (#657) ------------------------------------------
+
+    /// Records what a scan reported, from whichever thread reported it.
+    #[derive(Default)]
+    struct Recorder {
+        listed: std::sync::Mutex<Vec<Branch>>,
+        verdicts: std::sync::Mutex<Vec<(String, Deletable)>>,
+        /// How many separate `classified` calls arrived, as distinct
+        /// from how many verdicts they carried. Batching is the thing
+        /// keeping the phone's stream alive, so it is asserted on.
+        batches: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Progress for Recorder {
+        fn listed(&self, branches: &[Branch]) {
+            self.listed.lock().unwrap().extend_from_slice(branches);
+        }
+        fn classified(&self, verdicts: &[(String, Deletable)]) {
+            self.batches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.verdicts.lock().unwrap().extend_from_slice(verdicts);
+        }
+    }
+
+    /// The whole point: the page can render every row before any
+    /// verdict exists, because the metadata comes from a
+    /// `for-each-ref` that has already run.
+    #[test]
+    fn every_branch_is_listed_as_pending_before_any_verdict_arrives() {
+        let (_t, repo) = fixture();
+        run(&repo, &["checkout", "-q", "-b", "wip"]);
+        commit(&repo, "wip-work");
+        run(&repo, &["checkout", "-q", "main"]);
+
+        let rec = Recorder::default();
+        let out = scan_with_progress(&repo, &rec).unwrap();
+
+        let listed = rec.listed.lock().unwrap();
+        assert_eq!(listed.len(), out.len(), "the listing must be complete");
+        assert!(
+            listed.iter().all(|b| b.deletable == Deletable::Pending),
+            "a listed row carries no verdict; anything else would show \
+             an answer nothing established"
+        );
+        // Same rows, same order, so the page never reshuffles beneath
+        // the user as verdicts land.
+        let names = |bs: &[Branch]| bs.iter().map(|b| b.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&listed), names(&out));
+    }
+
+    /// Every listed row eventually gets exactly one verdict, and it is
+    /// the verdict the returned answer carries. A stream that
+    /// disagreed with the answer would let the page offer a deletion
+    /// the scan itself did not.
+    #[test]
+    fn the_stream_settles_every_row_and_agrees_with_the_answer() {
+        let (_t, repo) = fixture();
+        run(&repo, &["checkout", "-q", "-b", "squashed"]);
+        commit(&repo, "squashed-work");
+        run(&repo, &["checkout", "-q", "main"]);
+        run(&repo, &["merge", "-q", "--squash", "squashed"]);
+        run(&repo, &["commit", "-q", "-m", "squashed"]);
+        run(&repo, &["push", "-q", "origin", "main"]);
+        run(&repo, &["checkout", "-q", "-b", "open-work"]);
+        commit(&repo, "open");
+        run(&repo, &["checkout", "-q", "main"]);
+
+        let rec = Recorder::default();
+        let out = scan_with_progress(&repo, &rec).unwrap();
+
+        let verdicts = rec.verdicts.lock().unwrap();
+        assert_eq!(
+            verdicts.len(),
+            out.len(),
+            "one verdict per branch, no more and no fewer -- a missing \
+             one leaves the page short of its total forever"
+        );
+        for b in &out {
+            let streamed = verdicts
+                .iter()
+                .find(|(n, _)| *n == b.name)
+                .unwrap_or_else(|| panic!("no streamed verdict for {}", b.name));
+            assert_eq!(streamed.1, b.deletable, "{} disagreed", b.name);
+        }
+        assert_eq!(
+            find(&out, "squashed").deletable,
+            Deletable::Merged {
+                how: MergedHow::Squash
+            }
+        );
+    }
+
+    /// The tail flush. A worker whose share is not a multiple of
+    /// `BATCH` must still report its last verdicts: the failure mode
+    /// is a scan that finished while the page reads "47 of 512", which
+    /// is indistinguishable from the dead stream the count exists to
+    /// expose.
+    #[test]
+    fn a_partial_final_batch_is_still_reported() {
+        let (_t, repo) = fixture();
+        // One branch, so no worker can fill a batch of eight.
+        run(&repo, &["checkout", "-q", "-b", "lonely"]);
+        commit(&repo, "lonely-work");
+        run(&repo, &["checkout", "-q", "main"]);
+
+        let rec = Recorder::default();
+        let out = scan_with_progress(&repo, &rec).unwrap();
+        assert_eq!(rec.verdicts.lock().unwrap().len(), out.len());
+        assert!(out.len() < BATCH, "the fixture must not fill a batch");
+    }
+
+    /// Batching is what keeps a phone's stream alive: the hub buffers
+    /// 256 frames and ends the stream of a subscriber further behind
+    /// than that, so a frame per branch would kill the connection this
+    /// feature exists to serve.
+    #[test]
+    fn verdicts_are_batched_rather_than_sent_one_frame_per_branch() {
+        let (_t, repo) = fixture();
+        // Enough branches that a single worker's share exceeds BATCH.
+        for i in 0..(BATCH * WORKERS * 2) {
+            let name = format!("b{i}");
+            run(&repo, &["branch", "-q", &name, "main"]);
+        }
+
+        let rec = Recorder::default();
+        let out = scan_with_progress(&repo, &rec).unwrap();
+        let batches = rec.batches.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(rec.verdicts.lock().unwrap().len(), out.len());
+        assert!(
+            batches < out.len(),
+            "{batches} frames for {} branches is one per branch",
+            out.len()
+        );
+    }
+
+    /// A cache hit emits NOTHING. The answer is already complete, so a
+    /// `listed` frame would put every row back to `Pending` on screen
+    /// for the instant before the return value replaced it -- a
+    /// flicker whose only content is a lie about what is known.
+    #[test]
+    fn a_cache_hit_streams_nothing_because_there_is_no_gap_to_fill() {
+        // The fixture is a fresh temporary path, so nothing else can
+        // have primed it -- but `cache.rs`'s tests call `clear()`,
+        // which wipes the WHOLE map and would turn this hit into a
+        // miss. The shared lock keeps them apart.
+        let _serial = super::super::cache::serialised();
+        let (_t, repo) = fixture();
+
+        // Prime it, then ask again with the refs unmoved.
+        let first = scan_cached(&repo).unwrap();
+        let rec = Recorder::default();
+        let second = scan_cached_with_progress(&repo, &rec).unwrap();
+
+        assert_eq!(first, second);
+        assert!(rec.listed.lock().unwrap().is_empty());
+        assert!(rec.verdicts.lock().unwrap().is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -820,6 +1100,67 @@ mod tests {
 /// were ancestors. Kept so the cost can be re-checked on a different
 /// machine rather than taken on faith from a comment.
 mod live {
+    /// What streaming actually buys, measured rather than asserted:
+    /// how long until the page has EVERY row, against how long until
+    /// it has every verdict. Same invocation as the scan above --
+    /// `REPO=~/path cargo test -- --ignored live_stream`.
+    ///
+    /// The gap between the two numbers is the blank page #657 was
+    /// about.
+    #[test]
+    #[ignore]
+    fn live_stream_of_a_real_repository() {
+        use crate::branches::{Branch, Deletable, Progress};
+        use std::sync::Mutex;
+        use std::time::Instant;
+
+        struct Timing {
+            start: Instant,
+            first_row: Mutex<Option<(std::time::Duration, usize)>>,
+            settled: Mutex<Vec<(std::time::Duration, usize)>>,
+            done: std::sync::atomic::AtomicUsize,
+        }
+        impl Progress for Timing {
+            fn listed(&self, branches: &[Branch]) {
+                *self.first_row.lock().unwrap() = Some((self.start.elapsed(), branches.len()));
+            }
+            fn classified(&self, verdicts: &[(String, Deletable)]) {
+                let n = self
+                    .done
+                    .fetch_add(verdicts.len(), std::sync::atomic::Ordering::Relaxed)
+                    + verdicts.len();
+                self.settled.lock().unwrap().push((self.start.elapsed(), n));
+            }
+        }
+
+        let dir = std::path::PathBuf::from(std::env::var("REPO").unwrap());
+        // A cache hit would measure nothing, so start from a miss.
+        crate::branches::cache::clear();
+        let t = Timing {
+            start: Instant::now(),
+            first_row: Mutex::new(None),
+            settled: Mutex::new(Vec::new()),
+            done: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let out = super::scan_cached_with_progress(&dir, &t).unwrap();
+        let total_time = t.start.elapsed();
+
+        let (listed_at, listed_n) = t.first_row.lock().unwrap().expect("a listing frame");
+        let settled = t.settled.lock().unwrap();
+        let quarter = settled.iter().find(|(_, n)| *n * 4 >= out.len());
+        eprintln!("BRANCHES        {}", out.len());
+        eprintln!("every row       {listed_at:?}  ({listed_n} rows, no verdicts)");
+        if let Some((at, n)) = quarter {
+            eprintln!("a quarter       {at:?}  ({n} classified)");
+        }
+        eprintln!("every verdict   {total_time:?}");
+        eprintln!(
+            "frames          {} (batched at {})",
+            settled.len(),
+            super::BATCH
+        );
+    }
+
     #[test]
     #[ignore]
     fn live_scan_of_a_real_repository() {
