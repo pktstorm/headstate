@@ -12,6 +12,8 @@ import {
   type Point,
 } from "@/lib/health";
 import type { HealthSample } from "@/types/pr";
+import { IS_MOBILE_BUILD } from "@/lib/target";
+import { useConnectionState } from "@/api/connection";
 
 /// The machine's health: what it is doing now, and the last 24 hours.
 ///
@@ -21,6 +23,19 @@ import type { HealthSample } from "@/types/pr";
 /// describes the MACHINE, so a repo picker beside it would be a control
 /// that changes nothing -- see `App.tsx`, which renders no sidebar repo
 /// list and no `FilterBar` for it.
+///
+/// # Whose machine
+///
+/// On the phone this view describes the PAIRED DESKTOP, never the phone
+/// itself. A companion reporting its own battery would be answering a
+/// question nobody asked: the user opened it to check on the machine
+/// they left running.
+///
+/// The wording is switched on `IS_MOBILE_BUILD`, not on `useIsMobile()`.
+/// Which machine is being described is a fact about the BUILD, and
+/// `useIsMobile()` is also true for a narrow desktop window -- where a
+/// page headed "the desktop's health" would be describing the very
+/// machine it is running on. See the ground rules on #590.
 ///
 /// # Two rules the panels below exist to keep
 ///
@@ -252,6 +267,15 @@ export function SystemHealthPage() {
   const live = useSystemHealth(true);
   const history = useSystemHealthHistory(true);
 
+  // Who this page is about. On the desktop build it is always the
+  // machine underfoot, so the connection state is not even consulted --
+  // `useConnectionState` is `local` there by construction.
+  const connection = useConnectionState();
+  const desktopName =
+    IS_MOBILE_BUILD && "desktop" in connection ? connection.desktop : null;
+  const subject = IS_MOBILE_BUILD ? `${desktopName ?? "the desktop"}'s` : "this machine's";
+  const unreachable = IS_MOBILE_BUILD && connection.kind === "unreachable";
+
   const samples = useMemo(() => history.data ?? [], [history.data]);
   const toPoint = (pick: (s: HealthSample) => number | null): Point[] =>
     samples.map((s) => ({ t: Date.parse(s.sampled_at), v: pick(s) }));
@@ -273,10 +297,25 @@ export function SystemHealthPage() {
   );
 
   if (live.isError && live.data === undefined) {
+    // Health is never served from the companion's cached snapshot the
+    // way `get_cached` is -- there is no stored copy of a reading that
+    // is only meaningful at the instant it was taken. So on the phone
+    // an unreachable desktop arrives here, as a genuine error, and the
+    // page says so instead of rendering panels of zeros. A zero in a
+    // memory bar is a measurement; "not reachable" is the absence of
+    // one, and this codebase does not let the two look alike.
     return (
       <QueryError
-        title="Could not read this machine's health"
-        message={errorMessage(live.error)}
+        title={
+          unreachable
+            ? `Cannot reach ${desktopName ?? "the desktop"}`
+            : `Could not read ${subject} health`
+        }
+        message={
+          unreachable
+            ? "Its health can only be read while it is reachable, and nothing here is stored from before, so there is nothing to show."
+            : errorMessage(live.error)
+        }
         onRetry={() => void live.refetch()}
       />
     );
@@ -289,7 +328,7 @@ export function SystemHealthPage() {
     // rendering empty panels full of dashes.
     return (
       <div className="rounded-md border border-[#30363d] px-4 py-12 text-center text-sm text-[#8b949e]">
-        Reading this machine's health…
+        Reading {subject} health…
       </div>
     );
   }
@@ -306,6 +345,23 @@ export function SystemHealthPage() {
 
   return (
     <div className="flex flex-col gap-4">
+      {/* Whose machine, said once, at the top, on the phone only.
+          `ConnectionBanner` already names the paired desktop, but it
+          is chrome that sits above every view alike -- it says which
+          desktop this app is talking to, not what the page under it
+          is describing. On a page full of CPU and battery readings
+          rendered on a device that has its own CPU and battery, that
+          distinction is the whole point, so it is stated on the
+          content rather than left to be inferred from the chrome.
+          Not repeated per panel: eight panels each captioned with the
+          same hostname is noise that stops being read. */}
+      {IS_MOBILE_BUILD ? (
+        <p className="text-xs text-[#8b949e]">
+          Showing the health of{" "}
+          <span className="text-[#c9d1d9]">{desktopName ?? "the paired desktop"}</span>, not
+          this phone.
+        </p>
+      ) : null}
       {/* Two columns on a desktop, one on a phone. No media query
           needed: the grid does it, and every panel below is written
           to survive either width. */}
@@ -473,7 +529,13 @@ export function SystemHealthPage() {
             <Stat
               label="Battery"
               value={s.battery === null ? null : `${s.battery.percent.toFixed(0)}%`}
-              hint={s.battery === null ? "No battery on this machine" : undefined}
+              hint={
+                s.battery === null
+                  ? IS_MOBILE_BUILD
+                    ? "That desktop has no battery"
+                    : "No battery on this machine"
+                  : undefined
+              }
             />
             <Stat
               label="Power"
@@ -600,8 +662,15 @@ export function SystemHealthPage() {
 function GapNote() {
   return (
     <p className="mt-1 text-xs text-[#8b949e]">
-      Breaks in the line are periods when Headstate was not running. Nothing
-      is filled in across them.
+      {IS_MOBILE_BUILD
+        ? // The phone has a second way to produce a hole that the
+          // desktop does not: the desktop can be sampling perfectly
+          // while this phone is unable to reach it. Both are honest
+          // gaps and neither is interpolated, but they are different
+          // facts, and saying only the first would assert the desktop
+          // was off during a period it may have been running fine.
+          "Breaks in the line are periods with no reading — either Headstate was not running on that desktop, or this phone could not reach it. Nothing is filled in across them."
+        : "Breaks in the line are periods when Headstate was not running. Nothing is filled in across them."}
     </p>
   );
 }
