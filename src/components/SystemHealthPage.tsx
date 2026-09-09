@@ -320,18 +320,24 @@ function ProcessHead() {
 
 /// A disk figure, and the state it is in.
 ///
-/// Three states, not two, and the third is the reason this exists: a
-/// figure can be un-measured, measuring, or measured. Rendering the
-/// first as `0 B` is the "absent is never zero" rule applied to the
-/// disk half -- "we have not walked your worktrees yet" and "your
-/// worktrees are empty" are opposite claims, and the second one would
-/// send someone looking for files that are exactly where they left
-/// them.
+/// FOUR states, not two, and the ones that are not a number are the
+/// reason this exists: a figure can be un-measured, measuring, measured,
+/// or measured-and-there-was-nothing. Rendering the first as `0 B` is
+/// the "absent is never zero" rule applied to the disk half -- "we have
+/// not walked your worktrees yet" and "your worktrees are empty" are
+/// opposite claims, and the second one would send someone looking for
+/// files that are exactly where they left them.
+///
+/// The fourth state is the mirror of that mistake. Once the scan HAS
+/// run and found nothing, saying "not measured" reports a completed
+/// look as a failure to look -- so an honest "none found" belongs
+/// there, and only there.
 function DiskRow({
   label,
   bytes,
   hint,
   measuring,
+  empty,
   progress,
 }: {
   label: string;
@@ -340,6 +346,16 @@ function DiskRow({
   bytes: number | null;
   hint?: string;
   measuring: boolean;
+  /// True when the scan ran and found nothing of this kind to size.
+  ///
+  /// A fourth answer, distinct from a byte count, from "measuring",
+  /// and from "not measured". A machine with no virtualenvs is not an
+  /// unmeasured machine -- we looked, and there was nothing there --
+  /// and leaving it on "Not measured" after a completed pass reports
+  /// our own success as a failure to look. This is the one place a
+  /// "nothing" is honest, precisely because it answers a question that
+  /// was actually asked.
+  empty?: boolean;
   /// "3 of 41 repositories" while a batched source is still landing.
   /// The number that makes a partly-filled row legible rather than
   /// looking stuck, the same way `ArtifactsPage` reports it.
@@ -355,6 +371,11 @@ function DiskRow({
         {bytes === null ? (
           measuring ? (
             <span className="text-[#8b949e]">Measuring…</span>
+          ) : empty ? (
+            // We looked and there was nothing. Distinct from both a
+            // zero and a "not measured", and the only one of the three
+            // that is a real answer.
+            <span className="text-[#8b949e]">None found</span>
           ) : (
             <NotMeasured />
           )
@@ -485,10 +506,15 @@ function DiskFootprint() {
   return (
     <div>
       <div className="flex flex-col">
+        {/* `empty` is asserted from the DISCOVERY query, not from the
+            size map: "the scan succeeded and found no repositories" is
+            a fact only discovery knows. An empty size map means merely
+            that nothing has landed, which is also true mid-flight. */}
         <DiskRow
           label="Worktrees"
           bytes={sum(worktreeSizes.sizes)}
           measuring={repos.isFetching || worktreeSizes.pending > 0}
+          empty={repos.isSuccess && repoPaths.length === 0}
           progress={progress(worktreeSizes.pending, worktreeSizes.total, "repositories")}
         />
         <DiskRow
@@ -496,12 +522,14 @@ function DiskFootprint() {
           hint="target/, node_modules/, and the rest"
           bytes={sum(artifactSizes.sizes)}
           measuring={artifacts.isFetching || artifactSizes.pending > 0}
+          empty={artifacts.isSuccess && artifactList.length === 0}
           progress={progress(artifactSizes.pending, artifactSizes.total, "repositories")}
         />
         <DiskRow
           label="Virtualenvs"
           bytes={sum(venvSizes.sizes)}
           measuring={venvs.isFetching || venvSizes.measuring}
+          empty={venvs.isSuccess && venvList.length === 0}
           progress={progress(venvSizes.pending, venvSizes.total, "batches")}
         />
         <DiskRow

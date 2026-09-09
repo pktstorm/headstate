@@ -749,6 +749,19 @@ describe("what Headstate is costing", () => {
     expect(screen.getByText(/same figures the Worktrees, Artifacts and Docker/)).toBeTruthy();
   });
 
+  /// The mirror of "absent is never zero", and the case that is easy to
+  /// get backwards: once the scan HAS run and found nothing, saying
+  /// "not measured" reports a completed look as a failure to look. A
+  /// machine with no virtualenvs is not an unmeasured machine.
+  it("says none found, not not-measured, when a scan came back empty", async () => {
+    disk.venvs.mockResolvedValue([]);
+    show();
+    fireEvent.click(await screen.findByRole("button", { name: /Measure disk use/ }));
+    await waitFor(() => expect(screen.getByText("None found")).toBeTruthy());
+    // The sizing command must not have run for a set with nothing in it.
+    expect(disk.venvSizes).not.toHaveBeenCalled();
+  });
+
   /// The cost is stated before the click, not discovered after it. A
   /// button that says only "Measure" and then appears to hang for
   /// thirty seconds is how a user learns to distrust the view.
