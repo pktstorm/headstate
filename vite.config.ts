@@ -55,6 +55,28 @@ export default defineConfig(({ mode }) => ({
     include: ["src/**/*.{test,spec}.{ts,tsx}"],
     environment: "jsdom",
     globals: true,
+    // 15s, not vitest's default 5s.
+    //
+    // Not because any test is slow: 58% of this suite's wall-clock is
+    // jsdom CONSTRUCTION -- 141 environments, one per test file, about
+    // 154s of the 98s run (they overlap across workers). The default
+    // budget is measured against a test whose own work is a fraction of
+    // what surrounds it.
+    //
+    // A fully synchronous test in WorktreesPage.test.tsx -- render, then
+    // assert, no await anywhere -- hit "Test timed out in 5000ms" on a
+    // loaded Windows runner and blocked the v5.5.0 release, while 1548
+    // of 1549 tests passed and a re-run of the same commit went green.
+    // The whole 88-test file takes 2911ms when the runner is healthy:
+    // inside the budget, with no margin, and the two runs of that one
+    // commit differed by 1.5x on their own.
+    //
+    // The cost of raising it is that a genuinely hung test reports after
+    // 15s instead of 5s. The cost of leaving it is a release blocked by
+    // a test unrelated to the change being released. See #677, which
+    // also tracks reducing the jsdom cost itself -- the actual wound,
+    // of which this timeout is only the bleeding.
+    testTimeout: 15_000,
     coverage: { provider: "v8", reporter: ["text", "json-summary"] },
   },
 }));
