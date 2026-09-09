@@ -563,7 +563,7 @@ describe("WorktreesPage", () => {
   // used to show a dead Remove there; it now answers the question that
   // actually applies -- is there anything in here worth keeping?
   describe("Claudify", () => {
-    it.each([["never_pushed"], ["unmerged"], ["dirty"], ["unpushed"]])(
+    it.each([["never_pushed"], ["unmerged"], ["dirty"], ["unpushed"], ["empty"]])(
       "offers it for %s",
       (kind) => {
         state.classified = [wt({ safety: { kind } as Worktree["safety"] })];
@@ -1238,6 +1238,44 @@ describe("WorktreesPage", () => {
   // the user's disagreed and the app won -- with no way to act and no
   // way to find the row again among 124 candidates.
   describe("after an assessment", () => {
+    // #701: a scratch branch reported "never pushed — commits exist
+    // only here" beside "0 commits ahead". Both cannot be true, and the
+    // user believed the alarming one and spent a session disproving it
+    // by hand. The row now says which it is.
+    it("says an empty branch has nothing to lose rather than claiming commits", () => {
+      state.classified = [wt({ path: "/code/scratch", safety: { kind: "empty" } })];
+      render(<WorktreesPage />);
+      expect(screen.getByText(/no commits of its own/i)).toBeTruthy();
+      expect(screen.queryByText(/only here/i)).toBeNull();
+    });
+
+    // The gate does NOT move. #701 is a report about the reporting,
+    // and widening the app's only unrecoverable action is a separate
+    // decision on separate evidence.
+    //
+    // The row is one-action, so "not removable" shows as Claudify
+    // rather than as a greyed-out Remove -- the same shape every other
+    // un-removable state gets. The plain Remove button must be absent:
+    // if `Empty` had been folded into `Safe`, it would appear here,
+    // enabled, and this is where that would be caught.
+    it("still refuses one-click removal of an empty branch", () => {
+      state.classified = [wt({ path: "/code/scratch", safety: { kind: "empty" } })];
+      render(<WorktreesPage />);
+      expect(screen.queryByRole("button", { name: "Remove" })).toBeNull();
+      expect(screen.getByRole("button", { name: /claudify/i })).toBeTruthy();
+    });
+
+    // ...and the confirmation, which is the moment the decision is
+    // made, must not repeat the false claim either.
+    it("does not warn about unpushed commits when confirming an empty branch", () => {
+      state.classified = [wt({ path: "/code/scratch", safety: { kind: "empty" } })];
+      state.assessed = ["/code/scratch"];
+      render(<WorktreesPage />);
+      fireEvent.click(screen.getByRole("button", { name: /remove anyway/i }));
+      expect(screen.getByText(/nothing on it would be lost/i)).toBeTruthy();
+      expect(screen.queryByText(/not pushed anywhere/i)).toBeNull();
+    });
+
     it("offers no override on a worktree that was never assessed", () => {
       state.classified = [wt({ path: "/code/a", safety: { kind: "never_pushed" } })];
       render(<WorktreesPage />);

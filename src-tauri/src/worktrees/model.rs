@@ -60,6 +60,17 @@ pub enum Safety {
     Unpushed(u64),
     /// No upstream branch at all -- nothing has ever been pushed.
     NeverPushed,
+    /// The branch was created and never committed to.
+    ///
+    /// Its own state rather than a flavour of `Safe` or `NeverPushed`,
+    /// because the CLAIM is different and the difference is what the
+    /// user came for. `NeverPushed` says "these commits exist only
+    /// here", which for a branch with no commits of its own is simply
+    /// false -- and the row said it next to "0 commits ahead", a
+    /// contradiction one user spent a session resolving by hand.
+    /// `Safe` would be true but weaker: it invites "merged when?",
+    /// where this answers "there was never anything here".
+    Empty,
     /// The repository that owned this worktree is gone.
     ///
     /// A category of its own rather than a flavour of `Unknown`,
@@ -101,6 +112,22 @@ impl Safety {
     /// Only `Safe` may be deleted. Everything else is disabled in the UI
     /// rather than warned past -- a cleanup tool that occasionally eats a
     /// day of work is worse than no cleanup tool.
+    ///
+    /// `Empty` is deliberately NOT safe, though nothing on the branch
+    /// could be lost. #701 is a report that the REPORTING was wrong --
+    /// an empty branch was described as holding commits that exist only
+    /// here -- not that the gate was too tight. Making `Empty` safe
+    /// would silently promote a large, previously-refused population to
+    /// one-click deletable as a side effect of fixing wording: 52 of
+    /// 296 worktrees on the reporting machine have no upstream, and an
+    /// unknown share of those are empty. Widening the only
+    /// unrecoverable action in the app is its own decision, taken on
+    /// its own evidence, not a rider on a copy fix.
+    ///
+    /// The user is not stuck: `Empty` says plainly that there is
+    /// nothing to lose, and `remove_worktree_forced` -- reached through
+    /// a confirmation that quotes this reason -- is exactly the path
+    /// for "the app is being careful and I have read why".
     pub fn is_safe(&self) -> bool {
         matches!(self, Safety::Safe)
     }
@@ -115,6 +142,12 @@ impl Safety {
                 format!("{n} unpushed commit{}", if *n == 1 { "" } else { "s" })
             }
             Safety::NeverPushed => "never pushed — commits exist only here".into(),
+            // Says what is TRUE of the branch, not what the app will
+            // let you do about it. "Nothing to lose" is the fact the
+            // user was trying to establish by hand; whether the Remove
+            // button is enabled is a separate, more cautious question
+            // answered by `is_safe`.
+            Safety::Empty => "no commits of its own — nothing to lose".into(),
             Safety::Unmerged => "branch not merged".into(),
             Safety::Pending => "checking…".into(),
             // Says what IS known, not what could not be checked. The
