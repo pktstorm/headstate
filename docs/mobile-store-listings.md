@@ -496,13 +496,31 @@ is only the gate.
    (`docs/mobile-pairing-walkthrough.md`) has passed **twice with no
    findings**. Only then is the `mobile-release` job enabled.
 2. For the release under consideration, the walkthrough has been run on a
-   real iPhone and a real Android device from the **exact build number**
-   sitting in TestFlight and internal testing, and the run records are
+   real device from the **exact build number** sitting in TestFlight (and
+   internal testing, once Android ships), and the run records are
    committed.
+
+   **iOS can ship without Android.** They are separate stores with
+   separate accounts, and as of #673 the workflow gates them separately:
+   `ANDROID_RELEASE_ENABLED` unset means the Android job is *skipped*,
+   not failed, and the release publishes with the iOS artifacts alone.
+   Before that, a missing Play account failed the Android job and took
+   the whole publish step with it -- 38 mobile tags produced zero GitHub
+   releases while iOS was reaching TestFlight perfectly well.
+
+   So this gate is per platform. An Android walkthrough is required for
+   an Android release, and is not a prerequisite for an iOS one.
 3. The pre-submission checklist above is clean.
 4. Promote by hand: App Store Connect, the build's *Submit for Review*
    with manual release; Play Console, *Promote release* from internal
    testing to production. Neither is automated, by design.
+
+   Android additionally needs, before any of this: a Play Console
+   account, an upload keystore, and a service account, then the five
+   `ANDROID_*` / `PLAY_*` secrets in
+   [mobile-release-process.md](mobile-release-process.md#android) and
+   `ANDROID_RELEASE_ENABLED` set to `true`. None of that blocks an iOS
+   release.
 5. After the stores approve, release. The tag, the GitHub pre-release,
    and the store builds all carry the same version.
 
