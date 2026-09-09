@@ -15,9 +15,11 @@
 //! frame after connecting is always `prs-updated` with the cached
 //! snapshot. The stream ends when the device is revoked, when it fell
 //! too far behind, or when the listener stops; the phone reconnects and
-//! gets a fresh snapshot. Only the nine names in [`EVENT_NAMES`] are
+//! gets a fresh snapshot. Only the names in [`EVENT_NAMES`] are
 //! re-emitted; anything else is dropped, so the desktop cannot fire an
-//! arbitrary event in the webview.
+//! arbitrary event in the webview. The list is deliberately short, and
+//! [`tests::the_allowlist_matches_the_desktops`] pins it to the
+//! desktop's own copy so neither side can widen it alone.
 //!
 //! # The loop
 //!
@@ -58,6 +60,13 @@ pub const EVENT_NAMES: &[&str] = &[
     "reviewing-short",
     "update-run-progress",
     "update-run-done",
+    // Widening this list widens a security boundary: the whole point of
+    // it is that the desktop cannot fire an arbitrary event in this
+    // webview. Added deliberately (#657) so the Branches page fills in
+    // as branches classify instead of showing nothing for ten seconds.
+    // It carries branch names and deletability verdicts -- what the
+    // page is about to render anyway -- and no filesystem paths.
+    "branch-scan-progress",
 ];
 
 /// The event whose payload is the PR list, cached as the snapshot.
@@ -448,6 +457,49 @@ mod tests {
     use crate::keys::{DeviceKeys, SoftwareKeys};
     use crate::store::MemoryStore;
     use crate::testing::{Reply, TestServer};
+
+    /// The allowlist is copied, so nothing but a test stops the two
+    /// halves drifting -- and drift here is silent in exactly the way
+    /// that matters: a name the desktop emits and the phone drops
+    /// produces a page that never fills in, with no error anywhere.
+    ///
+    /// `include_str!` ties this to the desktop file at compile time, so
+    /// the lists are compared as they are checked in rather than as
+    /// someone remembers them. The same shape as
+    /// `surface::tests::table_is_identical_to_the_desktop_table`.
+    ///
+    /// It also guards the boundary in the widening direction: adding a
+    /// name to one side alone fails here, so nobody can quietly grow
+    /// the set of events the desktop may fire in this webview.
+    #[test]
+    fn the_allowlist_matches_the_desktops() {
+        let src = include_str!("../../src-tauri/src/remote/events.rs");
+        let start = src
+            .find("pub const EVENT_NAMES")
+            .expect("desktop events.rs must define EVENT_NAMES");
+        let body = &src[start..];
+        let end = body.find("];").expect("EVENT_NAMES must close");
+        let desktop: Vec<&str> = body[..end]
+            .lines()
+            .filter_map(|l| {
+                l.trim()
+                    .strip_prefix('"')?
+                    .split_once("\",")
+                    .map(|(n, _)| n)
+            })
+            .collect();
+        assert!(
+            desktop.len() > 5,
+            "parsed only {} names from the desktop's events.rs; the parser is broken",
+            desktop.len()
+        );
+        assert_eq!(
+            EVENT_NAMES.to_vec(),
+            desktop,
+            "src-mobile/src/events.rs EVENT_NAMES differs from \
+             src-tauri/src/remote/events.rs; copy the desktop's list verbatim"
+        );
+    }
 
     fn feed_all(chunks: &[&str]) -> Vec<Frame> {
         let mut p = SseParser::default();

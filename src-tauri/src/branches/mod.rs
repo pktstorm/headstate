@@ -12,4 +12,4 @@ pub mod scan;
 
 pub use delete::{delete_local, delete_remote, DeleteOutcome};
 pub use model::{Branch, Deletable, Location, MergedHow};
-pub use scan::{scan, scan_cached};
+pub use scan::{scan, scan_cached, scan_cached_with_progress, Progress};

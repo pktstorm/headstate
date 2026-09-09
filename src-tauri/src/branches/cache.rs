@@ -130,32 +130,46 @@ pub fn clear() {
     }
 }
 
+/// Serialises every test that touches the cache, in THIS module and in
+/// `scan.rs`.
+///
+/// `CACHE` is one process-wide static, and the tests here call
+/// `clear()`. Rust runs tests in PARALLEL by default, so without this
+/// one test's `clear` lands between another's `put` and `get` and the
+/// second sees a miss it never asked for.
+///
+/// It passed locally and failed only on the Windows runner, which is
+/// the signature of a scheduling race rather than a platform
+/// difference -- the ordering that exposes it is simply likelier under
+/// a different scheduler. Serialising is the honest fix; the
+/// alternative, giving each test its own path, would leave the
+/// `clear()` interference in place and merely make it rarer.
+///
+/// `pub(crate)` because `scan.rs` needs the same lock: its cache-hit
+/// test primes an entry and asks for it back, and a `clear()` landing
+/// in between would turn the hit into a miss and fail an assertion
+/// about streaming that has nothing to do with caching.
+#[cfg(test)]
+pub(crate) static SERIAL: Mutex<()> = Mutex::new(());
+
+/// Take the lock without disturbing what is cached. For tests that
+/// only need to be alone, not to start empty.
+#[cfg(test)]
+pub(crate) fn serialised() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::branches::model::{Branch, Deletable, Location};
-
-    /// Serialises these tests against each other.
-    ///
-    /// `CACHE` is one process-wide static, and every test here calls
-    /// `clear()`. Rust runs tests in PARALLEL by default, so without
-    /// this one test's `clear` lands between another's `put` and `get`
-    /// and the second sees a miss it never asked for.
-    ///
-    /// It passed locally and failed only on the Windows runner, which
-    /// is the signature of a scheduling race rather than a platform
-    /// difference -- the ordering that exposes it is simply likelier
-    /// under a different scheduler. Serialising is the honest fix; the
-    /// alternative, giving each test its own path, would leave the
-    /// `clear()` interference in place and merely make it rarer.
-    static SERIAL: Mutex<()> = Mutex::new(());
 
     /// Take the lock and start from an empty cache.
     ///
     /// Returns the guard, which the caller must hold for the body of
     /// the test -- dropping it early would put the race straight back.
     fn exclusive() -> std::sync::MutexGuard<'static, ()> {
-        let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = serialised();
         clear();
         guard
     }

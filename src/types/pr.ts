@@ -730,6 +730,27 @@ export interface DeleteOutcome {
   error: string | null;
 }
 
+/// One frame of a running branch scan, mirroring the Rust
+/// `BranchScanFrame` in `src-tauri/src/commands.rs`.
+///
+/// Two shapes on one event name because it is one stream. `listed`
+/// arrives once, with every row and — crucially — the TOTAL; then
+/// `classified` frames carry verdicts as the eight classification
+/// threads settle them.
+///
+/// The total is what separates a dead stream from a finished one. Fed
+/// only verdicts, a page that stopped receiving them at 47 would look
+/// exactly like a page that had received all of them; knowing 512 were
+/// promised, it can say so (#657).
+///
+/// `repo` is on every frame and is load-bearing: the events are
+/// app-global while a scan is per-repository, so a page that switched
+/// repository mid-scan would otherwise fold the old repository's
+/// verdicts into the new one's rows.
+export type BranchScanFrame =
+  | { kind: "listed"; repo: string; total: number; branches: Branch[] }
+  | { kind: "classified"; repo: string; verdicts: [string, Deletable][] };
+
 /// One moment of the machine's health, mirroring the Rust
 /// `health::Sample` in `src-tauri/src/health/mod.rs`.
 ///

@@ -18,9 +18,20 @@ const toasts = vi.hoisted(() => ({
 }));
 
 vi.mock("sonner", () => ({ toast: toasts }));
-// The hook, not the whole tauri module: `api/hooks` pulls in the rest of
-// the app's commands, and mocking that module wholesale would make this
-// test depend on every one of them.
+
+/// What `useBranchScan` reports, per test. Set by `streamingScan`.
+///
+/// The real hook is exercised end to end in `hooks.branchScan.test.tsx`;
+/// here it is a value, so a page test can pin the SHAPE the page is
+/// asked to render — including the shape it must never be able to tell
+/// apart from a finished one on its own.
+const scanState = vi.hoisted(() => ({
+  current: { branches: [] as Branch[], total: null as number | null, classified: 0 },
+}));
+
+// The hooks, not the whole tauri module: `api/hooks` pulls in the rest
+// of the app's commands, and mocking that module wholesale would make
+// this test depend on every one of them.
 vi.mock("../api/hooks", () => ({
   useBranches: (repoPath: string | undefined) => {
     const q = useQuery({
@@ -31,6 +42,7 @@ vi.mock("../api/hooks", () => ({
     });
     return q;
   },
+  useBranchScan: () => scanState.current,
 }));
 vi.mock("../api/tauri", () => ({
   listBranches: listFn,
@@ -99,6 +111,7 @@ describe("reason", () => {
 describe("BranchesPage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    scanState.current = { branches: [], total: null, classified: 0 };
     useFilters.getState().setView("branches");
     useFilters.getState().setFilter("repo", "/code/app");
     listFn.mockResolvedValue([
@@ -304,7 +317,7 @@ describe("BranchesPage", () => {
   it("says the scan is slow rather than showing nothing", () => {
     listFn.mockReturnValue(new Promise(() => {}));
     show();
-    expect(screen.getByText(/scanning branches/i)).toBeTruthy();
+    expect(screen.getByText(/reading branches/i)).toBeTruthy();
   });
 
   it("asks for a repository when none is selected", () => {
@@ -312,5 +325,146 @@ describe("BranchesPage", () => {
     show();
     expect(screen.getByText(/select a repository/i)).toBeTruthy();
     expect(listFn).not.toHaveBeenCalled();
+  });
+
+  // ---- streaming (#657) -------------------------------------------
+
+  /// A scan in flight: the query never settles, and the page has only
+  /// what the stream has given it.
+  const streamingScan = (branches: Branch[], total: number, classified: number) => {
+    listFn.mockReturnValue(new Promise(() => {}));
+    scanState.current = { branches, total, classified };
+  };
+
+  /// The point of the whole change. The cold visit used to be ten
+  /// seconds of blank page; the listing frame is one `for-each-ref`, so
+  /// every row can be on screen before any verdict exists.
+  it("renders every row from the stream before any verdict has arrived", () => {
+    streamingScan(
+      [
+        branch({ name: "done", deletable: { kind: "pending" } }),
+        branch({ name: "wip", deletable: { kind: "pending" } }),
+      ],
+      2,
+      0,
+    );
+    show();
+    expect(screen.queryByText(/reading branches/i)).toBeNull();
+    expect(screen.getByText("done")).toBeTruthy();
+    expect(screen.getByText("wip")).toBeTruthy();
+    // Exactly the row reasons — `getAllByText` is exact by default, so
+    // the status line, which merely quotes the word, is not counted.
+    expect(screen.getAllByText("Checking…").length).toBe(2);
+  });
+
+  /// A row with no verdict is not permission to delete. The gate is
+  /// `merged`, and `pending` is not it — the same rule the backend's
+  /// `Deletable::is_deletable` enforces.
+  it("does not let a branch with no verdict yet be selected", () => {
+    streamingScan(
+      [
+        branch({ name: "settled" }),
+        branch({ name: "waiting", deletable: { kind: "pending" } }),
+      ],
+      2,
+      1,
+    );
+    show();
+    expect(screen.getByLabelText("waiting").hasAttribute("disabled")).toBe(true);
+    // A verdict that HAS landed is usable straight away: that is the
+    // whole benefit, and each one is complete on its own.
+    expect(screen.getByLabelText("settled").hasAttribute("disabled")).toBe(false);
+  });
+
+  /// THE test this design exists for.
+  ///
+  /// The stream dies at 47 of 512 and nothing further ever arrives.
+  /// Without the total the page would be indistinguishable from one
+  /// that had received everything — 47 rows, some answered, no error.
+  /// That is the #701 failure mode: a partial answer reading as a
+  /// complete one.
+  ///
+  /// So the assertion is not "it renders" but that it SAYS SO: the
+  /// count is on screen, and it is short of the total.
+  it("says the list is incomplete when the stream dies part-way", () => {
+    const rows = [
+      ...Array.from({ length: 47 }, (_, i) => branch({ name: `settled-${i}` })),
+      ...Array.from({ length: 5 }, (_, i) =>
+        branch({ name: `stranded-${i}`, deletable: { kind: "pending" } }),
+      ),
+    ];
+    streamingScan(rows, 512, 47);
+    show();
+
+    const status = screen.getByRole("status");
+    expect(status.textContent).toMatch(/still scanning/i);
+    expect(status.textContent).toMatch(/47 of 512/);
+
+    // And it must not offer a sweep of a list it only half has. "All"
+    // over a partial list means "all of the ones that turned up".
+    const all = screen.getByRole("button", { name: /select all/i }) as HTMLButtonElement;
+    expect(all.disabled).toBe(true);
+  });
+
+  /// The complement, and the one that would be missed by testing only
+  /// the failure: when the scan finishes, the warning goes. A banner
+  /// that never clears is one users learn to ignore, which would cost
+  /// exactly the legibility it was added for.
+  it("drops the incomplete warning once the scan's own answer arrives", async () => {
+    scanState.current = {
+      branches: [branch({ name: "done", deletable: { kind: "pending" } })],
+      total: 1,
+      classified: 0,
+    };
+    listFn.mockResolvedValue([branch({ name: "done" })]);
+    show();
+    await screen.findByText(/merged \(squashed\)/i);
+    expect(screen.queryByRole("status")).toBeNull();
+    const all = screen.getByRole("button", { name: /select all/i }) as HTMLButtonElement;
+    expect(all.disabled).toBe(false);
+  });
+
+  /// The completed scan is the authority. A streamed row must never
+  /// outlive it, or the page would show a verdict from a scan the
+  /// query has already superseded.
+  it("replaces streamed rows with the completed scan when it resolves", async () => {
+    scanState.current = {
+      branches: [branch({ name: "guessed", deletable: { kind: "pending" } })],
+      total: 1,
+      classified: 0,
+    };
+    listFn.mockResolvedValue([branch({ name: "actual" })]);
+    show();
+    await screen.findByText("actual");
+    expect(screen.queryByText("guessed")).toBeNull();
+  });
+
+  /// A slow scan that has not even listed yet still says what it is
+  /// doing: the listing is fast but not instantaneous, and silence in
+  /// that window would be the original complaint in miniature.
+  it("still names the wait before the listing frame arrives", () => {
+    streamingScan([], 0, 0);
+    show();
+    expect(screen.getByText(/reading branches/i)).toBeTruthy();
+  });
+
+  /// A failed scan shows the failure, never a half-list reading as
+  /// data. Belt and braces from both ends: every fallible step in
+  /// `scan` — `default_branch` and both `for-each-ref` calls — runs
+  /// BEFORE the listing frame, so rows cannot have been streamed when
+  /// an error arrives; and the page's error branch returns ahead of the
+  /// list regardless. This pins the second half, because the first is
+  /// a property of statement order in another language.
+  it("shows the failure rather than the rows it managed to stream", async () => {
+    scanState.current = {
+      branches: [branch({ name: "half", deletable: { kind: "pending" } })],
+      total: 9,
+      classified: 0,
+    };
+    listFn.mockRejectedValue("this repository has no origin/HEAD to compare against");
+    show();
+    expect(await screen.findByText(/no origin\/HEAD/i)).toBeTruthy();
+    expect(screen.queryByText("half")).toBeNull();
+    expect(screen.queryByRole("status")).toBeNull();
   });
 });

@@ -4,9 +4,11 @@ import { type View, useFilters } from "../store/filters";
 import { listen, type UnlistenFn } from "./transport";
 import { safeUnlisten } from "./unlisten";
 import { timeCall, timed } from "./diag";
-import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import type {
   Artifact,
+  Branch,
+  BranchScanFrame,
   CleanupPrefs,
   DockerImage,
   Footprint,
@@ -1953,8 +1955,119 @@ export function useBranches(repoPath: string | undefined) {
     queryKey: ["branches", repoPath],
     queryFn: () => listBranches(repoPath!),
     enabled: !!repoPath,
+    // 10 seconds, deliberately, and not to be lengthened. This page
+    // decides whether a branch is safe to DELETE, and a stale "yes" is
+    // the expensive mistake. Streaming (#657) changes what the page can
+    // show DURING a scan; it does not change how long an answer stays
+    // trusted after one.
     staleTime: 10_000,
   });
+}
+
+/// What a running branch scan has reported so far.
+///
+/// `total` is `null` until the scan says how many branches it is about
+/// to classify. Once it has, `classified` climbing towards `total` is
+/// the page's evidence that the stream is alive — and a `classified`
+/// that stops short of `total` is the page's evidence that it is not.
+export interface BranchScanState {
+  /// Every row, in final order, verdicts filling in as they arrive.
+  branches: Branch[];
+  /// How many the scan said it would classify, or `null` before it did.
+  total: number | null;
+  /// How many verdicts have arrived.
+  classified: number;
+}
+
+const IDLE_SCAN: BranchScanState = { branches: [], total: null, classified: 0 };
+
+/// Branch rows as the desktop classifies them, for the cold visit.
+///
+/// # Why this exists next to `useBranches` rather than inside it
+///
+/// `useBranches` is the AUTHORITY: its resolved value is the completed
+/// scan, and it is what the delete controls read. This hook is a view
+/// of the same work in flight. Keeping them separate is what stops
+/// streamed data becoming the basis of a deletion — the frames land
+/// here, never in the query cache, so `delete_local`'s re-check against
+/// an uncached `scan` remains the only thing a deletion is gated on.
+///
+/// The cold visit is the case it exists for. #682's cache fixed the
+/// repeat visit and structurally cannot fix the first one: there is
+/// nothing to serve. The desktop already does this work per branch and
+/// in parallel, so every verdict is complete the moment its thread
+/// finishes; before this they simply all waited for the slowest.
+///
+/// Frames for another repository are dropped. The event is app-global
+/// and a scan is per-repository, so without the check a page that
+/// switched repositories mid-scan would fold the old one's verdicts
+/// into the new one's rows.
+export function useBranchScan(repoPath: string | undefined): BranchScanState {
+  // The repository is held IN the state, not merely in the effect's
+  // dependency list. A new repository must start from nothing, and
+  // resetting from inside the effect would be a synchronous `setState`
+  // during an effect -- a cascading render, and one that paints the
+  // previous repository's rows for a frame first. Held here, the reset
+  // is a comparison during render instead.
+  const [held, setState] = useState<BranchScanState & { repo?: string }>(IDLE_SCAN);
+  const state = held.repo === repoPath ? held : IDLE_SCAN;
+
+  useEffect(() => {
+    if (!repoPath) return;
+
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    listen<BranchScanFrame>("branch-scan-progress", (e) => {
+      const f = e.payload;
+      if (f.repo !== repoPath) return;
+      setState((was) => {
+        // Frames for the repository we are no longer showing cannot
+        // reach here (the guard above), but a frame arriving while the
+        // held state still describes the PREVIOUS one must build on
+        // nothing rather than on those rows.
+        const prev = was.repo === repoPath ? was : IDLE_SCAN;
+        if (f.kind === "listed") {
+          // A fresh listing REPLACES rather than merges: it is the
+          // start of a new scan, and carrying verdicts over from the
+          // previous one would show answers computed against refs that
+          // have since moved.
+          return { repo: repoPath, branches: f.branches, total: f.total, classified: 0 };
+        }
+        const byName = new Map(f.verdicts);
+        // Counted from the rows actually updated, not from
+        // `verdicts.length`. A frame that arrives before its listing —
+        // or names a branch the listing did not — must not advance a
+        // count the user reads as "this many rows are answered".
+        let landed = 0;
+        const branches = prev.branches.map((b) => {
+          const d = byName.get(b.name);
+          if (d === undefined || b.deletable.kind !== "pending") return b;
+          landed += 1;
+          return { ...b, deletable: d };
+        });
+        return { ...prev, repo: repoPath, branches, classified: prev.classified + landed };
+      });
+    }).then((fn) => {
+      if (cancelled) safeUnlisten(fn);
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      safeUnlisten(unlisten);
+      unlisten = undefined;
+    };
+  }, [repoPath]);
+
+  // Narrowed on the way out: `repo` is bookkeeping for the reset above,
+  // not something a caller should read or compare against.
+  return useMemo(
+    () => ({
+      branches: state.branches,
+      total: state.total,
+      classified: state.classified,
+    }),
+    [state.branches, state.total, state.classified],
+  );
 }
 
 /// Surface the outcome of a background update run.

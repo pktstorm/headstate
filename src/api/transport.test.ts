@@ -238,6 +238,11 @@ const POLL_EVENTS: [string, () => unknown][] = [
   ["worktree-removal-progress", hooks.useRemovalProgress],
   ["reviewing-short", hooks.useReviewShortfall],
   ["update-run-done", hooks.useUpdateRunOutcome],
+  // The tenth allowlisted name (#657). It is here for the same reason
+  // as the rest: the phone reaches it through this seam, so a hook that
+  // imported Tauri's `listen` directly would work on the desktop and
+  // silently never fire on the phone.
+  ["branch-scan-progress", () => hooks.useBranchScan("/code/app")],
 ];
 
 function wrapper({ children }: { children: ReactNode }) {

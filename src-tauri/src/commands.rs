@@ -2279,6 +2279,82 @@ pub async fn system_footprint(
     .map_err(|e| e.to_string())
 }
 
+/// The event name a branch scan reports its progress under.
+///
+/// One name, two frame shapes, because it is one stream: a `listed`
+/// frame then `classified` frames, and a consumer that saw only the
+/// second kind could not know how many to expect. On the allowlists in
+/// `remote/events.rs` and `src-mobile/src/events.rs`, so the phone
+/// receives it too.
+pub const BRANCH_SCAN_PROGRESS: &str = "branch-scan-progress";
+
+/// One frame of a branch scan.
+///
+/// `repo` is on EVERY frame, and load-bearing rather than
+/// informational: the events are app-global while the scan is
+/// per-repository, so a page that changed repository mid-scan would
+/// otherwise fold the old repository's verdicts into the new
+/// repository's rows.
+///
+/// The paths are NOT in the payload beyond the repository the caller
+/// already named, matching the rule `worktree-removal-progress`
+/// follows -- a progress event is not a place to leak what the user is
+/// working on. Branch names are here because they are the join key,
+/// and the page is already showing them.
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum BranchScanFrame {
+    /// Every branch, metadata only, all verdicts `Pending`. Sent once,
+    /// before any classification, and it carries the total: that is
+    /// what lets the page say "47 of 512" and so makes a stream that
+    /// died at 47 visibly incomplete rather than merely finished-looking.
+    #[serde(rename_all = "camelCase")]
+    Listed {
+        repo: String,
+        total: usize,
+        branches: Vec<crate::branches::Branch>,
+    },
+    /// A batch of settled verdicts, by branch name.
+    #[serde(rename_all = "camelCase")]
+    Classified {
+        repo: String,
+        verdicts: Vec<(String, crate::branches::Deletable)>,
+    },
+}
+
+/// Emits [`BranchScanFrame`]s as the scan produces them.
+struct BranchScanEmitter {
+    app: AppHandle,
+    repo: String,
+}
+
+impl crate::branches::Progress for BranchScanEmitter {
+    fn listed(&self, branches: &[crate::branches::Branch]) {
+        let _ = self.app.emit(
+            BRANCH_SCAN_PROGRESS,
+            BranchScanFrame::Listed {
+                repo: self.repo.clone(),
+                total: branches.len(),
+                branches: branches.to_vec(),
+            },
+        );
+    }
+
+    fn classified(&self, verdicts: &[(String, crate::branches::Deletable)]) {
+        // Called from all eight classification threads. `emit` takes
+        // `&self` and Tauri's handle is `Sync`, so no lock is needed
+        // here -- and adding one would serialise the workers behind
+        // the reporting, which is the opposite of the point.
+        let _ = self.app.emit(
+            BRANCH_SCAN_PROGRESS,
+            BranchScanFrame::Classified {
+                repo: self.repo.clone(),
+                verdicts: verdicts.to_vec(),
+            },
+        );
+    }
+}
+
 /// Every branch in a repository, classified.
 ///
 /// Blocking git work -- measured at ~9s on a 675-branch repository --
@@ -2290,10 +2366,26 @@ pub async fn system_footprint(
 /// keyed on the ref state, so it returns only when nothing that could
 /// change an answer has moved (#657). Deletion still calls `scan`
 /// directly and is unaffected.
+///
+/// # Why it also streams
+///
+/// The cache fixed the REPEAT visit and structurally cannot fix the
+/// cold one -- there is nothing to serve. So this reports what it
+/// finds as it finds it: one `listed` frame with every row, then
+/// verdicts as the threads settle them (#657). The return value is
+/// unchanged and remains the authority; the frames are an early view
+/// of the same work, not a second source of truth.
 #[tauri::command]
-pub async fn list_branches(repo_path: String) -> Result<Vec<crate::branches::Branch>, String> {
+pub async fn list_branches(
+    app: AppHandle,
+    repo_path: String,
+) -> Result<Vec<crate::branches::Branch>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        crate::branches::scan_cached(std::path::Path::new(&repo_path))
+        let emitter = BranchScanEmitter {
+            app,
+            repo: repo_path.clone(),
+        };
+        crate::branches::scan_cached_with_progress(std::path::Path::new(&repo_path), &emitter)
     })
     .await
     .map_err(|e| e.to_string())?
