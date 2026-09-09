@@ -54,7 +54,7 @@ env:
 jobs:
   # --- First release gate ---------------------------------------------
   #
-  # Both build jobs are disabled until the repository variable
+  # Build jobs are disabled until the repository variable
   # MOBILE_RELEASE_ENABLED is `true` (Settings > Secrets and variables >
   # Actions > Variables). The spec's "First release gate" keeps store
   # builds manual until the pairing walkthrough has passed twice with no
@@ -62,6 +62,19 @@ jobs:
   # needs no workflow edit. A dry run is exempt because it cannot reach a
   # store: rehearsing the pipeline is how you find out it works BEFORE
   # enabling it.
+  #
+  # Android has a SECOND gate, ANDROID_RELEASE_ENABLED, because the two
+  # platforms are provisioned independently and only Apple's is done.
+  # One variable meaning "mobile releases are on" could not express
+  # that, so every tag ran an Android job whose secrets do not exist: it
+  # failed Preflight, and because `publish` needs both platforms, it was
+  # skipped. The result was 38 mobile-v tags and zero GitHub releases --
+  # no artifacts, no checksums, no changelog -- while iOS was reaching
+  # TestFlight perfectly well and the run was red for a reason unrelated
+  # to it. See #673.
+  #
+  # Set ANDROID_RELEASE_ENABLED to `true` once the five Android secrets
+  # exist. Nothing else needs editing.
   ios-release:
     if: vars.MOBILE_RELEASE_ENABLED == 'true' || (github.event_name == 'workflow_dispatch' && inputs.dry_run)
     runs-on: macos-latest
@@ -567,7 +580,11 @@ jobs:
             "$RUNNER_TEMP/dist.p12" "$RUNNER_TEMP/dist.mobileprovision" "$RUNNER_TEMP/altool.json"
 
   android-release:
-    if: vars.MOBILE_RELEASE_ENABLED == 'true' || (github.event_name == 'workflow_dispatch' && inputs.dry_run)
+    # Both gates: the mobile release gate AND Android's own. A dry run
+    # is exempt from the first but NOT the second -- rehearsing a build
+    # whose signing secrets do not exist only reproduces the failure
+    # this gate exists to stop.
+    if: vars.ANDROID_RELEASE_ENABLED == 'true' && (vars.MOBILE_RELEASE_ENABLED == 'true' || (github.event_name == 'workflow_dispatch' && inputs.dry_run))
     runs-on: ubuntu-latest
     env:
       # Pinned rather than `$ANDROID_NDK_HOME`, which is whatever the
@@ -821,7 +838,23 @@ jobs:
   # where users get the app.
   publish:
     needs: [ios-release, android-release]
-    if: startsWith(github.ref, 'refs/tags/mobile-v') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+    # `always()` so a SKIPPED android-release does not skip this too.
+    # Without it, `needs` treats "skipped" like "did not succeed" and
+    # takes publish with it -- which is exactly how a disabled Android
+    # job silently cost every release its GitHub artifacts (#673).
+    #
+    # Skipped is not the same as failed, and only the second should
+    # stop publishing: `ios-release` must have SUCCEEDED, while
+    # `android-release` may succeed or be skipped but must not have
+    # failed. So a genuine Android build failure still blocks the
+    # release rather than quietly publishing half of one.
+    if: >-
+      always()
+      && startsWith(github.ref, 'refs/tags/mobile-v')
+      && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+      && needs.ios-release.result == 'success'
+      && needs.android-release.result != 'failure'
+      && needs.android-release.result != 'cancelled'
     runs-on: ubuntu-latest
     steps:
       # `gh release create` resolves the repository from the git remote,
@@ -846,8 +879,17 @@ jobs:
           # One SHA256SUMS in `sha256sum -c` format, verified here against
           # the bytes that were uploaded, so the file the release carries
           # is known to describe the assets next to it.
-          cat ./*.sha256 > SHA256SUMS
-          rm -f ./*.sha256
+          #
+          # Globbed via `find` rather than `cat ./*.sha256`: with Android
+          # skipped there are fewer artifacts, and an unmatched glob
+          # under `set -e` would abort the release with a "No such file"
+          # rather than publishing the platform that did build.
+          find . -maxdepth 1 -name '*.sha256' -exec cat {} + > SHA256SUMS
+          if [ ! -s SHA256SUMS ]; then
+            echo "No .sha256 files among the downloaded artifacts." >&2
+            exit 1
+          fi
+          find . -maxdepth 1 -name '*.sha256' -delete
           sha256sum -c SHA256SUMS
           cd ..
           ASSETS=()
@@ -857,9 +899,22 @@ jobs:
           [ ${#ASSETS[@]} -gt 0 ] || { echo "no assets to publish" >&2; exit 1; }
           printf 'publishing %s\n' "${ASSETS[@]}"
 
+          # The notes name only the stores this run actually reached.
+          # Saying "and the Play internal-testing track" when Android
+          # was skipped sends someone looking for a build that is not
+          # there -- the same class of untrue claim as an unnotarized
+          # DMG described as notarized.
+          if [ "${{ needs.android-release.result }}" = "success" ]; then
+            STORES="Uploaded to TestFlight and the Play internal-testing track."
+            WHICH="either build"
+          else
+            STORES="Uploaded to TestFlight. No Android build: \`ANDROID_RELEASE_ENABLED\` is not set (#673)."
+            WHICH="the iOS build"
+          fi
+
           NOTES="Mobile companion **$VERSION**, build **$BUILD_NUMBER** (CFBundleVersion on iOS, versionCode on Android).
 
-          Uploaded to TestFlight and the Play internal-testing track. Install from there, not from these assets: they are here for provenance. Run \`docs/mobile-pairing-walkthrough.md\` on a real device against build $BUILD_NUMBER before promoting either build (\`docs/mobile-release-process.md\`)."
+          $STORES Install from there, not from these assets: they are here for provenance. Run \`docs/mobile-pairing-walkthrough.md\` on a real device against build $BUILD_NUMBER before promoting $WHICH (\`docs/mobile-release-process.md\`)."
 
           # Notes diff against the previous MOBILE tag. Without
           # --notes-start-tag, --generate-notes picks the most recent tag
