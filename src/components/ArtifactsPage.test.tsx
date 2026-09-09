@@ -50,7 +50,6 @@ const art = (over: Partial<Artifact> = {}): Artifact => ({
   kind: "cargo_target",
   repo_path: "/code/repo",
   size_bytes: null,
-  modified_secs_ago: null,
   ...over,
 });
 
@@ -447,5 +446,33 @@ describe("selection during removal", () => {
       expect(screen.getByRole("button", { name: /Remove 1/ })).toBeTruthy(),
     );
     expect((screen.getByLabelText("Select /code/repo/a") as HTMLInputElement).checked).toBe(true);
+  });
+
+  /// #722: the date column showed a bare relative time, and the user
+  /// could not tell whether it meant CREATED or LAST WRITTEN.
+  ///
+  /// The distinction decides the action: a directory created months ago
+  /// but written to this morning is in active use; one created this
+  /// morning and untouched since is not. The value is the newest mtime
+  /// anywhere inside the tree, which is the more useful of the two --
+  /// asserted here so a future edit cannot quietly relabel it.
+  it("says the date is the last write, not the creation", () => {
+    state.artifacts = [art("/code/repo/a")];
+    state.ages = new Map([["/code/repo/a", 7200]]);
+    state.pending = 0;
+
+    render(<ArtifactsPage />);
+    const cell = screen.getByTitle(/Last written/i);
+    expect(cell).toBeTruthy();
+    expect(cell.getAttribute("title")).toMatch(/not when the directory itself was created/i);
+  });
+
+  /// "Oldest" invited exactly the wrong reading. The ordering is by last
+  /// write, and the label now says so.
+  it("names the sort by what it actually orders on", () => {
+    state.artifacts = [art("/code/repo/a")];
+    state.pending = 0;
+    render(<ArtifactsPage />);
+    expect(screen.getByRole("option", { name: /Least recently written/i })).toBeTruthy();
   });
 });

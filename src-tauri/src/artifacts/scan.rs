@@ -135,7 +135,6 @@ fn classify(path: &Path, kind: ArtifactKind, root: &Path) -> Option<Artifact> {
         kind,
         repo_path: repo_root(parent).unwrap_or_else(|| root.to_string_lossy().to_string()),
         size_bytes: None,
-        modified_secs_ago: None,
     })
 }
 
