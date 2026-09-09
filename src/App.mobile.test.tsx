@@ -270,3 +270,61 @@ describe("Stats on the companion build", () => {
     expect(within(screen.getByRole("navigation")).getByText("Stats")).toBeTruthy();
   });
 });
+
+/// The whole screen a phone opens on away from its desktop (#684).
+///
+/// The gates above `App` are the other half of that fix and are pinned in
+/// `AuthGate.offline.test.tsx`; this asserts that what they let through is
+/// worth having. `usePullRequests` is mocked to the fixtures because that
+/// is what the companion genuinely serves off-network: `get_cached` is the
+/// one read it answers from its stored snapshot
+/// (`src-mobile/src/companion.rs`), so an unreachable desktop still
+/// produces a real list.
+describe("the phone's shell with the desktop unreachable", () => {
+  beforeEach(() => {
+    stubViewport(390);
+    connection.current = {
+      kind: "unreachable",
+      desktop: "octocat's laptop",
+      lastPoll: new Date(Date.now() - 42 * 60_000).toISOString(),
+      stale: true,
+    };
+  });
+
+  it("still renders the cached pull requests", () => {
+    // "Show what it can." A saved copy is worth more than a wall, and
+    // the two markers below are what make showing it honest.
+    renderApp();
+    for (const pr of PR_FIXTURES) expect(screen.getAllByText(pr.title).length).toBeGreaterThan(0);
+  });
+
+  it("marks the rows as a saved copy rather than presenting them as live", () => {
+    // #602's rule: cached data is MARKED, never hidden and never passed
+    // off as current. `StaleRibbon` is attached to the content, which is
+    // the thing being doubted.
+    renderApp();
+    const ribbon = screen.getByRole("status");
+    expect(ribbon.textContent).toContain("Showing a saved copy");
+    expect(ribbon.textContent).toContain("octocat's laptop");
+  });
+
+  it("puts the desktop's status in the banner, in one line", () => {
+    // The right home for this fact, and the issue says so: one line
+    // naming the desktop and when it was last seen -- not a screen.
+    renderApp();
+    const banner = screen.getByRole("button", { name: /octocat's laptop is unreachable/ });
+    expect(banner.textContent).toContain("last seen");
+  });
+
+  it("covers nothing with a full-screen error", () => {
+    // The report's other half. An unreachable desktop is the ordinary
+    // state of a phone, so nothing here may read as a failure of the
+    // app: no crash screen, no auth accusation, no impossible advice.
+    renderApp();
+    expect(screen.queryByText(/something went wrong/i)).toBeNull();
+    expect(screen.queryByText(/not signed in to GitHub/i)).toBeNull();
+    expect(screen.queryByText(/brew install/i)).toBeNull();
+    // And the app is genuinely there underneath, not merely uncovered.
+    expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Pull requests");
+  });
+});
