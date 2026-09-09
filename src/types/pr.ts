@@ -458,12 +458,6 @@ export interface Artifact {
   /// yet" and "empty" are different facts, and showing 0 B for the
   /// former is a lie the user would act on.
   size_bytes: number | null;
-  /// Seconds since anything under it was written, or null if unknown.
-  ///
-  /// A running build does not make git dirty -- build output is
-  /// gitignored -- so this is the only signal that a directory is in
-  /// active use.
-  modified_secs_ago: number | null;
 }
 
 /// The outcome of removing one artifact directory.

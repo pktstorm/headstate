@@ -203,7 +203,10 @@ export function ArtifactsPage() {
             className="rounded border border-[#30363d] bg-[#0d1117] px-1 py-0.5 text-xs text-[#e6edf3]"
           >
             <option value="size">Largest</option>
-            <option value="age">Oldest</option>
+            {/* "Least recently written", not "Oldest": the ordering is
+                by last write, and "oldest" invites reading it as
+                creation date. */}
+            <option value="age">Least recently written</option>
           </select>
         </label>
 
@@ -438,7 +441,19 @@ function ArtifactRow({
           delete. How long ago it was written is the discriminator.
           Undefined renders as a skeleton, never as "just now" -- the
           same rule the size column follows for "not measured yet". */}
-      <span className={isMobile ? "shrink-0 text-xs text-[#8b949e]" : "w-24 shrink-0 text-right text-xs text-[#8b949e]"}>
+      {/* Titled, because the number alone cannot say WHICH date it is.
+          "3 months ago" against a build directory reads equally well as
+          "created then" or "last touched then", and those imply opposite
+          actions: a directory created months ago but written to this
+          morning is in active use, while one created this morning and
+          untouched since is not. The value is the newest mtime of
+          anything INSIDE the tree (`artifacts/mod.rs`), which is the
+          more useful of the two -- a running `cargo build` writes deep
+          inside without touching the root's own timestamp. #722. */}
+      <span
+        title="Last written: the most recent change to anything inside this directory, not when the directory itself was created."
+        className={isMobile ? "shrink-0 text-xs text-[#8b949e]" : "w-24 shrink-0 text-right text-xs text-[#8b949e]"}
+      >
         {ageSecs === undefined ? (
           <Skeleton className="ml-auto w-16" />
         ) : (

@@ -110,11 +110,4 @@ pub struct Artifact {
     /// would act on.
     #[serde(default)]
     pub size_bytes: Option<u64>,
-    /// Seconds since anything under it was written, or None if unknown.
-    ///
-    /// A running `cargo build` does NOT make git dirty -- build output is
-    /// gitignored -- so no git-based safety check can see it. This is the
-    /// only signal that a directory is in active use.
-    #[serde(default)]
-    pub modified_secs_ago: Option<u64>,
 }
