@@ -401,6 +401,21 @@ its source, or marked unconfirmed with what was tried.
   Source: <https://developer.apple.com/documentation/cryptokit/secureenclave/mldsa65/privatekey>
   and its `init(accesscontrol:authenticationcontext:)` page, read on
   2026-09-04.
+- **Confirmed on hardware, floor still unknown: which Secure Enclave
+  generations support ML-DSA.** Measured 2026-09-09 on an **iPhone 16
+  Pro (A18 Pro), iOS 26.6.1**: `SecureEnclave.MLDSA65.PrivateKey`
+  generates, the pairing records a post-quantum key, and the access
+  control gates it exactly as it gates the P-256 key. So ML-DSA-65 in
+  the Secure Enclave is real and biometric-gating applies to it -- that
+  much is no longer an inference.
+
+  What that does NOT establish is the floor. A18 Pro is the newest
+  silicon Apple ships; it confirms the ceiling, which was never in
+  doubt. The useful test is an **A13-A15 device on iOS 26**: if one of
+  those generates a key, the OS floor and the silicon floor coincide.
+  Until then the paragraph below stands as the reason the plugin tests
+  by trying rather than by checking a chip.
+
 - **Unconfirmed: which Secure Enclave generations support ML-DSA.** No
   Apple source names a hardware floor. Tried: the `SecureEnclave.MLDSA65`
   reference (availability is by OS version only, 26.0 everywhere); the

@@ -64,6 +64,29 @@ Fill in before starting. Every field is required.
 Findings go in the last section. A run is *clean* only if every box that
 applies to the platform is ticked and the findings section is empty.
 
+## Hardware capability, per device
+
+The spec's one remaining open question is which Secure Enclave and
+KeyMint generations actually provide ML-DSA-65 (#670). Apple documents
+`SecureEnclave.MLDSA65` by OS version only and names no hardware floor,
+so the answer can only come from devices. Add a row whenever a run
+happens on a device not already listed -- one line, and the question
+closes itself over time.
+
+| Device | SoC / KeyMint | OS | Post-quantum key |
+|---|---|---|---|
+| iPhone 16 Pro | A18 Pro | iOS 26.6.1 | yes |
+
+The value is what step 1.3 reported and what **Paired devices** shows: a
+*post-quantum* badge means `SecureEnclave.MLDSA65.PrivateKey` generated,
+and its absence means it threw and the pairing fell back to ECDSA P-256
+alone. Both are valid outcomes; only the recording matters.
+
+**The row worth chasing is an A13-A15 iPhone on iOS 26.** iOS 26 needs
+A13 or later, so if one of those generates a key, the OS floor and the
+silicon floor coincide and nothing further is needed. A18 Pro working
+tells us the newest hardware works, which was never in doubt.
+
 ## Before you start
 
 Use synthetic data throughout. Names and addresses in this document are
