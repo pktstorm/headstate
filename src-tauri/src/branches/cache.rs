@@ -135,6 +135,31 @@ mod tests {
     use super::*;
     use crate::branches::model::{Branch, Deletable, Location};
 
+    /// Serialises these tests against each other.
+    ///
+    /// `CACHE` is one process-wide static, and every test here calls
+    /// `clear()`. Rust runs tests in PARALLEL by default, so without
+    /// this one test's `clear` lands between another's `put` and `get`
+    /// and the second sees a miss it never asked for.
+    ///
+    /// It passed locally and failed only on the Windows runner, which
+    /// is the signature of a scheduling race rather than a platform
+    /// difference -- the ordering that exposes it is simply likelier
+    /// under a different scheduler. Serialising is the honest fix; the
+    /// alternative, giving each test its own path, would leave the
+    /// `clear()` interference in place and merely make it rarer.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    /// Take the lock and start from an empty cache.
+    ///
+    /// Returns the guard, which the caller must hold for the body of
+    /// the test -- dropping it early would put the race straight back.
+    fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+        let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        clear();
+        guard
+    }
+
     fn branch(name: &str) -> Branch {
         Branch {
             name: name.into(),
@@ -152,7 +177,7 @@ mod tests {
     /// The whole point: same refs, same answer, no rescan.
     #[test]
     fn an_unchanged_ref_state_hits() {
-        clear();
+        let _serial = exclusive();
         let dir = Path::new("/synthetic/repo-a");
         put(dir, "abc refs/heads/main".into(), &[branch("main")]);
         let got = get(dir, &"abc refs/heads/main".to_string());
@@ -165,7 +190,7 @@ mod tests {
     /// would call this unchanged and serve a stale deletion verdict.
     #[test]
     fn a_moved_tip_misses() {
-        clear();
+        let _serial = exclusive();
         let dir = Path::new("/synthetic/repo-b");
         put(dir, "abc refs/heads/main".into(), &[branch("main")]);
         assert!(get(dir, &"def refs/heads/main".to_string()).is_none());
@@ -175,7 +200,7 @@ mod tests {
     /// which could not have classified it -- must not be served.
     #[test]
     fn a_new_branch_misses() {
-        clear();
+        let _serial = exclusive();
         let dir = Path::new("/synthetic/repo-c");
         put(dir, "abc refs/heads/main".into(), &[branch("main")]);
         let two = "abc refs/heads/main\ndef refs/heads/feature".to_string();
@@ -187,7 +212,7 @@ mod tests {
     /// branches for the other -- easy to do with a fresh clone.
     #[test]
     fn one_repository_never_answers_for_another() {
-        clear();
+        let _serial = exclusive();
         let a = Path::new("/synthetic/repo-d");
         let b = Path::new("/synthetic/repo-e");
         let key = "abc refs/heads/main".to_string();
@@ -197,7 +222,7 @@ mod tests {
 
     #[test]
     fn clearing_forgets_everything() {
-        clear();
+        let _serial = exclusive();
         let dir = Path::new("/synthetic/repo-f");
         let key = "abc refs/heads/main".to_string();
         put(dir, key.clone(), &[branch("main")]);
