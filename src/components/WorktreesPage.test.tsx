@@ -618,6 +618,36 @@ describe("WorktreesPage", () => {
     expect(screen.getByText("2.0 KB")).not.toBeNull();
   });
 
+  /// The all-repositories rollup says it too, once the pass is done.
+  ///
+  /// The same #769 distinction in the other view: while repositories are
+  /// still answering, a null is "still coming" and the banner says so.
+  /// Once nothing is pending, a null is a walk that was abandoned, and
+  /// an em dash there would read as "measured, and the answer is
+  /// nothing".
+  it("says a worktree was not measured on the all-repositories view", () => {
+    Object.assign(state, {
+      repos: [
+        {
+          identity: null,
+          name: "proj",
+          path: "/code/proj",
+          worktrees: [wt({ path: "/code/proj/huge", size_bytes: null })],
+        },
+      ],
+      allSizes: new Map<string, number | null>([["/code/proj/huge", null]]),
+      // Nothing left to wait for, so the null is final.
+      sizesPending: 0,
+      sizesTotal: 1,
+    });
+    useFilters.setState({
+      filtersByView: { ...EMPTY, worktrees: {} },
+      view: "worktrees",
+    } as never);
+    render(<WorktreesPage />);
+    expect(screen.getByText(/not measured/i)).not.toBeNull();
+  });
+
   // Safety and size are separate passes; a row whose safety resolved must
   // not be held hostage by a size that has not.
   it("shows a resolved safety even while that row's size is still pending", () => {

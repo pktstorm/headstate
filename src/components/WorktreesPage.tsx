@@ -82,6 +82,16 @@ function Skeleton({ className = "" }: { className?: string }) {
   );
 }
 
+/// Why a size cell says "not measured" (#769).
+///
+/// One constant for both cells -- the per-repository row and the
+/// all-repositories rollup -- so the explanation cannot drift between
+/// two views of the same fact. It names the CAUSE rather than just the
+/// outcome, because "could not measure" alone leaves the user with
+/// nothing to do about it, and nesting is the cause they can act on.
+const UNMEASURED_HINT =
+  "This worktree could not be measured within the time limit. It is usually a very large tree, or one nested under another checkout so its files are walked twice.";
+
 function Row({
   wt,
   repoPath,
@@ -240,10 +250,7 @@ function Row({
             `sizePending` would leave the skeleton up for the rest of the
             pass. */}
         {sizeUnmeasurable ? (
-          <span
-            className="cursor-help text-[#6e7681]"
-            title="This worktree could not be measured within the time limit. It is usually a very large tree, or one nested under another checkout so its files are walked twice."
-          >
+          <span className="cursor-help text-[#6e7681]" title={UNMEASURED_HINT}>
             not measured
           </span>
         ) : sizePending && wt.size_bytes === null ? (
@@ -988,7 +995,21 @@ export function WorktreesPage() {
               {pathBasename(wt.path)}
             </span>
             <span className="w-20 shrink-0 text-right tabular-nums text-xs text-[#8b949e]">
-              {wt.size_bytes === null ? "—" : formatSize(wt.size_bytes)}
+              {/* The same three states as the per-repository cell. Once
+                  the pass has finished, a null here is no longer "still
+                  coming" -- it is a walk that was abandoned (#769), and
+                  an em dash would read as "measured, and the answer is
+                  nothing". The banner above covers the pending case, so
+                  this only has to separate the other two. */}
+              {wt.size_bytes === null && sizesPending === 0 ? (
+                <span className="cursor-help text-[#6e7681]" title={UNMEASURED_HINT}>
+                  not measured
+                </span>
+              ) : wt.size_bytes === null ? (
+                "—"
+              ) : (
+                formatSize(wt.size_bytes)
+              )}
             </span>
           </button>
         ))}
