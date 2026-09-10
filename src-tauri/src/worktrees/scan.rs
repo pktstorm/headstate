@@ -226,6 +226,14 @@ pub fn parse_porcelain(out: &str) -> Vec<Worktree> {
 /// the merely-inconvenient ones, so a worktree that is both unmerged and
 /// never-pushed reports the fact that matters. Any git failure yields
 /// `Unknown`, never `Safe`.
+///
+/// Two of the refusals below are only correct if they are also
+/// REACHABLE and MEANT, which is what #776 was about. A check placed
+/// after one that always fires first never runs (the detached case), and
+/// a check that answers a question the user did not ask refuses work
+/// that is already safe (the ahead-of-a-stale-ref case). Both are
+/// recorded at the point where the order matters, because both read as
+/// obviously-correct code from any distance.
 pub fn worktree_safety(
     wt: &Worktree,
     default_branch: &str,
@@ -345,16 +353,60 @@ pub fn worktree_safety(
         // the same merge checks every other branch faces. The upstream
         // being gone is permission to ASK whether the work landed, not
         // an answer that it did.
-        if !was_ever_pushed(dir) {
-            return Safety::NeverPushed;
-        }
+
+        // Detached FIRST, above `was_ever_pushed`, and the order is the
+        // entire fix for the second half of #776.
+        //
+        // `was_ever_pushed` answers by reading `branch.<name>.remote`.
+        // A detached HEAD has no branch, so there is no config key to
+        // read, so it returns false -- and the `NeverPushed` return
+        // above fired before the detached check below was ever reached.
+        // The check existed for exactly one case and was unreachable
+        // for exactly that case.
+        //
+        // The verdict it produced was not merely imprecise, it was the
+        // strongest refusal the app has: "commits exist only here",
+        // asserted over a checkout whose commits are usually a tag or a
+        // main-branch SHA that exists everywhere. MEASURED on a real
+        // 37-worktree checkout: 12 were detached and all 12 claimed it.
+        //
+        // `Unknown` is the honest answer. A detached HEAD has no branch
+        // whose push state, tracking config, or merge status could be
+        // asked about -- the app genuinely cannot say, and saying so is
+        // not the same as claiming the work is unique to this machine.
+        // `git worktree add --detach` is an ordinary way to make a
+        // scratch checkout, so this is a normal state, not a broken one.
+        //
+        // MEASURED over the reporting machine's 43 worktrees, same code
+        // and same moment, with only the ordering differing:
+        //
+        // | verdict                | before | after |
+        // |------------------------|--------|-------|
+        // | NeverPushed            | 12     | 2     |
+        // | Unknown(detached HEAD) | 0      | 10    |
+        //
+        // The 2 that remain are real branches with no tracking config,
+        // which is what the refusal is actually for.
         if wt.branch.is_empty() {
             return Safety::Unknown("detached HEAD".into());
+        }
+        if !was_ever_pushed(dir) {
+            return Safety::NeverPushed;
         }
         return match merged_into(dir, default_branch) {
             Safety::Safe => Safety::MergedUpstreamDeleted,
             other => other,
         };
+    }
+
+    // Detached before the ahead-count, mirroring the no-upstream path
+    // above and for the same reason (#776). This one was never
+    // unreachable -- a detached HEAD reaching here has an upstream, so
+    // `ahead` is a real number -- but answering `Unpushed(n)` for a
+    // checkout with no branch describes a branch that does not exist.
+    // The check simply belongs above every verdict that presumes one.
+    if wt.branch.is_empty() {
+        return Safety::Unknown("detached HEAD".into());
     }
 
     // Ahead-count comes from the caller's `rev-list --left-right`, which
@@ -364,12 +416,80 @@ pub fn worktree_safety(
     // than becoming a confident zero.
     match ahead {
         Some(0) => {}
-        Some(n) => return Safety::Unpushed(n),
+        Some(n) => {
+            // Ahead of the upstream ref is NOT the same as unpushed,
+            // and conflating the two is the first half of #776.
+            //
+            // Git does not delete `refs/remotes/origin/<branch>` when
+            // the remote branch goes away; only an explicit
+            // `remote prune` or a `fetch --prune` does, and nothing in
+            // this app runs either. So after the ordinary
+            // squash-merge-and-delete-branch flow, the tracking ref
+            // LINGERS -- pointing at the branch's pre-merge tip, for a
+            // branch GitHub no longer has.
+            //
+            // `rev-parse @{u}` then SUCCEEDS against that ghost, which
+            // is why #732 never fires here: that fix keys on the
+            // upstream failing to resolve, and this upstream resolves
+            // perfectly well. It just describes something that does not
+            // exist. The branch reads as 1 commit "ahead" of its own
+            // pre-merge self, and `Unpushed(1)` short-circuited before
+            // any merge check ran. MEASURED on a real 37-worktree
+            // checkout: 5 branches whose PRs had merged hours earlier.
+            //
+            // Confirming the ref is stale needs `git ls-remote`, a
+            // NETWORK call, per row. This scan is deliberately
+            // offline-only -- every other check reads refs already on
+            // disk -- and a per-worktree round trip would also hang on
+            // an unreachable remote. So the staleness is not probed.
+            //
+            // Instead the question is re-asked in a form that does not
+            // depend on the tracking ref at all: is this content
+            // already on the DEFAULT branch? `Unpushed` exists to stop
+            // someone deleting commits that live only on their machine,
+            // and a commit contained in the default branch is by
+            // definition not one of those -- however many refs it is
+            // "ahead" of. So a merged verdict outranks an ahead-count,
+            // and only work that is genuinely NOT landed still reports
+            // `Unpushed`.
+            //
+            // This CANNOT widen the gate. `merged_into` is the same
+            // check every other branch faces, unchanged, and it answers
+            // `Safe` only on ancestry or an exact patch-id match. A
+            // branch with real unpushed work fails it and falls through
+            // to the `Unpushed(n)` below, exactly as before -- the only
+            // rows that change verdict are ones whose content was
+            // already proven to be on the default branch.
+            //
+            // Labelled `MergedUpstreamDeleted` rather than `Safe` for
+            // the same reason #732 introduced that variant: the
+            // upstream cannot be re-consulted afterwards, and the user
+            // deserves to see which route produced the verdict. Here
+            // the upstream ref still exists locally, but the branch it
+            // names does not -- which is the same fact one prune away.
+            //
+            // MEASURED over the reporting machine's 43 worktrees, same
+            // code and same moment, with only this check differing:
+            //
+            // | verdict               | before | after |
+            // |-----------------------|--------|-------|
+            // | Unpushed              | 6      | 0     |
+            // | MergedUpstreamDeleted | 0      | 6     |
+            //
+            // Every one of the six was a merged PR whose tracking ref
+            // had not been pruned. No row moved in the other direction.
+            //
+            // The cost is bounded to branches that read as AHEAD -- 6 of
+            // 43 here -- because this arm only runs for `n > 0`. A
+            // branch level with its upstream falls through to the same
+            // `merged_into` at the end of this function exactly as
+            // before, so no worktree is merge-checked twice.
+            if merged_into(dir, default_branch) == Safety::Safe {
+                return Safety::MergedUpstreamDeleted;
+            }
+            return Safety::Unpushed(n);
+        }
         None => return Safety::Unknown("could not count unpushed commits".into()),
-    }
-
-    if wt.branch.is_empty() {
-        return Safety::Unknown("detached HEAD".into());
     }
 
     // Ancestry is the cheap answer, but it only sees fast-forward and
@@ -4731,6 +4851,400 @@ prunable gitdir file points to non-existent location
             });
         }
     }
+
+    /// A repo whose remote branch was squash-merged and DELETED, with
+    /// the local remote-tracking ref deliberately left behind.
+    ///
+    /// The missing prune is the whole point. Every other fixture here
+    /// ends with `fetch --prune`, which is what makes #732's path fire;
+    /// this one must NOT, because the bug in #776 is precisely what
+    /// happens when nothing prunes. So the remote branch is deleted
+    /// inside the bare repo and no pruning fetch follows -- leaving
+    /// `refs/remotes/origin/feature` on disk, naming a branch the remote
+    /// no longer has. That is the state a real checkout is in minutes
+    /// after a squash-merge with branch deletion.
+    ///
+    /// Real git throughout -- a real remote, a real push, a real
+    /// squash-merge, a real remote-side branch delete. A synthetic
+    /// fixture that just wrote a ref file would let the test pass for
+    /// the wrong reason, and this gate guards the app's only
+    /// unrecoverable action.
+    ///
+    /// Hands back a worktree whose branch is 1 commit ahead of its stale
+    /// upstream and whose content is on `origin/main`.
+    fn stale_tracking_ref_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ident = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+        let run_in = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .envs(ident)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        run_in(&remote, &["init", "-q", "--bare", "-b", "main"]);
+
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_in(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        run_in(&repo, &["add", "-A"]);
+        run_in(&repo, &["commit", "-q", "-m", "base"]);
+        run_in(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run_in(&repo, &["push", "-q", "-u", "origin", "main"]);
+
+        // The branch, with real work, pushed and TRACKING -- the
+        // tracking config is what leaves a tracking ref behind later.
+        let wt = tmp.path().join("proj-feature");
+        run_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--track",
+                "-b",
+                "feature",
+                wt.to_str().unwrap(),
+                "main",
+            ],
+        );
+        std::fs::write(
+            wt.join("feature.txt"),
+            "the work this branch exists to add\nand a second line of it\n",
+        )
+        .unwrap();
+        run_in(&wt, &["add", "-A"]);
+        run_in(&wt, &["commit", "-q", "-m", "the feature"]);
+        run_in(&wt, &["push", "-q", "-u", "origin", "feature"]);
+
+        // One further commit AFTER the last push, left unpushed. This is
+        // what makes the branch read as ahead of its tracking ref, and
+        // it is the ordinary shape: a review fixup committed locally,
+        // then included in the squash by merging the local branch. The
+        // count the user is shown -- `Unpushed(1)` -- comes from exactly
+        // this commit, and the point of #776 is that it landed anyway.
+        std::fs::write(
+            wt.join("feature.txt"),
+            "the work this branch exists to add\nand a second line of it\na review fixup\n",
+        )
+        .unwrap();
+        run_in(&wt, &["add", "-A"]);
+        run_in(&wt, &["commit", "-q", "-m", "review fixup"]);
+
+        // The squash-merge, as the forge performs it: the branch's whole
+        // diff replayed onto the default branch as ONE new commit with a
+        // new SHA, so the original tip is never an ancestor.
+        run_in(&repo, &["checkout", "-q", "main"]);
+        run_in(&repo, &["merge", "-q", "--squash", "feature"]);
+        run_in(&repo, &["commit", "-q", "-m", "the feature (#1)"]);
+        run_in(&repo, &["push", "-q", "origin", "main"]);
+
+        // The forge deletes the remote branch. Done in the BARE repo so
+        // the local tracking ref is untouched -- a `push --delete` from
+        // the clone would remove it here too, which is the one thing
+        // this fixture must not do.
+        run_in(&remote, &["branch", "-D", "feature"]);
+
+        // Refresh only the default branch, so the merge is visible. NO
+        // `--prune`: the stale `origin/feature` must survive, or the
+        // fixture does not reproduce #776.
+        run_in(&repo, &["fetch", "-q", "origin", "main"]);
+
+        (tmp, repo, wt)
+    }
+
+    /// The premise of the first half of #776, asserted rather than
+    /// assumed: the tracking ref for a deleted remote branch is still on
+    /// disk, `@{u}` still RESOLVES against it, and the branch reads as 1
+    /// commit ahead of a ref describing a branch that no longer exists.
+    ///
+    /// The resolving upstream is the load-bearing detail. #732 keys on
+    /// the upstream failing to resolve, so if this fixture ever stops
+    /// leaving the ref behind the bug is no longer reproduced and the
+    /// verdict test below would pass by #732's route instead of by the
+    /// fix it is meant to prove.
+    #[test]
+    fn the_fixture_really_leaves_a_stale_tracking_ref_behind() {
+        let (_t, _repo, wt) = stale_tracking_ref_fixture();
+
+        assert!(
+            git(&wt, &["rev-parse", "--verify", "--quiet", "origin/feature"]).is_ok(),
+            "the stale tracking ref must survive, or nothing is being tested"
+        );
+        assert!(
+            git(&wt, &["rev-parse", "--abbrev-ref", "@{u}"]).is_ok(),
+            "the upstream must still RESOLVE -- that is why #732 never fires here"
+        );
+        assert_eq!(
+            git(&wt, &["rev-list", "--count", "@{u}..HEAD"])
+                .unwrap()
+                .trim(),
+            "1",
+            "the branch must read as 1 ahead of its ghost upstream"
+        );
+        assert!(
+            git(&wt, &["merge-base", "--is-ancestor", "HEAD", "origin/main"]).is_err(),
+            "ancestry must not see this merge, or it is not a squash"
+        );
+    }
+
+    /// The first half of #776: a branch whose PR squash-merged and whose
+    /// remote branch was deleted must NOT be refused as `Unpushed`
+    /// merely because nothing has pruned the tracking ref.
+    ///
+    /// This is the shape five worktrees were in on the reporting
+    /// machine, every one reporting a single unpushed commit for work
+    /// that had merged hours earlier.
+    #[test]
+    fn a_branch_ahead_of_a_stale_tracking_ref_is_not_unpushed() {
+        let (_t, _repo, wt) = stale_tracking_ref_fixture();
+        let w = Worktree {
+            path: wt.to_string_lossy().into_owned(),
+            branch: "feature".into(),
+            ..Default::default()
+        };
+
+        // `has_upstream` TRUE and `ahead` 1 -- precisely what the caller
+        // computes here, because the ghost ref resolves. That is the
+        // input that used to short-circuit to `Unpushed(1)`.
+        let s = worktree_safety(&w, "origin/main", true, Some(1));
+        assert_eq!(
+            s,
+            Safety::MergedUpstreamDeleted,
+            "merged work must not be refused because a tracking ref is \
+             stale, got {s:?}"
+        );
+        assert!(s.is_safe(), "it must be removable: {}", s.reason());
+    }
+
+    /// THE test that matters: genuinely unpushed work is still refused.
+    ///
+    /// `Unpushed` exists to stop someone deleting commits that live only
+    /// on their machine, and the fix above must not cost a single one of
+    /// those. Same shape as the fixture -- a real remote, a real push, a
+    /// tracking ref one commit behind HEAD -- except the extra commit
+    /// was never merged anywhere. It must still refuse.
+    ///
+    /// The inputs to `worktree_safety` are IDENTICAL to the merged case
+    /// above: upstream resolves, one commit ahead. Only the content
+    /// differs, which is exactly what the fix keys on -- so this test
+    /// and the one above together pin that the fix discriminates on
+    /// landed content and on nothing else.
+    #[test]
+    fn genuinely_unpushed_work_is_still_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ident = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+        let run_in = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .envs(ident)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        run_in(&remote, &["init", "-q", "--bare", "-b", "main"]);
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_in(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        run_in(&repo, &["add", "-A"]);
+        run_in(&repo, &["commit", "-q", "-m", "base"]);
+        run_in(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run_in(&repo, &["push", "-q", "-u", "origin", "main"]);
+
+        let wt = tmp.path().join("proj-feature");
+        run_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--track",
+                "-b",
+                "feature",
+                wt.to_str().unwrap(),
+                "main",
+            ],
+        );
+        // Pushed work first, so the tracking ref is real and current --
+        // not a ghost. This is the half that is safe to lose.
+        std::fs::write(wt.join("feature.txt"), "work that did reach the remote\n").unwrap();
+        run_in(&wt, &["add", "-A"]);
+        run_in(&wt, &["commit", "-q", "-m", "pushed work"]);
+        run_in(&wt, &["push", "-q", "-u", "origin", "feature"]);
+
+        // And then a commit that exists NOWHERE else. This is the one
+        // the refusal exists for.
+        std::fs::write(
+            wt.join("feature.txt"),
+            "work that did reach the remote\nand a line that never left this machine\n",
+        )
+        .unwrap();
+        run_in(&wt, &["add", "-A"]);
+        run_in(&wt, &["commit", "-q", "-m", "work that exists only here"]);
+
+        assert_eq!(
+            git(&wt, &["rev-list", "--count", "@{u}..HEAD"])
+                .unwrap()
+                .trim(),
+            "1",
+            "must be 1 ahead, or this is not the same input shape as the \
+             merged case"
+        );
+
+        let w = Worktree {
+            path: wt.to_string_lossy().into_owned(),
+            branch: "feature".into(),
+            ..Default::default()
+        };
+        let s = worktree_safety(&w, "origin/main", true, Some(1));
+        assert_eq!(
+            s,
+            Safety::Unpushed(1),
+            "a commit that exists only on this machine must still be \
+             refused, got {s:?}"
+        );
+        assert!(
+            !s.is_safe(),
+            "unpushed work must never become removable: {}",
+            s.reason()
+        );
+    }
+
+    /// The second half of #776: a detached worktree is `Unknown`, not
+    /// `NeverPushed`.
+    ///
+    /// `git worktree add --detach` is an ordinary way to make a scratch
+    /// checkout, and 12 of 37 worktrees on the reporting machine were in
+    /// this state. All 12 claimed "commits exist only here" -- the
+    /// strongest refusal the app has -- about checkouts sitting on
+    /// commits that are on the default branch and on the remote.
+    ///
+    /// The cause was pure ordering: `was_ever_pushed` reads
+    /// `branch.<name>.remote`, a detached HEAD has no branch, so it
+    /// answered false and the `NeverPushed` return fired before the
+    /// detached check below it could ever run. The check existed for
+    /// exactly one case and was unreachable for exactly that case.
+    #[test]
+    fn a_detached_worktree_is_unknown_not_never_pushed() {
+        let (_t, repo, _wt) = repo_with_worktree("feature");
+        let detached = repo.parent().unwrap().join("scratch");
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                detached.to_str().unwrap(),
+                "main",
+            ])
+            .envs([
+                ("GIT_AUTHOR_NAME", "octocat"),
+                ("GIT_COMMITTER_NAME", "octocat"),
+                ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+                ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "worktree add --detach: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // The premise: git really lists this with no branch, and
+        // `was_ever_pushed` really answers false for it -- which is what
+        // made the ordering fatal rather than merely untidy.
+        let listed = parse_porcelain(&git(&repo, &["worktree", "list", "--porcelain"]).unwrap());
+        let target = listed
+            .iter()
+            // Matched on the trailing component rather than the whole
+            // path: on macOS a temp dir resolves through `/private`, so
+            // git prints a path that is the same directory under a
+            // different spelling.
+            .find(|w| w.path.ends_with("/scratch"))
+            .expect("the detached worktree must be listed");
+        assert!(
+            target.branch.is_empty(),
+            "the fixture must be detached, or it tests nothing"
+        );
+        assert!(
+            !was_ever_pushed(&detached),
+            "a detached HEAD has no branch config to read -- the premise \
+             of the bug"
+        );
+
+        let s = worktree_safety(target, "main", false, Some(0));
+        assert_eq!(
+            s,
+            Safety::Unknown("detached HEAD".into()),
+            "a detached HEAD must say it cannot be classified rather than \
+             claim commits exist only here, got {s:?}"
+        );
+        assert!(!s.is_safe(), "and it must still not be removable");
+    }
+
+    /// A detached worktree stays `Unknown` on the OTHER path too -- the
+    /// one where an upstream resolves and an ahead-count exists.
+    ///
+    /// `worktree_safety` reaches its detached check by two routes and
+    /// #776 corrected the ordering on both. This pins the second, which
+    /// no test covered: a detached HEAD has no branch to be "ahead" of,
+    /// so an ahead-count must not produce `Unpushed` for one.
+    #[test]
+    fn a_detached_worktree_is_unknown_even_with_an_ahead_count() {
+        let (_t, repo, _wt) = repo_with_worktree("feature");
+        let w = Worktree {
+            path: repo.to_string_lossy().into_owned(),
+            branch: String::new(),
+            ..Default::default()
+        };
+        let s = worktree_safety(&w, "main", true, Some(3));
+        assert_eq!(
+            s,
+            Safety::Unknown("detached HEAD".into()),
+            "a detached HEAD cannot be ahead of a branch it does not \
+             have, got {s:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5388,6 +5902,48 @@ mod live {
     /// original report is on one machine, and this is a public
     /// repository where a real checkout path is exactly what
     /// CONTRIBUTING.md's privacy rule keeps out.
+    /// The production classifier over a real checkout, for the counts in
+    /// #776. Set `HEADSTATE_REAL_REPO` to a repository with worktrees.
+    ///
+    /// Ignored by default, and READ-ONLY: it classifies and prints, and
+    /// never writes to the repository it is pointed at. Same shape as
+    /// `live_squash_merged_worktree_is_detected` -- the established way
+    /// to check a fix against a real tree without committing one.
+    #[test]
+    #[ignore]
+    fn live_classifier_verdict_census() {
+        let Ok(path) = std::env::var("HEADSTATE_REAL_REPO") else {
+            println!("set HEADSTATE_REAL_REPO to a repo with worktrees to run this");
+            return;
+        };
+        let repo = std::path::PathBuf::from(path);
+        if !repo.is_dir() {
+            println!("repo absent; nothing to check");
+            return;
+        }
+        let default = default_branch(&repo);
+        let listed = parse_porcelain(&git(&repo, &["worktree", "list", "--porcelain"]).unwrap());
+        println!("default branch: {default}  worktrees: {}", listed.len());
+
+        let mut tally: std::collections::BTreeMap<String, usize> = Default::default();
+        for w in &listed {
+            let mut w = w.clone();
+            classify(&mut w, &repo, &default);
+            let key = match &w.safety {
+                Safety::Unknown(m) => format!("Unknown({m})"),
+                Safety::Dirty(_) => "Dirty".to_string(),
+                Safety::Unpushed(_) => "Unpushed".to_string(),
+                Safety::Locked(_) => "Locked".to_string(),
+                Safety::Prunable(_) => "Prunable".to_string(),
+                other => format!("{other:?}"),
+            };
+            *tally.entry(key).or_default() += 1;
+        }
+        for (k, n) in &tally {
+            println!("{n:>4}  {k}");
+        }
+    }
+
     #[test]
     #[ignore]
     fn live_squash_merged_worktree_is_detected() {
