@@ -142,6 +142,7 @@ const ROWS: Row[] = [
   row(api.dockerStart, [], "docker_start"),
   row(api.assessedWorktrees, [], "assessed_worktrees"),
   row(api.removeWorktreeForced, [repoPath, worktreePath], "remove_worktree_forced", { repoPath, worktreePath }),
+  row(api.unlockWorktree, [repoPath, worktreePath], "unlock_worktree", { repoPath, worktreePath }),
   row(api.claudifyCommand, [repoPath, worktreePath, branch], "claudify_command", { repoPath, worktreePath, branch }),
   row(api.setAutoMerge, [id, repo, number, expectedHead, enable], "set_auto_merge", { id, repo, number, expectedHead, enable }),
   row(api.deleteHeadBranch, [refId, repo, number, branch, merged], "delete_head_branch", { refId, repo, number, branch, merged }),

@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Worktree, WorktreeRepo } from "@/types/pr";
+import type { Lock, Worktree, WorktreeRepo } from "@/types/pr";
 import { useFilters } from "@/store/filters";
 import { stubViewport } from "@/test-utils";
 
@@ -83,6 +83,7 @@ vi.mock("../api/hooks", () => ({
   useRemoveWorktree: () => removeFn,
   useRemoveWorktrees: () => removeManyFn,
   useRemoveWorktreeForced: () => forceFn,
+  useUnlockWorktree: () => unlockFn,
   useAssessed: () => ({ data: state.assessed }),
   useMarkAssessed: () => markAssessedFn,
   useClearAssessed: () => clearAssessedFn,
@@ -106,6 +107,7 @@ vi.mock("../api/hooks", () => ({
 
 const removeFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 const forceFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
+const unlockFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 type Outcome = { path: string; error: string | null };
 const removeManyFn = vi.hoisted(() =>
   vi.fn<(repo: string, paths: string[]) => Promise<Outcome[]>>((_r, paths) =>
@@ -136,6 +138,19 @@ vi.mock("@/lib/target", () => ({
 }));
 
 import { WorktreesPage } from "./WorktreesPage";
+
+/// A lock for the locked-row fixtures (#775).
+///
+/// Synthetic per CONTRIBUTING.md. `underlying` defaults to `unmerged`
+/// so a test that does not mention it cannot accidentally rely on the
+/// "would be safe once unlocked" wording.
+const lockOf = (over: Partial<Lock> = {}): Lock => ({
+  reason: "some tool (pid 123)",
+  age_days: 5,
+  holder_running: true,
+  underlying: { kind: "unmerged" },
+  ...over,
+});
 
 const wt = (over: Partial<Worktree>): Worktree => ({
   path: "/code/proj-a",
@@ -1778,7 +1793,7 @@ describe("WorktreesPage", () => {
     /// two chances to drift.
     it("warns on a locked row that forcing will not help", () => {
       state.classified = [
-        wt({ safety: { kind: "locked", detail: "some tool (pid 123)" } }),
+        wt({ safety: { kind: "locked", detail: lockOf() } }),
       ];
       render(<WorktreesPage />);
       openKebab();
@@ -1790,22 +1805,120 @@ describe("WorktreesPage", () => {
       expect(item).toBeTruthy();
     });
 
-    /// #775's territory, deliberately. Unlocking is contentious and is
-    /// not being decided here -- the menu explains the obstacle and
-    /// stops.
-    it("offers no unlock action", () => {
+    /// #779 asserted the OPPOSITE of this, and deliberately: unlocking
+    /// was #775's territory and was not being decided there. #775
+    /// decided it, so the assertion is inverted rather than deleted --
+    /// the old one is now the bug.
+    ///
+    /// What changed the balance is measurement, not taste: 20 of 44
+    /// worktrees on the reporting machine are locked, all naming one
+    /// pid that is alive only because it is the parent session, with
+    /// nothing running in any of the directories. At 45% of the list,
+    /// withholding the remedy leaves a view that cannot be used.
+    it("offers an unlock action on a locked row", () => {
       state.classified = [
-        wt({ safety: { kind: "locked", detail: "some tool (pid 123)" } }),
+        wt({ safety: { kind: "locked", detail: lockOf() } }),
       ];
       render(<WorktreesPage />);
       openKebab();
       // Anchored, because the Remove item's own warning necessarily
       // contains the word "unlocked" -- a loose /unlock/ would match
-      // the very copy that explains why there is no unlock action.
+      // the copy explaining that forcing will not help.
+      const items = screen
+        .getAllByRole("menuitem")
+        .map((el) => el.textContent ?? "");
+      expect(items.some((t) => /^\s*unlock/i.test(t))).toBe(true);
+    });
+
+    /// Only on a locked row. An unlock item beside an ordinary worktree
+    /// would be an action with nothing to act on, and on this page a
+    /// menu full of inapplicable verbs is how a user stops reading them.
+    it("offers no unlock action on a row that is not locked", () => {
+      state.classified = [wt({ safety: { kind: "unmerged" } })];
+      render(<WorktreesPage />);
+      openKebab();
       const items = screen
         .getAllByRole("menuitem")
         .map((el) => el.textContent ?? "");
       expect(items.some((t) => /^\s*unlock/i.test(t))).toBe(false);
+    });
+
+    /// The confirmation #753 asked for before any unlock button could
+    /// exist: it must NAME the holder and the age, so clearing a claim
+    /// cannot happen without reading it.
+    it("names the holder and the age before unlocking", () => {
+      unlockFn.mockClear();
+      state.classified = [
+        wt({ safety: { kind: "locked", detail: lockOf({ age_days: 5 }) } }),
+      ];
+      render(<WorktreesPage />);
+      openKebab();
+      fireEvent.click(screen.getByRole("menuitem", { name: /^unlock/i }));
+
+      // Nothing is cleared by opening the dialog.
+      expect(unlockFn).not.toHaveBeenCalled();
+
+      const dialog = screen.getByRole("dialog");
+      expect(dialog.textContent).toMatch(/5 days ago/);
+      expect(dialog.textContent).toMatch(/some tool \(pid 123\)/);
+    });
+
+    /// The pid is the thing #775 says stops being presented as
+    /// evidence. It is still SHOWN -- it is the locker's own words --
+    /// but a live process must never be offered as proof the lock is
+    /// current, because on the reporting machine that is true of all 20
+    /// abandoned locks.
+    it("does not present a running holder as proof the lock is live", () => {
+      state.classified = [
+        wt({
+          safety: { kind: "locked", detail: lockOf({ holder_running: true }) },
+        }),
+      ];
+      render(<WorktreesPage />);
+      openKebab();
+      fireEvent.click(screen.getByRole("menuitem", { name: /^unlock/i }));
+      expect(screen.getByRole("dialog").textContent).toMatch(/weak evidence/i);
+    });
+
+    /// What is underneath, in the dialog as well as the row: it is the
+    /// fact that turns unlocking from a leap into a decision, and the
+    /// dialog is the moment the decision is actually made.
+    it("says what is underneath the lock before clearing it", () => {
+      state.classified = [
+        wt({
+          safety: {
+            kind: "locked",
+            detail: lockOf({ underlying: { kind: "safe" } }),
+          },
+        }),
+      ];
+      render(<WorktreesPage />);
+      openKebab();
+      fireEvent.click(screen.getByRole("menuitem", { name: /^unlock/i }));
+      expect(screen.getByRole("dialog").textContent).toMatch(
+        /merged, pushed|safe to delete/i,
+      );
+    });
+
+    /// Unlocking must not be a quiet second route to removal. The
+    /// confirmation clears the lock and nothing else.
+    it("clears the lock and removes nothing when confirmed", async () => {
+      unlockFn.mockClear();
+      removeFn.mockClear();
+      forceFn.mockClear();
+      state.classified = [
+        wt({ path: "/code/a", safety: { kind: "locked", detail: lockOf() } }),
+      ];
+      render(<WorktreesPage />);
+      openKebab();
+      fireEvent.click(screen.getByRole("menuitem", { name: /^unlock/i }));
+      fireEvent.click(screen.getByRole("button", { name: /unlock it/i }));
+
+      await waitFor(() =>
+        expect(unlockFn).toHaveBeenCalledWith("/code/proj", "/code/a"),
+      );
+      expect(removeFn).not.toHaveBeenCalled();
+      expect(forceFn).not.toHaveBeenCalled();
     });
 
     /// The main checkout is never a removal candidate, and a menu item

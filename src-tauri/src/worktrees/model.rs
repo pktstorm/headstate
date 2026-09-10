@@ -118,7 +118,15 @@ pub enum Safety {
     /// passing that silently would defeat the only mechanism git gives a
     /// concurrent process for saying "I am using this". 13 of 34
     /// worktrees on the reporting machine were locked by running agents.
-    Locked(Option<String>),
+    ///
+    /// The payload grew a struct in #775. `Option<String>` said only
+    /// what git said, and on a machine where 20 of 44 worktrees are
+    /// locked that turned out to be the wrong amount of information in
+    /// both directions -- too much of the useless part, none of the
+    /// useful. `Lock` carries the age, whether the named process is
+    /// plausibly the holder, and what the worktree WOULD be without the
+    /// lock. See `Lock` for why each of those exists.
+    Locked(Lock),
     /// The directory is gone and git knows the registration is stale.
     ///
     /// Git emits `prunable <reason>` for exactly this, and `git worktree
@@ -141,6 +149,108 @@ pub enum Safety {
     Pending,
     /// Git could not answer; never assume safe on an error.
     Unknown(String),
+}
+
+/// What is known about a lock, beyond the fact of it.
+///
+/// #753 carried git's reason string alone, on the reasoning that "some
+/// tool (pid 123)" is what separates a live claim from a leftover one.
+/// Measured on the reporting machine once locks had accumulated, that
+/// reasoning did not survive contact:
+///
+/// - **20 of 44 worktrees are locked** -- 45% of the list, up from the
+///   third #753 measured.
+/// - **Every one names the same pid**, and that process is ALIVE. It is
+///   the long-lived parent session, not the individual short-lived
+///   workers that actually took the locks; those finished hours or days
+///   ago. `ps` therefore answers "alive" for every row, and a user
+///   reading the reason cannot tell a current claim from an abandoned
+///   one.
+/// - **`lsof -d cwd` returns nothing** for any of them. Nothing is
+///   working in those directories.
+/// - The reason string embeds its own `start <date>`, and **all 20
+///   carry the identical timestamp** -- the session's start, not the
+///   lock's. So the one thing in the string that looks like an age is
+///   the same on every row and ages all of them together.
+///
+/// So the pid is noise dressed as evidence, and this struct exists to
+/// put honest evidence beside it rather than to delete it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lock {
+    /// Git's own lock reason, or `None` for a lock taken without
+    /// `--reason` -- which git permits and reports as a bare `locked`
+    /// line.
+    ///
+    /// Kept verbatim. It is still the only thing the locker chose to
+    /// say, and rewriting it would be the app inventing a claim on
+    /// another process's behalf. What changed in #775 is its STANDING:
+    /// it is now one field among several rather than the whole answer.
+    pub reason: Option<String>,
+    /// Whole days since the lock was taken, or `None` if unreadable.
+    ///
+    /// **The load-bearing field, and the one that actually reads as
+    /// stale.** "locked 5 days ago" is a fact a user can act on where
+    /// a bare pid is not, and unlike the pid it differs per row: the
+    /// locks on the reporting machine span 6 September to today.
+    ///
+    /// Measured from the mtime of git's own `locked` file in the
+    /// worktree's admin directory, NOT from the `start` timestamp
+    /// inside the reason string. Verified against real git: locking
+    /// writes that file, and unlocking and re-locking rewrites it, so
+    /// its mtime is when the CURRENT claim was made. The reason's own
+    /// timestamp was tried first and rejected -- all 20 locks on the
+    /// reporting machine carry the same one, because it dates the
+    /// process, not the claim.
+    ///
+    /// `None` rather than 0 when it cannot be read. A lock of unknown
+    /// age is not a lock taken this second, and that is exactly the
+    /// direction in which a wrong guess would make removal feel safer.
+    pub age_days: Option<u64>,
+    /// Whether the pid named in the reason is running right now, or
+    /// `None` when the reason names no pid to check.
+    ///
+    /// Deliberately NOT called "the lock is live". A live pid is weak
+    /// evidence here and the app must not launder it into a strong
+    /// claim: on the reporting machine this is `Some(true)` for all 20
+    /// locks, every one of them abandoned, because the pid belongs to
+    /// the surviving parent. It is carried so the UI can say what was
+    /// checked -- and so a `Some(false)` can say the one genuinely
+    /// decisive thing, that the process named is gone.
+    pub holder_running: Option<bool>,
+    /// What this worktree would be if the lock were cleared.
+    ///
+    /// **The reason unlocking stops being a blind action** (#775). The
+    /// lock decides whether removal is POSSIBLE and the merge state
+    /// whether it is DESIRABLE; #753 answered only the first, which was
+    /// right as far as it went and left a user clearing a claim with no
+    /// idea whether the thing behind it was disposable. With 45% of
+    /// rows locked, that is what makes the view unusable.
+    ///
+    /// Boxed because `Safety` contains this struct, and a plain
+    /// `Safety` field here would make the type infinitely sized.
+    ///
+    /// This does NOT widen the gate. It is carried for display; the
+    /// verdict governing the button is still `Locked`, and `is_safe`
+    /// never looks inside. A locked worktree that is merged underneath
+    /// is still locked.
+    pub underlying: Box<Safety>,
+}
+
+impl Lock {
+    /// Prose for the age, or `None` when it is unknown.
+    ///
+    /// Whole days, because that is the resolution the decision needs:
+    /// nobody unlocks differently for 5 days versus 5 days and 3 hours,
+    /// and a precise figure would imply a precision the mtime does not
+    /// really carry. "today" rather than "0 days ago", which reads as a
+    /// missing value.
+    pub fn age_phrase(&self) -> Option<String> {
+        match self.age_days? {
+            0 => Some("today".into()),
+            1 => Some("yesterday".into()),
+            n => Some(format!("{n} days ago")),
+        }
+    }
 }
 
 /// Defaults to `Pending`, never `Safe`.
@@ -206,12 +316,43 @@ impl Safety {
             // answered by `is_safe`.
             Safety::Empty => "no commits of its own — nothing to lose".into(),
             Safety::Unmerged => "branch not merged".into(),
-            // Names the locker when git has one. "locked" alone would
-            // send the user to the command line to find out by whom;
-            // the reason is why `--reason` exists, and it is what
-            // separates a live claim from a stale one (#753).
-            Safety::Locked(Some(why)) => format!("locked: {why}"),
-            Safety::Locked(None) => "locked — no reason given".into(),
+            // AGE FIRST, then the reason (#775).
+            //
+            // #753 led with the reason on the theory that naming the
+            // locker separates a live claim from a stale one. Measured
+            // once locks accumulated, it does not: all 20 on the
+            // reporting machine name one pid, and that pid is alive
+            // because it is the surviving parent of workers that
+            // finished days ago. So the reason reads as live evidence
+            // for every row including every abandoned one.
+            //
+            // The age is the fact that differs per row and that a stale
+            // lock cannot fake. Leading with it means a five-day-old
+            // lock READS as five days old, which is the whole ask.
+            //
+            // The reason still follows, unrewritten. It is the locker's
+            // own words and occasionally identifies something real; it
+            // has simply stopped being the headline.
+            Safety::Locked(lock) => {
+                let mut s = "locked".to_string();
+                if let Some(age) = lock.age_phrase() {
+                    s.push(' ');
+                    s.push_str(&age);
+                }
+                match &lock.reason {
+                    Some(why) => s.push_str(&format!(" by {why}")),
+                    // Says the lock carries no note rather than
+                    // trailing off, which would read as a display bug.
+                    None => s.push_str(" — no reason given"),
+                }
+                // What the row could not say before: whether clearing
+                // the lock would reveal something disposable. Without
+                // it, unlocking is a leap.
+                if lock.underlying.is_safe() {
+                    s.push_str(" — merged, would be safe once unlocked");
+                }
+                s
+            }
             // Says the remedy, because unlike every other refusal here
             // there is one, it is safe, and it is one command. The old
             // wording for this state was "could not determine:

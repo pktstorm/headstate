@@ -269,6 +269,12 @@ export const assessedWorktrees = () => call<string[]>("assessed_worktrees");
 export const removeWorktreeForced = (repoPath: string, worktreePath: string) =>
   call<void>("remove_worktree_forced", { repoPath, worktreePath });
 
+/// Clear a worktree's lock (#775). Removes nothing -- `git worktree
+/// lock` puts it back -- but it clears a guard, so it is reached only
+/// from a confirmation naming the holder and the age.
+export const unlockWorktree = (repoPath: string, worktreePath: string) =>
+  call<void>("unlock_worktree", { repoPath, worktreePath });
+
 /// The clipboard payload for Claudify, plus whether Claude Code was
 /// found. `claude_installed` is advisory: the command is returned either
 /// way, since a user may paste it on another machine.

@@ -137,6 +137,13 @@ pub const SURFACE: &[(&str, Class)] = &[
     // is not a feature.
     ("apply_updates_in_background", Class::Write),
     ("cancel_update_run", Class::Write),
+    // Clears a worktree's lock (#775). Write, not Destructive: nothing
+    // is deleted and `git worktree lock` puts it back. It removes a
+    // guard, so the warning belongs in the confirmation that names the
+    // holder and the age -- not in a step-up prompt about an
+    // unrecoverable action this is not. Removal is unaffected: its own
+    // gate re-classifies the worktree from scratch afterwards.
+    ("unlock_worktree", Class::Write),
     // destructive: deletes files, branches, images, or volumes.
     ("delete_head_branch", Class::Destructive),
     ("delete_branches", Class::Destructive),
