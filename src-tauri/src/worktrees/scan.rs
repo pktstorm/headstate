@@ -256,7 +256,38 @@ pub fn worktree_safety(
     // calls per worktree -- 1.58s of pure duplication across a real
     // 145-worktree repo.
     if !has_upstream {
-        return Safety::NeverPushed;
+        // Two different situations produce a failing `rev-parse @{u}`,
+        // and they carry OPPOSITE verdicts (#732):
+        //
+        //   1. the branch was genuinely never pushed -- the commits
+        //      exist only here and deleting loses them;
+        //   2. the branch was pushed, its PR merged, and the remote
+        //      branch was deleted -- the work is on the default branch
+        //      and deleting loses nothing.
+        //
+        // Treating both as NeverPushed is what made every merged
+        // worktree unremovable: 27 of 29 branches on the machine that
+        // prompted this, holding the disk the view exists to reclaim.
+        //
+        // `branch.<name>.remote` tells them apart without a network
+        // call. Git leaves the tracking config in place when the remote
+        // ref disappears, so config-but-no-ref means case 2, and no
+        // config at all means case 1.
+        //
+        // Case 2 does NOT short-circuit to safe: it falls through to
+        // the same merge checks every other branch faces. The upstream
+        // being gone is permission to ASK whether the work landed, not
+        // an answer that it did.
+        if !was_ever_pushed(dir) {
+            return Safety::NeverPushed;
+        }
+        if wt.branch.is_empty() {
+            return Safety::Unknown("detached HEAD".into());
+        }
+        return match merged_into(dir, default_branch) {
+            Safety::Safe => Safety::MergedUpstreamDeleted,
+            other => other,
+        };
     }
 
     // Ahead-count comes from the caller's `rev-list --left-right`, which
@@ -281,6 +312,20 @@ pub fn worktree_safety(
     // repo on this machine: ancestry alone found 10 of 157 merged
     // worktrees, calling the other 147 unmerged. Those 147 are exactly
     // the ones filling the disk this view exists to reclaim.
+    merged_into(dir, default_branch)
+}
+
+/// Whether this branch's work is already on `default_branch`.
+///
+/// Split out of `worktree_safety` so the upstream-deleted path (#732)
+/// and the ordinary path reach their verdict through the SAME checks. A
+/// second copy of this decision would be a second place for "merged" to
+/// drift, and the two paths differ only in how they label success.
+///
+/// Returns `Safe` when merged; otherwise the specific reason it could
+/// not be established, never a bare bool -- an `Unknown` from a failed
+/// git call must not collapse into "unmerged".
+fn merged_into(dir: &Path, default_branch: &str) -> Safety {
     if git(
         dir,
         &["merge-base", "--is-ancestor", "HEAD", default_branch],
@@ -290,6 +335,41 @@ pub fn worktree_safety(
         return Safety::Safe;
     }
     squash_merged(dir, default_branch)
+}
+
+/// Whether this branch was EVER pushed, regardless of whether its
+/// upstream still resolves.
+///
+/// `git config --get branch.<name>.remote` is the evidence. Git writes
+/// it when a branch is first pushed with `-u` (or created with
+/// `--track`) and does NOT remove it when the remote branch is later
+/// deleted -- which is precisely the state a merged-and-tidied PR
+/// leaves behind.
+///
+/// Reads local config only: no fetch, no network, nothing that can hang
+/// on an unreachable remote. A branch that was never pushed has no such
+/// key and this returns false, preserving today's refusal for the case
+/// where commits really do exist only here.
+///
+/// Uses the CHECKOUT's own HEAD rather than a passed-in branch name so
+/// it cannot be asked about one branch while reading another's config.
+fn was_ever_pushed(dir: &Path) -> bool {
+    let Ok(branch) = git(dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]) else {
+        // Detached: there is no branch whose config could say.
+        return false;
+    };
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return false;
+    }
+    // A git failure here means "no such key", which is the honest
+    // answer to "was this pushed": we cannot show that it was.
+    git(
+        dir,
+        &["config", "--get", &format!("branch.{branch}.remote")],
+    )
+    .map(|v| !v.trim().is_empty())
+    .unwrap_or(false)
 }
 
 /// Whether this branch was created and never committed to.
@@ -1233,6 +1313,207 @@ HEAD 8ed50a741e1696d1a0c9506f2e033cf2887bb144
         assert!(
             !names.contains(&"proj-feature"),
             "a worktree must not be listed as its own repository: {names:?}"
+        );
+    }
+
+    /// #732: the state every merged PR leaves behind.
+    ///
+    /// A branch that was pushed, squash-merged, and whose remote branch
+    /// was then deleted. `rev-parse @{u}` fails exactly as it does for a
+    /// never-pushed branch, so this is the case that must NOT be
+    /// reported as "commits exist only here".
+    ///
+    /// Real git throughout, including a real bare remote and a real
+    /// squash merge: a synthetic fixture would let this pass for the
+    /// wrong reason, and the verdict decides whether work is deleted.
+    fn upstream_deleted_fixture(
+        squash: bool,
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ident = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+        let run_in = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .envs(ident)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        run_in(&remote, &["init", "-q", "--bare", "-b", "main"]);
+
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_in(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        run_in(&repo, &["add", "-A"]);
+        run_in(&repo, &["commit", "-q", "-m", "init"]);
+        run_in(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run_in(&repo, &["push", "-q", "-u", "origin", "main"]);
+
+        // The feature worktree: real work, really pushed.
+        let wt = tmp.path().join("proj-feature");
+        run_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                wt.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(wt.join("feature.txt"), "the work\n").unwrap();
+        run_in(&wt, &["add", "-A"]);
+        run_in(&wt, &["commit", "-q", "-m", "add the feature"]);
+        run_in(&wt, &["push", "-q", "-u", "origin", "feature"]);
+
+        if squash {
+            // Squash-merge, exactly as GitHub does it: the content lands
+            // on main as ONE new commit with a new SHA, so neither
+            // ancestry nor per-commit patch-ids match.
+            run_in(&repo, &["merge", "-q", "--squash", "feature"]);
+            run_in(&repo, &["commit", "-q", "-m", "add the feature (#1)"]);
+            run_in(&repo, &["push", "-q", "origin", "main"]);
+        }
+
+        // GitHub deletes the branch after merging, and the local side
+        // learns of it on the next prune. The tracking CONFIG survives.
+        run_in(&remote, &["branch", "-D", "feature"]);
+        run_in(&repo, &["fetch", "-q", "--prune", "origin"]);
+
+        (tmp, repo, wt)
+    }
+
+    /// The bug: a merged branch whose remote was deleted must not be
+    /// reported as never pushed.
+    #[test]
+    fn a_merged_branch_whose_remote_was_deleted_is_removable() {
+        let (_t, _repo, wt) = upstream_deleted_fixture(true);
+
+        // The premise: the upstream really is unresolvable, so this
+        // travels the same code path a never-pushed branch does.
+        assert!(
+            git(&wt, &["rev-parse", "--abbrev-ref", "@{u}"]).is_err(),
+            "fixture must leave @{{u}} unresolvable, or it tests nothing"
+        );
+
+        let w = Worktree {
+            path: wt.to_string_lossy().into_owned(),
+            branch: "feature".into(),
+            ..Default::default()
+        };
+        let s = worktree_safety(&w, "main", false, Some(0));
+        assert_eq!(
+            s,
+            Safety::MergedUpstreamDeleted,
+            "a merged branch with a deleted remote must say so, not \"never pushed\""
+        );
+        assert!(s.is_safe(), "it must be removable: {}", s.reason());
+        assert!(s.reason().contains("merged"), "{}", s.reason());
+        assert!(s.reason().contains("upstream deleted"), "{}", s.reason());
+    }
+
+    /// The other half of the gate, and the one that protects work: the
+    /// upstream being gone is permission to ASK whether the branch
+    /// merged, never an answer that it did.
+    #[test]
+    fn an_unmerged_branch_whose_remote_was_deleted_is_still_refused() {
+        let (_t, _repo, wt) = upstream_deleted_fixture(false);
+
+        let w = Worktree {
+            path: wt.to_string_lossy().into_owned(),
+            branch: "feature".into(),
+            ..Default::default()
+        };
+        let s = worktree_safety(&w, "main", false, Some(0));
+        assert!(
+            !s.is_safe(),
+            "unmerged work must survive a deleted upstream: {s:?}"
+        );
+        assert_ne!(
+            s,
+            Safety::MergedUpstreamDeleted,
+            "the branch never merged; saying it did would delete the work"
+        );
+    }
+
+    /// The regression this fix must not cause: a branch that genuinely
+    /// was never pushed has no tracking config, and keeps today's
+    /// refusal. Its commits exist nowhere else.
+    #[test]
+    fn a_genuinely_never_pushed_branch_is_still_never_pushed() {
+        let (_t, repo, wt) = repo_with_worktree("scratch");
+        // Give it a commit, so `Empty` does not answer first.
+        std::fs::write(wt.join("f.txt"), "local only\n").unwrap();
+        for args in [
+            vec!["add", "-A"],
+            vec!["commit", "-q", "-m", "work that exists only here"],
+        ] {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&wt)
+                .args(&args)
+                .envs([
+                    ("GIT_AUTHOR_NAME", "octocat"),
+                    ("GIT_COMMITTER_NAME", "octocat"),
+                    ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+                    ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+                ])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        }
+        assert!(
+            !was_ever_pushed(&wt),
+            "a branch with no tracking config was never pushed"
+        );
+
+        let w = Worktree {
+            path: wt.to_string_lossy().into_owned(),
+            branch: "scratch".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            worktree_safety(&w, "main", false, Some(0)),
+            Safety::NeverPushed
+        );
+        let _ = repo;
+    }
+
+    /// `was_ever_pushed` reads the CHECKOUT's own branch. A detached
+    /// HEAD has no branch whose config could answer, and must not
+    /// borrow another branch's.
+    #[test]
+    fn a_detached_head_was_not_ever_pushed() {
+        let (_t, _repo, wt) = upstream_deleted_fixture(true);
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&wt)
+            .args(["checkout", "-q", "--detach"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(
+            !was_ever_pushed(&wt),
+            "a detached HEAD has no branch config to read"
         );
     }
 
@@ -2531,6 +2812,7 @@ mod live {
                 Safety::Dirty(_) => "dirty",
                 Safety::Unpushed(_) => "unpushed",
                 Safety::NeverPushed => "never_pushed",
+                Safety::MergedUpstreamDeleted => "merged_upstream_deleted",
                 Safety::Empty => "empty",
                 Safety::Unmerged => "unmerged",
                 Safety::Pending => "pending",

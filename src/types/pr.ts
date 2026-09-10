@@ -177,6 +177,12 @@ export type Safety =
   | { kind: "dirty"; detail: number }
   | { kind: "unpushed"; detail: number }
   | { kind: "never_pushed" }
+  /// Merged, but the remote branch was deleted afterwards -- the usual
+  /// end state of a squash-merged PR whose branch GitHub tidied up
+  /// (#732). Removable: the work is on the default branch. Separate from
+  /// `safe` so the row can say which evidence it used, because this one
+  /// cannot be re-checked against a remote that no longer exists.
+  | { kind: "merged_upstream_deleted" }
   /// The branch was created and never committed to -- a scratch
   /// worktree. Distinct from `never_pushed`, which claims commits exist
   /// only here: for a branch with none, that claim is false, and the

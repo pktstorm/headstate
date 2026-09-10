@@ -60,6 +60,20 @@ pub enum Safety {
     Unpushed(u64),
     /// No upstream branch at all -- nothing has ever been pushed.
     NeverPushed,
+    /// Merged, but the remote branch has since been deleted (#732).
+    ///
+    /// Distinct from `Safe` because the ROUTE to the verdict differs and
+    /// the user deserves to see which one they got. `Safe` means the
+    /// upstream still exists and agrees; this means the upstream is gone
+    /// and the content was found on the default branch instead. Both are
+    /// removable, but only one of them can be re-checked against a
+    /// remote afterwards.
+    ///
+    /// Distinct from `NeverPushed` because it is the opposite verdict.
+    /// `rev-parse @{u}` fails identically for both, which is exactly the
+    /// bug: a branch whose PR merged and whose remote was then deleted
+    /// was reported as commits existing only on this machine.
+    MergedUpstreamDeleted,
     /// The branch was created and never committed to.
     ///
     /// Its own state rather than a flavour of `Safe` or `NeverPushed`,
@@ -129,7 +143,10 @@ impl Safety {
     /// a confirmation that quotes this reason -- is exactly the path
     /// for "the app is being careful and I have read why".
     pub fn is_safe(&self) -> bool {
-        matches!(self, Safety::Safe)
+        // Both arms mean the work is on the default branch and the tree
+        // is clean. They are separate variants so the row can say which
+        // evidence was used, not because one is safer than the other.
+        matches!(self, Safety::Safe | Safety::MergedUpstreamDeleted)
     }
 
     /// Display-ready prose for the row, so the UI does not re-derive it.
@@ -142,6 +159,7 @@ impl Safety {
                 format!("{n} unpushed commit{}", if *n == 1 { "" } else { "s" })
             }
             Safety::NeverPushed => "never pushed — commits exist only here".into(),
+            Safety::MergedUpstreamDeleted => "merged; upstream deleted".into(),
             // Says what is TRUE of the branch, not what the app will
             // let you do about it. "Nothing to lose" is the fact the
             // user was trying to establish by hand; whether the Remove
