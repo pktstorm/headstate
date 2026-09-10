@@ -1139,15 +1139,21 @@ export function useWorktreeSafety(repoPath: string | undefined) {
 /// Keyed by absolute path, which is unique across repositories, so one
 /// subscription serves both the per-repository and all-repositories
 /// views without them having to agree on anything.
-function useStreamingSizes(): Map<string, number> {
-  const [sizes, setSizes] = useState<Map<string, number>>(() => new Map());
+///
+/// A null VALUE means the Rust side gave up on that worktree's walk
+/// (#769); an absent KEY means it has not been walked yet. The map has
+/// to keep those apart, because they render differently -- "not
+/// measured" against a skeleton -- and collapsing them is what left a
+/// row promising a number for 15 minutes.
+function useStreamingSizes(): Map<string, number | null> {
+  const [sizes, setSizes] = useState<Map<string, number | null>>(() => new Map());
 
   useEffect(() => {
     // The same guarded teardown as every other listener here -- see
     // `usePullRequests` for why the promise cannot be unwrapped naively.
     let unlisten: UnlistenFn | undefined;
     let cancelled = false;
-    listen<[string, number]>("worktree-size", (e) => {
+    listen<[string, number | null]>("worktree-size", (e) => {
       const [path, bytes] = e.payload;
       setSizes((prev) => {
         // A fresh Map, not a mutation: React compares by identity, and
@@ -1195,6 +1201,14 @@ export function useWorktreeSizes(repoPath: string | undefined) {
     },
     enabled: Boolean(repoPath),
     staleTime: 5 * 60 * 1000,
+    // NOT the default `retry: 3`. This query is a full filesystem walk
+    // measured in minutes on a large repository, so the default turns
+    // one rejection into FOUR sequential walks with `isFetching` true
+    // throughout -- a column of skeletons for four times the walk, and
+    // then a silent em dash. That is #769's "15+ minutes" almost
+    // exactly. A failed walk is not a flaky network call; retrying it
+    // repeats a very expensive operation to get the same answer.
+    retry: false,
   });
   return { ...query, partial };
 }
@@ -1231,6 +1245,9 @@ export function useAllWorktreeSizes(repoPaths: string[], enabled: boolean) {
       queryFn: async () => new Map(await sizeWorktrees(path)),
       enabled,
       staleTime: 5 * 60 * 1000,
+      // Same reason as the single-repo hook: four sequential walks of a
+      // large repository is #769's wait, not a recovery.
+      retry: false,
     })),
   });
 
@@ -1238,7 +1255,7 @@ export function useAllWorktreeSizes(repoPaths: string[], enabled: boolean) {
   // pieces. Streamed values go in FIRST so a settled query's answer
   // wins on any key it has -- the settled set is the authoritative one,
   // and the stream is only ever an early view of the same walk.
-  const sizes = new Map<string, number>(streamed);
+  const sizes = new Map<string, number | null>(streamed);
   for (const r of results) {
     if (r.data) for (const [k, v] of r.data) sizes.set(k, v);
   }
@@ -1248,6 +1265,14 @@ export function useAllWorktreeSizes(repoPaths: string[], enabled: boolean) {
     /// makes a partially-filled page legible rather than broken.
     pending: results.filter((r) => r.isFetching).length,
     total: results.length,
+    /// How many repositories FAILED outright.
+    ///
+    /// Counted separately from `pending`, because a failed repository
+    /// leaves `pending` and never comes back: a caller that only
+    /// watches `pending` sees the number fall to zero and concludes
+    /// everything was measured. #769 is the shape of that mistake --
+    /// silence read as success.
+    failed: results.filter((r) => r.isError).length,
   };
 }
 

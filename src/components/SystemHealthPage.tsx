@@ -490,8 +490,15 @@ function DiskFootprint() {
   /// returning that would print "0 B" over a measurement still in
   /// flight -- the absent-is-not-zero failure in its most plausible
   /// disguise, because the number is briefly true-looking.
-  const sum = (sizes: Map<string, number>): number | null =>
-    sizes.size === 0 ? null : [...sizes.values()].reduce((n, v) => n + v, 0);
+  // A null VALUE is a worktree whose walk was abandoned (#769), and it
+  // is skipped rather than counted as 0: the total is already a
+  // "measured so far" figure, and folding an unmeasured tree in as zero
+  // would understate the reclaimable bytes by exactly the trees most
+  // worth reclaiming -- the ones too large to finish walking.
+  const sum = (sizes: Map<string, number | null>): number | null =>
+    sizes.size === 0
+      ? null
+      : [...sizes.values()].reduce<number>((n, v) => n + (v ?? 0), 0);
 
   const progress = (pending: number, total: number, unit: string) =>
     pending > 0 ? `${total - pending} of ${total} ${unit}` : undefined;

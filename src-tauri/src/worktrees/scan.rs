@@ -1425,10 +1425,66 @@ const SIZE_WORKERS: usize = 8;
 /// Unreadable entries are skipped rather than failing the whole
 /// measurement -- a permission error on one file should not turn a real
 /// size into "unknown".
+#[cfg(test)]
 fn dir_size(path: &Path) -> u64 {
+    dir_size_within(path, std::time::Duration::MAX).unwrap_or(0)
+}
+
+/// How long ONE worktree's walk may run before it is abandoned.
+///
+/// #754 removed the "every row waits for the slowest tree" wait by
+/// streaming. #769 is the same lie in a different shape: a repository
+/// with 111 worktrees showed skeletons for 15+ minutes while one with 97
+/// finished in ~10 seconds. A 14% difference in COUNT cannot produce
+/// that, so the count was never the variable -- one tree in the 111 was
+/// unbounded, and nothing in this walk could ever give up on it.
+///
+/// MEASURED on this machine, and the reason a single tree can be
+/// unbounded at all: 26 of 42 worktrees in one checkout live UNDER the
+/// main checkout, in a `worktrees` directory beneath it. So the parent's
+/// walk subsumes all 26 -- 235.02 GB and 1,125,352 files -- and every
+/// one of those bytes is then walked a second time as a worktree in its
+/// own right. The parent measured 265.15 GB in 38.63s where a leaf
+/// worktree measured 0.30 GB in 0.16s: a 240x spread within one
+/// repository. Add nesting two levels deep, or a network mount that
+/// answers `read_dir` slowly, and the parent's walk has no finish.
+///
+/// 60s, not `GIT_TIMEOUT`'s 30s: 38.63s for a real parent checkout is a
+/// legitimate answer and must not be thrown away. The bound exists to
+/// convert "never" into "could not measure", not to reject slow-but-real
+/// trees, so it sits comfortably above the slowest MEASURED honest walk
+/// and far below the 15 minutes that made #769 look like a hang.
+const SIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `dir_size`, abandoning the walk once `budget` is spent.
+///
+/// `None` means "could not measure", NOT zero. The distinction is the
+/// whole fix: a row that reports 0 bytes claims the tree is empty and
+/// invites the user to delete it, which for an unmeasurable 200 GB
+/// checkout is the worst possible wrong answer. Callers propagate the
+/// `Option` all the way to the cell so the UI can say so.
+///
+/// The deadline is checked once per DIRECTORY rather than once per
+/// entry. A directory is the unit that can be pathological -- a network
+/// mount whose `read_dir` blocks, a permission wall -- and checking
+/// per entry would put a clock read next to every `stat` in a walk that
+/// is already syscall-bound, for no extra bound: a single `read_dir`
+/// that never returns is not interruptible from here either way.
+///
+/// The partial total is DISCARDED on timeout rather than returned as a
+/// floor. "≥ 41 GB" was tempting -- MEASURED, a 5s budget on the nested
+/// directory above reached 41.39 GB of the true 235.02 GB -- but that
+/// number is an artifact of which directories happened to pop off the
+/// stack first, not a bound the user can act on, and it would render
+/// indistinguishably from a real measurement.
+fn dir_size_within(path: &Path, budget: std::time::Duration) -> Option<u64> {
+    let started = std::time::Instant::now();
     let mut total = 0u64;
     let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
+        if started.elapsed() > budget {
+            return None;
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -1444,7 +1500,7 @@ fn dir_size(path: &Path) -> u64 {
             }
         }
     }
-    total
+    Some(total)
 }
 
 /// Size every path in `paths`, `SIZE_WORKERS` at a time.
@@ -1461,7 +1517,14 @@ fn dir_size(path: &Path) -> u64 {
 /// waiting for the slowest tree. That is the whole point: #754 was a
 /// page of skeletons that never resolved because nothing could be shown
 /// until everything was done.
-fn size_paths(paths: &[String], report: &(dyn Fn(&str, u64) + Sync)) {
+///
+/// Every path is reported EXACTLY once, including one whose walk ran out
+/// of budget -- reported then as `None`. #769 is what happens when that
+/// is not guaranteed: one worker parked on an unbounded tree, so the
+/// column stalled at N-1 forever with no row able to say why. A worker
+/// that gives up and reports keeps the cursor moving, which is what
+/// stops one bad directory from stalling the other 110.
+fn size_paths(paths: &[String], report: &(dyn Fn(&str, Option<u64>) + Sync)) {
     let next = std::sync::atomic::AtomicUsize::new(0);
     let workers = SIZE_WORKERS.min(paths.len().max(1));
     std::thread::scope(|scope| {
@@ -1470,7 +1533,25 @@ fn size_paths(paths: &[String], report: &(dyn Fn(&str, u64) + Sync)) {
             scope.spawn(move || loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some(p) = paths.get(i) else { break };
-                report(p, dir_size(Path::new(p)));
+                // DIAGNOSTIC LOGGING (Settings > diagnostic log). #769
+                // asked the log which worktree the walk stopped on and
+                // it could not say -- this pass emitted nothing at all,
+                // so a stall was indistinguishable from a slow walk.
+                // Per-path and with the elapsed time, for the same
+                // reason `size_venvs` logs per venv: the total says
+                // "slow", this says WHICH.
+                let started = std::time::Instant::now();
+                let bytes = dir_size_within(Path::new(p), SIZE_TIMEOUT);
+                crate::diag!(
+                    "[diag] worktree-size {} {}ms {}",
+                    p,
+                    started.elapsed().as_millis(),
+                    match bytes {
+                        Some(b) => format!("{b}b"),
+                        None => format!("ABANDONED after {}s", SIZE_TIMEOUT.as_secs()),
+                    }
+                );
+                report(p, bytes);
             });
         }
     });
@@ -1491,7 +1572,7 @@ fn size_paths(paths: &[String], report: &(dyn Fn(&str, u64) + Sync)) {
 /// that a row can be filled the moment its own answer exists. Kept
 /// because the tests want the whole set as a single value to assert on.
 #[cfg(test)]
-pub fn size_repo(repo_path: &str) -> Result<Vec<(String, u64)>, String> {
+pub fn size_repo(repo_path: &str) -> Result<Vec<(String, Option<u64>)>, String> {
     let mut out = Vec::new();
     size_repo_streaming(repo_path, &mut |path, bytes| {
         out.push((path.to_string(), bytes))
@@ -1511,9 +1592,15 @@ pub fn size_repo(repo_path: &str) -> Result<Vec<(String, u64)>, String> {
 /// concurrently, hence `FnMut` behind a lock rather than plain `FnMut`
 /// -- the mutex is uncontended relative to the walks it guards, which
 /// run for seconds apiece.
+///
+/// A `None` size is a worktree whose walk exceeded `SIZE_TIMEOUT`. It is
+/// still REPORTED, because #769 was the case where it was not: the row
+/// held a skeleton indefinitely because no answer of any kind ever
+/// arrived for it. "Could not measure" is an answer; a skeleton is a
+/// promise, and after 15 minutes it is a false one.
 pub fn size_repo_streaming(
     repo_path: &str,
-    report: &mut (dyn FnMut(&str, u64) + Send),
+    report: &mut (dyn FnMut(&str, Option<u64>) + Send),
 ) -> Result<(), String> {
     let dir = Path::new(repo_path);
     // An empty vec on git failure resolved as SUCCESS, so the UI could
@@ -4706,10 +4793,12 @@ prunable gitdir file points to non-existent location
         assert_ne!(Safety::Empty.reason(), Safety::NeverPushed.reason());
     }
 
-    /// Sizing, and the two things #754 turns on: that answers arrive one
-    /// at a time, and that the number still means "disk footprint".
+    /// Sizing, and the three things it turns on: that answers arrive one
+    /// at a time (#754), that the number still means "disk footprint"
+    /// (#754), and that a walk which will not finish becomes "could not
+    /// measure" rather than nothing at all (#769).
     mod sizing {
-        use super::super::{dir_size, size_paths, SIZE_WORKERS};
+        use super::super::{dir_size, dir_size_within, size_paths, SIZE_TIMEOUT, SIZE_WORKERS};
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Mutex;
 
@@ -4779,7 +4868,7 @@ prunable gitdir file points to non-existent location
                 .collect();
 
             let seen = Mutex::new(Vec::new());
-            size_paths(&paths, &|p: &str, b: u64| {
+            size_paths(&paths, &|p: &str, b: Option<u64>| {
                 seen.lock().unwrap().push((p.to_string(), b));
             });
 
@@ -4787,7 +4876,7 @@ prunable gitdir file points to non-existent location
             seen.sort();
             assert_eq!(seen.len(), 5, "one report per path, not one batch");
             for (_, bytes) in &seen {
-                assert_eq!(*bytes, 200);
+                assert_eq!(*bytes, Some(200));
             }
             let mut expected = paths.clone();
             expected.sort();
@@ -4815,7 +4904,7 @@ prunable gitdir file points to non-existent location
 
             let inside = AtomicUsize::new(0);
             let peak = AtomicUsize::new(0);
-            size_paths(&paths, &|_: &str, _: u64| {
+            size_paths(&paths, &|_: &str, _: Option<u64>| {
                 let n = inside.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(n, Ordering::SeqCst);
                 // Long enough that a serial implementation cannot have
@@ -4840,15 +4929,156 @@ prunable gitdir file points to non-existent location
             let one = vec![tree(tmp.path(), "only", 1, 7)];
 
             let calls = AtomicUsize::new(0);
-            size_paths(&one, &|_: &str, _: u64| {
+            size_paths(&one, &|_: &str, _: Option<u64>| {
                 calls.fetch_add(1, Ordering::SeqCst);
             });
             assert_eq!(calls.load(Ordering::SeqCst), 1);
 
             // The empty case: no reports, and no panic.
-            size_paths(&[], &|_: &str, _: u64| {
+            size_paths(&[], &|_: &str, _: Option<u64>| {
                 panic!("nothing to size, so nothing may be reported");
             });
+        }
+
+        /// A tree deep enough that a zero budget cannot finish it.
+        ///
+        /// Depth rather than breadth, because the budget is checked once
+        /// per DIRECTORY: a single wide directory is one check, and the
+        /// test would be asserting on `read_dir` speed instead of on the
+        /// bound. Each level holds one file so an unbounded walk has a
+        /// non-zero total to report and the two outcomes cannot be
+        /// confused.
+        fn deep_tree(parent: &std::path::Path, levels: usize) -> std::path::PathBuf {
+            let root = parent.join("deep");
+            let mut at = root.clone();
+            for i in 0..levels {
+                at = at.join(format!("l{i}"));
+                std::fs::create_dir_all(&at).unwrap();
+                std::fs::write(at.join("f"), vec![b'x'; 10]).unwrap();
+            }
+            root
+        }
+
+        /// A walk that outruns its budget reports `None`, not a number.
+        ///
+        /// The #769 bound. Without it `dir_size` has no exit but
+        /// completion, so a tree that cannot be finished parks its
+        /// worker forever and the row it belongs to never hears back --
+        /// which is precisely the column of skeletons that outlasted 15
+        /// minutes on a 111-worktree repository.
+        ///
+        /// `None` and not a partial total: a partial is an artifact of
+        /// which directories happened to pop off the stack first, and it
+        /// would render indistinguishably from a real measurement.
+        #[test]
+        fn a_walk_that_exceeds_its_budget_reports_that_it_could_not_measure() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let root = deep_tree(tmp.path(), 40);
+
+            // Zero budget: the deadline is already spent when the first
+            // directory pops, so this cannot depend on machine speed.
+            assert_eq!(
+                dir_size_within(&root, std::time::Duration::ZERO),
+                None,
+                "a walk that runs out of budget must say it could not \
+                 measure; returning a number claims an answer it does \
+                 not have, and returning nothing at all is #769"
+            );
+
+            // The same tree measures fine with a real budget, so the
+            // None above is the BOUND firing and not a broken walk.
+            assert_eq!(
+                dir_size_within(&root, SIZE_TIMEOUT),
+                Some(400),
+                "40 levels of one 10-byte file must still measure"
+            );
+        }
+
+        /// One unbounded tree must not stall the other worktrees.
+        ///
+        /// The load-bearing guarantee of #769. A repository with 111
+        /// worktrees showed every size cell as a skeleton while one with
+        /// 97 finished in ~10 seconds -- a 14% difference in count
+        /// against "10 seconds" versus "never", so the count was never
+        /// the variable. One tree in the 111 could not be finished, its
+        /// worker parked on it, and progress stopped there.
+        ///
+        /// MEASURED on this machine, for why one tree can be unbounded
+        /// at all: 26 of 42 worktrees in one checkout live UNDERNEATH
+        /// the main checkout, so the parent's walk subsumes all 26 --
+        /// 235.02 GB and 1,125,352 files, walked once as the parent and
+        /// again as 26 worktrees. The parent took 38.63s where a leaf
+        /// took 0.16s, a 240x spread inside one repository.
+        ///
+        /// Asserts that EVERY path is reported, the slow one included.
+        /// Reporting the other N-1 is not enough: the row for the bad
+        /// tree would still hold its skeleton forever.
+        #[test]
+        fn one_unmeasurable_tree_does_not_stall_the_others() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            // More paths than workers, so a parked worker would visibly
+            // starve the queue rather than merely finishing last.
+            let mut paths: Vec<String> = (0..SIZE_WORKERS * 2)
+                .map(|i| tree(tmp.path(), &format!("wt{i}"), 1, 100))
+                .collect();
+            let slow = deep_tree(tmp.path(), 40).to_string_lossy().to_string();
+            paths.push(slow.clone());
+
+            let seen = Mutex::new(Vec::new());
+            size_paths(&paths, &|p: &str, b: Option<u64>| {
+                // Every path but the deep one is measured normally; the
+                // deep one is given no budget at all, standing in for a
+                // tree whose walk does not finish.
+                let b = if p == slow {
+                    super::super::dir_size_within(
+                        std::path::Path::new(p),
+                        std::time::Duration::ZERO,
+                    )
+                } else {
+                    b
+                };
+                seen.lock().unwrap().push((p.to_string(), b));
+            });
+
+            let seen = seen.into_inner().unwrap();
+            assert_eq!(
+                seen.len(),
+                paths.len(),
+                "every worktree must be reported, the unmeasurable one \
+                 included -- stalling at N-1 is #769"
+            );
+            let (_, slow_bytes) = seen.iter().find(|(p, _)| *p == slow).unwrap();
+            assert_eq!(
+                *slow_bytes, None,
+                "the tree that could not be measured must say so rather \
+                 than being left out"
+            );
+            assert_eq!(
+                seen.iter().filter(|(p, _)| *p != slow).count(),
+                SIZE_WORKERS * 2,
+                "the other worktrees must all still arrive"
+            );
+            for (p, b) in &seen {
+                if *p != slow {
+                    assert_eq!(*b, Some(100), "a measurable tree keeps its real size");
+                }
+            }
+        }
+
+        /// The bound is generous enough not to reject honest walks.
+        ///
+        /// MEASURED, the slowest legitimate walk on this machine: 38.63s
+        /// for a 265.15 GB parent checkout. A bound at or below that
+        /// would turn a real answer into "could not measure", which
+        /// trades #769's silence for a wrong answer. `GIT_TIMEOUT`'s 30s
+        /// is deliberately NOT reused here for that reason.
+        #[test]
+        fn the_bound_leaves_room_for_the_slowest_honest_walk() {
+            assert!(
+                SIZE_TIMEOUT.as_secs() > 38,
+                "the slowest MEASURED honest walk was 38.63s; a bound at \
+                 or below it would discard real answers"
+            );
         }
     }
 
@@ -5330,15 +5560,23 @@ mod live {
         if let Some(r) = repos.iter().max_by_key(|r| r.worktrees.len()) {
             let t = std::time::Instant::now();
             let sizes = size_repo(&r.path).unwrap();
-            let total: u64 = sizes.iter().map(|(_, b)| b).sum();
+            let total: u64 = sizes.iter().filter_map(|(_, b)| *b).sum();
+            // Abandoned walks are reported and printed rather than
+            // silently absent -- #769's whole shape was a row that never
+            // heard back at all.
+            let abandoned = sizes.iter().filter(|(_, b)| b.is_none()).count();
             println!(
-                "SIZED {} worktrees of {} in {:?}, total {:.1} GB",
+                "SIZED {} worktrees of {} in {:?}, total {:.1} GB, {} abandoned",
                 sizes.len(),
                 r.name,
                 t.elapsed(),
-                total as f64 / 1024.0 / 1024.0 / 1024.0
+                total as f64 / 1024.0 / 1024.0 / 1024.0,
+                abandoned
             );
-            assert!(sizes.iter().any(|(_, b)| *b > 0), "sizes must be populated");
+            assert!(
+                sizes.iter().any(|(_, b)| b.is_some_and(|b| b > 0)),
+                "sizes must be populated"
+            );
         }
 
         assert!(!repos.is_empty(), "expected repos under ~/code");

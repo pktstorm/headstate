@@ -82,6 +82,16 @@ function Skeleton({ className = "" }: { className?: string }) {
   );
 }
 
+/// Why a size cell says "not measured" (#769).
+///
+/// One constant for both cells -- the per-repository row and the
+/// all-repositories rollup -- so the explanation cannot drift between
+/// two views of the same fact. It names the CAUSE rather than just the
+/// outcome, because "could not measure" alone leaves the user with
+/// nothing to do about it, and nesting is the cause they can act on.
+const UNMEASURED_HINT =
+  "This worktree could not be measured within the time limit. It is usually a very large tree, or one nested under another checkout so its files are walked twice.";
+
 function Row({
   wt,
   repoPath,
@@ -90,6 +100,7 @@ function Row({
   onClaudify,
   onForget,
   sizePending,
+  sizeUnmeasurable = false,
   removing = false,
   assessed = false,
   onForce,
@@ -118,6 +129,15 @@ function Row({
   /// Sizes arrive in their own pass, after safety. Tracked separately so
   /// a row whose safety has resolved does not keep waiting on its size.
   sizePending?: boolean;
+  /// The walk for THIS worktree gave up before it finished (#769).
+  ///
+  /// Distinct from `sizePending`, and it has to be: both would otherwise
+  /// render as `size_bytes === null`, and the row would go on promising
+  /// a number that is never coming. That promise outlasting 15 minutes
+  /// is the bug. Distinct from a measured zero too -- "could not
+  /// measure" must never read as "this tree is empty", which is an
+  /// invitation to delete a checkout nobody has measured.
+  sizeUnmeasurable?: boolean;
   /// The repo this worktree belongs to. Needed to assess it: git has to
   /// be run from the repo, not the worktree.
   repoPath: string;
@@ -221,9 +241,19 @@ function Row({
   );
   const sizeCell = (
       <span className="w-20 shrink-0 text-right tabular-nums text-xs text-[#8b949e]">
-        {/* An em dash here read as "measured, and the answer is nothing".
-            A skeleton says a number is still coming. */}
-        {sizePending && wt.size_bytes === null ? (
+        {/* Three states, not two. An em dash read as "measured, and the
+            answer is nothing"; a skeleton says a number is still coming.
+            #769 needed a third: the walk ran out of budget, so no number
+            is coming and the row must stop implying one. Checked FIRST,
+            because the query can still be fetching other worktrees while
+            this one has already given up -- ordering it after
+            `sizePending` would leave the skeleton up for the rest of the
+            pass. */}
+        {sizeUnmeasurable ? (
+          <span className="cursor-help text-[#6e7681]" title={UNMEASURED_HINT}>
+            not measured
+          </span>
+        ) : sizePending && wt.size_bytes === null ? (
           <Skeleton className="w-12" />
         ) : (
           formatSize(wt.size_bytes)
@@ -518,6 +548,13 @@ export function WorktreesPage() {
   // made. `isFetching` is true only while something is actually in
   // flight.
   const sizing = sizesQuery.isFetching;
+  // The sizing pass failed outright, so NO size is coming for any row in
+  // this repository. Until #769 this was never read: `useWorktreeSizes`
+  // exposed `isError` and the page ignored it, so a rejected walk showed
+  // skeletons while it retried and then collapsed to an em dash -- the
+  // one reading the size cell's own comment says is wrong, because it
+  // claims a measurement that never happened.
+  const sizingFailed = sizesQuery.isError;
   const remove = useRemoveWorktree();
 
   /// Copy rather than spawn. The command lands in the user's own shell,
@@ -660,9 +697,17 @@ export function WorktreesPage() {
   // hook: React requires the same hooks in the same order on every
   // render, and the orphan and all-repositories branches return before
   // this point.
+  // `has` rather than `??`: an explicit null VALUE is "the walk was
+  // abandoned, no number is coming" (#769), where an absent KEY is "not
+  // measured yet". `??` collapses the two, so a row that gave up would
+  // fall back to its stale size and keep its skeleton forever.
   const withSizes = (classified ?? selected?.worktrees ?? []).map((w) => ({
     ...w,
-    size_bytes: sizes?.get(w.path) ?? w.size_bytes,
+    size_bytes: sizes?.has(w.path) ? (sizes.get(w.path) ?? null) : w.size_bytes,
+    /// This row's own walk was abandoned, OR the whole repository's
+    /// sizing pass failed. Either way no number is coming for it, and
+    /// the row must say so instead of holding a skeleton.
+    sizeUnmeasurable: (sizes?.has(w.path) && sizes.get(w.path) === null) || sizingFailed,
   }));
 
   // SORTING VS STREAMING (#771).
@@ -873,11 +918,16 @@ export function WorktreesPage() {
     // Sizes merged in as each repository answers. MEASURED: the full
     // set takes ~2 minutes, so awaiting it would show dashes for that
     // long with nothing to explain them -- which is what was reported.
+    // `has`, not `??`. A worktree the walk gave up on (#769) arrives as
+    // an explicit null VALUE, and `??` would fall straight through it to
+    // the stale `w.size_bytes` -- erasing the one fact that stops the
+    // row promising a number. An ABSENT key still means "not measured
+    // yet" and must keep the existing value.
     const withSizes = repos.map((r) => ({
       ...r,
       worktrees: r.worktrees.map((w) => ({
         ...w,
-        size_bytes: allSizes.get(w.path) ?? w.size_bytes,
+        size_bytes: allSizes.has(w.path) ? (allSizes.get(w.path) ?? null) : w.size_bytes,
       })),
     }));
     const { worktrees, totalBytes, sizesComplete } = rollupRepos(withSizes);
@@ -945,7 +995,21 @@ export function WorktreesPage() {
               {pathBasename(wt.path)}
             </span>
             <span className="w-20 shrink-0 text-right tabular-nums text-xs text-[#8b949e]">
-              {wt.size_bytes === null ? "—" : formatSize(wt.size_bytes)}
+              {/* The same three states as the per-repository cell. Once
+                  the pass has finished, a null here is no longer "still
+                  coming" -- it is a walk that was abandoned (#769), and
+                  an em dash would read as "measured, and the answer is
+                  nothing". The banner above covers the pending case, so
+                  this only has to separate the other two. */}
+              {wt.size_bytes === null && sizesPending === 0 ? (
+                <span className="cursor-help text-[#6e7681]" title={UNMEASURED_HINT}>
+                  not measured
+                </span>
+              ) : wt.size_bytes === null ? (
+                "—"
+              ) : (
+                formatSize(wt.size_bytes)
+              )}
             </span>
           </button>
         ))}
@@ -1401,6 +1465,7 @@ export function WorktreesPage() {
               onClaudify={claudify}
               onForget={forget}
               sizePending={sizing}
+              sizeUnmeasurable={wt.sizeUnmeasurable}
               removing={removing === wt.path}
             />
           ))

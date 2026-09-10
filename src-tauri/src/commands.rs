@@ -655,11 +655,20 @@ pub async fn classify_worktrees(
 /// which is what #754 reported as an indefinite load. The return value
 /// is kept so a caller that only wants the final set can ignore the
 /// events entirely.
+///
+/// A `None` size is a worktree whose walk exceeded `SIZE_TIMEOUT`. It is
+/// emitted like any other answer, and it is emitted DELIBERATELY rather
+/// than omitted: #769 was a repository where a row simply never heard
+/// back, and a skeleton with nothing behind it is the failure #754 set
+/// out to remove. `None` means "could not measure" and must never be
+/// flattened to 0 on the way out -- zero bytes reads as "this tree is
+/// empty, delete it", which for an unmeasurable checkout is the most
+/// damaging thing this column could say.
 #[tauri::command]
 pub async fn size_worktrees(
     app: AppHandle,
     repo_path: String,
-) -> Result<Vec<(String, u64)>, String> {
+) -> Result<Vec<(String, Option<u64>)>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let mut out = Vec::new();
         crate::worktrees::size_repo_streaming(&repo_path, &mut |path, bytes| {
