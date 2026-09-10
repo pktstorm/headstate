@@ -56,6 +56,45 @@ different pipeline with a different tag prefix. Nothing here touches it.
 The GitHub pre-release holds the `.ipa`, the `.aab`, and a `SHA256SUMS`
 file for provenance. Users do not install from it.
 
+## The public beta (TestFlight external testing)
+
+Internal testing reaches only App Store Connect users you add by hand. A
+**public link** lets anyone install the beta from a URL, which is what the
+desktop's *Get the mobile companion* button and its QR code point at
+(`TESTFLIGHT_JOIN_URL` in `src/components/GetCompanionPanel.tsx`).
+
+Setting it up is a console task, done once:
+
+1. **App Store Connect → the app → TestFlight**.
+2. Under **External Testing**, create a group (e.g. "Public Beta").
+   External, not Internal: internal groups cap at 100 App Store Connect
+   users and cannot have a public link.
+3. Add a build to the group.
+4. **Submit it for Beta App Review.** External testing requires review;
+   internal does not. It is lighter than an App Store submission but is a
+   real review, and it needs a beta description, a feedback email, and
+   review notes. Headstate pairs with a desktop rather than a service
+   account, so the notes must say what a reviewer can exercise without a
+   paired desktop and what they cannot. Export compliance is already
+   answered by the build (see below).
+5. Once approved, enable **Public Link** in the group's settings. A tester
+   cap is optional.
+6. Put the resulting `https://testflight.apple.com/join/<code>` URL into
+   `TESTFLIGHT_JOIN_URL`. It is a public URL by design, not a secret, so
+   it belongs in the repo rather than in a build secret. Until it is set,
+   the settings panel says the invitation is not available yet rather than
+   showing a code that resolves to nothing.
+
+Later builds reach the group without re-review while the version does not
+change materially; Apple re-reviews periodically. Builds expire after 90
+days, so the group needs a current build or the link installs nothing.
+
+A public link is genuinely public: anyone holding the URL can install, up
+to the cap, with no per-tester approval.
+
+Android has no equivalent yet — its store secrets are unconfigured
+(#673).
+
 ## Export compliance
 
 The app declares `ITSAppUsesNonExemptEncryption` **false** in

@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import { revealLog } from "@/api/tauri";
 import { useIsMobile } from "@/lib/useIsMobile";
 import { HelpButton } from "./HelpButton";
+import { GetCompanionPanel } from "./GetCompanionPanel";
 import { PairPhonePanel } from "./PairPhonePanel";
 import { PairedDesktopPanel } from "./PairedDesktopPanel";
 import { ALWAYS_OFFERED, VIEWS } from "./ViewSwitcher";
@@ -708,6 +709,7 @@ export function SettingsDialog({
             </p>
           ) : null}
         </div>
+        <GetCompanionPanel />
         <PairPhonePanel />
         <PairedDevicesList />
         </>}
