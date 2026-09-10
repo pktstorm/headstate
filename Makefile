@@ -136,6 +136,11 @@ lint-deps:
 	python3 scripts/check-tauri-versions.test.py
 	python3 scripts/check-tauri-versions.py
 	python3 scripts/android-release-signing.test.py
+	# Same class of guard: the mobile jobs are required checks that skip
+	# their own steps when nothing mobile changed, and the way that wiring
+	# breaks is a job reporting green having compiled nothing. Cheap to
+	# ask here, invisible until a phone release otherwise.
+	python3 scripts/check-mobile-gate.py
 
 # The shared step-up crate again: a path dependency is compiled by the
 # desktop's clippy but its own tests are not, and `cargo fmt --check`

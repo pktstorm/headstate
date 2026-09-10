@@ -55,6 +55,13 @@ jobs:
         run: ./scripts/check-privacy.sh
       - name: Workflow shells
         run: python3 scripts/check-workflow-shells.py
+      # The mobile jobs skip their own steps when nothing mobile changed.
+      # The failure mode of getting that wiring wrong is a job that
+      # reports green having compiled nothing, forever -- so it is
+      # checked here, in a job that always runs, rather than trusted to
+      # review. See the `mobile-changes` job.
+      - name: Mobile path gate
+        run: python3 scripts/check-mobile-gate.py
       # Asserted against the SOURCE css, unlike the toast check below which
       # needs a built bundle. This rule is hand-written and survives the
       # build unchanged, and the test suite structurally cannot see it:
@@ -343,16 +350,184 @@ jobs:
         shell: bash
         run: yarn tauri build --no-bundle
 
+  # Does this change touch anything a mobile job could possibly break?
+  #
+  # `mobile-android` (8.6 min measured avg) and `mobile-ios` (1.9 min) are
+  # the first and sixth most expensive jobs here, and CI runs at least
+  # TWICE per pull request -- once on push, once more per rebase, because
+  # the ruleset sets `strict_required_status_checks_policy`. Most changes
+  # cannot affect the phone at all, and paid ~9 minutes of the 7-13 minute
+  # wall clock for that answer anyway.
+  #
+  # ---- Why this is a gate job and not `paths:` or a job-level `if:` ----
+  #
+  # Both of those SKIP the job, and a skipped job reports NO status. All
+  # nine checks here are required by the `main` ruleset, including
+  # `mobile-android` and `mobile-ios` -- so a skipped one does not mean
+  # "passed", it means GitHub waits forever for a status that will never
+  # arrive, and the pull request is unmergeable with no way to override
+  # it from a branch. (The comment that used to sit here said these two
+  # were "not a required check yet". They were promoted; that is exactly
+  # what makes the naive fix a trap.)
+  #
+  # So the jobs always RUN and always report under their exact required
+  # names. What is conditional is their STEPS. A job whose steps are all
+  # skipped succeeds in about five seconds -- a real success, under the
+  # real name, which is what the ruleset is waiting for.
+  #
+  # ---- Why plain git and not a paths-filter action ----
+  #
+  # Every third-party action here is pinned to a full commit SHA because
+  # a tag is mutable (see the note at the top of this file). A filter is
+  # a `git diff --name-only` and a `grep`; buying that with another
+  # supply-chain entry to audit is the wrong trade.
+  mobile-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      # "true" when the mobile jobs must do their real work.
+      run: ${{ steps.filter.outputs.run }}
+    steps:
+      # `fetch-depth: 0` because the diff needs the merge base, and the
+      # default depth-1 checkout has no history to find one in.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Decide whether the mobile jobs have anything to check
+        id: filter
+        env:
+          # Through `env:`, not interpolated into the script body. Both
+          # are GitHub-controlled here (a SHA and a fixed event name), but
+          # `${{ }}` inside `run:` is textual substitution -- it becomes
+          # shell source before bash ever sees it -- so the habit is worth
+          # keeping uniform rather than judged case by case.
+          BASE: ${{ github.event.pull_request.base.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          # Anything that is NOT a pull request runs the full mobile
+          # suite, no questions asked. That is `push` to main, a `v*`
+          # tag, and `merge_group`.
+          #
+          # This is deliberate and it is the safe direction. A tag run is
+          # what `release.yml` waits on, so a release must never be
+          # cleared by a check that decided it had nothing to do. A
+          # merge-group run exists precisely to compile this change
+          # TOGETHER WITH the others merging beside it -- and "these
+          # files did not change" is a statement about one branch, not
+          # about the combined tree. Skipping there would discard the
+          # only signal the queue is for.
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "Event is $EVENT, not a pull request; running the mobile jobs in full."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # `...` (three dots) is the merge base, not a straight diff:
+          # it asks "what did this branch change", so unrelated commits
+          # that landed on main meanwhile do not count as this pull
+          # request's changes.
+          if ! CHANGED=$(git diff --name-only "$BASE"...HEAD); then
+            echo "::warning::Could not diff against the base commit; running the mobile jobs in full."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Files changed:"
+          echo "$CHANGED" | sed 's/^/  /'
+
+          # WHAT COUNTS AS MOBILE CODE. Each line is here for a reason
+          # that was checked by reading, not assumed. A false negative --
+          # a mobile job skipped when it should have run -- is a phone
+          # break merged with everything green, so every doubtful path is
+          # IN.
+          #
+          #   src-mobile/       the companion crate itself, obviously.
+          #
+          #   crates/           `headstate-stepup` is a PATH dependency of
+          #                     BOTH src-tauri and src-mobile: the step-up
+          #                     canonical bytes, header grammar and
+          #                     verifier live there and nowhere else
+          #                     (#695). A change there changes what a
+          #                     signature made on the phone has to satisfy.
+          #
+          #   src-tauri/src/remote/events.rs
+          #   src-tauri/src/remote/surface.rs
+          #                     The non-obvious ones, and the reason this
+          #                     filter cannot just be "src-mobile plus
+          #                     crates". src-mobile's tests `include_str!`
+          #                     these two DESKTOP files at compile time --
+          #                     `events.rs:496` and `surface.rs:205` -- to
+          #                     compare the event allowlist and the surface
+          #                     table against the desktop's as they are
+          #                     checked in. `make test-mobile` is the only
+          #                     thing that runs those comparisons. Leave
+          #                     these out and a change to the desktop's
+          #                     `EVENT_NAMES` skips the very job that
+          #                     exists to catch it drifting -- which is a
+          #                     page on the phone that never fills in, with
+          #                     no error anywhere. (The third copy of the
+          #                     allowlist, `src/api/transport.test.ts`, is
+          #                     covered by `src/` below and by
+          #                     `test-frontend`, which is unconditional.)
+          #
+          #   src/, index.html, public/, tsconfig*, vite.config.ts
+          #                     The frontend is SHARED. `mobile-ios` ends
+          #                     with `make mobile-frontend`, which is
+          #                     `VITE_TARGET=mobile yarn build` -> `tsc -b
+          #                     && vite build` over all of `src/`. That
+          #                     build is the ONLY place the
+          #                     `VITE_TARGET=mobile` half of the bundle is
+          #                     compiled before a release tag. So `src/`
+          #                     genuinely triggers, and it is why the
+          #                     saving is a quarter of pull requests
+          #                     rather than most of them -- measured: 7 of
+          #                     the last 29 merged pull requests skip.
+          #                     Including it is not caution, it is
+          #                     correctness.
+          #
+          #   package.json, yarn.lock
+          #                     That same Vite build installs from these,
+          #                     and Dependabot opens pull requests that
+          #                     touch nothing else.
+          #
+          #   Makefile          the mobile jobs are almost entirely
+          #                     `make` targets: mobile-frontend,
+          #                     lint-mobile, test-mobile,
+          #                     check-mobile-ios, check-mobile-android,
+          #                     deny-mobile, android-init.
+          #
+          #   scripts/          `make lint-mobile` shells out to
+          #                     scripts/check-plugin-commands.py, the only
+          #                     thing in CI that looks at the Kotlin at
+          #                     all (#698).
+          #
+          #   .github/workflows/ci.yml, .github/actions/
+          #                     the jobs themselves and the setup action
+          #                     they share. A change to this file must
+          #                     always test itself.
+          if echo "$CHANGED" | grep -qE '^(src-mobile/|crates/|src/|scripts/|public/|\.github/actions/|src-tauri/src/remote/(events|surface)\.rs$|index\.html$|package\.json$|yarn\.lock$|tsconfig[^/]*\.json$|vite\.config\.ts$|Makefile$|\.github/workflows/ci\.yml$)'; then
+            echo "Mobile-relevant paths changed; running the mobile jobs in full."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No mobile-relevant paths changed; the mobile jobs will report success without doing work."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
   # The mobile companion crate (`src-mobile`), on the two targets it ships
-  # for. Neither job is a required check yet, for the same reason the
-  # platform jobs were not on day one: they have never run, and a required
-  # check that is red blocks every unrelated PR. Promote them in the
-  # ruleset once they are reliably green.
+  # for.
   #
   # Linux carries the host-side gates (fmt, clippy, tests, cargo-deny) as
   # well as the Android cross-check, so a fresh clone with an NDK and this
   # file agree on what "the mobile crate passes" means.
+  #
+  # Every step below is gated on `mobile-changes`; see that job for why
+  # the condition is on the steps and not on the job. `needs` does not
+  # make this job skippable -- `mobile-changes` has no condition of its
+  # own, so it always succeeds and this always runs.
   mobile-android:
+    needs: mobile-changes
     runs-on: ubuntu-latest
     env:
       # Pinned rather than `$ANDROID_NDK_HOME`, which is whatever the
@@ -365,11 +540,13 @@ jobs:
       ANDROID_API: "24"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.mobile-changes.outputs.run == 'true'
 
       # The host-side steps (clippy, tests) compile the tauri crate for
       # Linux, which needs the WebKit and GTK headers. No appindicator:
       # phones have no tray and this crate does not enable it.
       - name: Linux system dependencies
+        if: needs.mobile-changes.outputs.run == 'true'
         run: |
           # Drop the third-party lists this project never installs
           # from, then refresh.
@@ -399,6 +576,7 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev
 
       - uses: ./.github/actions/setup
+        if: needs.mobile-changes.outputs.run == 'true'
         with:
           rust-components: clippy, rustfmt
           rust-workspaces: src-mobile
@@ -412,6 +590,7 @@ jobs:
       # error #533 hit locally. Setting the per-target CC/AR variables is
       # the documented, deterministic form of the same thing.
       - name: Android NDK
+        if: needs.mobile-changes.outputs.run == 'true'
         run: |
           set -euo pipefail
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION"
@@ -431,6 +610,7 @@ jobs:
           echo "$TOOLCHAIN" >> "$GITHUB_PATH"
 
       - name: Rust target
+        if: needs.mobile-changes.outputs.run == 'true'
         run: rustup target add aarch64-linux-android
 
       # `make lint-mobile` also runs scripts/check-plugin-commands.py, which
@@ -441,12 +621,15 @@ jobs:
       # name that disagrees with what Rust invokes is a runtime failure on a
       # device and nothing at build time -- nearly shipped in #696 (#698).
       - name: Rust formatting, Clippy, and plugin command names
+        if: needs.mobile-changes.outputs.run == 'true'
         run: make lint-mobile
 
       - name: Rust tests
+        if: needs.mobile-changes.outputs.run == 'true'
         run: make test-mobile
 
       - name: Check the Android target
+        if: needs.mobile-changes.outputs.run == 'true'
         run: make check-mobile-android
 
       # `gen/android` is the Android Studio project, committed like
@@ -455,6 +638,7 @@ jobs:
       # generates it and uploads it for the commit that checks it in;
       # once that lands this step reports "committed" and does nothing.
       - name: Android Studio project
+        if: needs.mobile-changes.outputs.run == 'true'
         id: gen-android
         run: |
           set -euo pipefail
@@ -468,7 +652,15 @@ jobs:
           fi
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: steps.gen-android.outputs.generated == 'true'
+        # The one step here with a condition of its own, so the mobile
+        # gate is ANDed onto it rather than replacing it. If the steps
+        # above did not run there is no generated project to upload, so
+        # `generated` is empty and this would be false anyway -- the
+        # first clause is belt and braces, and it keeps every step in
+        # this job carrying the same visible gate.
+        if: >-
+          needs.mobile-changes.outputs.run == 'true'
+          && steps.gen-android.outputs.generated == 'true'
         with:
           name: src-mobile-gen-android
           path: src-mobile/gen/android
@@ -478,25 +670,40 @@ jobs:
           if-no-files-found: error
 
       - name: Install cargo-deny
+        if: needs.mobile-changes.outputs.run == 'true'
         run: cargo install cargo-deny --locked
 
       - name: cargo-deny
+        if: needs.mobile-changes.outputs.run == 'true'
         run: make deny-mobile
 
   # `cargo check` for the iOS target only. Building the app archives and
   # exports, which needs a development team; the simulator run in #533 is
   # the proof the toolchain gives without one, and store builds stay
   # manual until the pairing walkthrough has passed twice.
+  #
+  # Gated on `mobile-changes` exactly like `mobile-android`; see that job
+  # for why the condition sits on the steps. The `needs` is load-bearing
+  # and not decoration: without it `needs.mobile-changes.outputs.run` is
+  # the empty string rather than "true", every step's condition is false,
+  # and this job reports a cheerful green having checked nothing at all,
+  # forever. That is the precise false negative this whole change has to
+  # avoid, so it is worth naming where it would happen.
   mobile-ios:
+    needs: mobile-changes
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.mobile-changes.outputs.run == 'true'
       - uses: ./.github/actions/setup
+        if: needs.mobile-changes.outputs.run == 'true'
         with:
           rust-workspaces: src-mobile
       - name: Rust target
+        if: needs.mobile-changes.outputs.run == 'true'
         run: rustup target add aarch64-apple-ios
       - name: Check the iOS target
+        if: needs.mobile-changes.outputs.run == 'true'
         run: make check-mobile-ios
       # The mobile FRONTEND bundle, which nothing else in CI built. The
       # Rust jobs above deliberately do not need `dist/`, and
@@ -507,4 +714,5 @@ jobs:
       # stamping. That is the most expensive place to discover a break.
       # Needs no simulator and no signing: it is a Vite build.
       - name: Build the mobile frontend
+        if: needs.mobile-changes.outputs.run == 'true'
         run: make mobile-frontend
