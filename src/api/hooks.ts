@@ -1856,11 +1856,6 @@ export function useReviewingCount() {
   });
 }
 
-/// GitHub's true open-PR count, when it exceeds what the query returned.
-///
-/// `null` in the normal case. The Rust loop emits `prs-truncated` only
-/// above the 100-PR page size, so this stays quiet for almost everyone
-/// while making the cap visible to the accounts it actually affects.
 /// How many fields GitHub refused on the last poll, or 0.
 ///
 /// Advisory, like `useTruncation`. GitHub answered with usable data and
@@ -1928,6 +1923,13 @@ export function useReviewShortfall(): number {
   return short;
 }
 
+/// GitHub's true open-PR count, when it exceeds what the poll fetched.
+///
+/// `null` until the first poll reports, then GitHub's count while the
+/// list is short and `0` once it is complete. The zero matters: the loop
+/// emits on every tick precisely so a recovered poll can take the notice
+/// back, and holding the last non-zero value left "showing 8 of 29" over
+/// a complete list until relaunch (#745).
 export function useTruncation(): number | null {
   const [total, setTotal] = useState<number | null>(null);
 

@@ -591,6 +591,10 @@ export default function App() {
                 prs={visible}
                 hasFilters={hasActiveFilters(filters)}
                 total={view === "my-prs" ? (truncatedTotal ?? undefined) : undefined}
+                // `source`, not `visible`: the truncation marker compares
+                // against GitHub's unfiltered count, so the number beside
+                // it has to be unfiltered too (#745).
+                fetched={source.length}
                 onOpen={(pr) => selectPr({ repo: pr.repo, number: pr.number })}
                 canWrite={view === "my-prs"}
                 selectable={view === "my-prs"}
