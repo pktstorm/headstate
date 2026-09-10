@@ -73,6 +73,21 @@ describe("GetCompanionPanel", () => {
     expect(screen.getByText(/not on this Mac/i)).toBeTruthy();
   });
 
+  it("ships with a real invitation, used when no url is passed", () => {
+    // Every other test passes `joinUrl` explicitly, so none of them
+    // would notice the shipped constant being empty or malformed --
+    // which would silently render the "not available yet" state to
+    // every user while the tests stayed green (#736).
+    render(<GetCompanionPanel />);
+    open();
+
+    const link = screen.getByText(/^https:\/\/testflight\.apple\.com\/join\//);
+    expect(link.textContent).toMatch(
+      /^https:\/\/testflight\.apple\.com\/join\/[A-Za-z0-9]+$/,
+    );
+    expect(screen.queryByText(/not available yet/i)).toBeNull();
+  });
+
   it("says there is nothing to scan yet when no invitation is configured", () => {
     // The state that ships first: #736 is a console task on Apple's
     // side, so an empty link is real and will be seen.

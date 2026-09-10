@@ -63,7 +63,11 @@ Internal testing reaches only App Store Connect users you add by hand. A
 desktop's *Get the mobile companion* button and its QR code point at
 (`TESTFLIGHT_JOIN_URL` in `src/components/GetCompanionPanel.tsx`).
 
-Setting it up is a console task, done once:
+The group is **live**: "HeadState beta", public link
+`https://testflight.apple.com/join/HwV4gMHr`.
+
+Setting it up is a console task, done once — recorded here because it has
+to be repeated if the group is ever recreated:
 
 1. **App Store Connect → the app → TestFlight**.
 2. Under **External Testing**, create a group (e.g. "Public Beta").
@@ -86,8 +90,19 @@ Setting it up is a console task, done once:
    showing a code that resolves to nothing.
 
 Later builds reach the group without re-review while the version does not
-change materially; Apple re-reviews periodically. Builds expire after 90
-days, so the group needs a current build or the link installs nothing.
+change materially; Apple re-reviews periodically.
+
+**Builds expire after 90 days.** A group whose only build has expired
+still serves its public link, and the link then installs nothing -- which
+looks like a broken app rather than an expired build. Adding each new
+mobile release to the group is what keeps the link honest, so do it as
+part of cutting the release, not only when someone reports it broken.
+
+If the link ever stops working -- expired, capped, or the group turned
+off -- blank `TESTFLIGHT_JOIN_URL` rather than leaving it pointing at a
+dead page. The panel then says the invitation is unavailable, which is
+true, instead of sending someone to a page that fails after they have
+already installed TestFlight.
 
 A public link is genuinely public: anyone holding the URL can install, up
 to the cap, with no per-tester approval.

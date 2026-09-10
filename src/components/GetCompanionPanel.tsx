@@ -3,11 +3,15 @@ import { useState } from "react";
 
 /// The public TestFlight join link for the companion beta (#736).
 ///
-/// Empty until the external TestFlight group exists and its public link
-/// is enabled -- see `docs/mobile-release-process.md`. A placeholder URL
-/// would be worse than none: a QR code that resolves to nothing sends
-/// someone to a dead page having already installed TestFlight, and they
-/// have no way to tell whether they did something wrong.
+/// Live since the external "HeadState beta" group opened its public link
+/// (#736) -- see `docs/mobile-release-process.md` for how it was set up
+/// and what keeps it working.
+///
+/// The empty-string case is kept working rather than deleted: a public
+/// link can be turned off, hit its tester cap, or point at a group whose
+/// only build has expired (90 days). Blanking this constant is then the
+/// honest response, and the panel already says the invitation is
+/// unavailable instead of showing a code that resolves to nothing.
 ///
 /// Not a secret. A public link is public by design, so it belongs in the
 /// repo rather than in a build secret -- and putting it here means the
@@ -16,7 +20,7 @@ import { useState } from "react";
 /// Module-private: the panel is the only thing that needs it, and it
 /// reaches it as `joinUrl`'s default. Exporting it would be an unused
 /// export, which `knip` fails the build over.
-const TESTFLIGHT_JOIN_URL = "";
+const TESTFLIGHT_JOIN_URL = "https://testflight.apple.com/join/HwV4gMHr";
 
 /// How to get the companion app onto a phone.
 ///
