@@ -53,6 +53,7 @@ import { Sheet, SheetContent, SheetTitle } from "./components/ui/sheet";
 import { applyFilters, hasActiveFilters, sortPrs } from "./lib/derive";
 import { shortcutFor } from "./lib/shortcuts";
 import { useIsMobile } from "./lib/useIsMobile";
+import { relativeSeconds } from "./lib/time";
 import { useActiveFilters, useFilters } from "./store/filters";
 
 /// The assembled app shell. `AuthGate` already wraps this component once in
@@ -150,6 +151,7 @@ export default function App() {
     refetch: refetchReviewing,
     isRefreshing: reviewingRefreshing,
     isFromCache: reviewingFromCache,
+    staleSecs: reviewingStaleSecs,
   } = reviewingQuery;
   // DIAGNOSTIC LOGGING (Settings > diagnostic log).
   useReviewingDiag({
@@ -527,8 +529,24 @@ export default function App() {
                 at stale data with nothing to say it was being
                 refreshed. */}
             {view === "to-review" && reviewingRefreshing && reviewingFromCache ? (
-              <p className="mb-3 rounded-md border border-[#30363d] bg-[#161b22] px-4 py-2 text-xs text-[#8b949e]">
-                Showing the last saved list — checking GitHub for changes…
+              // Amber, and it names the age, when the snapshot is past
+              // the freshness window (#742). Such a snapshot used to be
+              // thrown away, which reached the view as an empty list --
+              // "nothing awaits your review", stated confidently, for
+              // as long as the live fetch took. Showing the old rows
+              // and saying how old they are beats asserting there are
+              // none. Inside the window it stays the quiet grey note:
+              // a snapshot seconds old needs no warning.
+              <p
+                className={
+                  reviewingStaleSecs === null
+                    ? "mb-3 rounded-md border border-[#30363d] bg-[#161b22] px-4 py-2 text-xs text-[#8b949e]"
+                    : "mb-3 rounded-md border border-[#d29922]/30 bg-[#d29922]/10 px-4 py-2 text-xs text-[#d29922]"
+                }
+              >
+                {reviewingStaleSecs === null
+                  ? "Showing the last saved list — checking GitHub for changes…"
+                  : `Showing a saved list from ${relativeSeconds(reviewingStaleSecs)} — checking GitHub for changes…`}
               </p>
             ) : null}
             <FilterBar prs={source} />

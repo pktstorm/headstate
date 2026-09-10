@@ -165,6 +165,22 @@ export interface CycleTrend {
   sampled: boolean;
 }
 
+/// A cached pull-request list, and whether it is too old to present as
+/// current.
+///
+/// `stale_secs` is null for a snapshot inside the freshness window --
+/// the ordinary case, shown with no marker. A number means the rows were
+/// true that many seconds ago and the view must say so.
+///
+/// This type exists because "too old to trust" and "there is nothing
+/// here" used to be the same value, an empty array (#742). The list then
+/// rendered a confident "nothing awaits your review" for as long as the
+/// live fetch took -- seventeen seconds on the account that reported it.
+export interface CachedSnapshot {
+  prs: PullRequest[];
+  stale_secs: number | null;
+}
+
 /// Why a worktree can or cannot be removed.
 ///
 /// An enum rather than a boolean because the UI has to explain itself:
