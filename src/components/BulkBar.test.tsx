@@ -12,14 +12,20 @@ vi.mock("@/api/hooks", () => ({ useActOnPrs: () => batch }));
 
 const toastError = vi.fn();
 const toastSuccess = vi.fn();
+const toastInfo = vi.fn();
 vi.mock("sonner", () => ({
-  toast: { success: (...a: unknown[]) => toastSuccess(...a), error: (...a: unknown[]) => toastError(...a) },
+  toast: {
+    success: (...a: unknown[]) => toastSuccess(...a),
+    error: (...a: unknown[]) => toastError(...a),
+    info: (...a: unknown[]) => toastInfo(...a),
+  },
 }));
 
 beforeEach(() => {
   batch.mockClear();
   toastError.mockClear();
   toastSuccess.mockClear();
+  toastInfo.mockClear();
   useFilters.getState().clearChecked();
 });
 
@@ -154,10 +160,120 @@ describe("BulkBar", () => {
     expect(useFilters.getState().checked).toEqual([prKey(PR_FIXTURES[1])]);
   });
 
+  /// #752. `PR_FIXTURES[2]` is already in the merge queue; `[0]` is not.
+  ///
+  /// The batch is the assertion, not the wording: enqueueing a PR that
+  /// is already queued is the pointless request the issue exists to
+  /// stop, and it produced six "already in the queue" refusals in a
+  /// real session log.
+  describe("an action that would do nothing", () => {
+    it("leaves already-queued pull requests out of the batch", async () => {
+      select(PR_FIXTURES[0], PR_FIXTURES[2]);
+      batch.mockResolvedValueOnce([
+        { repo: PR_FIXTURES[0].repo, number: PR_FIXTURES[0].number, error: null },
+      ]);
+      render(<BulkBar prs={PR_FIXTURES} />);
+      fireEvent.click(screen.getByRole("button", { name: "Add to merge queue" }));
+      confirm("Add to merge queue");
+      await waitFor(() => expect(batch).toHaveBeenCalled());
+      expect(batch.mock.calls[0][0].map((t) => t[2])).toEqual([PR_FIXTURES[0].number]);
+    });
+
+    /// The issue's own suggested wording: say it in the dialog, where
+    /// the count is already the thing being checked.
+    it("says how many are already queued, and still lists them", () => {
+      select(PR_FIXTURES[0], PR_FIXTURES[2]);
+      render(<BulkBar prs={PR_FIXTURES} />);
+      fireEvent.click(screen.getByRole("button", { name: "Add to merge queue" }));
+      const dialog = within(screen.getByRole("dialog"));
+      expect(dialog.getByText(/2 selected/)).not.toBeNull();
+      expect(dialog.getByText(/1 already in the merge queue/)).not.toBeNull();
+      // The skipped row is still NAMED. Dropping it would make the
+      // dialog disagree with the selection it is confirming.
+      expect(
+        dialog.getByText(new RegExp(`${PR_FIXTURES[2].number}`)),
+      ).not.toBeNull();
+    });
+
+    /// The rule `BulkBar` documents: the batch is resolved against the
+    /// UNFILTERED list, so nothing may quietly leave the SELECTION.
+    ///
+    /// Skipping is a property of the action, not of the selection, and
+    /// this is what proves the difference: after confirming an enqueue
+    /// that skipped a row, that row is still selected -- so choosing a
+    /// different action next still acts on it.
+    it("does not unselect the rows an action skipped", async () => {
+      select(PR_FIXTURES[0], PR_FIXTURES[2]);
+      batch.mockResolvedValueOnce([
+        { repo: PR_FIXTURES[0].repo, number: PR_FIXTURES[0].number, error: null },
+      ]);
+      render(<BulkBar prs={PR_FIXTURES} />);
+      // Before confirming, the bar still counts BOTH.
+      expect(screen.getByText("2 selected")).not.toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Add to merge queue" }));
+      confirm("Add to merge queue");
+      await waitFor(() => expect(toastSuccess).toHaveBeenCalled());
+      // The toast names the skip rather than claiming two were updated.
+      expect(String(toastSuccess.mock.calls[0][0])).toMatch(/1 skipped/);
+    });
+
+    /// A batch with nothing left to do must say so rather than send an
+    /// empty request and report "0 updated", which reads as a failure.
+    it("sends nothing when every selected row is already in that state", () => {
+      select(PR_FIXTURES[2]);
+      render(<BulkBar prs={PR_FIXTURES} />);
+      fireEvent.click(screen.getByRole("button", { name: "Add to merge queue" }));
+      confirm("Add to merge queue");
+      expect(batch).not.toHaveBeenCalled();
+      expect(toastInfo).toHaveBeenCalled();
+    });
+
+    /// The issue asked for the other bulk actions to be checked for the
+    /// same shape. "Mark ready" on a PR that is not a draft is it.
+    it("leaves non-drafts out of a Mark ready batch", async () => {
+      select(PR_FIXTURES[0], PR_FIXTURES[1]);
+      batch.mockResolvedValueOnce([
+        { repo: PR_FIXTURES[1].repo, number: PR_FIXTURES[1].number, error: null },
+      ]);
+      render(<BulkBar prs={PR_FIXTURES} />);
+      fireEvent.click(screen.getByRole("button", { name: "Mark ready" }));
+      confirm("Mark ready");
+      await waitFor(() => expect(batch).toHaveBeenCalled());
+      expect(batch.mock.calls[0][0].map((t) => t[2])).toEqual([PR_FIXTURES[1].number]);
+    });
+
+    /// Close is never redundant -- the list holds only open pull
+    /// requests -- so the skip logic must not touch it.
+    it("closes every selected pull request, queued or not", async () => {
+      select(PR_FIXTURES[0], PR_FIXTURES[2]);
+      batch.mockResolvedValueOnce(
+        [PR_FIXTURES[0], PR_FIXTURES[2]].map((p) => ({
+          repo: p.repo,
+          number: p.number,
+          error: null,
+        })),
+      );
+      render(<BulkBar prs={PR_FIXTURES} />);
+      fireEvent.click(screen.getByRole("button", { name: "Close PRs" }));
+      confirm("Close PRs");
+      await waitFor(() => expect(batch).toHaveBeenCalled());
+      expect(batch.mock.calls[0][0].map((t) => t[2]).sort()).toEqual(
+        [PR_FIXTURES[0].number, PR_FIXTURES[2].number].sort(),
+      );
+    });
+  });
+
+  /// `PR_FIXTURES[1]`, the DRAFT, rather than `[0]`.
+  ///
+  /// "Mark ready" on `[0]` is a no-op -- it is already ready -- so since
+  /// #752 the batch is empty and nothing is sent. The old fixture made
+  /// this test pass by exercising exactly the pointless call the issue
+  /// is about; the action now has to be one that can really change the
+  /// pull request for the success path to be reached at all.
   it("clears the selection when everything succeeded", async () => {
-    select(PR_FIXTURES[0]);
+    select(PR_FIXTURES[1]);
     batch.mockResolvedValueOnce([
-      { repo: PR_FIXTURES[0].repo, number: PR_FIXTURES[0].number, error: null },
+      { repo: PR_FIXTURES[1].repo, number: PR_FIXTURES[1].number, error: null },
     ]);
     render(<BulkBar prs={PR_FIXTURES} />);
     fireEvent.click(screen.getByRole("button", { name: "Mark ready" }));

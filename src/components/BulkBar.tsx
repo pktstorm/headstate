@@ -24,6 +24,38 @@ export function prKey(pr: { repo: string; number: number }): string {
   return `${pr.repo}#${pr.number}`;
 }
 
+/// Why an action would do nothing to this pull request, or null.
+///
+/// A pull request already in the merge queue cannot be enqueued, and one
+/// already ready cannot be marked ready. The single-PR paths have always
+/// known this -- `PrActions` and `PrKebab` both switch on
+/// `in_merge_queue` and offer `dequeue` instead -- and bulk did not, so
+/// selecting eight rows with three already queued sent `enqueue` for all
+/// eight and GitHub refused three of them (#752).
+///
+/// Phrased as the REASON rather than a boolean because the dialog shows
+/// it: "3 already in the merge queue" is something a user can check
+/// their selection against, where a count of skipped rows is not.
+///
+/// `close` and `draft` are deliberately absent. The list holds only open
+/// pull requests, so `close` is never redundant; `draft` on a PR that is
+/// already a draft would be, but the bar offers "Convert to draft"
+/// alongside "Mark ready" and a selection mixing both is the ordinary
+/// case -- which `noOp` already describes correctly for whichever one
+/// the user picks.
+function noOp(pr: PullRequest, action: PrActionName): string | null {
+  switch (action) {
+    case "enqueue":
+      return pr.in_merge_queue ? "already in the merge queue" : null;
+    case "ready":
+      return pr.is_draft ? null : "already ready for review";
+    case "draft":
+      return pr.is_draft ? "already a draft" : null;
+    default:
+      return null;
+  }
+}
+
 /// The bar shown while rows are selected.
 ///
 /// Every action confirms here, not just Close. A single merge applies
@@ -41,10 +73,39 @@ export function BulkBar({ prs }: { prs: PullRequest[] }) {
   const selected = prs.filter((pr) => checked.includes(prKey(pr)));
   if (selected.length === 0) return null;
 
+  // Split the SELECTION for the pending action, without changing it.
+  //
+  // This is not the shrinking the unfiltered-list rule forbids. That
+  // rule is about the batch changing behind the user's back -- a filter
+  // narrowed after selecting, removing rows they never unticked. Here
+  // nothing is removed: `checked` is untouched, every selected row is
+  // still listed in the dialog, and the split is a property of the
+  // ACTION rather than of the view. The same eight rows are still
+  // selected the moment the dialog closes, and picking a different
+  // action splits them differently.
+  //
+  // Deriving it per-action at confirmation time is what makes that
+  // true. Filtering the selection when rows are ticked would bake one
+  // action's notion of redundancy into the selection itself, which is
+  // the silent shrink under another name (#752).
+  const applicable = pending ? selected.filter((pr) => noOp(pr, pending) === null) : selected;
+  const skipped = pending ? selected.filter((pr) => noOp(pr, pending) !== null) : [];
+
   const run = (action: PrActionName) => {
+    // Send only the rows the action can change. The user has just been
+    // shown exactly which ones those are and confirmed against that
+    // count, so this acts on what was agreed rather than on a batch
+    // three of whose members were always going to be refused.
+    const targets = selected.filter((pr) => noOp(pr, action) === null);
+    if (targets.length === 0) {
+      // Nothing to do, and saying so beats a "0 updated" toast that
+      // reads like the batch silently failed.
+      toast.info("Nothing to do — every selected pull request is already in that state");
+      return;
+    }
     setBusy(true);
     actOnPrs(
-      selected.map((pr) => [pr.id, pr.repo, pr.number] as [string, string, number]),
+      targets.map((pr) => [pr.id, pr.repo, pr.number] as [string, string, number]),
       action,
     ).then(
       (outcomes) => {
@@ -54,7 +115,15 @@ export function BulkBar({ prs }: { prs: PullRequest[] }) {
         // Never a bare "done": partial failure is the normal case, and a
         // single success message would hide the rejections.
         if (failed.length === 0) {
-          toast.success(`${ok} pull request${ok === 1 ? "" : "s"} updated`);
+          // The skipped rows are named in the SAME sentence as the
+          // updated ones. The toast used to say "8 updated" when five
+          // changed, which is the dishonesty #752 is about -- and a
+          // count alone would leave the user wondering which three.
+          const also =
+            selected.length > targets.length
+              ? ` — ${selected.length - targets.length} skipped, already in that state`
+              : "";
+          toast.success(`${ok} pull request${ok === 1 ? "" : "s"} updated${also}`);
           clearChecked();
         } else {
           toast.error(`${failed.length} of ${outcomes.length} failed`, {
@@ -110,18 +179,40 @@ export function BulkBar({ prs }: { prs: PullRequest[] }) {
       {pending ? (
         <Dialog open onOpenChange={(o) => !o && setPending(null)}>
           <DialogContent className="max-w-2xl">
+            {/* The title counts what will ACTUALLY change. Asking
+                "Add 8 to the merge queue?" when three are already there
+                is asking a question the app knows the answer to. */}
             <DialogTitle>
-              {BULK.find((b) => b.action === pending)?.label} {selected.length} pull request
-              {selected.length === 1 ? "" : "s"}?
+              {BULK.find((b) => b.action === pending)?.label} {applicable.length} pull request
+              {applicable.length === 1 ? "" : "s"}?
             </DialogTitle>
+            {skipped.length > 0 ? (
+              // The count the user selected is still stated, so the
+              // dialog reconciles with the "8 selected" in the bar
+              // rather than appearing to have lost rows (#752).
+              <p className="mt-2 text-sm text-[#d29922]">
+                {selected.length} selected — {skipped.length}{" "}
+                {skipped[0] ? noOp(skipped[0], pending) : ""}, so {skipped.length === 1 ? "it" : "they"}{" "}
+                will be skipped.
+              </p>
+            ) : null}
             {/* The full list, not a count: "Close 12 pull requests?" is
-                not something anyone can act on safely. */}
+                not something anyone can act on safely.
+
+                EVERY selected row is still listed, skipped ones included
+                and marked. Dropping them would make the dialog disagree
+                with the selection it is confirming, which is the silent
+                shrink the unfiltered-list rule exists to prevent. */}
             <ul className="mt-3 max-h-64 overflow-y-auto text-sm text-[#8b949e]">
-              {selected.map((pr) => (
-                <li key={prKey(pr)} className="py-0.5">
-                  {pr.repo}#{pr.number} — {pr.title}
-                </li>
-              ))}
+              {selected.map((pr) => {
+                const why = pending ? noOp(pr, pending) : null;
+                return (
+                  <li key={prKey(pr)} className={`py-0.5 ${why ? "opacity-60" : ""}`}>
+                    {pr.repo}#{pr.number} — {pr.title}
+                    {why ? <span className="ml-1 text-[#d29922]">({why})</span> : null}
+                  </li>
+                );
+              })}
             </ul>
             <div className="mt-5 flex justify-end gap-2">
               <button
@@ -144,8 +235,8 @@ export function BulkBar({ prs }: { prs: PullRequest[] }) {
                     : "bg-[#1f6feb] hover:bg-[#316dca]"
                 }`}
               >
-                {BULK.find((b) => b.action === pending)?.label} {selected.length} pull request
-                {selected.length === 1 ? "" : "s"}
+                {BULK.find((b) => b.action === pending)?.label} {applicable.length} pull request
+                {applicable.length === 1 ? "" : "s"}
               </button>
             </div>
           </DialogContent>

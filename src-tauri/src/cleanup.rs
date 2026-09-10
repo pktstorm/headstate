@@ -259,6 +259,10 @@ pub fn propose(prefs: &CleanupPrefs, roots: &[String], now: &str) -> Vec<LedgerE
                 // Live is never removed unattended. Its project exists
                 // and something touched it recently.
                 crate::caches::VenvState::Live => false,
+                // A truncated walk cannot support any proposal. The
+                // unattended pass is the worst place to guess: nobody
+                // is watching it decide (#747).
+                crate::caches::VenvState::Unknown => false,
             };
             if !eligible {
                 continue;
@@ -346,6 +350,7 @@ mod tests {
                 VenvState::Orphaned => true,
                 VenvState::Stale => venvs_stale,
                 VenvState::Live => false,
+                VenvState::Unknown => false,
             }
         }
 
@@ -363,6 +368,16 @@ mod tests {
         fn stale_requires_the_opt_in() {
             assert!(!eligible(VenvState::Stale, false));
             assert!(eligible(VenvState::Stale, true));
+        }
+
+        /// #747: a truncated walk proposes NOTHING, whatever the opt-in
+        /// says. `Unknown` means the scan did not finish, so "nothing
+        /// owns this venv" was never established -- and the unattended
+        /// pass is the one place where a wrong call is unwitnessed.
+        #[test]
+        fn an_unfinished_scan_proposes_nothing() {
+            assert!(!eligible(VenvState::Unknown, false));
+            assert!(!eligible(VenvState::Unknown, true));
         }
 
         /// Live is never proposed, whatever the settings say. Its

@@ -54,6 +54,10 @@ function isRemovable(v: Venv, state: VenvState): boolean {
 /// is gone, so mtime says nothing about whether anyone wants it.
 function displayState(v: Venv, idleSecs: number | undefined): VenvState {
   if (v.state === "orphaned") return "orphaned";
+  // An idle time cannot complete an incomplete scan. Ageing `unknown`
+  // into `stale` here would make it removable again, undoing the
+  // suppression the backend applied for exactly that reason (#747).
+  if (v.state === "unknown") return "unknown";
   if (idleSecs !== undefined && idleSecs >= STALE_SECS) return "stale";
   return v.state;
 }
@@ -62,6 +66,9 @@ const TONE: Record<VenvState, string> = {
   orphaned: "bg-[#f85149]/15 text-[#f85149]",
   stale: "bg-[#d29922]/15 text-[#d29922]",
   live: "bg-[#238636]/15 text-[#3fb950]",
+  // Grey, deliberately: the danger tones say "act on this", and the
+  // whole point of `unknown` is that this run cannot tell you to.
+  unknown: "bg-[#8b949e]/15 text-[#8b949e]",
 };
 
 /// Poetry virtualenvs, on the Artifacts page.
@@ -103,6 +110,10 @@ export function VenvSection() {
 
   const orphans = rows.filter((r) => r.state === "orphaned");
   const orphanBytes = orphans.reduce((n, r) => n + (sizes.get(r.v.path) ?? 0), 0);
+  // A truncated project walk suppresses the orphan verdict for the whole
+  // run, so `unknown` rows are the SIGNAL that the count above is not the
+  // real one -- there may be orphans hiding among them (#747).
+  const unknown = rows.filter((r) => r.state === "unknown");
   const selectedBytes = [...checked].reduce((n, p) => n + (sizes.get(p) ?? 0), 0);
 
   return (
@@ -154,6 +165,23 @@ export function VenvSection() {
           </button>
         ) : null}
       </div>
+
+      {/* Says the answer is incomplete, in the one place the answer is
+          read. The old behaviour returned a short list with no marker at
+          all, so a run that had stopped walking early looked exactly
+          like one that found nothing -- and "0 orphaned" is a claim, not
+          an absence of one (#747). */}
+      {unknown.length > 0 ? (
+        <p
+          role="status"
+          className="mb-3 rounded border border-[#d29922]/40 bg-[#d29922]/10 px-3 py-2 text-xs text-[#d29922]"
+        >
+          The project scan did not finish, so {unknown.length} virtualenv
+          {unknown.length === 1 ? "" : "s"} could not be checked. They are shown as
+          unknown and cannot be removed — some may in fact be orphaned. Narrowing the
+          scanned directories in Settings will let the scan complete.
+        </p>
+      ) : null}
 
       {confirming ? (
         <Dialog open onOpenChange={(o) => !o && setConfirming(false)}>
@@ -253,7 +281,12 @@ export function VenvSection() {
                 aria-label={
                   removable
                     ? `Select ${v.project} virtualenv`
-                    : `${v.project} virtualenv cannot be removed: its project still exists and is in use`
+                    : // The REASON differs, and a disabled control that
+                      // explains itself has to explain the right thing:
+                      // `unknown` is not "in use", it is "not checked".
+                      state === "unknown"
+                      ? `${v.project} virtualenv cannot be removed: the project scan did not finish, so it could not be checked`
+                      : `${v.project} virtualenv cannot be removed: its project still exists and is in use`
                 }
                 className="shrink-0 disabled:opacity-30"
               />

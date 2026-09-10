@@ -517,7 +517,12 @@ export interface ArtifactRemoval {
 }
 
 /// Why a Poetry virtualenv is reclaimable.
-export type VenvState = "orphaned" | "stale" | "live";
+///
+/// `unknown` is not a reason -- it is the absence of one. The project
+/// walk that decides orphanhood stopped early, so this run cannot say
+/// whether anything still owns the venv, and it is offered for removal
+/// by neither the manual nor the unattended path (#747).
+export type VenvState = "orphaned" | "stale" | "live" | "unknown";
 
 /// One Poetry virtualenv.
 export interface Venv {

@@ -39,6 +39,18 @@ pub enum VenvState {
     Stale,
     /// The project exists and the venv is in use. Never offered.
     Live,
+    /// Nothing we scanned hashes to it, but the scan did not finish.
+    ///
+    /// The state `Orphaned`'s own documentation already promised --
+    /// "subject only to the scan roots being complete" -- and which did
+    /// not exist until the walk was found truncating in ordinary use
+    /// (#747). It is the difference between "nothing owns this" and "I
+    /// did not finish looking", and only the first may be acted on.
+    ///
+    /// Never removable, by either the manual or the unattended path. A
+    /// venv here is not declared safe OR unsafe; the honest report is
+    /// that this run cannot say.
+    Unknown,
 }
 
 /// One Poetry virtualenv.
