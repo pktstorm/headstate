@@ -1120,13 +1120,72 @@ export function useWorktreeSafety(repoPath: string | undefined) {
   });
 }
 
+/// Sizes streaming in from the Rust side, one worktree at a time.
+///
+/// The Rust command emits `worktree-size` per worktree as it finishes
+/// walking it, and this collects them into a map that grows while the
+/// command is still running.
+///
+/// Why a subscription rather than just awaiting the command: the walk is
+/// the expensive pass by a wide margin, and its cost tracks BYTES, not
+/// worktree count -- MEASURED, 21.40s for a single 200 GB checkout
+/// against 0.78s for a 0.33 GB one. Awaiting the whole set means every
+/// row waits on the largest tree, which on a 100-worktree machine is the
+/// indefinite page of skeletons #754 reported. Partial answers are the
+/// entire point, so they must be observable before the promise settles.
+///
+/// Keyed by absolute path, which is unique across repositories, so one
+/// subscription serves both the per-repository and all-repositories
+/// views without them having to agree on anything.
+function useStreamingSizes(): Map<string, number> {
+  const [sizes, setSizes] = useState<Map<string, number>>(() => new Map());
+
+  useEffect(() => {
+    // The same guarded teardown as every other listener here -- see
+    // `usePullRequests` for why the promise cannot be unwrapped naively.
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    listen<[string, number]>("worktree-size", (e) => {
+      const [path, bytes] = e.payload;
+      setSizes((prev) => {
+        // A fresh Map, not a mutation: React compares by identity, and
+        // an in-place `set` would leave every row showing its skeleton
+        // because nothing re-rendered.
+        const next = new Map(prev);
+        next.set(path, bytes);
+        return next;
+      });
+    }).then((fn) => {
+      if (cancelled) safeUnlisten(fn);
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      safeUnlisten(unlisten);
+    };
+  }, []);
+
+  return sizes;
+}
+
 /// Disk sizes for one repo's worktrees, keyed by path.
 ///
-/// The slowest of the three passes (~13s for 147 worktrees), so it is
-/// last: the list appears, then safety, then sizes. Sizes change only
-/// when the tree does, so they are cached for longer than the rest.
+/// The slowest of the three passes by far, so it is last: the list
+/// appears, then safety, then sizes.
+///
+/// `partial` carries the sizes that have landed while the query is still
+/// in flight. Until #754 this hook offered only the settled `data`, so
+/// the per-repository view had nothing to show between "started" and
+/// "every worktree measured" -- and on a repository with a large
+/// checkout that gap is minutes. The all-repositories view got
+/// progressive fill from having one query per repository; the
+/// per-repository view is ONE query, so it needed the finer grain.
+///
+/// Sizes change only when the tree does, so they are cached for longer
+/// than the rest.
 export function useWorktreeSizes(repoPath: string | undefined) {
-  return useQuery({
+  const partial = useStreamingSizes();
+  const query = useQuery({
     queryKey: ["worktree-sizes", repoPath],
     queryFn: async () => {
       const pairs = await sizeWorktrees(repoPath as string);
@@ -1135,25 +1194,35 @@ export function useWorktreeSizes(repoPath: string | undefined) {
     enabled: Boolean(repoPath),
     staleTime: 5 * 60 * 1000,
   });
+  return { ...query, partial };
 }
 
-/// Sizes for EVERY repository, landing one repository at a time.
+/// Sizes for EVERY repository, landing one worktree at a time.
 ///
-/// MEASURED: sizing all 41 repositories on a real machine takes 119
-/// seconds -- `size_repo` shells out to `du` per worktree, and 158
-/// worktrees at roughly 0.75s each is the whole cost. Issuing them all
-/// and awaiting the set would leave the all-repositories view showing
-/// dashes for two minutes with nothing to say why, which is exactly
-/// what was reported.
+/// MEASURED, and the numbers that used to be here were wrong in a way
+/// that mattered: this claimed `size_repo` "shells out to `du`" at
+/// "roughly 0.75s each". It does neither -- it is a native recursive
+/// walk, and its cost tracks BYTES rather than worktree count. On one
+/// checkout: 21.40s for a 200 GB main checkout, 0.78s for a 0.33 GB
+/// worktree, 0.01s for a 0.01 GB one. A per-worktree average is
+/// meaningless, and believing one is what made #754 look like a hang
+/// rather than a walk that had not finished.
 ///
-/// So: one query PER REPOSITORY, merged as each resolves. The view
-/// fills in progressively and can say how much is still outstanding.
+/// Two levels of granularity, because one was not enough:
+///
+///   - one query PER REPOSITORY, so a repository's results land without
+///     waiting for the others;
+///   - `worktree-size` events merged on top, so a row fills as soon as
+///     its OWN tree is walked rather than waiting for the largest tree
+///     in its repository.
+///
 /// The per-repository queries share `worktree-sizes` keys with
 /// `useWorktreeSizes`, so opening a repository afterwards is free.
 ///
 /// `staleTime` is long for the same reason it is on the single-repo
 /// hook: a worktree's size does not change unless its contents do.
 export function useAllWorktreeSizes(repoPaths: string[], enabled: boolean) {
+  const streamed = useStreamingSizes();
   const results = useQueries({
     queries: repoPaths.map((path) => ({
       queryKey: ["worktree-sizes", path],
@@ -1164,8 +1233,10 @@ export function useAllWorktreeSizes(repoPaths: string[], enabled: boolean) {
   });
 
   // Merged into one map, so callers do not care that it arrived in
-  // pieces.
-  const sizes = new Map<string, number>();
+  // pieces. Streamed values go in FIRST so a settled query's answer
+  // wins on any key it has -- the settled set is the authoritative one,
+  // and the stream is only ever an early view of the same walk.
+  const sizes = new Map<string, number>(streamed);
   for (const r of results) {
     if (r.data) for (const [k, v] of r.data) sizes.set(k, v);
   }

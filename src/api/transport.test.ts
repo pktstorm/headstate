@@ -247,6 +247,11 @@ const POLL_EVENTS: [string, () => unknown][] = [
   // client that needs it most: it has no window to leave open and
   // watch a ten-minute deletion in.
   ["branch-delete-progress", () => hooks.useBranchDeleteProgress("/code/app")],
+  // The twelfth (#754). Sizes stream in per worktree because the walk
+  // has no useful upper bound, and a hook that imported Tauri's
+  // `listen` directly would work on the desktop and silently never
+  // fire on the phone — which is the whole reason this list exists.
+  ["worktree-size", () => hooks.useWorktreeSizes("/code/app")],
 ];
 
 function wrapper({ children }: { children: ReactNode }) {

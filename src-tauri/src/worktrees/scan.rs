@@ -1212,11 +1212,44 @@ pub fn scan_dirs_fast(dirs: &[String]) -> Vec<Repo> {
     repos
 }
 
+/// How many threads share the walk of ONE directory tree.
+///
+/// The walk is syscall-bound, not seek-bound: on an SSD the disk is
+/// never the limit, so the "concurrent I/O contends for one spindle"
+/// intuition does not apply. MEASURED over 18 worktrees totalling
+/// 187 GB, one worker per worktree from a fixed pool:
+///
+/// ```text
+///   workers=1    35.30s      workers=8     5.05s
+///   workers=2    17.08s      workers=16    5.18s
+///   workers=4    12.93s      workers=32    4.69s
+/// ```
+///
+/// 7x from 1 to 8, then flat. #754 proposed SERIALISING these on the
+/// theory that concurrent walks fight over the disk; the measurement
+/// says the opposite, and serialising would be a 7x regression. 8 is
+/// the knee, and matches `CLASSIFY_WORKERS` for the same reason.
+const SIZE_WORKERS: usize = 8;
+
 /// Bytes on disk for a directory tree.
 ///
-/// Walks rather than shelling out to `du`: one subprocess per worktree
-/// across 296 of them is a lot of process churn for a number, and this
-/// skips symlinks so a link into another tree is not counted twice.
+/// Walks rather than shelling out to `du`: this skips symlinks so a
+/// link into another tree is not counted twice, and `du` deduplicates
+/// hardlinks -- which sounds right but is wrong for this feature.
+/// MEASURED on one 13.45 GB worktree, `du -s` reported 10.91 GB, because
+/// package managers hardlink into a shared store. The question the
+/// column answers is "how much do I get back by deleting this?", and
+/// for a hardlinked file that is its full length until the last link
+/// goes. `du` is faster (17.07s vs 25.49s on a 205 GB tree) but it
+/// answers a different question.
+///
+/// Counts EVERYTHING, including `node_modules` and `target`. #754 raised
+/// skipping them, as `project_dirs` does, and it is dramatic: MEASURED,
+/// the same 13.45 GB worktree walks in 0.00s and reports 0.01 GB. But
+/// that is a 99.9% under-report, and it is under-reporting precisely the
+/// bytes the user opened this view to reclaim. A "size" column that
+/// omits the size is not a faster answer, it is a wrong one. The cost is
+/// paid by parallelism and by reporting progress instead.
 ///
 /// Unreadable entries are skipped rather than failing the whole
 /// measurement -- a permission error on one file should not turn a real
@@ -1243,24 +1276,91 @@ fn dir_size(path: &Path) -> u64 {
     total
 }
 
+/// Size every path in `paths`, `SIZE_WORKERS` at a time.
+///
+/// A shared cursor rather than fixed chunks, because worktree sizes vary
+/// by three orders of magnitude -- MEASURED on one checkout: 21.40s for
+/// the main checkout, 0.78s and 0.01s for two others. Splitting the
+/// slice into equal chunks would leave seven threads idle behind
+/// whichever chunk drew the 200 GB tree; work-stealing off one cursor
+/// keeps every thread busy until there is nothing left.
+///
+/// `report` is called once per path AS IT FINISHES, from whichever
+/// thread finished it, so a caller can stream partial answers instead of
+/// waiting for the slowest tree. That is the whole point: #754 was a
+/// page of skeletons that never resolved because nothing could be shown
+/// until everything was done.
+fn size_paths(paths: &[String], report: &(dyn Fn(&str, u64) + Sync)) {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let workers = SIZE_WORKERS.min(paths.len().max(1));
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let next = &next;
+            scope.spawn(move || loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(p) = paths.get(i) else { break };
+                report(p, dir_size(Path::new(p)));
+            });
+        }
+    });
+}
+
 /// Sizes for one repo's worktrees, keyed by path.
 ///
-/// A separate pass from classification: ~60ms per worktree, so ~18s
-/// across all 296 here. The UI fills these in after the list and the
-/// safety states are already on screen.
+/// A separate pass from classification, and by far the most expensive
+/// one. MEASURED, single-threaded, on one checkout: 21.40s for a 200 GB
+/// main checkout and 0.78s for a 0.33 GB worktree -- the cost tracks
+/// bytes and file count, NOT worktree count, so a per-worktree average
+/// is meaningless. (The old comment here claimed "~60ms per worktree",
+/// which is off by more than two orders of magnitude for a large tree
+/// and is what led #754's reporter to look for a hang instead of a slow
+/// walk.) `size_paths` parallelises it; see `SIZE_WORKERS`.
+///
+/// Test-only since #754: production goes through the streaming form so
+/// that a row can be filled the moment its own answer exists. Kept
+/// because the tests want the whole set as a single value to assert on.
+#[cfg(test)]
 pub fn size_repo(repo_path: &str) -> Result<Vec<(String, u64)>, String> {
+    let mut out = Vec::new();
+    size_repo_streaming(repo_path, &mut |path, bytes| {
+        out.push((path.to_string(), bytes))
+    })?;
+    Ok(out)
+}
+
+/// `size_repo`, but handing each worktree over the moment it is
+/// measured.
+///
+/// The streaming form is the one the UI wants and the collected form is
+/// written in terms of it, rather than the other way round: a caller
+/// that can show partial results should never have to wait for a
+/// `Vec` that is only complete when the slowest tree is done.
+///
+/// `report` is called from a worker thread and may be called
+/// concurrently, hence `FnMut` behind a lock rather than plain `FnMut`
+/// -- the mutex is uncontended relative to the walks it guards, which
+/// run for seconds apiece.
+pub fn size_repo_streaming(
+    repo_path: &str,
+    report: &mut (dyn FnMut(&str, u64) + Send),
+) -> Result<(), String> {
     let dir = Path::new(repo_path);
     // An empty vec on git failure resolved as SUCCESS, so the UI could
     // not tell "this repo has no worktrees" from "we could not look".
     let list = git(dir, &["worktree", "list", "--porcelain"])
         .map_err(|e| format!("could not list worktrees: {e}"))?;
-    Ok(parse_porcelain(&list)
-        .into_iter()
-        .map(|w| {
-            let bytes = dir_size(Path::new(&w.path));
-            (w.path, bytes)
-        })
-        .collect())
+    let paths: Vec<String> = parse_porcelain(&list).into_iter().map(|w| w.path).collect();
+
+    let sink = std::sync::Mutex::new(report);
+    size_paths(&paths, &|path, bytes| {
+        // A poisoned lock means another worker panicked mid-report.
+        // Dropping this one result is better than panicking every
+        // remaining thread and losing the whole measurement.
+        if let Ok(mut f) = sink.lock() {
+            f(path, bytes);
+        }
+    });
+    Ok(())
 }
 
 /// When a branch's tip landed in the default branch.
@@ -4198,6 +4298,152 @@ prunable gitdir file points to non-existent location
         // shows the first for the second.
         assert!(Safety::Empty.reason().contains("nothing to lose"));
         assert_ne!(Safety::Empty.reason(), Safety::NeverPushed.reason());
+    }
+
+    /// Sizing, and the two things #754 turns on: that answers arrive one
+    /// at a time, and that the number still means "disk footprint".
+    mod sizing {
+        use super::super::{dir_size, size_paths, SIZE_WORKERS};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        /// A directory with `n` files of `bytes` each, plus its path.
+        fn tree(parent: &std::path::Path, name: &str, n: usize, bytes: usize) -> String {
+            let dir = parent.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            for i in 0..n {
+                std::fs::write(dir.join(format!("f{i}")), vec![b'x'; bytes]).unwrap();
+            }
+            dir.to_string_lossy().to_string()
+        }
+
+        /// The measurement counts `node_modules` and `target`.
+        ///
+        /// #754 proposed skipping them, as `caches::project_dirs` does.
+        /// This is the guard against doing it by reflex: the column
+        /// exists to answer "how much do I reclaim by deleting this?",
+        /// and MEASURED on a real 13.45 GB worktree the skipping walk
+        /// reports 0.01 GB -- a 99.9% under-report of exactly the bytes
+        /// the user came to reclaim.
+        #[test]
+        fn heavy_directories_are_counted_not_skipped() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let root = tmp.path().join("wt");
+            std::fs::create_dir_all(&root).unwrap();
+            // 100 bytes of source, 10_000 bytes in the directories a
+            // "source size" walk would skip.
+            tree(&root, "src", 1, 100);
+            for skipped in [".git", "node_modules", "target", ".terraform", ".venv"] {
+                tree(&root, skipped, 1, 2_000);
+            }
+
+            let total = dir_size(&root);
+            assert_eq!(
+                total, 10_100,
+                "every byte on disk must be counted; skipping the heavy \
+                 directories would report 100"
+            );
+        }
+
+        /// Symlinks are still not followed -- a link into another tree
+        /// must not be counted twice, and a loop must not hang the walk.
+        #[test]
+        #[cfg(unix)]
+        fn symlinks_are_not_followed() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let root = tmp.path().join("wt");
+            std::fs::create_dir_all(&root).unwrap();
+            tree(&root, "real", 1, 500);
+            // A link back to the root: followed, this walk never ends.
+            std::os::unix::fs::symlink(&root, root.join("loop")).unwrap();
+            assert_eq!(dir_size(&root), 500);
+        }
+
+        /// Each path is reported AS IT FINISHES, not once at the end.
+        ///
+        /// The whole of #754's second bug: the view held every row on a
+        /// skeleton because nothing could be shown until the slowest
+        /// tree was done. A caller can only bound that promise if the
+        /// measurement hands over partial answers.
+        #[test]
+        fn every_path_is_reported_individually() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let paths: Vec<String> = (0..5)
+                .map(|i| tree(tmp.path(), &format!("wt{i}"), 2, 100))
+                .collect();
+
+            let seen = Mutex::new(Vec::new());
+            size_paths(&paths, &|p: &str, b: u64| {
+                seen.lock().unwrap().push((p.to_string(), b));
+            });
+
+            let mut seen = seen.into_inner().unwrap();
+            seen.sort();
+            assert_eq!(seen.len(), 5, "one report per path, not one batch");
+            for (_, bytes) in &seen {
+                assert_eq!(*bytes, 200);
+            }
+            let mut expected = paths.clone();
+            expected.sort();
+            let got: Vec<String> = seen.into_iter().map(|(p, _)| p).collect();
+            assert_eq!(got, expected);
+        }
+
+        /// The walks actually overlap.
+        ///
+        /// MEASURED over 18 worktrees totalling 187 GB: 35.30s with one
+        /// worker against 5.05s with eight. #754 proposed serialising
+        /// these on the theory that concurrent walks contend for the
+        /// disk; on an SSD the walk is syscall-bound and that is a 7x
+        /// regression, so the concurrency is load-bearing and a
+        /// refactor that quietly removes it must fail here.
+        ///
+        /// Asserts overlap rather than wall-clock time: a timing
+        /// threshold on CI hardware is a flake generator.
+        #[test]
+        fn paths_are_walked_concurrently() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let paths: Vec<String> = (0..SIZE_WORKERS)
+                .map(|i| tree(tmp.path(), &format!("wt{i}"), 1, 10))
+                .collect();
+
+            let inside = AtomicUsize::new(0);
+            let peak = AtomicUsize::new(0);
+            size_paths(&paths, &|_: &str, _: u64| {
+                let n = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(n, Ordering::SeqCst);
+                // Long enough that a serial implementation cannot have
+                // two reports in flight at once, short enough not to
+                // slow the suite.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                inside.fetch_sub(1, Ordering::SeqCst);
+            });
+
+            assert!(
+                peak.load(Ordering::SeqCst) > 1,
+                "sizing must run paths concurrently; saw no overlap, which \
+                 is the 7x-slower serial shape"
+            );
+        }
+
+        /// Fewer paths than workers must not spawn idle threads, and
+        /// zero paths must not spawn a pool at all or divide by zero.
+        #[test]
+        fn worker_count_never_exceeds_the_work() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let one = vec![tree(tmp.path(), "only", 1, 7)];
+
+            let calls = AtomicUsize::new(0);
+            size_paths(&one, &|_: &str, _: u64| {
+                calls.fetch_add(1, Ordering::SeqCst);
+            });
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            // The empty case: no reports, and no panic.
+            size_paths(&[], &|_: &str, _: u64| {
+                panic!("nothing to size, so nothing may be reported");
+            });
+        }
     }
 }
 
