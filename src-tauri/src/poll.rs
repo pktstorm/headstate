@@ -588,9 +588,27 @@ fn spawn_recheck(app: AppHandle, client: Arc<GitHubClient>, last_known: Vec<Pull
 /// can keep a read alive indefinitely without ever tripping a read timeout,
 /// and the loop must reach its sleep either way.
 ///
-/// Generous relative to the ~3s measured fetch, so it fires only on a
-/// genuine hang and never truncates a merely slow response.
-pub const FETCH_TIMEOUT: Duration = Duration::from_secs(90);
+/// Bounded BELOW `MIN_FOCUSED_SECS`, which is the property that matters
+/// and which 90s did not have. At the fastest interval the user can
+/// choose, a 90s ceiling means a hung poll is still in flight when the
+/// next tick fires: two fetches overlap, each spending the rate-limit
+/// budget, and the banner blames whichever loses. A ceiling under the
+/// floor makes a poll's failure land strictly before its successor
+/// starts.
+///
+/// 30s, not lower: measured per-POST latency on a reported six-day
+/// session is p50 6,655ms, p90 8,814ms, p99 30,126ms (n=3,806). A 30s
+/// ceiling therefore abandons roughly the slowest 1% and leaves p90 with
+/// better than 3x headroom. The three polls in that log which ran to the
+/// old 90s ceiling had been useless for 90 seconds each while the next
+/// tick was only 120s away -- giving up at 30s and retrying is strictly
+/// better than waiting out a request that has already missed its window.
+///
+/// The measured floor is `mergeStateStatus`, which GitHub computes per
+/// pull request synchronously (see `client.rs`). That is why this is a
+/// ceiling rather than a target: the query cannot be made reliably fast,
+/// so the loop's job is to fail fast and retry rather than to hang.
+pub const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Wakes the poll loop out of its sleep.
 ///
@@ -1101,6 +1119,43 @@ mod tests {
     fn a_timeout_is_transient() {
         assert!(ClientError::Timeout(90).is_transient());
     }
+
+    /// A poll must give up before its successor starts.
+    ///
+    /// The regression this guards: `FETCH_TIMEOUT` was 90s while
+    /// `MIN_FOCUSED_SECS` is 60, so a user on the fastest allowed
+    /// interval could have a hung fetch still in flight when the next
+    /// tick fired -- two concurrent fetches, both spending rate-limit
+    /// budget, for a request that had already been useless for a full
+    /// interval.
+    ///
+    /// Asserted against the CONSTANT rather than a literal, so raising
+    /// the ceiling past the floor fails here instead of in the field.
+    #[test]
+    fn the_fetch_ceiling_is_under_the_shortest_poll_interval() {
+        assert!(
+            FETCH_TIMEOUT < Duration::from_secs(MIN_FOCUSED_SECS),
+            "a fetch may not outlive the gap to the next poll: \
+             FETCH_TIMEOUT={FETCH_TIMEOUT:?} MIN_FOCUSED_SECS={MIN_FOCUSED_SECS}"
+        );
+    }
+
+    /// The ceiling must still clear the measured p90, or ordinary slow
+    /// polls would be cut off and the list would stop updating for
+    /// users whose accounts are merely large.
+    ///
+    /// p90 is 8,814ms per POST across 3,806 requests in a reported
+    /// six-day session; p99 is 30,126ms. 30s keeps better than 3x
+    /// headroom over p90 while abandoning roughly the slowest 1%.
+    #[test]
+    fn the_fetch_ceiling_still_clears_the_measured_p90() {
+        const MEASURED_P90: Duration = Duration::from_millis(8_814);
+        assert!(
+            FETCH_TIMEOUT >= MEASURED_P90 * 3,
+            "the ceiling must not cut off ordinary slow polls: \
+             FETCH_TIMEOUT={FETCH_TIMEOUT:?}"
+        );
+    }
     use crate::github::model::MergeStateStatus;
 
     /// `notify_one` stores a permit when nobody is waiting, so a refresh
@@ -1152,18 +1207,27 @@ mod tests {
             Ok(res) => res,
             Err(_) => Err(ClientError::Timeout(FETCH_TIMEOUT.as_secs())),
         };
-        assert!(matches!(mapped, Err(ClientError::Timeout(90))));
+        // Against the CONSTANT, not a literal: this test is about the
+        // mapping into the error arm, not about what the ceiling happens
+        // to be, and hardcoding the number made #744's change to it fail
+        // here for no reason.
+        let secs = FETCH_TIMEOUT.as_secs();
+        assert!(matches!(mapped, Err(ClientError::Timeout(s)) if s == secs));
     }
 
     /// The ceiling has to clear a normal fetch by a wide margin, or a
     /// merely slow response would be reported as a failure.
+    ///
+    /// The no-overlap half of this used to read `FETCH_TIMEOUT < FOCUSED
+    /// + FOCUSED` -- 240s, which the old 90s ceiling satisfied
+    /// comfortably while still being able to outlive a 60s interval.
+    /// That is why the overlap went unnoticed; the real bound is
+    /// `MIN_FOCUSED_SECS`, and it is asserted in
+    /// `the_fetch_ceiling_is_under_the_shortest_poll_interval` above.
     #[test]
     fn fetch_timeout_leaves_headroom_over_a_normal_fetch() {
         // PRS_QUERY's own doc records ~2.9s for 27 PRs.
         assert!(FETCH_TIMEOUT >= Duration::from_secs(30));
-        // And still well under the shortest poll interval, so a wedged
-        // tick cannot overlap the next one.
-        assert!(FETCH_TIMEOUT < FOCUSED + FOCUSED);
     }
     use crate::github::model::{CiState, Label, ReviewState};
     use chrono::Utc;

@@ -42,6 +42,47 @@ query($q: String!, $first: Int!, $after: String) {
         headRef { id }
         author { login }
         repository { nameWithOwner }
+        # `mergeStateStatus` is the single most expensive field here, and
+        # it STAYS. #744 investigated removing it; the measurements said
+        # not to, and they are recorded here so the next reader does not
+        # repeat the experiment.
+        #
+        # It is genuinely slow: GitHub computes it per pull request
+        # synchronously. MEASURED live against this query's own shape,
+        # `first: 25`, marginal cost over an `id`-only search:
+        #
+        #   5 items  ~ +0.26s     10 items ~ +0.9s     25 items ~ +3.1s
+        #
+        # -- roughly 50-125ms per item, matching the ~154ms recorded on
+        # `client.rs` when PAGE_SIZE was set.
+        #
+        # WHY DEFERRING IT DOES NOT WORK. The cost is per ITEM, not per
+        # request, so a second query that fetches only `id` and
+        # `mergeStateStatus` for the same 25 pull requests still measured
+        # ~4.8-7.4s against a ~2.2-3.5s baseline. Deferral relocates the
+        # spend, it does not remove it, and it adds a rate-limit point
+        # and a second list to keep in step with the paging race.
+        #
+        # Splitting the query in two and issuing both concurrently DOES
+        # cut wall time (median 8.6s -> 6.6s, 6 of 6 runs), but the
+        # deferred half sets a ~6.4s floor of its own, so time-to-paint
+        # only improves from a median ~9.7s to ~8.4s -- about 1.3s, which
+        # is inside the run-to-run variance.
+        #
+        # WHY IT IS NOT WORTH THAT 1.3s. `unknown` is ALREADY a meaningful
+        # value on this field: GitHub returns it while recomputing after
+        # an approval, and `hooks.ts` polls every 3s precisely on that
+        # state (#699). A deferred fetch would make "not requested yet"
+        # indistinguishable from "GitHub is recomputing", turning that
+        # poller into a permanent spin and reintroducing the exact staleness
+        # bug #699 fixed. The consumers all fail safe on `unknown` -- merge
+        # is refused, chips and actions are withheld -- so nothing would be
+        # UNSAFE, but every row would flicker its merge chip in after paint
+        # on every poll, and the merge button would be withheld for a
+        # second on pull requests that can in fact merge.
+        #
+        # The latency answer for #744 was the FETCH CEILING instead: see
+        # `poll::FETCH_TIMEOUT`.
         mergeable mergeStateStatus reviewDecision isInMergeQueue totalCommentsCount
         # `isInMergeQueue` stays TRUE for an entry the queue has
         # rejected, so a pull request that was declined rendered as
