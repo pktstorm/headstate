@@ -22,11 +22,16 @@ import {
   thermalColor,
   type Point,
 } from "@/lib/health";
-import type { FootprintProcess, HealthGpu, HealthSample } from "@/types/pr";
+import type {
+  FootprintProcess,
+  FootprintProcessGroup,
+  HealthGpu,
+  HealthSample,
+} from "@/types/pr";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { useConnectionState } from "@/api/connection";
 import { type HealthPage, useFilters } from "@/store/filters";
-import { HEALTH_PAGES } from "./SystemHealthSidebar";
+import { healthPagesFor } from "./SystemHealthSidebar";
 import { useIsMobile } from "@/lib/useIsMobile";
 import { ChevronLeft } from "lucide-react";
 
@@ -940,7 +945,20 @@ export function SystemHealthPage() {
   // the depth the overview cannot afford. Everything below this branch
   // is the overview exactly as it was -- the landing page is unchanged
   // by design, and these are additions reached from it.
-  if (healthPage !== "overview") {
+  //
+  // One of them is conditional. A machine with no discoverable GPU has
+  // no GPU PAGE, not an empty one (#717) -- the same rule that decides
+  // whether the overview draws a GPU panel, and the reason the sidebar
+  // does not offer the row.
+  //
+  // Checked HERE as well as in the sidebar, because the sidebar filters
+  // on the CURRENT sample and a GPU can leave one: an eGPU unplugged,
+  // or the very first sample landing after the page was opened from a
+  // stale cache. Falling through to the overview is the honest answer
+  // -- there would be nothing truthful to put on the page, and an empty
+  // one claims a device was found and could not be read.
+  const offered = healthPagesFor(s.gpus.length).some((p) => p.id === healthPage);
+  if (healthPage !== "overview" && offered) {
     return (
       <DetailPage
         page={healthPage}
@@ -959,7 +977,7 @@ export function SystemHealthPage() {
           page they drill down from. Above the pressure cards because
           it is navigation: what the page can show, before what it is
           showing. Desktop renders nothing here; the sidebar has it. */}
-      <HealthPageNav />
+      <HealthPageNav gpuCount={s.gpus.length} />
       {/* Whose machine, said once, at the top, on the phone only.
           `ConnectionBanner` already names the paired desktop, but it
           is chrome that sits above every view alike -- it says which
@@ -1422,14 +1440,20 @@ function GapNote() {
 /// door. Which machine is being DESCRIBED is the build question, and
 /// that is decided elsewhere on this page. Getting these two the wrong
 /// way round is the category error #598 fixed.
-function HealthPageNav() {
+function HealthPageNav({ gpuCount }: { gpuCount: number }) {
   const isMobile = useIsMobile();
   const setHealthPage = useFilters((f) => f.setHealthPage);
   if (!isMobile) return null;
 
   // "overview" is skipped: this row IS the overview, so a card leading
   // to where you already are would be a control that does nothing.
-  const pages = HEALTH_PAGES.filter((p) => p.id !== "overview");
+  //
+  // `healthPagesFor` is the same filter the sidebar applies, called
+  // rather than reimplemented so the phone and the desktop cannot drift
+  // into offering different pages -- which is what `HEALTH_PAGES` being
+  // one array exists to prevent, and would be undone by a second copy
+  // of the GPU rule here.
+  const pages = healthPagesFor(gpuCount).filter((p) => p.id !== "overview");
 
   return (
     <nav aria-label="System health sections">
@@ -1489,7 +1513,7 @@ function DetailPage({
 }) {
   const isMobile = useIsMobile();
   const setHealthPage = useFilters((f) => f.setHealthPage);
-  const meta = HEALTH_PAGES.find((p) => p.id === page);
+  const meta = healthPagesFor(sample.gpus.length).find((p) => p.id === page);
 
   return (
     <div className="flex flex-col gap-4">
@@ -1519,6 +1543,8 @@ function DetailPage({
         <MemoryDetail sample={sample} samples={samples} sampledAt={sampledAt} />
       ) : page === "disk" ? (
         <DiskDetail sample={sample} />
+      ) : page === "gpu" ? (
+        <GpuDetail sample={sample} samples={samples} sampledAt={sampledAt} />
       ) : page === "network" ? (
         <NetworkDetail sample={sample} />
       ) : (
@@ -1564,6 +1590,7 @@ function DetailPage({
 /// same reason every other absence on this page is.
 function TopProcesses({
   processes,
+  groups,
   processCount,
   /// Which column is the reason these rows were chosen. The other is
   /// still shown -- a process is interesting for both -- but only one
@@ -1572,9 +1599,42 @@ function TopProcesses({
   by,
 }: {
   processes: FootprintProcess[] | undefined;
+  /// The same rows summed by name, from the same reading (#721).
+  ///
+  /// `undefined` when the desktop is too old to send them, which is a
+  /// different fact from an empty list and is why the toggle is hidden
+  /// rather than shown offering a mode that cannot be entered.
+  groups: FootprintProcessGroup[] | undefined;
   processCount: number | undefined;
   by: "cpu" | "memory";
 }) {
+  // Individual is the DEFAULT, and deliberately.
+  //
+  // It is the view that makes no inference at all: each row is one
+  // process the kernel reported, with its own PID. Grouping by name is
+  // a heuristic -- it merges genuinely unrelated programs that happen
+  // to share a name -- and a heuristic that is on by default is one
+  // nobody chose. So the honest view is the one you land on, and the
+  // useful-but-inferred one is one click away.
+  //
+  // # Not persisted, on purpose
+  //
+  // `useUiPrefs` would have made this sync desktop-to-phone for almost
+  // nothing, and it was considered. The argument against it is what a
+  // grouped row LOOKS like: `acme-agent (26)` at 13% is a claim about
+  // twenty-six processes, and someone returning next week to a view
+  // they set once and forgot will read it as one process at 13% -- a
+  // wrong number with no visible cause. A view mode that changes what
+  // a row MEANS is different from one that changes how rows are packed
+  // (`density`, which does persist, and where being wrong costs
+  // nothing).
+  //
+  // It is also the same call `healthPage` itself makes for the same
+  // reason: this state answers one question in one sitting. Local
+  // `useState` rather than the store, so it also resets when you leave
+  // the page -- there is no cross-component reader for it.
+  const [grouped, setGrouped] = useState(false);
+
   if (processes === undefined) {
     return (
       <p className="text-sm">
@@ -1594,16 +1654,83 @@ function TopProcesses({
     return <p className="text-sm text-[#8b949e]">No processes were reported.</p>;
   }
 
-  const rest =
-    processCount === undefined ? null : Math.max(0, processCount - processes.length);
+  // The toggle is only offered when the grouped rows actually arrived.
+  // An older desktop sends none, and a control that switches to an
+  // empty view is worse than no control -- the user would read it as a
+  // machine on which nothing groups.
+  const canGroup = groups !== undefined;
+  // Guarded on `canGroup` rather than on `grouped` alone: nothing can
+  // set `grouped` while the toggle is hidden, but a later edit could,
+  // and the failure would be an empty table under a heading.
+  const showGrouped = grouped && canGroup;
+
+  // How many processes the visible rows actually account for. Under
+  // grouping a row is many processes, so the count of what is NOT shown
+  // is the sum of the counts rather than the number of rows -- which is
+  // what keeps the sentence below true in both modes. Getting this
+  // wrong is subtle and plausible: "1436 total minus 8 rows" reads
+  // perfectly and is off by however many siblings each group holds.
+  const shown = showGrouped
+    ? (groups ?? []).reduce((n, g) => n + g.count, 0)
+    : processes.length;
+  const rest = processCount === undefined ? null : Math.max(0, processCount - shown);
+  // A group whose CPU sum is over fewer members than the group claims.
+  // Rare -- it needs the platform to have failed on one process's
+  // accounting -- but a partial total presented as a complete one is
+  // exactly the lie this view exists to refuse.
+  const partial = showGrouped
+    ? (groups ?? []).filter((g) => g.cpu_unmeasured > 0)
+    : [];
 
   return (
     <div>
+      {canGroup ? (
+        <div
+          className="mb-3 flex items-center gap-1"
+          role="group"
+          aria-label={`How ${by === "cpu" ? "CPU" : "memory"} rows are counted`}
+        >
+          {/* Two buttons rather than a checkbox labelled "Grouped".
+              These are two ways of counting the same machine, and a
+              checkbox makes one of them the absence of the other --
+              which reads as "Grouped: off" rather than as "Individual",
+              and hides that the default is itself a choice. */}
+          {(
+            [
+              ["Individual", false],
+              ["Grouped", true],
+            ] as const
+          ).map(([label, value]) => (
+            <button
+              key={label}
+              type="button"
+              onClick={() => setGrouped(value)}
+              // `aria-pressed`, not `aria-current`: these ARE toggles.
+              // The sidebar's pages are navigation and use
+              // `aria-current="page"`; this changes what the table in
+              // front of you means without moving you anywhere.
+              aria-pressed={showGrouped === value}
+              className={`tap-target rounded-md border px-2.5 py-1 text-xs ${
+                showGrouped === value
+                  ? "border-[#1f6feb] bg-[#1f6feb] text-white"
+                  : "border-[#30363d] bg-[#21262d] text-[#e6edf3] hover:border-[#8b949e]"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      ) : null}
+
       <table className="w-full text-sm">
         <thead>
           <tr className="text-left text-xs text-[#8b949e]">
             <th className="font-normal">Process</th>
-            <th className="font-normal text-right">PID</th>
+            {/* No PID column under grouping, rather than an empty or
+                a "first PID" one. A group has no PID: printing one of
+                the twenty-six would name a process the row is not
+                about, and it is the column a reader copies into `ps`. */}
+            {showGrouped ? null : <th className="font-normal text-right">PID</th>}
             {/* Same heading as the footprint panel's, and for the same
                 reason: `cpu_percent` is a share of ONE core, so a
                 process using three legitimately reads 280%. Under a
@@ -1621,24 +1748,107 @@ function TopProcesses({
           </tr>
         </thead>
         <tbody>
-          {/* Keyed on the PID, not the name: several processes of one
-              app share a name, and keying on it would make React reuse
-              one row's DOM for another process. */}
-          {processes.map((p) => (
-            <ProcessRow key={p.pid} p={p} />
-          ))}
+          {showGrouped
+            ? // Keyed on the NAME, which is what identifies a group --
+              // and unlike the individual rows, it is unique here by
+              // construction: one row per distinct name.
+              (groups ?? []).map((g) => <ProcessGroupRow key={g.name} group={g} />)
+            : /* Keyed on the PID, not the name: several processes of one
+                 app share a name, and keying on it would make React reuse
+                 one row's DOM for another process. */
+              processes.map((p) => <ProcessRow key={p.pid} p={p} />)}
         </tbody>
       </table>
       {rest !== null && rest > 0 ? (
         <p className="mt-2 text-xs leading-relaxed text-[#8b949e]">
-          The {processes.length} biggest by{" "}
-          {by === "cpu" ? "CPU" : "memory"}, of {processCount} processes running.
-          The other {rest} are not listed — on an ordinary machine almost all
-          of them are idle, and a list of every process is not an answer to
-          what is using this one.
+          {showGrouped ? (
+            <>
+              The {(groups ?? []).length} biggest by summed{" "}
+              {by === "cpu" ? "CPU" : "memory"}, covering {shown} of{" "}
+              {processCount} processes running. The other {rest} are not listed
+              — on an ordinary machine almost all of them are idle, and a list
+              of every process is not an answer to what is using this one.
+            </>
+          ) : (
+            <>
+              The {processes.length} biggest by {by === "cpu" ? "CPU" : "memory"},
+              of {processCount} processes running. The other {rest} are not
+              listed — on an ordinary machine almost all of them are idle, and a
+              list of every process is not an answer to what is using this one.
+            </>
+          )}
+        </p>
+      ) : null}
+      {showGrouped ? (
+        // What grouping IS, said where it is in effect. Rows named
+        // `acme-agent (26)` are a claim about twenty-six processes that
+        // share a name -- not about one program, which the app cannot
+        // actually establish without walking ancestry it deliberately
+        // does not walk. See `ProcessGroup` on the Rust side.
+        <p className="mt-2 text-xs leading-relaxed text-[#8b949e]">
+          Rows are every process of that name added together, with the count in
+          brackets. It groups by <em>name</em>, not by which process started
+          which — so two unrelated programs that happen to share a name are one
+          row here. Switch to Individual to see them as the system reports them.
+        </p>
+      ) : null}
+      {partial.length > 0 ? (
+        // Absent is not zero, inside a sum. A process whose CPU the
+        // platform would not report is not added in as 0 -- it is left
+        // out and counted here, so a total over 25 of 26 is never
+        // presented as a total over 26.
+        <p className="mt-2 text-xs leading-relaxed text-[#8b949e]">
+          {partial.map((g) => g.name).join(", ")}{" "}
+          {partial.length === 1 ? "has" : "have"} processes whose CPU this
+          machine did not report. Those are left out of the total rather than
+          counted as zero, so the summed figure covers fewer processes than the
+          count in brackets.
         </p>
       ) : null}
     </div>
+  );
+}
+
+/// One grouped row: every process of a name, summed (#721).
+///
+/// Separate from `ProcessRow` rather than a mode of it. The two render
+/// different numbers of columns (a group has no PID) and different
+/// first cells, and switching one component on a flag would make the
+/// individual table's markup depend on a feature it does not have.
+///
+/// CPU is NOT clamped and NOT drawn as a bar, for the same reason as
+/// `ProcessRow` and more so: this is a sum of per-core shares, so
+/// twenty-six processes at 0.5% legitimately reads 13%, and a group
+/// genuinely using four cores reads 400%.
+function ProcessGroupRow({ group: g }: { group: FootprintProcessGroup }) {
+  return (
+    <tr className="border-t border-[#30363d]">
+      <td className="py-1 pr-2">
+        <span className="text-[#e6edf3]">{g.name}</span>
+        {/* The count is not decoration: it is what stops a summed row
+            being read as a single process. `(1)` is printed too --
+            omitting it for groups of one would make the presence of a
+            number mean "several", which is a second thing to learn. */}
+        <span className="ml-1.5 text-xs tabular-nums text-[#8b949e]">({g.count})</span>
+      </td>
+      <td className="py-1 pr-2 text-right tabular-nums text-[#e6edf3]">
+        {g.cpu_percent.toFixed(0)}%
+        {g.cpu_unmeasured > 0 ? (
+          // Marked on the row as well as explained under the table: a
+          // reader comparing two rows needs to know THIS one is a
+          // partial sum at the moment they read it.
+          <span
+            className="ml-1 text-xs text-[#8b949e]"
+            title={`${g.cpu_unmeasured} of ${g.count} processes reported no CPU figure and are not in this total`}
+          >
+            *
+          </span>
+        ) : null}
+      </td>
+      <td className="py-1 text-right tabular-nums text-[#e6edf3]">
+        {formatSize(g.memory)}
+      </td>
+    </tr>
   );
 }
 
@@ -1684,6 +1894,7 @@ function CpuDetail({
         ) : (
           <TopProcesses
             processes={fp.data.top_cpu}
+            groups={fp.data.top_cpu_grouped}
             processCount={fp.data.process_count}
             by="cpu"
           />
@@ -1802,6 +2013,7 @@ function MemoryDetail({
           <>
             <TopProcesses
               processes={fp.data.top_memory}
+              groups={fp.data.top_memory_grouped}
               processCount={fp.data.process_count}
               by="memory"
             />
@@ -1969,6 +2181,317 @@ function DiskDetail({ sample: s }: { sample: HealthSample }) {
         <DiskFootprint />
       </Panel>
     </div>
+  );
+}
+
+/// The GPU page: utilization over time, memory, and the pipeline
+/// stages the overview collapses (#717).
+///
+/// # Why this page exists when the overview already has a GPU panel
+///
+/// #705 put GPU on the overview, where there is room for one number per
+/// device. #710 gave every other class a page and left GPU out because
+/// #705 had not landed. So GPU was the one class with a panel and no
+/// page, and the three things a page can afford that a panel cannot are
+/// exactly what was missing: a full-width 24-hour chart per device, the
+/// memory figures with the unified-memory caveat stated at length, and
+/// the per-renderer breakdown the overview has to collapse.
+///
+/// # A machine with no GPU never reaches here
+///
+/// The sidebar does not offer the row and `SystemHealthPage` does not
+/// route to it -- see the guard there. This component therefore assumes
+/// at least one GPU and does not render an "no GPU found" state, which
+/// would be the empty page #717 explicitly refuses.
+///
+/// # Per-platform, and why the page differs between them
+///
+/// The verdicts are #705's and this page respects them rather than
+/// re-deciding them:
+///
+/// - **macOS.** `ioreg` answers with a device figure, a renderer
+///   figure, a tiler figure and the unified-memory pair. Every section
+///   below has content.
+/// - **Linux/AMD.** `amdgpu` sysfs answers with one busy percentage and
+///   discrete VRAM. The stages section says the platform does not split
+///   them, rather than repeating the device number under three labels.
+/// - **Linux/Intel, NVIDIA, Windows.** No unprivileged reading exists
+///   or none was built, so `gpus` is empty and there is no page at all.
+function GpuDetail({
+  sample: s,
+  samples,
+  sampledAt,
+}: {
+  sample: HealthSample;
+  samples: HealthSample[];
+  sampledAt: number;
+}) {
+  // One series per device, by INDEX rather than by name. A machine can
+  // have two cards with the same reported name, and matching on the
+  // name would draw one device's history under both. Index is what the
+  // Rust side's ordering guarantees -- `gpu::read` sorts its Linux
+  // cards and `ioreg` walks the tree in a fixed order -- so position is
+  // stable between samples in a way a name is not.
+  //
+  // A sample taken before this GPU existed, or on a platform that
+  // reported no GPU, has no entry at that index and contributes `null`,
+  // which `splitOnGaps` breaks the line across. That is the correct
+  // reading: the app was running and did not measure this device, which
+  // is not the same as a device that was idle.
+  const series = useMemo(
+    () =>
+      s.gpus.map((_, i) =>
+        samples.map((x) => ({
+          t: Date.parse(x.sampled_at),
+          v: x.gpus[i]?.utilization_percent ?? null,
+        })),
+      ),
+    [samples, s.gpus],
+  );
+
+  return (
+    <div className="flex flex-col gap-4">
+      {s.gpus.map((g, i) => (
+        <GpuDeviceDetail
+          key={`${g.name}-${i}`}
+          gpu={g}
+          series={series[i]}
+          sampledAt={sampledAt}
+          // Only shown when there are two: on a single-GPU machine an
+          // index would be a number that distinguishes nothing.
+          index={s.gpus.length > 1 ? i : null}
+        />
+      ))}
+
+      {/* Why there is no process list on this page, said once at the
+          bottom rather than as an empty panel.
+
+          The CPU and Memory pages name the processes responsible, and a
+          reader arriving here reasonably expects the same. The kernel
+          does not attribute GPU work per process the way it attributes
+          CPU and resident memory: on macOS the per-process GPU counters
+          live behind `powermetrics`, which needs sudo, and the same
+          privilege wall that keeps degrees off the Power page keeps
+          these off this one. Saying so is better than the reader
+          concluding the panel failed to load. */}
+      <p className="text-xs leading-relaxed text-[#8b949e]">
+        There is no list of what is using the GPU. Unlike CPU and memory, the
+        system does not attribute graphics work to individual processes without
+        elevated privileges — the same wall that keeps temperatures off the
+        Power page — so Headstate reports the device totals it can read rather
+        than a per-process breakdown it would have to guess at.
+      </p>
+    </div>
+  );
+}
+
+/// One GPU, at page depth.
+///
+/// Separate from `GpuCard` (the overview's) rather than a mode of it.
+/// The two answer different questions -- "is the GPU busy" in three
+/// figures, versus "what is it doing and what has it been doing" across
+/// three panels -- and a single component switched on a `detail` flag
+/// would be two layouts sharing a name, which is how the overview ends
+/// up quietly changing when the page does.
+function GpuDeviceDetail({
+  gpu: g,
+  series,
+  sampledAt,
+  index,
+}: {
+  gpu: HealthGpu;
+  series: Point[];
+  sampledAt: number;
+  /// The device's position, on a machine with more than one. `null` on
+  /// a single-GPU machine, where a "#0" would distinguish nothing.
+  index: number | null;
+}) {
+  const memPct =
+    g.memory_used === null || g.memory_total === null
+      ? null
+      : percentOf(g.memory_used, g.memory_total);
+
+  // `?? null` rather than a truthiness check: these are OPTIONAL on the
+  // wire (an older desktop, or a sample stored before #717) as well as
+  // nullable, and `undefined` and `null` mean the same thing here --
+  // the platform did not report a stage figure. Both must render as
+  // "not measured", and neither may become a 0.
+  const renderer = g.renderer_percent ?? null;
+  const tiler = g.tiler_percent ?? null;
+  const hasStages = renderer !== null || tiler !== null;
+
+  return (
+    <>
+      <Panel
+        title={index === null ? "Utilization" : `${g.name} — utilization`}
+        subtitle={
+          index === null
+            ? "What the graphics device is doing right now"
+            : `Device ${index + 1}`
+        }
+      >
+        <div className="flex flex-wrap gap-6">
+          <Stat label="Device" value={g.name} />
+          {/* Null rather than 0 for a GPU that reported no utilization:
+              an idle GPU and an unreadable one are opposite answers,
+              and this is the field where they look most alike. */}
+          <Stat
+            label="Utilization"
+            value={
+              g.utilization_percent === null
+                ? null
+                : `${g.utilization_percent.toFixed(0)}%`
+            }
+          />
+        </div>
+        {g.utilization_percent !== null ? (
+          <div className="mt-3">
+            <Bar percent={g.utilization_percent} label={`${g.name} utilization`} />
+          </div>
+        ) : null}
+
+        <div className="mt-4">
+          <div className="text-xs text-[#8b949e]">
+            Utilization over the last 24 hours
+          </div>
+          {/* The same treatment CPU and memory get, gaps and all -- the
+              chart is the reason this class needed a page, since the
+              overview has room for a sparkline only under the first
+              device. */}
+          <Sparkline
+            points={series}
+            max={100}
+            label={index === null ? "GPU" : `GPU ${index + 1}`}
+            color="#a371f7"
+            now={sampledAt}
+          />
+          <GapNote />
+        </div>
+      </Panel>
+
+      <Panel
+        title="Pipeline stages"
+        subtitle="Where inside the GPU the work is landing"
+      >
+        {hasStages ? (
+          <>
+            <div className="flex flex-wrap gap-6">
+              <Stat
+                label="Renderer"
+                value={renderer === null ? null : `${renderer.toFixed(0)}%`}
+              />
+              <Stat
+                label="Tiler"
+                value={tiler === null ? null : `${tiler.toFixed(0)}%`}
+              />
+              <Stat
+                label="Device"
+                value={
+                  g.utilization_percent === null
+                    ? null
+                    : `${g.utilization_percent.toFixed(0)}%`
+                }
+                hint="The figure the overview shows"
+              />
+            </div>
+            <div className="mt-3 flex flex-col gap-2">
+              {renderer !== null ? (
+                <div className="flex items-center gap-2">
+                  <span className="w-16 shrink-0 text-xs text-[#8b949e]">Renderer</span>
+                  <Bar percent={renderer} label={`${g.name} renderer utilization`} />
+                  <span className="w-10 shrink-0 text-right text-xs tabular-nums text-[#8b949e]">
+                    {renderer.toFixed(0)}%
+                  </span>
+                </div>
+              ) : null}
+              {tiler !== null ? (
+                <div className="flex items-center gap-2">
+                  <span className="w-16 shrink-0 text-xs text-[#8b949e]">Tiler</span>
+                  <Bar percent={tiler} label={`${g.name} tiler utilization`} />
+                  <span className="w-10 shrink-0 text-right text-xs tabular-nums text-[#8b949e]">
+                    {tiler.toFixed(0)}%
+                  </span>
+                </div>
+              ) : null}
+            </div>
+            {/* What the two stages ARE, which is the whole reason this
+                panel is worth its space. Without it, three percentages
+                that do not sum to anything read as a bug -- they are
+                three independent hardware stages, not a breakdown of
+                one total, and a reader who adds them will think so. */}
+            <p className="mt-3 text-xs leading-relaxed text-[#8b949e]">
+              This GPU is a <em>tile-based deferred renderer</em>: the tiler
+              sorts geometry into screen tiles and the renderer shades them.
+              They are separate stages that can saturate independently, so the
+              three figures do not add up to anything — each is that stage&apos;s
+              own busy time. A device pinned by its tiler is short of geometry
+              throughput; one pinned by its renderer is short of shading.
+            </p>
+          </>
+        ) : (
+          // NOT "Not measured" rows for the two stages. This platform
+          // reports one busy figure and has no stages to report, which
+          // is a different fact from a stage we failed to read -- the
+          // same distinction the whole view is built on, applied to a
+          // capability rather than to a reading.
+          <p className="text-sm leading-relaxed text-[#8b949e]">
+            This platform reports one utilization figure for the whole device
+            and does not break it down by pipeline stage. macOS reports a
+            renderer and a tiler figure separately; the AMD driver on Linux
+            publishes a single busy percentage, which is the number above.
+          </p>
+        )}
+      </Panel>
+
+      <Panel
+        title="Memory"
+        subtitle={g.unified_memory ? "Shared with the system" : "The device's own VRAM"}
+      >
+        <div className="flex flex-wrap gap-6">
+          <Stat
+            label="In use"
+            value={g.memory_used === null ? null : formatSize(g.memory_used)}
+            hint={
+              g.unified_memory && g.memory_used !== null ? "Shared with system" : undefined
+            }
+          />
+          <Stat
+            label={g.unified_memory ? "Allocated pool" : "Total VRAM"}
+            value={g.memory_total === null ? null : formatSize(g.memory_total)}
+          />
+          <Stat
+            label="Of the pool"
+            value={memPct === null ? null : `${memPct.toFixed(0)}%`}
+          />
+        </div>
+        {memPct !== null ? (
+          <div className="mt-3">
+            <Bar percent={memPct} label={`${g.name} memory in use`} />
+          </div>
+        ) : null}
+        {g.unified_memory ? (
+          // The caveat #705 established, with the room a page has to
+          // state it properly. The overview says it in three lines
+          // because a panel must; here the specific arithmetic error is
+          // named, because this page is where someone comparing the two
+          // figures ends up.
+          <p className="mt-3 text-xs leading-relaxed text-[#8b949e]">
+            This GPU uses <em>unified memory</em>: it has no memory of its own
+            and shares one physical pool with the CPU. The figures above are a
+            share of the very memory the Memory page reports —{" "}
+            <span className="text-[#c9d1d9]">not additional memory</span>. Adding
+            them to the system total would describe a machine with more RAM than
+            this one has.
+          </p>
+        ) : (
+          <p className="mt-3 text-xs leading-relaxed text-[#8b949e]">
+            This device has its own VRAM, separate from system memory, so these
+            figures are additional to what the Memory page reports rather than a
+            share of it.
+          </p>
+        )}
+      </Panel>
+    </>
   );
 }
 

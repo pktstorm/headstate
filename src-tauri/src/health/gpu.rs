@@ -22,6 +22,22 @@
 //! being here rather than behind a button; `size_worktrees` is behind a
 //! button because it takes THIRTEEN SECONDS, which is not this.
 //!
+//! # The pipeline stages (#717)
+//!
+//! macOS reports three utilization figures, not one:
+//! `Device Utilization %`, `Renderer Utilization %` and
+//! `Tiler Utilization %`. [`Gpu::utilization_percent`] is the device
+//! figure -- the one that answers "is the GPU busy" and the only one
+//! the overview has room for. The other two are carried in
+//! [`Gpu::renderer_percent`] and [`Gpu::tiler_percent`] for the detail
+//! page, because on a tile-based deferred renderer the two stages
+//! saturate independently and the device number cannot say which.
+//!
+//! Absent everywhere else, and deliberately not filled in from the
+//! device figure. `amdgpu` publishes one busy percentage with no
+//! breakdown, so copying it under three labels would report two
+//! measurements nobody took.
+//!
 //! # Unified memory
 //!
 //! On Apple Silicon the GPU has no memory of its own -- it shares the
@@ -114,6 +130,27 @@ pub struct Gpu {
     /// this panel and the Memory panel look like they disagree about
     /// the size of the machine.
     pub unified_memory: bool,
+    /// The RENDERER's own share of the device, 0-100, where the
+    /// platform splits the pipeline (#717).
+    ///
+    /// macOS reports `Renderer Utilization %` and `Tiler Utilization %`
+    /// beside the device figure. The overview collapses the device
+    /// number alone, which is the right summary; the detail page shows
+    /// these two because they answer a question the single number
+    /// cannot -- a GPU pinned at 90% by geometry setup and one pinned
+    /// by shading are the same row on the overview and different
+    /// problems underneath.
+    ///
+    /// `None` everywhere the platform does not split them, which is
+    /// every platform but macOS. Absent, never zero: an idle renderer
+    /// and a platform that does not report one are opposite facts.
+    pub renderer_percent: Option<f64>,
+    /// The TILER's share, on the same terms as `renderer_percent`.
+    ///
+    /// Apple's GPUs are tile-based deferred renderers: the tiler bins
+    /// geometry into screen tiles and the renderer shades them. They
+    /// are separate hardware stages that saturate independently.
+    pub tiler_percent: Option<f64>,
 }
 
 /// Every GPU the platform will describe, or an empty vector.
@@ -182,11 +219,21 @@ fn parse_ioreg(text: &str) -> Vec<Gpu> {
         let name = name.take().unwrap_or_else(|| "GPU".to_string());
         let used = ioreg_number(&stats, "In use system memory");
         let total = ioreg_number(&stats, "Alloc system memory");
-        // "Device Utilization %" is the whole device. Renderer and
-        // Tiler are the two halves of Apple's pipeline and are reported
-        // separately; the device figure is the one that answers "is the
-        // GPU busy", so the other two are not surfaced.
+        // "Device Utilization %" is the whole device, and it is the
+        // figure that answers "is the GPU busy" -- so it stays the one
+        // the overview shows.
+        //
+        // Renderer and Tiler are the two stages of Apple's pipeline and
+        // are reported separately. #705 read only the device figure
+        // because the overview has room for one number; #717 surfaces
+        // these two on the detail page, where the extra rows are the
+        // whole reason to have drilled in.
         let util = ioreg_number(&stats, "Device Utilization %").map(|n| n as f64);
+        let renderer = ioreg_number(&stats, "Renderer Utilization %").map(|n| n as f64);
+        let tiler = ioreg_number(&stats, "Tiler Utilization %").map(|n| n as f64);
+        // The stage figures alone do not make a node a GPU: a node that
+        // carries neither the device figure nor any memory is not one
+        // we can describe, and the discovery rule #705 set stands.
         if util.is_none() && used.is_none() && total.is_none() {
             return;
         }
@@ -202,6 +249,8 @@ fn parse_ioreg(text: &str) -> Vec<Gpu> {
             // the `ioreg` keys themselves say "system memory" -- this
             // IS the unified pool.
             unified_memory: true,
+            renderer_percent: renderer.map(|u| u.clamp(0.0, 100.0)),
+            tiler_percent: tiler.map(|u| u.clamp(0.0, 100.0)),
         });
     }
 
@@ -297,6 +346,13 @@ fn platform() -> Vec<Gpu> {
             // Discrete VRAM: `mem_info_vram_total` is the card's own
             // pool, separate from system memory.
             unified_memory: false,
+            // `amdgpu` publishes one busy percentage and no per-stage
+            // breakdown -- `gpu_busy_percent` is the whole device.
+            // Absent rather than a copy of the device figure: repeating
+            // one number under three labels would invent a measurement
+            // that was never taken.
+            renderer_percent: None,
+            tiler_percent: None,
         });
     }
     gpus
@@ -339,8 +395,14 @@ mod tests {
     fn whatever_is_reported_is_well_formed() {
         for g in read() {
             assert!(!g.name.is_empty(), "a reported GPU has a name");
-            if let Some(u) = g.utilization_percent {
-                assert!((0.0..=100.0).contains(&u), "utilization {u}");
+            for (what, v) in [
+                ("device", g.utilization_percent),
+                ("renderer", g.renderer_percent),
+                ("tiler", g.tiler_percent),
+            ] {
+                if let Some(u) = v {
+                    assert!((0.0..=100.0).contains(&u), "{what} utilization {u}");
+                }
             }
             if let (Some(used), Some(total)) = (g.memory_used, g.memory_total) {
                 assert!(used <= total, "{used} in use of {total} allocated");
@@ -389,6 +451,59 @@ mod tests {
         assert_eq!(g.memory_used, Some(1_202_913_280));
         assert_eq!(g.memory_total, Some(10_952_982_528));
         assert!(g.unified_memory);
+        // The two pipeline stages, read separately from the device
+        // figure (#717). The fixture happens to have all three equal
+        // at an idle 7%, which is what an idle Mac reports.
+        assert_eq!(g.renderer_percent, Some(7.0));
+        assert_eq!(g.tiler_percent, Some(7.0));
+    }
+
+    /// The stages are read INDEPENDENTLY of the device figure.
+    ///
+    /// The fixture above has all three at 7%, which passes whether the
+    /// stages are parsed or the device number is copied into them
+    /// three times -- so it guards nothing on its own. Here the three
+    /// differ, which is the ordinary case under load: a tile-based
+    /// renderer saturates its tiler and its shader stage at different
+    /// rates, and that difference is the entire reason the detail page
+    /// shows them.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_two_pipeline_stages_are_read_separately_from_the_device() {
+        let text = r#"+-o AGXAcceleratorG14X  <class AGXAcceleratorG14X, id 0x1, registered>
+    {
+      "PerformanceStatistics" = {"Device Utilization %"=88,"Renderer Utilization %"=91,"Tiler Utilization %"=12,"In use system memory"=5,"Alloc system memory"=9}
+      "model" = "Apple M2 Max"
+    }
+"#;
+        let gpus = parse_ioreg(text);
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].utilization_percent, Some(88.0));
+        assert_eq!(gpus[0].renderer_percent, Some(91.0));
+        assert_eq!(gpus[0].tiler_percent, Some(12.0));
+    }
+
+    /// A GPU whose node carries no stage keys reports them ABSENT.
+    ///
+    /// The same rule as every other field here, applied to the two
+    /// added by #717: an Intel Mac's accelerator node carries a device
+    /// figure and no Apple pipeline stages, and a zero in those slots
+    /// would claim we measured an idle renderer on hardware that has
+    /// no such stage to measure.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_gpu_without_pipeline_stages_reports_them_absent_not_zero() {
+        let text = r#"+-o IntelAccelerator  <class IntelAccelerator, id 0x1, registered>
+    {
+      "PerformanceStatistics" = {"Device Utilization %"=41,"In use system memory"=5,"Alloc system memory"=9}
+      "model" = "Intel Iris"
+    }
+"#;
+        let gpus = parse_ioreg(text);
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].utilization_percent, Some(41.0));
+        assert_eq!(gpus[0].renderer_percent, None, "absent is not zero");
+        assert_eq!(gpus[0].tiler_percent, None, "absent is not zero");
     }
 
     /// "In use system memory" and "In use system memory (driver)" share

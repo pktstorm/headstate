@@ -48,6 +48,14 @@ export const ALL_HEALTH_PAGES = [
   "cpu",
   "memory",
   "disk",
+  // Only reachable on a machine with a discoverable GPU (#717). It is
+  // in the union unconditionally because the union is the set of pages
+  // that EXIST; whether one is offered is a fact about the machine, and
+  // `SystemHealthSidebar` filters it out where `gpus` is empty -- the
+  // same rule that decides whether the overview draws a GPU panel at
+  // all. A page in the union that is not offered is fine; a page
+  // offered that renders nothing is not.
+  "gpu",
   "network",
   // Battery, thermal and uptime together, and last. None of the three
   // has enough of its own to carry a page: battery is two numbers with
