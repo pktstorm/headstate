@@ -38,6 +38,7 @@ import type {
   History,
   ImageRemovalOutcome,
   MergedDetail,
+  NetProcess,
   Periods,
   PrDetail,
   PullRequest,
@@ -706,3 +707,25 @@ export const systemHealthHistory = () =>
 /// `Class::Read`, so the phone can ask a paired desktop for this and
 /// get the DESKTOP's cost -- the only reading that makes sense there.
 export const systemFootprint = () => call<Footprint>("system_footprint");
+
+/// Which processes are using the network, right now (#718).
+///
+/// # This call takes about FIVE SECONDS to return
+///
+/// Not a slow network, not a hung app: `nettop` samples for a full
+/// interval before it prints, and no flag shortens it (measured at
+/// 5.06-5.25s across every combination that might have). The caller is
+/// therefore required to SAY so while it waits -- a spinner that sits
+/// for five seconds without explanation is its own bug -- and to keep
+/// this off the five-second health poll entirely, which is why it is a
+/// separate command rather than a field on `system_health`.
+///
+/// See `useNetworkProcesses` for the cadence that follows from that,
+/// and `health::netproc` on the Rust side for the measurements.
+///
+/// Returns an empty list on every platform but macOS: there is no
+/// unprivileged per-process attribution on Linux, and Windows' is real
+/// unwritten work. The view states the reason rather than drawing an
+/// empty table.
+export const systemNetworkProcesses = () =>
+  call<NetProcess[]>("system_network_processes");

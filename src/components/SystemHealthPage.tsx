@@ -1,9 +1,12 @@
 import { useMemo, useState } from "react";
 import {
+  NET_PROCESSES_POLL_MS,
+  NET_PROCESSES_SAMPLE_MS,
   useAllWorktreeSizes,
   useArtifactSizes,
   useArtifacts,
   useDockerDiskUsage,
+  useNetworkProcesses,
   useSystemFootprint,
   useSystemHealth,
   useSystemHealthHistory,
@@ -19,10 +22,12 @@ import {
   formatRate,
   formatUptime,
   interfaceRates,
+  netProcessRates,
   peakRate,
   percentOf,
   splitOnGaps,
   thermalColor,
+  type NetProcessReading,
   type Point,
   type RatePoint,
 } from "@/lib/health";
@@ -2279,9 +2284,239 @@ function InterfaceHistory({
   );
 }
 
-/// The Network page: throughput over 24 hours, and totals since boot.
+/// How many processes the network table lists at once.
 ///
-/// # Why the history panel comes first
+/// Eight, matching `TOP_N` on the CPU and Memory pages for the same
+/// reasons argued there: it outlasts one application (a browser is five
+/// or six processes), it fits without scrolling on a phone, and below
+/// the top few essentially everything is moving nothing. Deliberately
+/// the same number, so a reader moving between the three pages is
+/// comparing lists of the same shape.
+const TOP_NET_PROCESSES = 8;
+
+/// Which processes are using the network (#718).
+///
+/// # This panel is the reason the page has a cadence of its own
+///
+/// Every other reading on this page rides the five-second health poll.
+/// This one costs ~5 SECONDS per reading -- `nettop` samples for a
+/// whole interval before printing, and no flag shortens it -- which is
+/// the entire poll interval, so it runs on `NET_PROCESSES_POLL_MS`
+/// instead and only while this component is mounted. See the hook,
+/// where the cadence is argued, and `health::netproc` for the
+/// measurements.
+///
+/// # The two things this panel must say out loud
+///
+/// Both are consequences of that cost, and both would read as bugs if
+/// left unexplained:
+///
+/// 1. **The first reading takes about five seconds.** A spinner sitting
+///    for five seconds with no explanation is its own bug, so the
+///    waiting state says what is happening and how long it takes.
+/// 2. **One reading is not a rate.** The counts are cumulative since
+///    each process started, so the first reading can only be ordered by
+///    lifetime totals -- which ranks a process that pulled 6 GB last
+///    week above one saturating the link right now. The panel says so
+///    while that is what it is showing, and switches wording once it
+///    has two readings to difference.
+function NetworkProcesses() {
+  // `true`: this component only mounts on the Network page, so the
+  // poll starts when the page opens and stops when it closes. That is
+  // the whole containment strategy for a five-second subprocess.
+  const q = useNetworkProcesses(true);
+
+  // The last TWO readings, because a rate needs two and TanStack hands
+  // out one. Each is stored with its ARRIVAL TIME rather than with the
+  // nominal cadence: a rate must be divided by the interval that
+  // actually elapsed, and this one slips whenever the machine is busy
+  // or the laptop was asleep between readings.
+  //
+  // Adjusted DURING RENDER rather than in an effect, which is React's
+  // own "adjusting state when a prop changes" pattern: React discards
+  // the render and re-runs this component immediately, before anything
+  // is committed to the DOM, so there is no flash of a table computed
+  // from the stale pair. An effect would paint the old rates once
+  // first, and on this panel that is visible -- the whole table's
+  // numbers would change a frame after the reading landed.
+  const [seen, setSeen] = useState<{
+    prev: NetProcessReading | null;
+    cur: NetProcessReading | null;
+  }>({ prev: null, cur: null });
+  // Keyed on the ARRIVAL TIMESTAMP, not on the array identity. TanStack
+  // re-renders with the same `data` reference for reasons that are not
+  // a new reading, and rotating on one of those would difference a
+  // reading against itself and draw 0 B/s across the whole table. It is
+  // also what stops this render-phase update from looping: the
+  // condition is false on the re-render it causes.
+  const arrived = q.dataUpdatedAt;
+  const fresh =
+    q.data !== undefined && arrived !== 0 && seen.cur?.t !== arrived
+      ? { prev: seen.cur, cur: { t: arrived, processes: q.data } }
+      : seen;
+  if (fresh !== seen) setSeen(fresh);
+  const { prev, cur } = fresh;
+
+  const rates = useMemo(
+    () => (prev === null || cur === null ? null : netProcessRates(prev, cur)),
+    [prev, cur],
+  );
+
+  // Rates when there are two readings, lifetime totals when there is
+  // one. Both are sorted by the sum of the two directions: a process
+  // that is only uploading and one that is only downloading are equally
+  // interesting, and ranking by received alone would bury the first.
+  const rows = useMemo(() => {
+    if (rates !== null) {
+      return [...rates]
+        .sort((a, b) => b.in_rate + b.out_rate - (a.in_rate + a.out_rate))
+        .slice(0, TOP_NET_PROCESSES);
+    }
+    if (cur === null) return [];
+    return [...cur.processes]
+      .sort((a, b) => b.bytes_in + b.bytes_out - (a.bytes_in + a.bytes_out))
+      .slice(0, TOP_NET_PROCESSES)
+      .map((p) => ({
+        name: p.name,
+        pid: p.pid,
+        in_rate: null,
+        out_rate: null,
+        bytes_in: p.bytes_in,
+        bytes_out: p.bytes_out,
+      }));
+  }, [rates, cur]);
+
+  if (q.isError) {
+    return (
+      <p className="text-sm text-[#8b949e]">
+        Could not read the per-process network table: {errorMessage(q.error)}
+      </p>
+    );
+  }
+
+  // The five-second wait, named. This is the state that would otherwise
+  // be an unexplained spinner, and it is a state the user will see
+  // every single time they open this page.
+  if (cur === null) {
+    return (
+      <p className="text-sm leading-relaxed text-[#8b949e]">
+        Measuring… this takes about {NET_PROCESSES_SAMPLE_MS / 1000} seconds.
+        macOS only reports per-process network use by sampling for a full
+        interval before it answers, so the first figures cannot arrive sooner.
+        Nothing is stuck.
+      </p>
+    );
+  }
+
+  if (cur.processes.length === 0) {
+    // Not "no processes are using the network" — on the platforms that
+    // return nothing here, nothing was measured at all. Which of the
+    // two it is depends on the platform, and #705's precedent is that
+    // an evidenced "cannot be read unprivileged" is said plainly rather
+    // than rendered as an empty table.
+    return (
+      <p className="text-sm leading-relaxed">
+        <NotMeasured />
+        <span className="ml-1 block text-[#8b949e]">
+          Only macOS reports network use per process without elevated
+          privileges. On Linux <code>/proc/&lt;pid&gt;/net/dev</code> is
+          per-namespace rather than per-process — every process in the root
+          namespace reads the same whole-machine totals the panels below
+          already show — and the tools that do attribute traffic
+          (<code>nethogs</code>, eBPF) need <code>CAP_NET_ADMIN</code> or more.
+          On Windows the unprivileged route sees TCP only, missing the UDP and
+          QUIC that carry most of a browser&apos;s traffic, so it is not built
+          rather than built wrong.
+        </span>
+      </p>
+    );
+  }
+
+  const rated = rates !== null;
+  return (
+    <div>
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="text-left text-xs text-[#8b949e]">
+            <th className="font-normal">Process</th>
+            <th className="font-normal text-right">PID</th>
+            {/* The headings change with what the numbers MEAN. Showing
+                a lifetime total under a heading that says "/s" is the
+                misreading this whole panel is arranged to avoid. */}
+            <th className="font-normal text-right">{rated ? "In" : "Received"}</th>
+            <th className="font-normal text-right">{rated ? "Out" : "Sent"}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            // Keyed on the PID where there is one: several processes of
+            // one application share a name, and keying on the name
+            // would make React reuse one row's DOM for another process.
+            <tr key={r.pid === null ? `n:${r.name}` : `p:${r.pid}`}>
+              <td className="max-w-0 truncate pr-2 text-[#e6edf3]" title={r.name}>
+                {r.name}
+              </td>
+              <td className="text-right tabular-nums text-[#8b949e]">
+                {/* Absent is not zero, and it is not a guess either. A
+                    row whose label carried no parseable PID gets a dash
+                    rather than a fabricated number a reader might paste
+                    into `kill`. */}
+                {r.pid === null ? <NotMeasured /> : r.pid}
+              </td>
+              <td className="text-right tabular-nums text-[#e6edf3]">
+                {r.in_rate === null ? formatSize(r.bytes_in) : formatRate(r.in_rate)}
+              </td>
+              <td className="text-right tabular-nums text-[#e6edf3]">
+                {r.out_rate === null ? formatSize(r.bytes_out) : formatRate(r.out_rate)}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      {rated ? (
+        <p className="mt-2 text-xs leading-relaxed text-[#8b949e]">
+          Rates over the last interval, from the difference between two
+          readings. The {rows.length} busiest of {cur.processes.length}{" "}
+          processes with network accounting — a process that started or exited
+          between the two readings has no interval to measure and is not
+          listed, rather than being shown at zero.
+        </p>
+      ) : (
+        // The single-reading state, and the sentence that keeps it from
+        // being read as a rate. This is the ~5-to-20-second window
+        // between the page opening and the second reading landing.
+        <p className="mt-2 text-xs leading-relaxed text-[#8b949e]">
+          These are <em>lifetime totals</em> since each process started, not
+          current speeds — macOS reports cumulative counters, so a single
+          reading cannot be a rate. Rates appear once a second reading lands,
+          about {(NET_PROCESSES_POLL_MS + NET_PROCESSES_SAMPLE_MS) / 1000}{" "}
+          seconds from now. Until then a process that moved a lot last week
+          outranks one saturating the link right now.
+        </p>
+      )}
+      <p className="mt-2 text-xs leading-relaxed text-[#8b949e]">
+        Re-read every {NET_PROCESSES_POLL_MS / 1000} seconds, and only while
+        this page is open: each reading costs about{" "}
+        {NET_PROCESSES_SAMPLE_MS / 1000} seconds of sampling, which is far too
+        expensive for the poll driving the rest of this view.
+      </p>
+    </div>
+  );
+}
+
+/// The Network page: what is using the network, throughput over 24
+/// hours, and totals since boot.
+///
+/// # Why the process panel comes first
+///
+/// The same argument the CPU page makes: the overview already answered
+/// "is the machine using the network", and someone who clicked through
+/// did so because that number was interesting. The next thing they want
+/// is the NAME of what is doing it (#718). The interface charts below
+/// are the aggregate they already saw, in more detail.
+///
+/// # Why the history panel comes before the totals
 ///
 /// The totals were all this page had (#719), and a cumulative counter
 /// that only ever rises cannot show a spike, a stall, or a pattern: a
@@ -2316,6 +2551,17 @@ function NetworkDetail({
 
   return (
     <div className="flex flex-col gap-4">
+      {/* First, for the same reason the CPU page puts its processes
+          first: the overview already said the machine is using the
+          network, and the question that brought the reader here is
+          which program. */}
+      <Panel
+        title="What is using the network"
+        subtitle="Per process, on this page's own slower cadence"
+      >
+        <NetworkProcesses />
+      </Panel>
+
       <Panel
         title="Throughput"
         subtitle="Per interface, over the last 24 hours"

@@ -190,6 +190,7 @@ pub fn run() {
             commands::system_health,
             commands::system_health_history,
             commands::system_footprint,
+            commands::system_network_processes,
             commands::delete_branches,
             commands::delete_remote_branches,
             commands::remove_worktree,

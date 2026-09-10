@@ -61,6 +61,11 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("system_health", Class::Read),
     ("system_health_history", Class::Read),
     ("system_footprint", Class::Read),
+    // Which processes are using the DESKTOP's network (#718). Costs
+    // ~5s on the desktop, so the Network page calls it on its own slow
+    // cadence and never beside the health poll -- see
+    // `health::netproc` on the desktop side.
+    ("system_network_processes", Class::Read),
     ("docker_disk_usage", Class::Read),
     ("docker_dangling_volumes", Class::Read),
     ("docker_running_containers", Class::Read),
