@@ -160,7 +160,10 @@ const sample = (over: Partial<HealthSample> = {}): HealthSample => ({
     { mount: "/", total: 500 * 1024 ** 3, available: 200 * 1024 ** 3, is_root: true },
     { mount: "/Volumes/spare", total: 1024 ** 4, available: 900 * 1024 ** 3, is_root: false },
   ],
-  battery: { percent: 82, on_ac: false },
+  // Charge 82, capacity 84: two DIFFERENT numbers on purpose, so a
+  // test that renders one where the other belongs cannot pass by them
+  // happening to match.
+  battery: { percent: 82, on_ac: false, capacity_percent: 84, cycle_count: 413 },
   thermal: "nominal",
   networks: [
     { name: "en0", rx_bytes: 8 * 1024 ** 3, tx_bytes: 2 * 1024 ** 3 },
@@ -466,6 +469,79 @@ describe("the Network page", () => {
     expect(meters[0].getAttribute("aria-label")).toContain("en0");
   });
 
+  /// #719: the panel that did not exist. A cumulative counter cannot
+  /// show a spike; this is the chart that can.
+  it("draws throughput over 24 hours, per interface", async () => {
+    const at = (minsAgo: number) =>
+      new Date(Date.now() - minsAgo * 60_000).toISOString();
+    historyFn.mockResolvedValue([
+      sample({
+        sampled_at: at(3),
+        networks: [{ name: "en0", rx_bytes: 0, tx_bytes: 0 }],
+      }),
+      sample({
+        sampled_at: at(2),
+        networks: [{ name: "en0", rx_bytes: 60_000_000, tx_bytes: 6_000_000 }],
+      }),
+      sample({
+        sampled_at: at(1),
+        networks: [{ name: "en0", rx_bytes: 120_000_000, tx_bytes: 12_000_000 }],
+      }),
+    ]);
+    liveFn.mockResolvedValue(
+      sample({ networks: [{ name: "en0", rx_bytes: 120_000_000, tx_bytes: 12_000_000 }] }),
+    );
+    renderPage();
+
+    await screen.findByText("Throughput");
+    // 60 MB per 60-second interval = 1 MB/s, and the unit says it is a
+    // RATE rather than a quantity.
+    await screen.findByText(/peak 1\.0 MB\/s/i);
+    // Both directions are drawn, and separately: a single combined line
+    // could not tell an upload from a download.
+    expect(screen.getByTestId("sparkline-en0 received")).toBeTruthy();
+    expect(screen.getByTestId("sparkline-en0 sent")).toBeTruthy();
+  });
+
+  /// **The mutation test, at the UI level.** A counter reset must reach
+  /// the screen as a break in the line and a sentence naming it -- not
+  /// as a plausible rate, and not as a silent zero.
+  it("names a counter reset rather than drawing a rate through it", async () => {
+    const at = (minsAgo: number) =>
+      new Date(Date.now() - minsAgo * 60_000).toISOString();
+    historyFn.mockResolvedValue([
+      sample({
+        sampled_at: at(4),
+        networks: [{ name: "en0", rx_bytes: 4_000_000_000, tx_bytes: 0 }],
+      }),
+      sample({
+        sampled_at: at(3),
+        networks: [{ name: "en0", rx_bytes: 4_060_000_000, tx_bytes: 0 }],
+      }),
+      // The machine rebooted: the counter starts again from nothing.
+      sample({
+        sampled_at: at(2),
+        networks: [{ name: "en0", rx_bytes: 1_000, tx_bytes: 0 }],
+      }),
+      sample({
+        sampled_at: at(1),
+        networks: [{ name: "en0", rx_bytes: 61_000, tx_bytes: 0 }],
+      }),
+    ]);
+    liveFn.mockResolvedValue(
+      sample({ networks: [{ name: "en0", rx_bytes: 61_000, tx_bytes: 0 }] }),
+    );
+    renderPage();
+
+    await screen.findByText("Throughput");
+    // The reset is explained, not left as an unexplained blank.
+    await screen.findByText(/counter reset/i);
+    // And the line is genuinely broken: the received sparkline reports
+    // more than one measured run, which is what `data-runs` carries.
+    const chart = screen.getByTestId("sparkline-en0 received");
+    expect(Number(chart.getAttribute("data-runs"))).toBeGreaterThan(1);
+  });
+
   it("says the bars are a share of traffic, not saturation", async () => {
     // Every other bar on this page means "how full". Reusing the shape
     // for a different meaning without saying so is how a reader
@@ -484,9 +560,58 @@ describe("the Power page", () => {
     await screen.findByText(/mains-powered, which is not the same as a battery at zero/i);
   });
 
+  /// #720's naming trap, guarded at the UI. "Battery health" normally
+  /// means capacity relative to design, which is a DIFFERENT number
+  /// from charge -- and the fixture deliberately gives them different
+  /// values so a panel rendering one where the other belongs is
+  /// visible rather than coincidentally right.
+  it("keeps charge and capacity in separate panels", async () => {
+    renderPage();
+
+    // Charge, under a heading about charge.
+    await screen.findByText("Battery");
+    expect(screen.getByText("82%")).toBeTruthy();
+
+    // Capacity, under its own heading, with the cycle count that makes
+    // it readable.
+    await screen.findByText("Battery capacity");
+    expect(screen.getByText("84%")).toBeTruthy();
+    expect(screen.getByText("413")).toBeTruthy();
+
+    // And the page says in words that they are not the same figure --
+    // the whole point, since "84%" beside a charge bar reads as charge.
+    // Matched on a contiguous phrase: the sentence emphasises "not" in
+    // its own element, so a regex spanning that would never match.
+    await screen.findByText(/the charge above/i, { exact: false });
+  });
+
+  /// Capacity the platform will not report is said, not silently
+  /// dropped: a panel that vanishes on Linux looks like a bug, and a
+  /// zero would claim a dead cell.
+  it("says capacity was not measured rather than showing a zero", async () => {
+    liveFn.mockResolvedValue(
+      sample({
+        battery: { percent: 55, on_ac: false, capacity_percent: null, cycle_count: null },
+      }),
+    );
+    renderPage();
+
+    await screen.findByText("Battery capacity");
+    // The charge is still a real reading.
+    expect(screen.getByText("55%")).toBeTruthy();
+    // The capacity is absent, and absent is never zero.
+    expect(screen.queryByText("0%")).toBeNull();
+    await screen.findByText(/macOS only/i);
+  });
+
   it("couples thermal and battery only when both facts are in hand", async () => {
     liveFn.mockResolvedValue(
-      sample({ thermal: "serious", battery: { percent: 40, on_ac: false } }),
+      sample({
+        thermal: "serious",
+        // Capacity absent: this test is about the thermal coupling, and
+        // a machine that does not report capacity must still render.
+        battery: { percent: 40, on_ac: false, capacity_percent: null, cycle_count: null },
+      }),
     );
     renderPage();
     await screen.findByText(/warm and on battery/i);
@@ -496,7 +621,10 @@ describe("the Power page", () => {
     // An invented warning about a state the machine is not in would be
     // the page's own rule broken.
     liveFn.mockResolvedValue(
-      sample({ thermal: "serious", battery: { percent: 40, on_ac: true } }),
+      sample({
+        thermal: "serious",
+        battery: { percent: 40, on_ac: true, capacity_percent: null, cycle_count: null },
+      }),
     );
     renderPage();
     await screen.findByText("Thermal pressure");
@@ -953,7 +1081,10 @@ describe("the page list stays complete", () => {
       // fixture the page correctly does not exist, which is its own
       // test below.
       gpu: /^pipeline stages$/i,
-      network: /^since boot$/i,
+      // "Throughput", not "since boot": #719 gave the network page a
+      // 24-hour history, and that chart is what the page now leads
+      // with. The since-boot totals remain, lower down.
+      network: /^throughput$/i,
       power: /^battery$/i,
     };
     // Every page needs a machine that can offer it. Only GPU is

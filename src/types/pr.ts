@@ -891,9 +891,34 @@ interface HealthVolume {
   is_root: boolean;
 }
 
+/// The battery, which carries TWO different percentages.
+///
+/// Mirrors the Rust `health::Battery`, including the distinction that
+/// struct exists to keep: `percent` is CHARGE (how full the cell is now,
+/// moving minute to minute) and `capacity_percent` is HEALTH (how much
+/// it can still hold relative to when it was made, moving over years).
+///
+/// The UI renders them in SEPARATE panels with different words. A
+/// battery at 100% charge and 71% capacity is completely normal for an
+/// older laptop, and a reader who sees "84%" beside a charge bar
+/// concludes their battery is draining when in fact it has aged.
 interface HealthBattery {
+  /// CHARGE, 0-100.
   percent: number;
   on_ac: boolean;
+  /// CAPACITY relative to design, 0-100 -- the figure usually called
+  /// "battery health".
+  ///
+  /// `null` on every platform but macOS, and null on macOS where
+  /// `ioreg` does not publish the pair it comes from. Never 0 for "not
+  /// measured": a battery at 0% of its design capacity is a dead cell,
+  /// the opposite claim from "we did not look".
+  capacity_percent: number | null;
+  /// Charge cycles, `null` where the platform does not publish it.
+  ///
+  /// The context that makes capacity readable: 84% after 400 cycles is
+  /// ordinary ageing, and after 40 it is a fault.
+  cycle_count: number | null;
 }
 
 interface HealthInterface {

@@ -16,11 +16,15 @@ import { formatSize } from "@/lib/worktrees";
 import {
   THERMAL_MEANING,
   barColor,
+  formatRate,
   formatUptime,
+  interfaceRates,
+  peakRate,
   percentOf,
   splitOnGaps,
   thermalColor,
   type Point,
+  type RatePoint,
 } from "@/lib/health";
 import type {
   FootprintProcess,
@@ -1546,7 +1550,7 @@ function DetailPage({
       ) : page === "gpu" ? (
         <GpuDetail sample={sample} samples={samples} sampledAt={sampledAt} />
       ) : page === "network" ? (
-        <NetworkDetail sample={sample} />
+        <NetworkDetail sample={sample} samples={samples} sampledAt={sampledAt} />
       ) : (
         <PowerDetail sample={sample} sampledAt={sampledAt} />
       )}
@@ -2184,6 +2188,232 @@ function DiskDetail({ sample: s }: { sample: HealthSample }) {
   );
 }
 
+/// One interface's throughput over the last 24 hours (#719).
+///
+/// # Why a rate needs more care than a percentage
+///
+/// Every other chart on this page plots a value the sample already
+/// carries. This one plots a DIFFERENCE between two samples, and a
+/// difference has two ways to lie that a direct reading does not:
+///
+/// 1. A pair spanning a period the app was closed differences two
+///    readings hours apart, which would draw a whole day's traffic as
+///    one minute's throughput.
+/// 2. A counter that RESET -- an interface going down, a reboot --
+///    differences to a large negative number.
+///
+/// Both are handled in `interfaceRates`, and both come back the same
+/// way: as a `null` value. That is deliberate, because `splitOnGaps`
+/// already breaks a run on a null, so a reset draws as a gap without
+/// this component knowing anything about resets. The alternative --
+/// clamping a reset to zero -- would render a reboot as a quiet
+/// minute, which is a claim about the traffic rather than an admission
+/// that the counter is no longer comparable.
+function InterfaceHistory({
+  name,
+  rx,
+  tx,
+  now,
+}: {
+  name: string;
+  rx: RatePoint[];
+  tx: RatePoint[];
+  now: number;
+}) {
+  // ONE ceiling for both directions, so in and out are visually
+  // comparable. Scaling each to its own peak would draw a trickle of
+  // upload at the same height as a saturated download, which is the
+  // opposite of what a reader takes from two stacked charts.
+  const peak = Math.max(peakRate(rx) ?? 0, peakRate(tx) ?? 0);
+  const resets = [...rx, ...tx].filter((p) => p.reason === "reset").length;
+
+  if (peak <= 0) {
+    return (
+      <div>
+        <div className="text-sm text-[#e6edf3]">{name}</div>
+        <p className="mt-1 text-xs">
+          <NotMeasured>— no throughput recorded yet</NotMeasured>
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div className="flex items-baseline justify-between gap-2">
+        <span className="truncate text-sm text-[#e6edf3]">{name}</span>
+        <span className="shrink-0 text-xs tabular-nums text-[#8b949e]">
+          peak {formatRate(peak)}
+        </span>
+      </div>
+      <div className="mt-1 flex flex-col gap-1">
+        <div>
+          <div className="text-xs text-[#8b949e]">In</div>
+          <Sparkline points={rx} max={peak} label={`${name} received`} now={now} />
+        </div>
+        <div>
+          <div className="text-xs text-[#8b949e]">Out</div>
+          <Sparkline
+            points={tx}
+            max={peak}
+            label={`${name} sent`}
+            now={now}
+            color="#a371f7"
+          />
+        </div>
+      </div>
+      {/* Named rather than left as an unexplained break in the line. A
+          reader who sees a gap assumes the app was closed; a counter
+          reset is a different fact about the machine, and it is the one
+          the user can act on -- it means the interface went down or the
+          machine rebooted. */}
+      {resets > 0 ? (
+        <p className="mt-1 text-xs text-[#8b949e]">
+          {resets === 1 ? "One break" : `${resets} breaks`} in the line{" "}
+          {resets === 1 ? "is" : "are"} a counter reset — this interface went
+          down, or the machine rebooted. Byte counts start again from zero, so
+          there is no rate to draw across it.
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+/// The Network page: throughput over 24 hours, and totals since boot.
+///
+/// # Why the history panel comes first
+///
+/// The totals were all this page had (#719), and a cumulative counter
+/// that only ever rises cannot show a spike, a stall, or a pattern: a
+/// machine that pulled 40 GB overnight and one that pulled 40 GB over a
+/// month look identical. The totals are still worth showing -- "how
+/// much has this machine moved" is a real question -- but they are the
+/// weaker answer, so they sit below the one that shows shape over time.
+function NetworkDetail({
+  sample: s,
+  samples,
+  sampledAt,
+}: {
+  sample: HealthSample;
+  samples: HealthSample[];
+  sampledAt: number;
+}) {
+  // The busiest first, so the interface that carried the traffic is the
+  // first row rather than wherever the platform happened to list it.
+  // Sorted here rather than in Rust because, unlike the process lists,
+  // nothing is being dropped -- every interface is shown, so the order
+  // is presentation and not selection.
+  const interfaces = useMemo(
+    () => [...s.networks].sort((a, b) => b.rx_bytes + b.tx_bytes - (a.rx_bytes + a.tx_bytes)),
+    [s.networks],
+  );
+  // Differenced from the stored series. Gaps and counter resets both
+  // come back as null values, which `Sparkline` already draws as
+  // breaks -- see `InterfaceHistory`.
+  const rates = useMemo(() => interfaceRates(samples), [samples]);
+  const totalRx = interfaces.reduce((n, i) => n + i.rx_bytes, 0);
+  const totalTx = interfaces.reduce((n, i) => n + i.tx_bytes, 0);
+
+  return (
+    <div className="flex flex-col gap-4">
+      <Panel
+        title="Throughput"
+        subtitle="Per interface, over the last 24 hours"
+      >
+        {interfaces.length === 0 ? (
+          <p className="text-sm">
+            <NotMeasured />
+          </p>
+        ) : (
+          <div className="flex flex-col gap-4">
+            {interfaces.map((n) => {
+              const r = rates.get(n.name);
+              return (
+                <InterfaceHistory
+                  key={n.name}
+                  name={n.name}
+                  rx={r?.rx ?? []}
+                  tx={r?.tx ?? []}
+                  now={sampledAt}
+                />
+              );
+            })}
+          </div>
+        )}
+        {/* Says what the breaks mean, once, above the charts that show
+            them. Two different facts share the same visual treatment --
+            an unmeasured period and a counter reset -- and a blank
+            stretch nobody explains reads as a bug in the chart. */}
+        <p className="mt-3 text-xs leading-relaxed text-[#8b949e]">
+          Rates come from differencing the cumulative counters between
+          samples, so a break in a line is either a period Headstate was not
+          running or a counter that reset. Neither is drawn as a rate,
+          because a period nobody measured has none.
+        </p>
+      </Panel>
+
+      <Panel title="Since boot" subtitle="Across every interface">
+        <div className="flex flex-wrap gap-6">
+          <Stat label="Received" value={formatSize(totalRx)} />
+          <Stat label="Sent" value={formatSize(totalTx)} />
+          <Stat label="Interfaces" value={`${interfaces.length}`} />
+        </div>
+      </Panel>
+
+      <Panel title="Per interface" subtitle="Busiest first">
+        {interfaces.length === 0 ? (
+          <p className="text-sm">
+            <NotMeasured />
+          </p>
+        ) : (
+          <div className="flex flex-col gap-3">
+            {interfaces.map((n) => {
+              const total = n.rx_bytes + n.tx_bytes;
+              // A share of the machine's total traffic, which is what
+              // makes a list of a dozen interfaces readable: it says
+              // which one actually carried anything. `percentOf`
+              // returns null on a zero total rather than NaN -- a
+              // freshly booted machine really can have moved no bytes.
+              const share = percentOf(total, totalRx + totalTx);
+              return (
+                <div key={n.name}>
+                  <div className="flex items-baseline justify-between gap-2">
+                    <span className="truncate text-sm text-[#e6edf3]">{n.name}</span>
+                    <span className="shrink-0 text-xs tabular-nums text-[#8b949e]">
+                      {formatSize(n.rx_bytes)} in · {formatSize(n.tx_bytes)} out
+                    </span>
+                  </div>
+                  <div className="mt-1">
+                    <Bar
+                      percent={share ?? 0}
+                      label={`${n.name} share of total traffic`}
+                    />
+                  </div>
+                  <div className="mt-1 text-xs tabular-nums text-[#8b949e]">
+                    {share === null ? (
+                      <NotMeasured />
+                    ) : (
+                      `${formatSize(total)} total (${share.toFixed(0)}% of all traffic)`
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        {/* The bar here is a SHARE, not a utilisation. Everywhere else
+            on this page a bar means "how full", and using the same
+            shape for a different meaning without saying so is how a
+            reader concludes an interface is 80% saturated. */}
+        <p className="mt-3 text-xs leading-relaxed text-[#8b949e]">
+          Totals since the machine booted, not current speeds — the
+          Throughput panel above has the rates. The bars show each
+          interface&apos;s share of all traffic, not how saturated it is.
+        </p>
+      </Panel>
+    </div>
+  );
+}
 /// The GPU page: utilization over time, memory, and the pipeline
 /// stages the overview collapses (#717).
 ///
@@ -2495,85 +2725,6 @@ function GpuDeviceDetail({
   );
 }
 
-/// The Network page: every interface, with its share of the total.
-function NetworkDetail({ sample: s }: { sample: HealthSample }) {
-  // The busiest first, so the interface that carried the traffic is the
-  // first row rather than wherever the platform happened to list it.
-  // Sorted here rather than in Rust because, unlike the process lists,
-  // nothing is being dropped -- every interface is shown, so the order
-  // is presentation and not selection.
-  const interfaces = useMemo(
-    () => [...s.networks].sort((a, b) => b.rx_bytes + b.tx_bytes - (a.rx_bytes + a.tx_bytes)),
-    [s.networks],
-  );
-  const totalRx = interfaces.reduce((n, i) => n + i.rx_bytes, 0);
-  const totalTx = interfaces.reduce((n, i) => n + i.tx_bytes, 0);
-
-  return (
-    <div className="flex flex-col gap-4">
-      <Panel title="Since boot" subtitle="Across every interface">
-        <div className="flex flex-wrap gap-6">
-          <Stat label="Received" value={formatSize(totalRx)} />
-          <Stat label="Sent" value={formatSize(totalTx)} />
-          <Stat label="Interfaces" value={`${interfaces.length}`} />
-        </div>
-      </Panel>
-
-      <Panel title="Per interface" subtitle="Busiest first">
-        {interfaces.length === 0 ? (
-          <p className="text-sm">
-            <NotMeasured />
-          </p>
-        ) : (
-          <div className="flex flex-col gap-3">
-            {interfaces.map((n) => {
-              const total = n.rx_bytes + n.tx_bytes;
-              // A share of the machine's total traffic, which is what
-              // makes a list of a dozen interfaces readable: it says
-              // which one actually carried anything. `percentOf`
-              // returns null on a zero total rather than NaN -- a
-              // freshly booted machine really can have moved no bytes.
-              const share = percentOf(total, totalRx + totalTx);
-              return (
-                <div key={n.name}>
-                  <div className="flex items-baseline justify-between gap-2">
-                    <span className="truncate text-sm text-[#e6edf3]">{n.name}</span>
-                    <span className="shrink-0 text-xs tabular-nums text-[#8b949e]">
-                      {formatSize(n.rx_bytes)} in · {formatSize(n.tx_bytes)} out
-                    </span>
-                  </div>
-                  <div className="mt-1">
-                    <Bar
-                      percent={share ?? 0}
-                      label={`${n.name} share of total traffic`}
-                    />
-                  </div>
-                  <div className="mt-1 text-xs tabular-nums text-[#8b949e]">
-                    {share === null ? (
-                      <NotMeasured />
-                    ) : (
-                      `${formatSize(total)} total (${share.toFixed(0)}% of all traffic)`
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        )}
-        {/* The bar here is a SHARE, not a utilisation. Everywhere else
-            on this page a bar means "how full", and using the same
-            shape for a different meaning without saying so is how a
-            reader concludes an interface is 80% saturated. */}
-        <p className="mt-3 text-xs leading-relaxed text-[#8b949e]">
-          Totals since the machine booted, not current speeds — Headstate
-          samples cumulative counters, so a rate would mean subtracting two
-          readings. The bars show each interface&apos;s share of all traffic,
-          not how saturated it is.
-        </p>
-      </Panel>
-    </div>
-  );
-}
 
 /// Battery, thermal pressure and uptime — the machine's condition.
 ///
@@ -2636,6 +2787,57 @@ function PowerDetail({
           </p>
         )}
       </Panel>
+
+      {/* CAPACITY, in its own panel, never in the one above.
+          "Battery health" normally means capacity relative to design --
+          a different number from charge, moving over years rather than
+          minutes. A three-year-old laptop at 100% charge and 84%
+          capacity is entirely normal, and putting the two figures side
+          by side is how a reader concludes their fully-charged battery
+          is somehow at 84%. Separate panel, separate heading, and the
+          word "charge" appears in neither. */}
+      {s.battery !== null && s.battery.capacity_percent !== null ? (
+        <Panel title="Battery capacity" subtitle="How much the cell can still hold">
+          <div className="flex flex-wrap gap-6">
+            <Stat
+              label="Of original capacity"
+              value={`${s.battery.capacity_percent.toFixed(0)}%`}
+            />
+            <Stat
+              label="Charge cycles"
+              value={
+                s.battery.cycle_count === null
+                  ? null
+                  : `${s.battery.cycle_count}`
+              }
+            />
+          </div>
+          <p className="mt-2 text-xs leading-relaxed text-[#8b949e]">
+            This is <em>not</em> the charge above. It is how much the battery
+            can hold now compared with when it was made, which falls slowly
+            over years — a battery at{" "}
+            {s.battery.capacity_percent.toFixed(0)}% of its original capacity
+            still charges to 100%, it just holds less than it once did.
+            {s.battery.cycle_count !== null
+              ? ` Read alongside the cycle count: wear after ${s.battery.cycle_count} cycles is ordinary ageing.`
+              : ""}
+          </p>
+        </Panel>
+      ) : s.battery !== null ? (
+        // A battery whose capacity the platform will not report. Said
+        // rather than silently omitted: a panel that vanishes on Linux
+        // looks like a bug, and "not measured" is the honest answer.
+        <Panel title="Battery capacity" subtitle="How much the cell can still hold">
+          <p className="text-sm">
+            <NotMeasured />
+          </p>
+          <p className="mt-2 text-xs leading-relaxed text-[#8b949e]">
+            Capacity relative to design — a different figure from the charge
+            above. Headstate reads it on macOS only; no other platform
+            publishes it without elevated privileges.
+          </p>
+        </Panel>
+      ) : null}
 
       <Panel title="Thermal pressure" subtitle="The system's own verdict, not a temperature">
         <div

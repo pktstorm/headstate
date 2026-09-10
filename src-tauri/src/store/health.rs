@@ -36,8 +36,9 @@ pub fn record(conn: &Connection, s: &Sample) -> Result<(), StoreError> {
         "INSERT OR REPLACE INTO health_samples
            (sampled_at, load_1, load_5, load_15, cpu_percent,
             mem_total, mem_used, mem_available,
-            battery_percent, on_ac, thermal, uptime_secs, detail)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            battery_percent, on_ac, battery_capacity_percent,
+            thermal, uptime_secs, detail)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             s.sampled_at,
             s.load.map(|l| l[0]),
@@ -49,6 +50,11 @@ pub fn record(conn: &Connection, s: &Sample) -> Result<(), StoreError> {
             s.memory.available as i64,
             s.battery.as_ref().map(|b| b.percent),
             s.battery.as_ref().map(|b| i64::from(b.on_ac)),
+            // CHARGE is `battery_percent` above; this is CAPACITY, a
+            // different number entirely. Both are stored because a
+            // query that confused them would be silently wrong -- see
+            // `health::Battery`.
+            s.battery.as_ref().and_then(|b| b.capacity_percent),
             s.thermal,
             s.uptime_secs as i64,
             detail,
@@ -176,6 +182,100 @@ mod tests {
         assert!(got[0].gpus[0].unified_memory);
         assert_eq!(got[0].gpus[0].renderer_percent, Some(91.0));
         assert_eq!(got[0].gpus[0].tiler_percent, None, "absent stays absent");
+    }
+
+    /// Charge and CAPACITY are different numbers, and both survive.
+    ///
+    /// The failure this guards is not a lost field but a SWAPPED one:
+    /// `battery_percent` and `battery_capacity_percent` are adjacent
+    /// columns holding two percentages that mean opposite things, and a
+    /// transposed pair would render a three-year-old battery at 84%
+    /// charge as one at 84% capacity, or worse the reverse. Asserted
+    /// with deliberately different values so a swap cannot pass.
+    #[test]
+    fn charge_and_capacity_round_trip_without_being_confused() {
+        let c = conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut s = sample(&now);
+        s.battery = Some(crate::health::Battery {
+            percent: 62.0,
+            on_ac: true,
+            capacity_percent: Some(84.0),
+            cycle_count: Some(413),
+        });
+        record(&c, &s).unwrap();
+
+        let got = history(&c).unwrap();
+        let b = got[0].battery.as_ref().expect("the battery survives");
+        assert_eq!(b.percent, 62.0, "charge");
+        assert_eq!(b.capacity_percent, Some(84.0), "capacity, not charge");
+        assert_eq!(b.cycle_count, Some(413));
+
+        // And the column carries the CAPACITY, not the charge -- the
+        // detail JSON round-tripping correctly would hide a swap here.
+        let col: Option<f64> = c
+            .query_row(
+                "SELECT battery_capacity_percent FROM health_samples",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(col, Some(84.0));
+    }
+
+    /// A battery whose capacity the platform will not report stays
+    /// absent rather than becoming a zero.
+    ///
+    /// A battery at 0% of its design capacity is a dead cell. Reporting
+    /// "we did not look" as that number would tell a Linux user -- where
+    /// no capacity is read at all -- that their battery has failed.
+    #[test]
+    fn an_unreported_capacity_stays_absent() {
+        let c = conn();
+        let mut s = sample(&chrono::Utc::now().to_rfc3339());
+        s.battery = Some(crate::health::Battery {
+            percent: 91.0,
+            on_ac: false,
+            capacity_percent: None,
+            cycle_count: None,
+        });
+        record(&c, &s).unwrap();
+        let got = history(&c).unwrap();
+        let b = got[0].battery.as_ref().unwrap();
+        assert_eq!(b.capacity_percent, None, "absent is never zero");
+        assert_eq!(b.cycle_count, None);
+    }
+
+    /// Per-interface counters survive, which is the raw material #719
+    /// differences into a rate.
+    ///
+    /// They live in `detail`, and had this not round-tripped there
+    /// would be no network history to compute from at all -- the
+    /// feature is entirely a consumer of what this test asserts.
+    #[test]
+    fn per_interface_counters_round_trip() {
+        let c = conn();
+        let mut s = sample(&chrono::Utc::now().to_rfc3339());
+        s.networks = vec![
+            crate::health::Interface {
+                name: "en0".into(),
+                rx_bytes: 4_000_000_000,
+                tx_bytes: 1_000_000_000,
+            },
+            crate::health::Interface {
+                name: "lo0".into(),
+                rx_bytes: 12,
+                tx_bytes: 12,
+            },
+        ];
+        record(&c, &s).unwrap();
+        let got = history(&c).unwrap();
+        assert_eq!(got[0].networks.len(), 2);
+        assert_eq!(got[0].networks[0].name, "en0");
+        // Above 2^32: a counter narrowed to u32 somewhere in the round
+        // trip would wrap and read as a reset, which the UI draws as a
+        // gap -- so the wrong type here would silently blank the chart.
+        assert_eq!(got[0].networks[0].rx_bytes, 4_000_000_000);
     }
 
     /// Anything older than the window is gone, so the table cannot grow

@@ -185,7 +185,9 @@ const sample = (over: Partial<HealthSample> = {}): HealthSample => ({
   disks: [
     { mount: "/", total: 500 * 1024 ** 3, available: 100 * 1024 ** 3, is_root: true },
   ],
-  battery: { percent: 82, on_ac: false },
+  // Charge 82, capacity 84 -- deliberately different numbers, so a
+  // panel rendering one in place of the other is visible.
+  battery: { percent: 82, on_ac: false, capacity_percent: 84, cycle_count: 413 },
   thermal: "nominal",
   networks: [{ name: "en0", rx_bytes: 1024 ** 3, tx_bytes: 512 * 1024 ** 2 }],
   uptime_secs: 3 * 86_400 + 4 * 3600,
