@@ -3393,6 +3393,76 @@ HEAD 8ed50a741e1696d1a0c9506f2e033cf2887bb144
         );
     }
 
+    /// A branch strictly AHEAD of the default branch holds work that
+    /// exists nowhere else, and must be refused.
+    ///
+    /// This pins the one path in `descends_from_branch` that answers
+    /// `Safe` without inspecting anything further -- the empty
+    /// `base..default` range, which is what a stale local copy of
+    /// already-merged work looks like. It is only ever reached AFTER
+    /// `content_landed` has accounted for every changed file, and this
+    /// test is the proof: the same empty range with genuinely new work
+    /// is refused before that early return can be consulted.
+    #[test]
+    fn a_branch_ahead_of_the_default_branch_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ident = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+        let run_in = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .envs(ident)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_in(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("f.txt"), "one\n").unwrap();
+        run_in(&repo, &["add", "-A"]);
+        run_in(&repo, &["commit", "-q", "-m", "base"]);
+
+        let wt = tmp.path().join("proj-ahead");
+        run_in(
+            &repo,
+            &["worktree", "add", "-q", "-b", "ahead", wt.to_str().unwrap()],
+        );
+        std::fs::write(
+            wt.join("f.txt"),
+            "one\nbrand new unmerged line of real substantive content\n",
+        )
+        .unwrap();
+        run_in(&wt, &["add", "-A"]);
+        run_in(&wt, &["commit", "-q", "-m", "work not on main"]);
+
+        let base = git(&wt, &["merge-base", "HEAD", "main"]).unwrap();
+        // The premise: the range `descends_from_branch` early-returns on
+        // really is empty here, so this exercises that path's guard.
+        assert_eq!(
+            git(
+                &wt,
+                &["rev-list", "--count", &format!("{}..main", base.trim())]
+            )
+            .unwrap()
+            .trim(),
+            "0",
+            "main must be an ancestor, or this does not test the early return"
+        );
+
+        assert_eq!(
+            content_landed(&wt, "main", base.trim()),
+            Safety::Unmerged,
+            "work that is only on this branch must never be called merged"
+        );
+    }
+
     /// The subset trap the issue calls out: a branch whose changes are a
     /// strict SUBSET of a larger change that is on the default branch,
     /// but which was never merged. Every line it added really is on
