@@ -7,7 +7,10 @@ use crate::github::model::{
     CycleTrend, History, MergedDetail, Periods, PrDetail, PullRequest, Stats,
 };
 use crate::github::mutate::{PrAction, ReviewVerdict};
-use crate::store::{load_snapshot, open_db, save_snapshot, settings, CachedList};
+use crate::store::{
+    load_snapshot, load_snapshot_marked, open_db, save_snapshot, settings, CachedList,
+    CachedSnapshot,
+};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -1919,13 +1922,13 @@ pub async fn count_reviewing(client: State<'_, GhClient>) -> Result<u64, String>
 /// cannot be made meaningfully faster (see #328), so the only way to
 /// stop the user staring at nothing is to have something to show.
 #[tauri::command]
-pub fn get_cached_reviewing(app: AppHandle) -> Result<Vec<PullRequest>, String> {
+pub fn get_cached_reviewing(app: AppHandle) -> Result<CachedSnapshot, String> {
     let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
-    let out = load_snapshot(&conn, CachedList::Reviewing).map_err(|e| e.to_string());
+    let out = load_snapshot_marked(&conn, CachedList::Reviewing).map_err(|e| e.to_string());
     crate::diag!(
         "[diag] cmd get_cached_reviewing {}",
         match &out {
-            Ok(v) => format!("ok n={}", v.len()),
+            Ok(v) => format!("ok n={} stale={:?}", v.prs.len(), v.stale_secs),
             Err(e) => format!("err: {e}"),
         }
     );

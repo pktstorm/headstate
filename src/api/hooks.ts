@@ -415,15 +415,48 @@ const PRS_FN = timed("prs", async () => {
   return refreshNow();
 });
 
+/// The `refreshPrs` currently in flight, so a second caller joins it
+/// instead of starting a rival (#742).
+///
+/// One user gesture routinely causes two of these. Approving a pull
+/// request refreshes, and the auto-enqueue that follows refreshes again
+/// seconds later -- and `refresh_now` searches every watched repository,
+/// which on the account that reported this took 7-17 seconds. The second
+/// call would abandon the first mid-flight, which is what surfaced as
+/// "Background refresh failed": a real session log held 25 refreshes
+/// started with no matching completion, every one of them preceded by a
+/// second action within seconds.
+///
+/// Joining rather than debouncing, deliberately. A debounce would delay
+/// the first refresh hoping a second arrives; this starts immediately
+/// and lets whoever asks next share the answer. The caller's contract is
+/// unchanged either way: await it, and the list is up to date.
+let refreshInFlight: Promise<void> | null = null;
+
 async function refreshPrs(qc: QueryClient): Promise<void> {
-  try {
-    qc.setQueryData(["prs"], await refreshNow());
-  } catch {
-    // The write already succeeded; only the read-back failed. Fall back
-    // to the poll loop, which the Rust side has already woken. Throwing
-    // here would report a successful action as failed.
-    void qc.invalidateQueries({ queryKey: ["prs"] });
-  }
+  // A caller arriving mid-flight gets the SAME promise. Note this is
+  // shared across every mutation, which is the point: they all refresh
+  // the same `["prs"]` key, so two concurrent fetches of it can only
+  // disagree about which answer lands last.
+  if (refreshInFlight) return refreshInFlight;
+
+  refreshInFlight = (async () => {
+    try {
+      qc.setQueryData(["prs"], await refreshNow());
+    } catch {
+      // The write already succeeded; only the read-back failed. Fall back
+      // to the poll loop, which the Rust side has already woken. Throwing
+      // here would report a successful action as failed.
+      void qc.invalidateQueries({ queryKey: ["prs"] });
+    } finally {
+      // Cleared before the promise resolves to its awaiters, so the next
+      // gesture after this one starts a genuinely fresh fetch rather
+      // than joining a settled promise.
+      refreshInFlight = null;
+    }
+  })();
+
+  return refreshInFlight;
 }
 
 /// Apply an action to a pull request, then refresh what it affected.
@@ -1776,7 +1809,18 @@ export function useReviewing(enabled = true) {
   // `live.data` is checked rather than `live.isSuccess`, so a refetch
   // still in flight keeps showing the previous LIVE list rather than
   // falling back to a staler cached one.
-  const data = live.data ?? cached.data;
+  //
+  // The cache now arrives as `{prs, stale_secs}` rather than a bare
+  // array (#742). It used to age itself out by returning NOTHING, which
+  // reached here as `[]` -- and `[] ?? x` is `[]`, so an aged-out cache
+  // beat the loading state and the view rendered a confident "nothing
+  // awaits your review" until the live fetch landed. On the account
+  // that reported this, that was seventeen seconds.
+  const data = live.data ?? cached.data?.prs;
+
+  // Only meaningful while the CACHE is what is on screen: once live data
+  // arrives it is current by definition, whatever the disk said.
+  const staleSecs = live.data === undefined ? (cached.data?.stale_secs ?? null) : null;
 
   return {
     ...live,
@@ -1792,6 +1836,9 @@ export function useReviewing(enabled = true) {
     isRefreshing: live.isFetching,
     /// Whether what is on screen came from disk rather than GitHub.
     isFromCache: live.data === undefined && cached.data !== undefined,
+    /// How old the shown rows are, when they are too old to present as
+    /// current. `null` means either fresh or live -- no marker needed.
+    staleSecs,
   };
 }
 

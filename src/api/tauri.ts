@@ -13,6 +13,7 @@
 
 import { call } from "./transport";
 import type {
+  CachedSnapshot,
   Artifact,
   Branch,
   DeleteOutcome,
@@ -403,7 +404,7 @@ export const setPollInterval = (secs: number) =>
 export const getReviewing = () => call<PullRequest[]>("get_reviewing");
 /// The last successful review list, straight from SQLite. Never talks
 /// to GitHub.
-export const getCachedReviewing = () => call<PullRequest[]>("get_cached_reviewing");
+export const getCachedReviewing = () => call<CachedSnapshot>("get_cached_reviewing");
 
 /// Median cycle time this week against last, in one request.
 export const getCycleTrend = () => call<CycleTrend>("get_cycle_trend");

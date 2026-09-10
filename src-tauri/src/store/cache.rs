@@ -7,6 +7,7 @@
 use super::schema::StoreError;
 use crate::github::model::PullRequest;
 use rusqlite::{Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 
 /// Which cached list a row holds.
 ///
@@ -94,6 +95,86 @@ fn is_fresh(fetched_at: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
     // corrections, timezone changes, a VM resuming), and refusing a
     // snapshot for that would blank the view over something harmless.
     age <= MAX_SNAPSHOT_AGE_SECS
+}
+
+/// A snapshot, and whether it is old enough that the caller must say so.
+///
+/// Exists because "too old to trust" and "there is nothing here" were
+/// the same value -- an empty `Vec` -- and the UI cannot tell an honest
+/// empty list from a discarded one (#742). It rendered a confident "no
+/// pull requests await your review" for the seventeen seconds a live
+/// fetch took, which on a slow account is long enough to be believed.
+///
+/// The old snapshot is returned rather than dropped: those rows were
+/// true an hour ago, which is strictly more information than nothing.
+/// What changes is that the caller is told, and must mark it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CachedSnapshot {
+    pub prs: Vec<PullRequest>,
+    /// Seconds since the snapshot was written, when it is past
+    /// `MAX_SNAPSHOT_AGE_SECS`. `None` means fresh -- show it plainly.
+    ///
+    /// An option rather than always-Some so the fresh path stays the
+    /// simple one: a caller that ignores this field still behaves
+    /// correctly for every snapshot the old code would have accepted.
+    pub stale_secs: Option<i64>,
+}
+
+/// How old `fetched_at` is, or `None` if it cannot be parsed.
+fn age_secs(fetched_at: &str, now: chrono::DateTime<chrono::Utc>) -> Option<i64> {
+    let naive = chrono::NaiveDateTime::parse_from_str(fetched_at, "%Y-%m-%d %H:%M:%S").ok()?;
+    Some(now.signed_duration_since(naive.and_utc()).num_seconds())
+}
+
+/// `load_snapshot`, but a too-old snapshot is returned and MARKED
+/// rather than discarded. See [`CachedSnapshot`].
+pub fn load_snapshot_marked(
+    conn: &Connection,
+    which: CachedList,
+) -> Result<CachedSnapshot, StoreError> {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT payload, fetched_at FROM snapshot WHERE id = ?1",
+            [which.id()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+
+    let Some((payload, at)) = row else {
+        return Ok(CachedSnapshot {
+            prs: Vec::new(),
+            stale_secs: None,
+        });
+    };
+
+    let now = chrono::Utc::now();
+    // An unparseable timestamp keeps counting as stale, as it did
+    // before: the cost of marking a good snapshot is a ribbon, and the
+    // cost of trusting a bad one is showing merged work as open.
+    let stale_secs = if is_fresh(&at, now) {
+        None
+    } else {
+        log::info!(
+            "showing a {} snapshot from {at} as stale: older than {MAX_SNAPSHOT_AGE_SECS}s",
+            which.label()
+        );
+        // `max(1)` so a stale snapshot never reports zero seconds old,
+        // which would read as fresh in the UI. An unparseable timestamp
+        // has no age to report and gets the threshold as a floor.
+        Some(age_secs(&at, now).unwrap_or(MAX_SNAPSHOT_AGE_SECS).max(1))
+    };
+
+    match serde_json::from_str::<Vec<PullRequest>>(&payload) {
+        Ok(prs) => Ok(CachedSnapshot { prs, stale_secs }),
+        // Unreadable is not stale-but-usable: there is nothing to show.
+        Err(e) => {
+            log::warn!("discarding an unreadable {} snapshot: {e}", which.label());
+            Ok(CachedSnapshot {
+                prs: Vec::new(),
+                stale_secs: None,
+            })
+        }
+    }
 }
 
 pub fn load_snapshot(conn: &Connection, which: CachedList) -> Result<Vec<PullRequest>, StoreError> {

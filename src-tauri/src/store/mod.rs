@@ -24,7 +24,7 @@ pub mod health;
 mod schema;
 pub mod settings;
 
-pub use cache::{load_snapshot, save_snapshot, CachedList};
+pub use cache::{load_snapshot, load_snapshot_marked, save_snapshot, CachedList, CachedSnapshot};
 pub use schema::{open_db, StoreError};
 
 /// Test-only: the remote pairing tests migrate an in-memory connection.
@@ -98,6 +98,67 @@ mod tests {
     #[test]
     fn loading_from_an_empty_db_returns_empty_not_an_error() {
         assert_eq!(load_snapshot(&db(), CachedList::Authored).unwrap().len(), 0);
+    }
+
+    /// #742: a snapshot past the freshness window must come back MARKED,
+    /// not discarded.
+    ///
+    /// `load_snapshot` returns an empty Vec for a stale snapshot, which
+    /// the UI could not tell from "nothing awaits your review" -- so it
+    /// rendered a confident empty list for as long as the live fetch
+    /// took. `load_snapshot_marked` returns the rows and their age.
+    #[test]
+    fn a_stale_snapshot_is_returned_with_its_age() {
+        let conn = db();
+        save_snapshot(&conn, CachedList::Reviewing, &[sample()]).unwrap();
+        // Backdate past the hour-long window.
+        // Every row: this database holds only the one snapshot just
+        // written, and `id()` is private to the cache module.
+        conn.execute(
+            "UPDATE snapshot SET fetched_at = datetime('now', '-2 hours')",
+            [],
+        )
+        .unwrap();
+
+        // The old path still hides it, which is what callers that only
+        // want fresh data rely on.
+        assert_eq!(
+            load_snapshot(&conn, CachedList::Reviewing).unwrap().len(),
+            0,
+            "load_snapshot still ages out"
+        );
+
+        let marked = load_snapshot_marked(&conn, CachedList::Reviewing).unwrap();
+        assert_eq!(marked.prs.len(), 1, "the rows survive");
+        let age = marked.stale_secs.expect("a stale snapshot reports its age");
+        assert!(
+            (7100..7300).contains(&age),
+            "two hours, give or take clock granularity: {age}"
+        );
+    }
+
+    /// The other direction: a snapshot inside the window must NOT be
+    /// marked, or every ordinary paint would carry a warning and the
+    /// marker would stop meaning anything.
+    #[test]
+    fn a_fresh_snapshot_is_not_marked() {
+        let conn = db();
+        save_snapshot(&conn, CachedList::Reviewing, &[sample()]).unwrap();
+        let marked = load_snapshot_marked(&conn, CachedList::Reviewing).unwrap();
+        assert_eq!(marked.prs.len(), 1);
+        assert_eq!(
+            marked.stale_secs, None,
+            "just written: nothing to warn about"
+        );
+    }
+
+    /// An absent snapshot is not a stale one. Marking it would put an
+    /// "old data" warning over a view that has never had any.
+    #[test]
+    fn no_snapshot_at_all_is_not_marked() {
+        let marked = load_snapshot_marked(&db(), CachedList::Reviewing).unwrap();
+        assert!(marked.prs.is_empty());
+        assert_eq!(marked.stale_secs, None);
     }
 
     #[test]
