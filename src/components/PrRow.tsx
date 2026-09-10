@@ -48,36 +48,74 @@ function CiGlyph({ pr }: { pr: PullRequest }) {
   );
 }
 
+/// The colour the app spends on stacking, shared by the chip and the
+/// tinted base ref so the two read as one statement rather than two
+/// coincidental purples. Same hue the metadata line already gives "In
+/// merge queue" -- both mean "GitHub is going to handle this one
+/// differently", which is exactly what the reader needs to notice.
+const STACKED_COLOUR = "text-[#a371f7]";
+
 /// `head → base` for every PR.
 ///
 /// Always the full pair, so the row reads the same way whatever it
-/// targets. A PR whose base is NOT the default branch is stacked on
-/// another PR -- it cannot merge until its base does -- so the target is
-/// tinted to make that visible without changing the layout.
+/// targets. When the base is another open PR's branch the target is
+/// tinted, which is where a reader who has already seen the chip looks
+/// to find out WHICH branch it sits on.
 ///
 /// GitHub itself puts this in the PR header rather than the list row, so
-/// it stays on the muted metadata line rather than becoming a chip.
-function BranchPair({ pr }: { pr: PullRequest }) {
+/// it stays on the muted metadata line.
+///
+/// `stackedOn` is passed in, not computed (#743). It used to be guessed
+/// here as `base_ref !== "main" && base_ref !== "master"`, which is a
+/// claim this component has no standing to make: it can see one PR, and
+/// "not the default branch" is not the same fact as "stacked". That
+/// guess tinted every PR targeting a release train, a `develop`
+/// integration branch, or a default branch under any third name, and it
+/// could never say which PR the base belonged to because a single row
+/// does not know the others exist.
+function BranchPair({ pr, stackedOn }: { pr: PullRequest; stackedOn?: number }) {
   if (!pr.head_ref || !pr.base_ref) return null;
-  const stacked = pr.base_ref !== "main" && pr.base_ref !== "master";
-  // The purple tint was the ONLY thing saying "this PR is stacked", and
-  // the base ref renders identically either way -- so a reader who does
-  // not separate purple from the surrounding grey sees no difference at
-  // all. The title said "Merges X into Y" for both states, so it did not
-  // disclose it either.
-  //
-  // A "stacked" suffix rather than a chip: this is the muted metadata
-  // line, and the tint was deliberately chosen over a chip to keep the
-  // row's layout. One word preserves that intent where a chip would not.
-  const title = stacked
-    ? `Merges ${pr.head_ref} into ${pr.base_ref} — stacked on another branch, so it cannot merge until its base does`
-    : `Merges ${pr.head_ref} into ${pr.base_ref}`;
+  const title =
+    stackedOn === undefined
+      ? `Merges ${pr.head_ref} into ${pr.base_ref}`
+      : `Merges ${pr.head_ref} into ${pr.base_ref} — the head branch of #${stackedOn}, which must merge first`;
   return (
     <span className="ml-2" title={title}>
       • <span className="font-mono">{pr.head_ref}</span>
       <span className="mx-1">→</span>
-      <span className={`font-mono ${stacked ? "text-[#a371f7]" : ""}`}>{pr.base_ref}</span>
-      {stacked ? <span className="ml-1 text-[#a371f7]">(stacked)</span> : null}
+      <span className={`font-mono ${stackedOn === undefined ? "" : STACKED_COLOUR}`}>
+        {pr.base_ref}
+      </span>
+    </span>
+  );
+}
+
+/// Says a PR is stacked, up in the title area where a chip is read.
+///
+/// The old marker was a purple tint plus a "(stacked)" suffix on the
+/// muted metadata line -- and dense mode drops that line entirely, so
+/// half the app's rows disclosed nothing at all. Users then clicked "add
+/// to merge queue" on stacked PRs and GitHub refused them, because a
+/// stacked PR has to be enqueued through a different API (#743).
+///
+/// It names the parent (`on #1234`) rather than saying only "stacked":
+/// the number is what turns the marker from a warning into something
+/// actionable -- it is the PR to go merge, and it is already in the list
+/// the reader is looking at, since that is the only way it was resolved.
+///
+/// Borrows `ReviewGlyph`'s shape -- a hairline-bordered pill at 40%
+/// opacity -- rather than the state chip's `border-current`, because
+/// this is a fact ABOUT the PR standing beside its state, not a
+/// competing verdict on it. It never suppresses the state chip: a
+/// stacked PR can also be a draft, or blocked, and those still decide
+/// what to do first.
+function StackedChip({ stackedOn }: { stackedOn: number }) {
+  return (
+    <span
+      className={`shrink-0 rounded-full border border-[#a371f7]/40 px-1.5 py-0.5 text-xs ${STACKED_COLOUR}`}
+      title={`Stacked on #${stackedOn}: this pull request cannot merge until #${stackedOn} does, and GitHub's merge queue will refuse it through the normal path`}
+    >
+      on #{stackedOn}
     </span>
   );
 }
@@ -169,6 +207,7 @@ export function PrRow({
   onRange,
   cursored = false,
   selectable = false,
+  stackedOn,
 }: {
   pr: PullRequest;
   onOpen?: () => void;
@@ -184,6 +223,14 @@ export function PrRow({
   /// Show the bulk-selection checkbox. Off on the review view for the
   /// same reason `canWrite` is: every bulk action is a write.
   selectable?: boolean;
+  /// The number of the open PR this one is stacked on, when there is
+  /// one. Supplied by the list for the same reason `onRange` is: only
+  /// the list can see the other PRs, and a stack is a relationship
+  /// between two of them rather than a property of either (`deriveStacked`
+  /// in `@/lib/derive`). Undefined means standalone AS FAR AS THIS LIST
+  /// CAN SEE -- a parent that is filtered out or already merged is
+  /// indistinguishable from no parent, so the row stays silent.
+  stackedOn?: number;
 }) {
   const state = prState(pr);
   const pending = pendingReviewers(pr);
@@ -297,6 +344,12 @@ export function PrRow({
               {state.label}
             </span>
           ) : null}
+          {/* Beside the state chip, not instead of it: "on #12" and
+              "Blocked" answer different questions, and a stacked PR is
+              routinely also a draft. Rendered in BOTH densities --
+              unlike the branch pair below, which dense mode drops --
+              because this is the disclosure the row exists to make. */}
+          {stackedOn === undefined ? null : <StackedChip stackedOn={stackedOn} />}
           <CiGlyph pr={pr} />
           <ReviewGlyph pr={pr} />
           {(dense ? pr.labels.slice(0, DENSE_LABELS) : pr.labels).map((label) => (
@@ -347,7 +400,7 @@ export function PrRow({
             <span className="ml-2 text-[#f85149]">• Conflicts</span>
           )}
           {pr.merge === "checking" && <span className="ml-2">• Checking mergeability</span>}
-          <BranchPair pr={pr} />
+          <BranchPair pr={pr} stackedOn={stackedOn} />
           {/* WHO is blocking this, which `review` cannot say -- it
               collapses every reviewer into one verdict and names
               nobody. This is the difference between "waiting on a

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { PR_FIXTURES, prWithState } from "../fixtures/prs";
 import {
-  applyFilters, awaitingReview, changesRequested, deriveStats,
+  applyFilters, awaitingReview, changesRequested, deriveStacked, deriveStats,
   isStale, needsAttention, pendingReviewers, readyToQueue, sortPrs, STALE_DAYS,
 } from "./derive";
 
@@ -359,5 +359,120 @@ describe("pendingReviewers", () => {
     delete old.latest_reviews;
     expect(() => pendingReviewers(old as never)).not.toThrow();
     expect(pendingReviewers(old as never)).toEqual([]);
+  });
+});
+
+/// #743: a stacked PR looked exactly like a standalone one, so users hit
+/// "add to merge queue" on PRs GitHub then refused -- a stack has to be
+/// enqueued through the asynchronous REST API instead.
+describe("deriveStacked", () => {
+  const base = prWithState("success", "mergeable", "none", {
+    id: "PR_base",
+    number: 10,
+    head_ref: "stack/part-1",
+    base_ref: "main",
+  });
+  const child = prWithState("success", "mergeable", "none", {
+    id: "PR_child",
+    number: 11,
+    head_ref: "stack/part-2",
+    base_ref: "stack/part-1",
+  });
+
+  it("names the PR a stacked one sits on", () => {
+    expect(deriveStacked([base, child]).get(child.id)).toBe(10);
+  });
+
+  it("leaves the bottom of the stack unmarked", () => {
+    expect(deriveStacked([base, child]).has(base.id)).toBe(false);
+  });
+
+  /// The whole point of the structural rule. Graphite, `spr`, `gh stack`
+  /// and a hand-made stack all name their branches differently and all
+  /// produce the same head-to-base shape, so the detection keys on the
+  /// shape. Nothing here follows any tool's convention.
+  it("recognises a stack whose branches follow no known naming scheme", () => {
+    const bottom = prWithState("success", "mergeable", "none", {
+      id: "PR_a",
+      number: 20,
+      head_ref: "refactor-the-parser",
+      base_ref: "trunk",
+    });
+    const top = prWithState("success", "mergeable", "none", {
+      id: "PR_b",
+      number: 21,
+      head_ref: "use-the-new-parser",
+      base_ref: "refactor-the-parser",
+    });
+    expect(deriveStacked([bottom, top]).get(top.id)).toBe(20);
+  });
+
+  /// The failure mode of guessing from the base name alone, which is
+  /// what the row used to do (`base_ref !== "main" && !== "master"`).
+  /// A release train, a `develop` integration branch, or simply a repo
+  /// whose default branch has a third name are all NOT stacks, and
+  /// calling them stacked would put a marker on rows where merging is
+  /// blocked on nothing.
+  it("does not call a PR stacked merely because its base is not main", () => {
+    const onRelease = prWithState("success", "mergeable", "none", {
+      id: "PR_rel",
+      number: 30,
+      head_ref: "fix/hotfix",
+      base_ref: "release/2026-09",
+    });
+    expect(deriveStacked([onRelease]).size).toBe(0);
+  });
+
+  /// Branch names are unique only within a repository, so two repos each
+  /// with a `develop` would otherwise mark each other's PRs.
+  it("never resolves a parent across repositories", () => {
+    const other = prWithState("success", "mergeable", "none", {
+      id: "PR_other",
+      number: 40,
+      repo: "octocat/spoon-knife",
+      head_ref: "stack/part-1",
+      base_ref: "main",
+    });
+    expect(deriveStacked([other, child]).size).toBe(0);
+  });
+
+  /// A three-deep stack: every PR above the bottom points at the one
+  /// directly beneath it, not all of them at the root.
+  it("resolves each level of a deeper stack to its immediate parent", () => {
+    const third = prWithState("success", "mergeable", "none", {
+      id: "PR_third",
+      number: 12,
+      head_ref: "stack/part-3",
+      base_ref: "stack/part-2",
+    });
+    const out = deriveStacked([base, child, third]);
+    expect(out.get(child.id)).toBe(10);
+    expect(out.get(third.id)).toBe(11);
+  });
+
+  /// A parent that has merged is gone from the open list, so nothing can
+  /// name it. Silence is the right answer -- a marker that cannot say
+  /// which PR to go merge is worse than none.
+  it("stays silent when the parent is not in the list", () => {
+    expect(deriveStacked([child]).size).toBe(0);
+  });
+
+  /// The mapper defaults absent refs to "" (see
+  /// `missing_branch_refs_map_to_empty_strings` in map.rs), and every
+  /// such PR would otherwise match every other such PR.
+  it("does not pair up PRs whose refs came back empty", () => {
+    const a = prWithState("success", "mergeable", "none", {
+      id: "PR_empty_a",
+      number: 50,
+      head_ref: "",
+      base_ref: "",
+    });
+    const b = prWithState("success", "mergeable", "none", {
+      id: "PR_empty_b",
+      number: 51,
+      head_ref: "",
+      base_ref: "",
+    });
+    expect(deriveStacked([a, b]).size).toBe(0);
   });
 });
