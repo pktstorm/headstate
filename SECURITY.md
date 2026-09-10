@@ -229,3 +229,5 @@ for this repository:
 Please include enough detail to reproduce the issue (steps, affected
 version, and impact). We'll acknowledge reports and follow up as we
 investigate.
+
+<!-- skip-path proof for PR #765; throwaway branch, deleted after the run. -->
