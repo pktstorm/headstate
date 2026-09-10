@@ -453,3 +453,45 @@ describe("measuring progress", () => {
     expect(screen.queryByText(/measuring/i)).toBeNull();
   });
 });
+
+/// #747: the project walk hit its cap during ordinary use, and a
+/// truncated walk yields an undersized set of live project roots --
+/// exactly the condition under which a live virtualenv is misreported as
+/// an orphan. The backend now withholds the verdict, reporting `unknown`
+/// instead, and this is where that has to become visible.
+describe("a project scan that did not finish", () => {
+  it("says the answer is incomplete rather than showing a short list", () => {
+    state.venvs = [venv({ state: "unknown" })];
+    render(<VenvSection />);
+    expect(screen.getByRole("status").textContent).toMatch(/did not finish/i);
+  });
+
+  /// The whole point of the suppression: an unchecked venv must not be
+  /// offered for deletion. Its checkbox is the control that would do it.
+  it("does not offer an unchecked virtualenv for removal", () => {
+    state.venvs = [venv({ state: "unknown" })];
+    render(<VenvSection />);
+    const box = screen.getByRole("checkbox") as HTMLInputElement;
+    expect(box.disabled).toBe(true);
+    expect(box.getAttribute("aria-label")).toMatch(/did not finish/i);
+  });
+
+  /// An idle time must not age `unknown` into `stale`, which IS
+  /// removable -- that would reintroduce the risk by the back door.
+  it("does not let a long idle time make it removable", () => {
+    const year = 416 * 24 * 60 * 60;
+    state.venvs = [venv({ state: "unknown" })];
+    state.idle = new Map([["/cache/hello-world-delivery-AAAAAAAA-py3.13", year]]);
+    render(<VenvSection />);
+    expect((screen.getByRole("checkbox") as HTMLInputElement).disabled).toBe(true);
+    expect(screen.queryByText("stale")).toBeNull();
+  });
+
+  /// A complete scan is the ordinary case and must stay silent -- a
+  /// banner on every run would train the user to ignore it.
+  it("says nothing when the scan finished", () => {
+    state.venvs = [venv({ state: "orphaned" })];
+    render(<VenvSection />);
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+});

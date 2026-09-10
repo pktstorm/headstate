@@ -804,7 +804,15 @@ pub async fn scan_venvs(app: AppHandle) -> Result<Vec<crate::caches::Venv>, Stri
     let roots = get_worktree_dirs(app);
     tauri::async_runtime::spawn_blocking(move || {
         let dirs = crate::caches::project_dirs(&roots);
-        log::info!("venv scan: {} candidate project directories", dirs.len());
+        log::info!(
+            "venv scan: {} candidate project directories{}",
+            dirs.dirs.len(),
+            if dirs.truncated {
+                " (TRUNCATED -- orphan verdicts withheld)"
+            } else {
+                ""
+            }
+        );
         crate::caches::scan_poetry(&dirs)
     })
     .await

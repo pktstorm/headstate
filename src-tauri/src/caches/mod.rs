@@ -24,7 +24,31 @@ use std::path::Path;
 /// idle for 416 days, so the signal is not subtle when it matters.
 const STALE_SECS: u64 = 90 * 24 * 60 * 60;
 
-/// Every directory under the scan roots that could have produced a venv.
+/// How long the walk may run before it gives up.
+///
+/// TIME rather than a directory count, because the thing being defended
+/// against is a hang -- "a pathological tree cannot hang the scan" is a
+/// claim about duration, and a count only approximates it (#747).
+///
+/// The count it replaces was set from a throughput that does not hold.
+/// The old comment cited 48,000 directories in under a second (~20us
+/// each); measured on a machine with many repositories the same walk
+/// runs at ~300us per directory, so the 200,000 cap stood for something
+/// between four seconds and a minute depending only on how warm the
+/// filesystem cache was. Ten seconds is above every honest measurement
+/// taken here -- the default scan root walked 26,846 directories in
+/// ~1.9s -- while still bounding a tree that never ends.
+const MAX_WALK: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A hard ceiling that outlives any plausible real tree.
+///
+/// Kept alongside the deadline only because the deadline is checked per
+/// directory read: a single directory containing millions of entries is
+/// one read, and this stops the vector growing without bound inside it.
+const MAX_DIRS: usize = 2_000_000;
+
+/// Every directory under the scan roots that could have produced a venv,
+/// and whether the walk finished.
 ///
 /// COMPLETENESS is the safety property here. A venv is called orphaned
 /// because nothing in this set hashes to it, so a set that is too small
@@ -32,34 +56,79 @@ const STALE_SECS: u64 = 90 * 24 * 60 * 60;
 /// deleting something wanted. It therefore walks broadly and cheaply,
 /// and errs toward including directories rather than excluding them.
 ///
+/// `truncated` exists because that failure was previously SILENT: the
+/// walk logged a warning, returned a short list, and every caller
+/// treated it as the complete picture (#747). A partial set cannot
+/// support an orphan verdict, so the fact that it is partial has to
+/// travel with it rather than being left in a log nobody reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectDirs {
+    pub dirs: Vec<String>,
+    /// True when the walk stopped early. Callers must not report
+    /// anything as orphaned on the strength of a truncated set.
+    pub truncated: bool,
+}
+
+impl ProjectDirs {
+    /// A set asserted to be complete.
+    ///
+    /// The completeness is the CLAIM being made, so it is spelled out at
+    /// every construction site rather than defaulting: a caller that
+    /// builds one of these is promising the walk finished, and that
+    /// promise is what permits an orphan verdict.
+    pub fn complete(dirs: Vec<String>) -> Self {
+        Self {
+            dirs,
+            truncated: false,
+        }
+    }
+}
+
 /// Skips only what cannot contain a Python project root: `.git`, and the
 /// artifact directories that hold thousands of vendored packages. A
 /// `node_modules` tree can hold 50,000 directories and none of them is a
 /// Poetry project.
-pub fn project_dirs(roots: &[String]) -> Vec<String> {
-    const SKIP: &[&str] = &[".git", "node_modules", "target", ".terraform", ".venv"];
-    // Depth-first with an explicit cap, so a pathological tree cannot
-    // hang the scan. 48,000 directories on a real machine took under a
-    // second; the cap is far above that and exists only as a backstop.
-    const MAX_DIRS: usize = 200_000;
+///
+/// Deliberately NOT extended to trim the walk. Measured against the
+/// default scan root, the biggest remaining candidates were `Pods`
+/// (4,797 directories), `__pycache__` (1,563) and `build` (1,405) -- and
+/// the walk is bounded by time, not by count, so removing them buys
+/// milliseconds while adding a way to miss a project root. `build` in
+/// particular is an ordinary source directory name in some projects, and
+/// wrongly skipping one is precisely the undersized-set failure this
+/// module exists to avoid.
+const SKIP: &[&str] = &[".git", "node_modules", "target", ".terraform", ".venv"];
 
+pub fn project_dirs(roots: &[String]) -> ProjectDirs {
+    let deadline = std::time::Instant::now() + MAX_WALK;
     let mut out = Vec::new();
+    let mut truncated = false;
     let mut stack: Vec<std::path::PathBuf> = roots.iter().map(std::path::PathBuf::from).collect();
 
     while let Some(dir) = stack.pop() {
-        if out.len() >= MAX_DIRS {
-            log::warn!("stopped walking project directories at {MAX_DIRS}");
+        if out.len() >= MAX_DIRS || std::time::Instant::now() > deadline {
+            log::warn!(
+                "stopped walking project directories after {} entries; \
+                 orphan detection is suppressed for this scan",
+                out.len()
+            );
+            truncated = true;
             break;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         for e in entries.flatten() {
-            let Ok(meta) = e.metadata() else { continue };
-            // `metadata()` from `read_dir` does not follow symlinks, so
-            // a link to a directory reports false here -- which is what
-            // we want: a linked tree is reachable by its real path.
-            if !meta.is_dir() {
+            // `file_type()` rather than `metadata()`: both refuse a
+            // symlink to a directory here -- which is what we want, a
+            // linked tree is reachable by its real path -- but
+            // `metadata()` costs a stat syscall per entry where
+            // `file_type()` reads what the directory scan already
+            // returned. Measured on the default scan root, the same
+            // 26,846 directories took ~7.9s by metadata and ~1.9s by
+            // file type, a 4x saving for identical results (#747).
+            let Ok(ft) = e.file_type() else { continue };
+            if !ft.is_dir() {
                 continue;
             }
             let name = e.file_name().to_string_lossy().to_string();
@@ -70,7 +139,10 @@ pub fn project_dirs(roots: &[String]) -> Vec<String> {
             stack.push(e.path());
         }
     }
-    out
+    ProjectDirs {
+        dirs: out,
+        truncated,
+    }
 }
 
 /// Every Poetry venv, classified against the directories we can see.
@@ -80,7 +152,17 @@ pub fn project_dirs(roots: &[String]) -> Vec<String> {
 /// this set hashes to it, so a short list would call live venvs orphans.
 /// The caller passes every directory under the configured scan roots for
 /// exactly that reason.
-pub fn scan_poetry(project_dirs: &[String]) -> Vec<Venv> {
+///
+/// When the walk was TRUNCATED the orphan verdict is withheld entirely:
+/// every venv the set cannot account for is reported `Unknown` rather
+/// than `Orphaned` (#747). "Nothing hashes to it" and "nothing I got
+/// around to looking at hashes to it" are different claims, and only the
+/// first justifies offering a delete button. Suppressing the verdict
+/// here rather than at each call site means the UI list, the unattended
+/// cleanup pass and the delete-time re-check all inherit it, because
+/// none of them can see an `Orphaned` that was never produced.
+pub fn scan_poetry(dirs: &ProjectDirs) -> Vec<Venv> {
+    let project_dirs = &dirs.dirs;
     let Some(dir) = poetry::cache_dir() else {
         return Vec::new();
     };
@@ -114,10 +196,13 @@ pub fn scan_poetry(project_dirs: &[String]) -> Vec<Venv> {
                 project,
                 // Classified on `source` alone here; staleness needs the
                 // idle time, which is not known until measurement.
-                state: if source.is_none() {
-                    VenvState::Orphaned
-                } else {
-                    VenvState::Live
+                //
+                // An unmatched venv is only an ORPHAN if the walk that
+                // built the index actually finished (#747).
+                state: match (source.is_none(), dirs.truncated) {
+                    (true, false) => VenvState::Orphaned,
+                    (true, true) => VenvState::Unknown,
+                    (false, _) => VenvState::Live,
                 },
                 source,
                 size_bytes: None,
@@ -187,6 +272,11 @@ pub fn measure(path: &Path) -> (u64, Option<u64>) {
 pub fn classify_measured(state: VenvState, idle_secs: Option<u64>) -> VenvState {
     match state {
         VenvState::Orphaned => VenvState::Orphaned,
+        // An idle time cannot rescue an incomplete scan. Letting
+        // `Unknown` fall through to the staleness test below would turn
+        // "I did not finish looking" into `Stale`, which IS removable --
+        // reintroducing the deletion risk by the back door (#747).
+        VenvState::Unknown => VenvState::Unknown,
         _ => match idle_secs {
             Some(secs) if secs >= STALE_SECS => VenvState::Stale,
             // Unknown idle time is treated as LIVE. A directory we could
@@ -251,6 +341,85 @@ mod tests {
         assert_eq!(classify_measured(VenvState::Live, None), VenvState::Live);
     }
 
+    /// #747: an incomplete scan cannot be aged into a removable state.
+    ///
+    /// `Unknown` reaches `classify_measured` with a real idle time --
+    /// the measurement pass runs regardless -- and a long one would
+    /// otherwise satisfy the staleness test below it. That would convert
+    /// "I did not finish looking" into `Stale`, which the manual path
+    /// removes without a second prompt.
+    #[test]
+    fn an_unfinished_scan_never_becomes_stale() {
+        let year = 416 * 24 * 60 * 60;
+        assert_eq!(
+            classify_measured(VenvState::Unknown, Some(year)),
+            VenvState::Unknown
+        );
+        assert_eq!(
+            classify_measured(VenvState::Unknown, Some(0)),
+            VenvState::Unknown
+        );
+        assert_eq!(
+            classify_measured(VenvState::Unknown, None),
+            VenvState::Unknown
+        );
+    }
+
+    /// #747: the walk reports whether it finished.
+    ///
+    /// A complete walk of a small tree is the ordinary case, and it must
+    /// say so -- the orphan verdict is gated on this flag, so a walk that
+    /// wrongly claimed truncation would suppress the whole feature.
+    #[test]
+    fn a_completed_walk_is_not_truncated() {
+        let t = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(t.path().join("a").join("b")).unwrap();
+        let found = project_dirs(&[t.path().to_string_lossy().to_string()]);
+        assert!(!found.truncated);
+        // Compared as PATHS rather than by string suffix: the separator
+        // differs by platform and the tests run on Windows too.
+        let names: Vec<_> = found
+            .dirs
+            .iter()
+            .map(|d| {
+                Path::new(d)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert!(names.iter().any(|n| n == "a"), "{names:?}");
+        assert!(names.iter().any(|n| n == "b"), "{names:?}");
+    }
+
+    /// #747: the skip list keeps excluding vendored trees.
+    ///
+    /// Guards the walk's cost model rather than its correctness: these
+    /// directories hold thousands of entries and no Poetry project, and
+    /// the deadline is only generous because they never enter the walk.
+    #[test]
+    fn the_walk_skips_vendored_trees() {
+        let t = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(t.path().join("node_modules").join("pkg")).unwrap();
+        std::fs::create_dir_all(t.path().join("keep")).unwrap();
+        let found = project_dirs(&[t.path().to_string_lossy().to_string()]);
+        assert!(
+            found
+                .dirs
+                .iter()
+                .any(|d| Path::new(d).file_name().is_some_and(|n| n == "keep")),
+            "{:?}",
+            found.dirs
+        );
+        // Neither the skipped directory nor anything beneath it.
+        assert!(
+            !found.dirs.iter().any(|d| Path::new(d)
+                .components()
+                .any(|c| c.as_os_str() == "node_modules")),
+            "a vendored tree entered the walk"
+        );
+    }
+
     /// The boundary, from both sides.
     #[test]
     fn staleness_is_bounded_at_ninety_days() {
@@ -311,9 +480,24 @@ impl Default for RemovalPolicy {
 
 pub fn remove_venv(
     path: &str,
-    project_dirs: &[String],
+    project_dirs: &ProjectDirs,
     policy: RemovalPolicy,
 ) -> Result<(), String> {
+    // 0. The set this decision rests on has to be complete.
+    //
+    // Every check below asks "does a live project hash to this?", and a
+    // truncated walk answers no for projects it simply never reached --
+    // which is the undersized-set failure that turns a live venv into a
+    // deletion candidate (#747). Refusing here rather than trusting the
+    // caller keeps the guarantee at the point of deletion, in the same
+    // spirit as re-deriving ownership below instead of believing the
+    // row the user clicked.
+    if project_dirs.truncated {
+        return Err(
+            "the project scan did not finish, so this cannot be confirmed as an orphan".into(),
+        );
+    }
+    let project_dirs = &project_dirs.dirs;
     let p = Path::new(path);
 
     // 1. Never a symlink, checked BEFORE canonicalising -- which
@@ -403,7 +587,7 @@ fn is_inside_cache(canon: &Path, cache: &Path) -> Result<(), String> {
 /// Remove several, reporting each independently.
 pub fn remove_venvs(
     paths: &[String],
-    project_dirs: &[String],
+    project_dirs: &ProjectDirs,
     policy: RemovalPolicy,
 ) -> Vec<VenvRemoval> {
     paths
@@ -451,8 +635,39 @@ mod removal_tests {
         let Some(v) = TempVenv::new(ORPHAN) else {
             return; // no Poetry cache on this machine
         };
-        remove_venv(&v.path.to_string_lossy(), &[], RemovalPolicy::default()).unwrap();
+        remove_venv(
+            &v.path.to_string_lossy(),
+            &ProjectDirs::complete(vec![]),
+            RemovalPolicy::default(),
+        )
+        .unwrap();
         assert!(!v.path.exists());
+    }
+
+    /// #747: a truncated walk cannot authorise a deletion.
+    ///
+    /// The same venv as `removes_an_orphan` -- a name nothing on the
+    /// machine hashes to -- so the ONLY difference is that the walk did
+    /// not finish. Without the guard the emptiness of the set reads as
+    /// "nothing owns it" and the directory is removed, which is the
+    /// undersized-set failure in its most direct form.
+    #[test]
+    fn refuses_when_the_project_scan_did_not_finish() {
+        let Some(v) = TempVenv::new("headstate-test-trunc-ZZZZZZZZ-py3.99") else {
+            return; // no Poetry cache on this machine
+        };
+        let truncated = ProjectDirs {
+            dirs: vec![],
+            truncated: true,
+        };
+        let err = remove_venv(
+            &v.path.to_string_lossy(),
+            &truncated,
+            RemovalPolicy::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("did not finish"), "{err}");
+        assert!(v.path.exists(), "a truncated scan deleted a virtualenv");
     }
 
     /// The verdict is re-derived at delete time. If the project came
@@ -470,7 +685,7 @@ mod removal_tests {
         };
         let err = remove_venv(
             &v.path.to_string_lossy(),
-            &[project],
+            &ProjectDirs::complete(vec![project]),
             RemovalPolicy::default(),
         )
         .unwrap_err();
@@ -497,7 +712,7 @@ mod removal_tests {
 
         let err = remove_venv(
             &v.path.to_string_lossy(),
-            &[project],
+            &ProjectDirs::complete(vec![project]),
             RemovalPolicy::default(),
         )
         .unwrap_err();
@@ -521,7 +736,7 @@ mod removal_tests {
         // Files were written moments ago by TempVenv::new.
         let err = remove_venv(
             &v.path.to_string_lossy(),
-            &[project],
+            &ProjectDirs::complete(vec![project]),
             RemovalPolicy {
                 allow_stale: true,
                 stale_days: 90,
@@ -552,7 +767,7 @@ mod removal_tests {
 
         let err = remove_venv(
             &path.to_string_lossy(),
-            &[project],
+            &ProjectDirs::complete(vec![project]),
             RemovalPolicy {
                 allow_stale: true,
                 stale_days: 90,
@@ -570,7 +785,12 @@ mod removal_tests {
         let Some(v) = TempVenv::new("headstate-test-noopt-ZZZZZZZZ-py3.99") else {
             return;
         };
-        remove_venv(&v.path.to_string_lossy(), &[], RemovalPolicy::default()).unwrap();
+        remove_venv(
+            &v.path.to_string_lossy(),
+            &ProjectDirs::complete(vec![]),
+            RemovalPolicy::default(),
+        )
+        .unwrap();
         assert!(!v.path.exists());
     }
 
@@ -627,8 +847,12 @@ mod removal_tests {
         let Some(v) = TempVenv::new("headstate-test-plain-directory") else {
             return;
         };
-        let err =
-            remove_venv(&v.path.to_string_lossy(), &[], RemovalPolicy::default()).unwrap_err();
+        let err = remove_venv(
+            &v.path.to_string_lossy(),
+            &ProjectDirs::complete(vec![]),
+            RemovalPolicy::default(),
+        )
+        .unwrap_err();
         assert!(err.contains("not a Poetry virtualenv"), "{err}");
         assert!(v.path.exists());
     }
@@ -646,7 +870,12 @@ mod removal_tests {
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink(real.path(), &link).unwrap();
 
-        let err = remove_venv(&link.to_string_lossy(), &[], RemovalPolicy::default()).unwrap_err();
+        let err = remove_venv(
+            &link.to_string_lossy(),
+            &ProjectDirs::complete(vec![]),
+            RemovalPolicy::default(),
+        )
+        .unwrap_err();
         let _ = std::fs::remove_file(&link);
         assert!(err.contains("symlink"), "{err}");
         assert!(real.path().join("keep.txt").exists(), "target untouched");
@@ -662,7 +891,7 @@ mod removal_tests {
                 v.path.to_string_lossy().to_string(),
                 "/nowhere/at/all".to_string(),
             ],
-            &[],
+            &ProjectDirs::complete(vec![]),
             RemovalPolicy::default(),
         );
         assert_eq!(out.len(), 2);
