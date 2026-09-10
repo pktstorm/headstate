@@ -2,7 +2,7 @@ import { ActingOnDesktop } from "./ActingOnDesktop";
 import { summarisePull } from "@/lib/pullSummary";
 import { ExternalLink } from "./ExternalLink";
 import { Sparkles } from "lucide-react";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import {
   useClearAssessed,
   useMarkAssessed,
@@ -38,6 +38,9 @@ import {
   upstreamShort,
   upstreamTone,
   refAge,
+  sortWorktrees,
+  WORKTREE_SORT_LABELS,
+  type WorktreeSort,
 } from "../lib/worktrees";
 import { HelpButton } from "./HelpButton";
 import { WorktreeKebab } from "./WorktreeKebab";
@@ -58,10 +61,11 @@ import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 
 /// Local git worktrees, so lingering ones can be found and removed.
 ///
-/// Sorted by size within a repo -- with 152 worktrees on one repository,
-/// the biggest offenders are what you came for. But SAFETY is the primary
-/// axis: every row says whether it can be removed and why not, because
-/// 52 of 295 worktrees here hold commits that exist nowhere else.
+/// Sorted largest-first by default -- with 152 worktrees on one
+/// repository, the biggest offenders are what you came for -- and by
+/// name, size or age on request (#771). But SAFETY is the primary axis:
+/// every row says whether it can be removed and why not, because 52 of
+/// 295 worktrees here hold commits that exist nowhere else.
 /// A shimmering placeholder sized to the text it stands in for.
 ///
 /// Deliberately not a spinner per row: 289 spinners is a disco, and a
@@ -238,9 +242,9 @@ function Row({
           and without a reserved width that swap re-flowed every column
           in the table. A row's layout should not depend on which action
           it currently offers. */}
-      {/* Fixed width still, but wider: the assessed state now holds a
-          button AND a kebab, and the point of the fixed cell is that a
-          row's layout never depends on which action it offers. */}
+      {/* Fixed width still, but wider: every row now holds a button AND
+          a kebab, and the point of the fixed cell is that a row's
+          layout never depends on which action it offers. */}
       <span
         className={
           isMobile
@@ -257,17 +261,14 @@ function Row({
         // across restarts, and cleared only when the branch moved -- so
         // one exploratory click permanently removed the only route to
         // that worktree's prompt. Needing the prompt again is normal.
-        <>
-          <button
-            type="button"
-            onClick={() => onForce(wt)}
-            title="You assessed this worktree — remove it despite the safety gate"
-            className="shrink-0 rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#f85149] hover:bg-[#f85149]/10"
-          >
-            Remove anyway…
-          </button>
-          <WorktreeKebab worktree={wt} onClaudify={onClaudify} onForget={onForget} />
-        </>
+        <button
+          type="button"
+          onClick={() => onForce(wt)}
+          title="You assessed this worktree — remove it despite the safety gate"
+          className="shrink-0 rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#f85149] hover:bg-[#f85149]/10"
+        >
+          Remove anyway…
+        </button>
       ) : claudifiable ? (
         <button
           type="button"
@@ -306,6 +307,28 @@ function Row({
           {removing ? "Removing…" : orphaned ? "Delete" : "Remove"}
         </button>
       )}
+      {/* On EVERY row now, not only the assessed ones (#770).
+
+          It used to appear solely beside "Remove anyway…", which meant
+          the kebab existed exactly where removal was already on screen
+          and was absent from the 124 rows where it was the missing
+          affordance. Removal past the gate was reachable only from the
+          Claudify toast's "I read the assessment" button — a transient
+          surface for an unrecoverable action, so a stray click cost
+          another agent invocation to get back.
+
+          The ORPHANED rows keep their own Delete button as the only
+          route: git cannot act on them at all, so the menu's removal
+          items would be the wrong call. The kebab itself is still
+          rendered there, because the Claudify pair may apply. */}
+      <WorktreeKebab
+        worktree={wt}
+        assessed={assessed}
+        onClaudify={onClaudify}
+        onForget={onForget}
+        onRemove={onRemove}
+        onForce={onForce}
+      />
       </span>
       {/* The disclosure, not a second action: the row keeps its
           one-action rule and this only reveals what the app already
@@ -591,6 +614,25 @@ export function WorktreesPage() {
     command: string;
     claudeInstalled: boolean;
   } | null>(null);
+  /// The chosen ordering, and the gesture clock that fixes it (#771).
+  ///
+  /// Local state rather than the `filters` store: sort here is a
+  /// working choice made while clearing one repository, not a saved
+  /// preference to restore on the next launch, and the store's `sort`
+  /// key already means something else on the PR views.
+  ///
+  /// "Largest first" is the default because it is the question the page
+  /// exists to answer -- on a machine with 100+ worktrees per repo,
+  /// "which of these is biggest" is why you opened it.
+  const [sort, setSort] = useState<WorktreeSort>("size-desc");
+  /// Bumped by an explicit gesture -- choosing a sort, or clicking
+  /// "re-sort" -- and by nothing else. It is what freezes the order
+  /// against the size stream; see the comment on `shown`.
+  const [sortedAt, setSortedAt] = useState(0);
+  const chooseSort = (next: WorktreeSort) => {
+    setSort(next);
+    setSortedAt((n) => n + 1);
+  };
   const [pending, setPending] = useState<Worktree | null>(null);
   /// The path currently being removed, or null. A path rather than a
   /// boolean so only the clicked row goes busy.
@@ -607,6 +649,79 @@ export function WorktreesPage() {
   // there -- the manifest is needed at the moment of confirming, not
   // on every render of a list nobody is acting on.
   const assessed = new Set(assessedPaths ?? []);
+
+  // Classified data replaces the unclassified listing as it arrives, so
+  // the page is useful immediately and gets more informative rather than
+  // blocking on ~16s of git calls. Sizes are merged in here rather than
+  // by refetching the list, so the page never flickers back to
+  // unclassified.
+  //
+  // Computed HERE, above every early return, because the sort below is a
+  // hook: React requires the same hooks in the same order on every
+  // render, and the orphan and all-repositories branches return before
+  // this point.
+  const withSizes = (classified ?? selected?.worktrees ?? []).map((w) => ({
+    ...w,
+    size_bytes: sizes?.get(w.path) ?? w.size_bytes,
+  }));
+
+  // SORTING VS STREAMING (#771).
+  //
+  // Sizes land progressively (#754, #758), so a live size sort re-orders
+  // rows under the cursor: the row you were reaching for slides away as
+  // some other row's `du` returns. On this page that is not a cosmetic
+  // annoyance -- the button it moves out from under you removes a
+  // directory -- so a silent live re-sort is the one option that is
+  // genuinely unsafe.
+  //
+  // The previous code answered this by refusing to sort at all until
+  // every size was in, which is why the page could sit in path order for
+  // two minutes with nothing to explain it.
+  //
+  // So: sort on the values known when the sort was CHOSEN, and re-sort
+  // only on an explicit gesture. `sortedAt` is that gesture's clock --
+  // picking a sort takes a fresh snapshot, and clicking "re-sort" takes
+  // another. Between gestures the ORDER is frozen while each row's
+  // displayed size keeps updating live, so a landing measurement is
+  // never hidden; it simply does not move anything.
+  //
+  // What is memoised is the ORDER ALONE -- a list of paths -- and not
+  // the rows themselves. Freezing the rows would freeze their contents
+  // too, so a size landing after the snapshot would stay invisible
+  // behind its skeleton until the next gesture. That is the opposite of
+  // the intent: the number is never withheld, only its power to move
+  // the row is.
+  //
+  // `orderKey` is the only dependency that may bump the memo, since the
+  // freshly-built `withSizes` array is a new reference on every render
+  // and listing it would restore exactly the live re-ordering this
+  // exists to prevent. `length` rides along so a worktree appearing or
+  // disappearing is not silently dropped from the list.
+  const orderKey = `${sort}:${sortedAt}`;
+  const snapshot = useMemo(
+    () => ({
+      order: sortWorktrees(withSizes, sort, assessed).map((w) => w.path),
+      // Which paths already had a size when this order was fixed. Kept
+      // alongside the order because it is the only way to tell later
+      // that a measurement has landed SINCE -- comparing against the
+      // live rows would compare them with themselves.
+      measured: new Set(
+        withSizes.filter((w) => w.size_bytes !== null && w.size_bytes !== undefined).map((w) => w.path),
+      ),
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [orderKey, withSizes.length],
+  );
+  const order = snapshot.order;
+  // The live rows, in the frozen order. A path the snapshot has not
+  // seen yet sorts to the end rather than being dropped -- a worktree
+  // must never vanish from the list because it appeared between
+  // gestures.
+  const rank = new Map(order.map((p, i) => [p, i]));
+  const shown = [...withSizes].sort(
+    (a, b) => (rank.get(a.path) ?? Infinity) - (rank.get(b.path) ?? Infinity),
+  );
+
   const [forcing, setForcing] = useState<Worktree | null>(null);
   const [pullingPath, setPullingPath] = useState<string | null>(null);
   const removeOrphanFn = useRemoveOrphan();
@@ -838,34 +953,23 @@ export function WorktreesPage() {
     );
   }
 
-  // Classified data replaces the unclassified listing as it arrives, so
-  // the page is useful immediately and gets more informative rather than
-  // blocking on ~16s of git calls.
-  // Sizes arrive last and are merged in here rather than refetching the
-  // list, so the page never flickers back to unclassified.
-  const shown = (classified ?? selected?.worktrees ?? [])
-    .map((w) => ({ ...w, size_bytes: sizes?.get(w.path) ?? w.size_bytes }))
-    // Sorting by size while sizes are still arriving would make rows jump
-    // under the cursor -- a row you were about to click moves as its
-    // number lands. Hold the stable path order until they are all in.
-    .sort((a, b) => {
-      // The main checkout first, ALWAYS. It is not a peer of the rows
-      // below it -- every one of those is a removal candidate and it
-      // never is, so sorting it among them invites reading it as one.
-      // Its row also carries the upstream prose ("behind by 40"), which
-      // is the reason the worktrees under it are stale, and an
-      // explanation belongs above the thing it explains.
-      if (a.is_main !== b.is_main) return a.is_main ? -1 : 1;
-      // Assessed rows first: the user just came back from reading a
-      // verdict, and finding that row among 124 candidates is the part
-      // that made this feel unfinished.
-      const aa = assessed.has(a.path) ? 0 : 1;
-      const bb = assessed.has(b.path) ? 0 : 1;
-      if (aa !== bb) return aa - bb;
-      return sizing
-        ? a.path.localeCompare(b.path)
-        : (b.size_bytes ?? 0) - (a.size_bytes ?? 0);
-    });
+  // How many rows have gained a size since the current order was fixed.
+  //
+  // This is what makes the frozen order HONEST rather than merely
+  // stable: without it the user reads a "Largest first" list that is
+  // quietly out of date and has no way to know. With it, the page says
+  // so and offers the one click that fixes it. Only meaningful on a
+  // size sort -- name never goes stale, and `last_commit` arrives with
+  // the row rather than streaming in afterwards.
+  const sizeSorted = sort === "size-asc" || sort === "size-desc";
+  const restaleCount = sizeSorted
+    ? withSizes.filter(
+        (w) =>
+          w.size_bytes !== null &&
+          w.size_bytes !== undefined &&
+          !snapshot.measured.has(w.path),
+      ).length
+    : 0;
 
   // Withheld unless classification actually SUCCEEDED. A failed pass
   // used to resolve as an empty success, so rows sat on "checking..."
@@ -950,6 +1054,48 @@ export function WorktreesPage() {
             {sizesComplete ? "" : "at least "}
             {formatSize(totalBytes)} total
           </span>
+        ) : null}
+
+        {/* The three columns the row already renders, both ways (#771).
+            A `<select>` rather than clickable column headers: this list
+            is not a table -- the safety verdict is prose that wraps, and
+            there are no headers to click. `ArtifactsPage` reached the
+            same shape for the same reason, so this matches it rather
+            than inventing a third pattern. */}
+        <label className="flex items-center gap-1 text-xs text-[#8b949e]">
+          Sort
+          <select
+            value={sort}
+            onChange={(e) => chooseSort(e.target.value as WorktreeSort)}
+            aria-label="Sort worktrees"
+            className="rounded border border-[#30363d] bg-[#0d1117] px-1 py-0.5 text-xs text-[#e6edf3]"
+          >
+            {(Object.keys(WORKTREE_SORT_LABELS) as WorktreeSort[]).map((k) => (
+              <option key={k} value={k}>
+                {WORKTREE_SORT_LABELS[k]}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        {/* The explicit gesture that makes the frozen order honest.
+
+            Rows are ordered on the sizes known when the sort was
+            chosen, so a measurement landing afterwards does not move
+            anything under the cursor -- but it would leave a "Largest
+            first" list quietly out of date with no way to tell. This
+            says how many rows have been measured since, and one click
+            applies them. Silent when there is nothing to apply, so it
+            is not a permanent piece of furniture. */}
+        {restaleCount > 0 ? (
+          <button
+            type="button"
+            onClick={() => setSortedAt((n) => n + 1)}
+            aria-live="polite"
+            className="rounded border border-[#30363d] px-2 py-0.5 text-xs text-[#58a6ff] hover:bg-[#161b22]"
+          >
+            re-sort — {restaleCount} newly measured
+          </button>
         ) : null}
 
         {/* The count is in the label, so the scope is legible before

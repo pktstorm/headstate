@@ -508,8 +508,15 @@ describe("WorktreesPage", () => {
     expect(screen.getByText(/safe to delete/)).not.toBeNull();
   });
 
-  // A row you are about to click must not move as its number lands.
-  it("holds a stable order while sizes are still arriving", () => {
+  /// A row you are about to click must not move as its number lands.
+  ///
+  /// #771 replaced the old answer -- refuse to sort at all until every
+  /// size was in -- with a sort over what IS known plus a frozen order.
+  /// The unmeasured row therefore sorts LAST rather than pinning the
+  /// whole list to path order: an unknown size is not a claim of 0 B,
+  /// and ranking it as the smallest is what would hide the directory
+  /// that might be huge.
+  it("sorts on what is known while sizes are still arriving, unknowns last", () => {
     Object.assign(state, {
       repos: [
         {
@@ -526,9 +533,8 @@ describe("WorktreesPage", () => {
     });
     const { container } = render(<WorktreesPage />);
     const names = [...container.querySelectorAll(".font-mono")].map((n) => n.textContent);
-    // Path order while sizing, NOT size order -- zzz is far bigger but
-    // must not jump to the top until every size is in.
-    expect(names[0]).toMatch(/^aaa/);
+    expect(names[0]).toMatch(/^zzz/);
+    expect(names[1]).toMatch(/^aaa/);
   });
 
   it("sorts by size once every size has arrived", () => {
@@ -787,15 +793,21 @@ describe("WorktreesPage", () => {
       await waitFor(() => expect(clearAssessedFn).toHaveBeenCalledWith(w.path));
     });
 
-    /// The kebab is only for the assessed state -- an unassessed row
-    /// already has Claudify as its one action, and a menu holding a
-    /// duplicate of it would be noise.
-    it("shows no kebab before an assessment is marked", () => {
+    /// The kebab is on every row from #770 onwards, but the
+    /// Claudify/Forget PAIR inside it is still only for the assessed
+    /// state: an unassessed row already has Claudify as its one action,
+    /// and a menu holding a duplicate of the button beside it would be
+    /// noise. What the menu does carry unconditionally is removal --
+    /// that is the affordance the toast used to own.
+    it("omits the assessment items from the kebab until one is marked", () => {
       state.classified = [wt({ safety: { kind: "never_pushed" } })];
       state.assessed = [];
       render(<WorktreesPage />);
       expect(screen.getByRole("button", { name: /claudify/i })).toBeTruthy();
-      expect(screen.queryByRole("button", { name: /more actions/i })).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: /more actions/i }));
+      expect(screen.queryByRole("menuitem", { name: /copy the claudify command/i })).toBeNull();
+      expect(screen.queryByRole("menuitem", { name: /forget the assessment/i })).toBeNull();
+      expect(screen.getByRole("menuitem", { name: /remove worktree/i })).toBeTruthy();
     });
 
     /// #396: an ABSENT clipboard produced NO toast at all.
@@ -1518,6 +1530,281 @@ describe("WorktreesPage", () => {
     it("shows no total before any size has arrived", () => {
       withSizes([null, null]);
       expect(screen.queryByText(/total/i)).toBeNull();
+    });
+  });
+
+  /// #770: removal past the safety gate was reachable ONLY from the
+  /// Claudify toast's "I read the assessment" button. A toast is for
+  /// something you can ignore -- it leaves on a timer or on a stray
+  /// click -- so the more careful the user was being, the more likely
+  /// they lost the only route to the thing they had just asked for, and
+  /// the only way back was another agent invocation.
+  ///
+  /// Every test here that asserts the kebab OFFERS removal also asserts
+  /// the gate still refuses what it should. Removal is the one
+  /// unrecoverable action in this app, and a menu that quietly widened
+  /// it would be a far worse bug than the one being fixed.
+  describe("the row kebab", () => {
+    const openKebab = () =>
+      fireEvent.click(screen.getByRole("button", { name: /more actions/i }));
+
+    /// The affordance that used to live only on a toast, now on a
+    /// surface that does not disappear.
+    it("offers removal on a row whose gate refuses it, without an assessment", () => {
+      state.classified = [wt({ safety: { kind: "never_pushed" } })];
+      state.assessed = [];
+      render(<WorktreesPage />);
+
+      // The primary button is Claudify -- the gate has NOT moved.
+      expect(screen.getByRole("button", { name: /claudify/i })).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Remove" })).toBeNull();
+      // ...and removal is reachable anyway, from the persistent menu.
+      openKebab();
+      expect(screen.getByRole("menuitem", { name: /remove worktree/i })).toBeTruthy();
+    });
+
+    /// Safe and MergedUpstreamDeleted are offered PLAINLY: both mean
+    /// the work is on the default branch and the tree is clean, so both
+    /// take the ordinary confirmation rather than the override.
+    it.each([["safe"], ["merged_upstream_deleted"]] as const)(
+      "sends a %s row to the plain confirmation",
+      (kind) => {
+        state.classified = [wt({ safety: { kind } })];
+        render(<WorktreesPage />);
+        openKebab();
+        fireEvent.click(screen.getByRole("menuitem", { name: /remove worktree/i }));
+
+        const dialog = screen.getByRole("dialog");
+        expect(within(dialog).getByText(/remove this worktree\?/i)).toBeTruthy();
+        // The ordinary dialog, not the override: no "I have reviewed
+        // this", and no warning about an unrecoverable loss.
+        expect(within(dialog).queryByText(/i have reviewed this/i)).toBeNull();
+      },
+    );
+
+    /// A gate that a menu can walk past is not a gate. An unsafe row
+    /// reaches removal only through the confirmation that names the
+    /// specific loss -- the same one "Remove anyway…" opens.
+    it("sends an unsafe row through the override confirmation, not the plain one", () => {
+      state.classified = [wt({ safety: { kind: "never_pushed" } })];
+      render(<WorktreesPage />);
+      openKebab();
+      fireEvent.click(screen.getByRole("menuitem", { name: /remove worktree/i }));
+
+      const dialog = screen.getByRole("dialog");
+      expect(within(dialog).getByText(/not pushed anywhere/i)).toBeTruthy();
+      expect(within(dialog).getByRole("button", { name: /i have reviewed this/i })).toBeTruthy();
+    });
+
+    /// Nothing is deleted by opening a menu. The confirmation is the
+    /// gate, and it has to be answered.
+    it("removes nothing until the confirmation is answered", () => {
+      forceFn.mockClear();
+      state.classified = [wt({ safety: { kind: "never_pushed" } })];
+      render(<WorktreesPage />);
+      openKebab();
+      fireEvent.click(screen.getByRole("menuitem", { name: /remove worktree/i }));
+      expect(forceFn).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByRole("button", { name: /i have reviewed this/i }));
+      expect(forceFn).toHaveBeenCalled();
+    });
+
+    /// #753's finding, reused rather than reworded.
+    ///
+    /// `remove_worktree_forced` relaxes Headstate's gate but still
+    /// calls git WITHOUT `--force`, and git refuses a locked tree on
+    /// its own account -- so a user who confirms here gets an error.
+    /// The menu says so BEFORE the click, and says it in `forceWarning`'s
+    /// words: two copies of a warning about an unrecoverable action are
+    /// two chances to drift.
+    it("warns on a locked row that forcing will not help", () => {
+      state.classified = [
+        wt({ safety: { kind: "locked", detail: "some tool (pid 123)" } }),
+      ];
+      render(<WorktreesPage />);
+      openKebab();
+
+      const item = screen.getByRole("menuitem", { name: /remove worktree/i });
+      expect(item.textContent).toMatch(/git will refuse to remove it until it is unlocked/i);
+      // Offered, not hidden: the user may well want to clear the lock,
+      // and an absent item teaches nothing.
+      expect(item).toBeTruthy();
+    });
+
+    /// #775's territory, deliberately. Unlocking is contentious and is
+    /// not being decided here -- the menu explains the obstacle and
+    /// stops.
+    it("offers no unlock action", () => {
+      state.classified = [
+        wt({ safety: { kind: "locked", detail: "some tool (pid 123)" } }),
+      ];
+      render(<WorktreesPage />);
+      openKebab();
+      // Anchored, because the Remove item's own warning necessarily
+      // contains the word "unlocked" -- a loose /unlock/ would match
+      // the very copy that explains why there is no unlock action.
+      const items = screen
+        .getAllByRole("menuitem")
+        .map((el) => el.textContent ?? "");
+      expect(items.some((t) => /^\s*unlock/i.test(t))).toBe(false);
+    });
+
+    /// The main checkout is never a removal candidate, and a menu item
+    /// offering to delete the repository's own checkout would be the
+    /// worst possible thing to get wrong here.
+    it("never offers to remove the main checkout", () => {
+      state.classified = [
+        wt({ path: "/code/proj", is_main: true, safety: { kind: "main_checkout" } }),
+      ];
+      render(<WorktreesPage />);
+      openKebab();
+      expect(screen.queryByRole("menuitem", { name: /remove worktree/i })).toBeNull();
+    });
+
+    /// An orphan has no repository for git to run in, so it is removed
+    /// by a different call entirely -- and the row's own Delete button
+    /// already offers it. A second, wrong route from the menu would be
+    /// worse than none.
+    it("leaves an orphan to its own Delete button", () => {
+      state.classified = [wt({ safety: { kind: "orphaned" } })];
+      render(<WorktreesPage />);
+      expect(screen.getByRole("button", { name: /^delete$/i })).toBeTruthy();
+      openKebab();
+      expect(screen.queryByRole("menuitem", { name: /remove worktree/i })).toBeNull();
+    });
+  });
+
+  /// #771: the list rendered name, size and age on every row and could
+  /// order by none of them, on a page whose whole purpose is "which of
+  /// these is biggest".
+  describe("sorting", () => {
+    const shownNames = (container: HTMLElement) =>
+      [...container.querySelectorAll(".font-mono")].map((n) => n.textContent ?? "");
+
+    const threeRows = () => {
+      state.classified = [
+        wt({ path: "/code/bravo", size_bytes: 500, last_commit: "2026-01-01T00:00:00Z" }),
+        wt({ path: "/code/alpha", size_bytes: 9_000, last_commit: "2025-01-01T00:00:00Z" }),
+        wt({ path: "/code/charlie", size_bytes: 50, last_commit: "2026-09-01T00:00:00Z" }),
+      ];
+    };
+
+    it("defaults to largest first, which is the question the page exists for", () => {
+      threeRows();
+      const { container } = render(<WorktreesPage />);
+      expect(shownNames(container)[0]).toMatch(/^alpha/);
+    });
+
+    it("orders by name, size and age, in both directions", () => {
+      threeRows();
+      const { container } = render(<WorktreesPage />);
+      const select = screen.getByRole("combobox", { name: /sort worktrees/i });
+
+      const first = (value: string) => {
+        fireEvent.change(select, { target: { value } });
+        return shownNames(container)[0];
+      };
+
+      expect(first("size-desc")).toMatch(/^alpha/);
+      expect(first("size-asc")).toMatch(/^charlie/);
+      // Least recently committed first: the safe wins.
+      expect(first("age-desc")).toMatch(/^alpha/);
+      expect(first("age-asc")).toMatch(/^charlie/);
+      expect(first("name-asc")).toMatch(/^alpha/);
+      expect(first("name-desc")).toMatch(/^charlie/);
+    });
+
+    /// The streaming answer, and the reason the order is a snapshot.
+    ///
+    /// A size landing must NOT re-order the list under the cursor: the
+    /// button it would move out from under you removes a directory. So
+    /// the row's displayed size updates live while its POSITION does
+    /// not, and the page offers an explicit gesture to apply the rest.
+    it("does not re-order rows as sizes land", () => {
+      state.classified = [
+        wt({ path: "/code/measured", size_bytes: 500 }),
+        wt({ path: "/code/pending", size_bytes: null }),
+      ];
+      state.sizing = true;
+      const { container, rerender } = render(<WorktreesPage />);
+      expect(shownNames(container)[0]).toMatch(/^measured/);
+
+      // `pending` turns out to be far the bigger of the two...
+      state.partialSizes = new Map([["/code/pending", 9_000_000]]);
+      rerender(<WorktreesPage />);
+
+      // ...its size is shown at once, because withholding a landed
+      // measurement would be the other kind of dishonesty...
+      expect(screen.getByText("8.6 MB")).toBeTruthy();
+      // ...but the ORDER has not moved under the user.
+      expect(shownNames(container)[0]).toMatch(/^measured/);
+    });
+
+    /// A frozen order that says nothing is merely stale. The page has
+    /// to admit the list is out of date and offer the one click that
+    /// fixes it, or the user reads a "Largest first" that silently is
+    /// not.
+    it("offers an explicit re-sort once newly measured rows exist", () => {
+      state.classified = [
+        wt({ path: "/code/measured", size_bytes: 500 }),
+        wt({ path: "/code/pending", size_bytes: null }),
+      ];
+      state.sizing = true;
+      const { container, rerender } = render(<WorktreesPage />);
+      expect(screen.queryByRole("button", { name: /re-sort/i })).toBeNull();
+
+      state.partialSizes = new Map([["/code/pending", 9_000_000]]);
+      rerender(<WorktreesPage />);
+
+      const resort = screen.getByRole("button", { name: /re-sort/i });
+      expect(resort.textContent).toMatch(/1 newly measured/);
+      fireEvent.click(resort);
+
+      // The gesture applies the measurements that had landed since.
+      expect(shownNames(container)[0]).toMatch(/^pending/);
+      expect(screen.queryByRole("button", { name: /re-sort/i })).toBeNull();
+    });
+
+    /// Changing the sort is itself an explicit gesture, so it takes a
+    /// fresh snapshot -- the user asked for a new order and gets one
+    /// built from everything known right now.
+    it("takes a fresh snapshot when the sort is changed", () => {
+      state.classified = [
+        wt({ path: "/code/measured", size_bytes: 500 }),
+        wt({ path: "/code/pending", size_bytes: null }),
+      ];
+      state.sizing = true;
+      const { container, rerender } = render(<WorktreesPage />);
+
+      state.partialSizes = new Map([["/code/pending", 9_000_000]]);
+      rerender(<WorktreesPage />);
+      expect(shownNames(container)[0]).toMatch(/^measured/);
+
+      fireEvent.change(screen.getByRole("combobox", { name: /sort worktrees/i }), {
+        target: { value: "size-desc" },
+      });
+      expect(shownNames(container)[0]).toMatch(/^pending/);
+    });
+
+    /// Name is fully known at first render, so it is the escape hatch
+    /// while sizes are still landing -- and it must never carry the
+    /// "newly measured" nag, which would be asking the user to re-apply
+    /// something that cannot change the order.
+    it("does not nag about measurements on a name sort", () => {
+      state.classified = [
+        wt({ path: "/code/measured", size_bytes: 500 }),
+        wt({ path: "/code/pending", size_bytes: null }),
+      ];
+      state.sizing = true;
+      const { rerender } = render(<WorktreesPage />);
+      fireEvent.change(screen.getByRole("combobox", { name: /sort worktrees/i }), {
+        target: { value: "name-asc" },
+      });
+
+      state.partialSizes = new Map([["/code/pending", 9_000_000]]);
+      rerender(<WorktreesPage />);
+      expect(screen.queryByRole("button", { name: /re-sort/i })).toBeNull();
     });
   });
 });
