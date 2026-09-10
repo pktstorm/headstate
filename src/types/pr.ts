@@ -745,6 +745,28 @@ export type BranchScanFrame =
   | { kind: "listed"; repo: string; total: number; branches: Branch[] }
   | { kind: "classified"; repo: string; verdicts: [string, Deletable][] };
 
+/// One frame of a running branch DELETION, mirroring the Rust
+/// `BranchDeleteFrame` in `src-tauri/src/commands.rs`.
+///
+/// Two shapes because a deletion is two phases with different
+/// meanings, and collapsing them into one counter is the bug this
+/// exists to fix. The safety re-check is a full uncached scan at ~64ms
+/// per branch, so on the 562-branch batch that was reported a single
+/// counter would read 0/562 for MINUTES — indistinguishable from a
+/// hang — before a single ref came off (#724).
+///
+/// `checking` therefore counts branches the re-check has classified,
+/// and its total is every branch in the repository, since that is what
+/// the gate scans. `deleting` counts the selected batch, and carries
+/// `failed` on every frame so refusals are visible while the run is
+/// still going rather than only in the toasts afterwards.
+///
+/// Counts only: no branch names, no paths. Unlike the scan's frames,
+/// which are filling a list of names in, nothing here needs a join key.
+export type BranchDeleteFrame =
+  | { kind: "checking"; repo: string; done: number; total: number }
+  | { kind: "deleting"; repo: string; done: number; total: number; failed: number };
+
 /// One moment of the machine's health, mirroring the Rust
 /// `health::Sample` in `src-tauri/src/health/mod.rs`.
 ///

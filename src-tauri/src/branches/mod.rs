@@ -10,6 +10,9 @@ pub mod delete;
 pub mod model;
 pub mod scan;
 
-pub use delete::{delete_local, delete_remote, DeleteOutcome};
+pub use delete::{
+    delete_local, delete_local_with_progress, delete_remote, delete_remote_with_progress,
+    DeleteOutcome, DeleteProgress,
+};
 pub use model::{Branch, Deletable, Location, MergedHow};
 pub use scan::{scan, scan_cached, scan_cached_with_progress, Progress};

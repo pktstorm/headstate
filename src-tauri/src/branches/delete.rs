@@ -5,12 +5,106 @@
 //! minutes old and a branch can be merged, checked out, or advanced in
 //! between -- so the list the user ticked is a list of names, never a
 //! list of permissions.
+//!
+//! # Two phases, reported separately (#724)
+//!
+//! A deletion is a re-check and then a deletion, and the re-check is
+//! the slow half: it is a full uncached [`scan::scan`] of the
+//! repository, ~64ms per branch, so 562 selected branches spent
+//! MINUTES in the gate before the first ref was touched. Reported as
+//! one counter, that reads as broken -- the number would sit at 0/562
+//! through the longest part of the wait, which is exactly the "ten
+//! minutes with no progress" this module was reported for.
+//!
+//! So [`DeleteProgress`] has a call per phase. `checking` counts
+//! branches classified by the re-check scan; `deleted` counts refs
+//! actually removed, and carries the failures so far, because a batch
+//! where thirty branches were refused must say so while it runs rather
+//! than in a burst of toasts at the end.
 
 use std::path::Path;
 
 use super::model::{Branch, Deletable};
 use super::scan;
 use crate::worktrees::scan::git;
+
+/// What a caller wants told while a deletion runs.
+///
+/// Three calls, in this order: `checking` repeatedly while the safety
+/// re-check scans the repository, then `deleted` once per branch as
+/// refs come off. `failed` is reported through `deleted`'s count
+/// rather than separately so a consumer cannot render a total that
+/// disagrees with itself.
+///
+/// A trait rather than closures for the same reason [`scan::Progress`]
+/// is one: the re-check phase delegates to `scan_with_progress`, whose
+/// sink is shared across eight classification threads and so must be
+/// `Sync`. `checking` must therefore tolerate arriving from several
+/// threads at once, out of order.
+pub trait DeleteProgress: Sync {
+    /// The re-check scan classified `done` of `total` branches.
+    ///
+    /// `total` is every branch in the REPOSITORY, not the batch: the
+    /// gate scans the whole repository once, and saying "12 of 562
+    /// selected" while scanning 900 would be a count of the wrong
+    /// thing. The phase label is what tells the user which is which.
+    fn checking(&self, done: usize, total: usize);
+    /// `done` of `total` selected branches have been attempted, of
+    /// which `failed` were refused or errored.
+    ///
+    /// Called AFTER each attempt, so the count means "done" and not
+    /// "started" -- the same rule `remove_worktrees_with_progress`
+    /// follows. `total` here IS the batch.
+    fn deleted(&self, done: usize, total: usize, failed: usize);
+}
+
+/// The sink for callers that want only the answer.
+pub struct SilentDelete;
+
+impl DeleteProgress for SilentDelete {
+    fn checking(&self, _: usize, _: usize) {}
+    fn deleted(&self, _: usize, _: usize, _: usize) {}
+}
+
+/// Bridges the scan's own progress into the deletion's checking phase.
+///
+/// The re-check IS a scan, so this reuses `scan_with_progress` rather
+/// than inventing a second way to count the same work (#723's
+/// mechanism, one operation, one protocol). The scan reports a listing
+/// then batches of verdicts; the deletion only needs how far through
+/// it is, so that is all this forwards.
+struct CheckingPhase<'a> {
+    to: &'a dyn DeleteProgress,
+    done: std::sync::atomic::AtomicUsize,
+    /// Remembered from the listing so `classified` can repeat it: the
+    /// scan tells a sink the total once and the verdicts thereafter,
+    /// but every frame this forwards has to carry both numbers or the
+    /// page has nothing to render a fraction against.
+    total: std::sync::atomic::AtomicUsize,
+}
+
+impl scan::Progress for CheckingPhase<'_> {
+    fn listed(&self, branches: &[Branch]) {
+        self.total
+            .store(branches.len(), std::sync::atomic::Ordering::Relaxed);
+        // Emitted at 0/N rather than withheld: this is the frame that
+        // lets the page say "Checking 562 branches" instead of showing
+        // nothing for the minutes that follow.
+        self.to.checking(0, branches.len());
+    }
+
+    fn classified(&self, verdicts: &[(String, Deletable)]) {
+        // Relaxed: the eight classification threads need this counter
+        // correct in total, and no other memory is published through
+        // it.
+        let done = self
+            .done
+            .fetch_add(verdicts.len(), std::sync::atomic::Ordering::Relaxed)
+            + verdicts.len();
+        self.to
+            .checking(done, self.total.load(std::sync::atomic::Ordering::Relaxed));
+    }
+}
 
 /// What happened to one branch.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -78,34 +172,91 @@ fn still_deletable(branches: &[Branch], name: &str) -> Result<(), String> {
 /// delete, against the repository as it stands, never against what the
 /// UI last displayed.
 pub fn delete_local(repo_path: &str, names: &[String]) -> Vec<DeleteOutcome> {
-    let dir = Path::new(repo_path);
-    // ONE scan for the whole batch, not one per branch.
-    let branches = match scan::scan(dir) {
-        Ok(b) => b,
-        // A scan that failed is not permission to delete: every branch
-        // is refused with the reason, rather than proceeding blind.
-        Err(e) => {
-            return names
-                .iter()
-                .map(|name| DeleteOutcome {
-                    name: name.clone(),
-                    error: Some(format!("could not re-check branches before deleting: {e}")),
-                })
-                .collect()
-        }
+    delete_local_with_progress(repo_path, names, &SilentDelete)
+}
+
+/// The re-check every deletion opens with, reporting as it scans.
+///
+/// Factored out of both delete functions because the phase boundary
+/// has to be identical in each: the local and remote halves of one
+/// "delete in both places" run back to back, and a user watching two
+/// differently-shaped progress reports for one action learns nothing
+/// from either.
+///
+/// `Err` carries the already-refused outcomes, so the caller returns
+/// them unchanged: a scan that failed is not permission to delete.
+fn recheck(
+    dir: &Path,
+    names: &[String],
+    progress: &dyn DeleteProgress,
+) -> Result<Vec<Branch>, Vec<DeleteOutcome>> {
+    let phase = CheckingPhase {
+        to: progress,
+        done: std::sync::atomic::AtomicUsize::new(0),
+        total: std::sync::atomic::AtomicUsize::new(0),
     };
+    // ONE scan for the whole batch, not one per branch, and `scan`
+    // rather than `scan_cached`: the gate runs against the repository
+    // as it stands, never against what the UI last displayed. The
+    // progress sink observes that scan; it does not replace it.
+    scan::scan_with_progress(dir, &phase).map_err(|e| {
+        names
+            .iter()
+            .map(|name| DeleteOutcome {
+                name: name.clone(),
+                error: Some(format!("could not re-check branches before deleting: {e}")),
+            })
+            .collect()
+    })
+}
+
+/// Delete one branch per call, counting attempts and failures.
+///
+/// The failure count goes out with every frame rather than only at the
+/// end. Thirty refusals in a batch of 562 is something the user wants
+/// to know while there is still a run to abandon, not after it.
+fn delete_each(
+    names: &[String],
+    progress: &dyn DeleteProgress,
+    mut delete_one: impl FnMut(&str) -> Option<String>,
+) -> Vec<DeleteOutcome> {
+    let total = names.len();
+    let mut failed = 0;
     names
         .iter()
-        .map(|name| {
-            let error = still_deletable(&branches, name)
-                .err()
-                .or_else(|| git(dir, &["branch", "-D", name]).err());
+        .enumerate()
+        .map(|(i, name)| {
+            let error = delete_one(name);
+            if error.is_some() {
+                failed += 1;
+            }
+            // AFTER the attempt, so the count means "done".
+            progress.deleted(i + 1, total, failed);
             DeleteOutcome {
                 name: name.clone(),
                 error,
             }
         })
         .collect()
+}
+
+/// `delete_local`, telling `progress` which phase it is in and how far
+/// through that phase it has got (#724).
+pub fn delete_local_with_progress(
+    repo_path: &str,
+    names: &[String],
+    progress: &dyn DeleteProgress,
+) -> Vec<DeleteOutcome> {
+    let dir = Path::new(repo_path);
+    let branches = match recheck(dir, names, progress) {
+        Ok(b) => b,
+        Err(refused) => return refused,
+    };
+    delete_each(names, progress, |name| {
+        still_deletable(&branches, name)
+            .err()
+            .or_else(|| git(dir, &["branch", "-D", name]).err())
+    })
 }
 
 /// Delete branches on the remote.
@@ -116,38 +267,36 @@ pub fn delete_local(repo_path: &str, names: &[String]) -> Vec<DeleteOutcome> {
 /// still re-checks the merge gate first -- being remote does not make
 /// the branch any more disposable.
 pub fn delete_remote(repo_path: &str, names: &[String]) -> Vec<DeleteOutcome> {
+    delete_remote_with_progress(repo_path, names, &SilentDelete)
+}
+
+/// `delete_remote`, reporting its phases the same way (#724).
+///
+/// The remote half is if anything the one that needs it more: each
+/// deletion is a network round trip, so the second phase is slow here
+/// too, not just the re-check.
+pub fn delete_remote_with_progress(
+    repo_path: &str,
+    names: &[String],
+    progress: &dyn DeleteProgress,
+) -> Vec<DeleteOutcome> {
     let dir = Path::new(repo_path);
-    let branches = match scan::scan(dir) {
+    let branches = match recheck(dir, names, progress) {
         Ok(b) => b,
-        Err(e) => {
-            return names
-                .iter()
-                .map(|name| DeleteOutcome {
-                    name: name.clone(),
-                    error: Some(format!("could not re-check branches before deleting: {e}")),
-                })
-                .collect()
-        }
+        Err(refused) => return refused,
     };
-    names
-        .iter()
-        .map(|name| {
-            // `origin/feature` names a remote-tracking ref; the push
-            // needs the remote and the branch separately.
-            let error = match name.split_once('/') {
-                None => Some(format!(
-                    "{name} does not name a remote branch (expected <remote>/<branch>)"
-                )),
-                Some((remote, branch)) => still_deletable(&branches, name)
-                    .err()
-                    .or_else(|| git(dir, &["push", remote, "--delete", branch]).err()),
-            };
-            DeleteOutcome {
-                name: name.clone(),
-                error,
-            }
-        })
-        .collect()
+    delete_each(names, progress, |name| {
+        // `origin/feature` names a remote-tracking ref; the push needs
+        // the remote and the branch separately.
+        match name.split_once('/') {
+            None => Some(format!(
+                "{name} does not name a remote branch (expected <remote>/<branch>)"
+            )),
+            Some((remote, branch)) => still_deletable(&branches, name)
+                .err()
+                .or_else(|| git(dir, &["push", remote, "--delete", branch]).err()),
+        }
+    })
 }
 
 #[cfg(test)]
@@ -625,5 +774,228 @@ mod tests {
             String::from_utf8_lossy(&refs.stdout).trim().is_empty(),
             "the remote branch must be gone too -- this is the #473 failure"
         );
+    }
+
+    // ---- progress, two phases (#724) --------------------------------
+
+    /// Records what a deletion reported, in order, from any thread.
+    ///
+    /// Order is the property under test as much as the numbers are: the
+    /// bug was a counter that sat at zero through the checking phase,
+    /// which is only visible if the phases are told apart and the
+    /// sequence is kept.
+    #[derive(Default)]
+    struct Recorder {
+        checking: std::sync::Mutex<Vec<(usize, usize)>>,
+        deleting: std::sync::Mutex<Vec<(usize, usize, usize)>>,
+        /// Every call in arrival order, tagged by phase, so a
+        /// `deleted` that arrived before the checking finished would
+        /// be caught rather than averaged away.
+        order: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl DeleteProgress for Recorder {
+        fn checking(&self, done: usize, total: usize) {
+            self.checking.lock().unwrap().push((done, total));
+            self.order.lock().unwrap().push("checking");
+        }
+        fn deleted(&self, done: usize, total: usize, failed: usize) {
+            self.deleting.lock().unwrap().push((done, total, failed));
+            self.order.lock().unwrap().push("deleting");
+        }
+    }
+
+    /// Build `n` merged branches, all genuinely deletable.
+    fn merged_branches(repo: &Path, n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| {
+                let name = format!("done-{i}");
+                run(repo, &["checkout", "-q", "-b", &name, "main"]);
+                commit(repo, &format!("work-{i}"));
+                squash_merge(repo, &name);
+                name
+            })
+            .collect()
+    }
+
+    /// THE bug: the checking phase must report progress of its own.
+    ///
+    /// The re-check is a full uncached scan and it runs BEFORE any
+    /// deletion, so a single counter reads 0/N for the whole of the
+    /// slowest part -- on the reported 562-branch batch, minutes of it.
+    /// This asserts the phase is reported at all, and that the count
+    /// inside it actually moves rather than only announcing itself.
+    #[test]
+    fn the_checking_phase_reports_before_anything_is_deleted() {
+        let (_t, repo) = fixture();
+        let names = merged_branches(&repo, 3);
+
+        let rec = Recorder::default();
+        let out = delete_local_with_progress(repo.to_str().unwrap(), &names, &rec);
+        assert!(out.iter().all(|o| o.error.is_none()), "{out:?}");
+
+        let checking = rec.checking.lock().unwrap().clone();
+        assert!(
+            !checking.is_empty(),
+            "the checking phase reported nothing; a counter that only starts at deletion \
+             sits at zero for the whole of the slow half"
+        );
+        // The total is the REPOSITORY's branches, which includes main
+        // and so exceeds the batch. Reporting the batch size here would
+        // be a count of the wrong thing.
+        let (_, total) = checking[0];
+        assert!(
+            total >= names.len(),
+            "the checking phase must count the branches the gate scans, got {total}"
+        );
+        let deepest = checking.iter().map(|(d, _)| *d).max().unwrap();
+        assert!(
+            deepest > 0,
+            "the checking count never moved off zero, which is the reported failure"
+        );
+
+        // And it is genuinely a PHASE: no deletion is reported until
+        // the checking is over.
+        let order = rec.order.lock().unwrap().clone();
+        let first_delete = order.iter().position(|p| *p == "deleting").unwrap();
+        assert!(
+            order[..first_delete].iter().all(|p| *p == "checking"),
+            "checking and deleting interleaved; the phases must be distinguishable"
+        );
+        assert!(
+            order[first_delete..].iter().all(|p| *p == "deleting"),
+            "the checking phase reported after deletion had started"
+        );
+    }
+
+    /// The deleting phase counts the BATCH, one frame per branch,
+    /// after each attempt.
+    #[test]
+    fn the_deleting_phase_counts_every_branch_in_the_batch() {
+        let (_t, repo) = fixture();
+        let names = merged_branches(&repo, 3);
+
+        let rec = Recorder::default();
+        delete_local_with_progress(repo.to_str().unwrap(), &names, &rec);
+
+        let deleting = rec.deleting.lock().unwrap().clone();
+        assert_eq!(
+            deleting,
+            vec![(1, 3, 0), (2, 3, 0), (3, 3, 0)],
+            "expected one frame per branch, counting done out of the batch"
+        );
+    }
+
+    /// Refusals are visible WHILE it runs, not only in the summary.
+    ///
+    /// A batch where thirty of 562 are refused should say so with five
+    /// hundred still to go. The count rides on every frame from the
+    /// failure onwards, so it cannot be missed by a page that rendered
+    /// between two of them.
+    #[test]
+    fn a_refusal_mid_batch_is_reported_as_it_happens() {
+        let (_t, repo) = fixture();
+        run(&repo, &["checkout", "-q", "-b", "ok-one"]);
+        commit(&repo, "a");
+        squash_merge(&repo, "ok-one");
+        // Unmerged: the gate refuses it, and it sits in the MIDDLE so
+        // the failure has to surface before the batch is over.
+        run(&repo, &["checkout", "-q", "-b", "nope", "main"]);
+        commit(&repo, "b");
+        run(&repo, &["checkout", "-q", "-b", "ok-two", "main"]);
+        commit(&repo, "c");
+        squash_merge(&repo, "ok-two");
+
+        let rec = Recorder::default();
+        let names = vec![
+            "ok-one".to_string(),
+            "nope".to_string(),
+            "ok-two".to_string(),
+        ];
+        let out = delete_local_with_progress(repo.to_str().unwrap(), &names, &rec);
+        assert!(
+            out[1].error.is_some(),
+            "fixture wrong: nope must be refused"
+        );
+
+        let deleting = rec.deleting.lock().unwrap().clone();
+        assert_eq!(deleting[0], (1, 3, 0));
+        assert_eq!(
+            deleting[1],
+            (2, 3, 1),
+            "the refusal must be reported on the frame it happened on"
+        );
+        assert_eq!(
+            deleting[2],
+            (3, 3, 1),
+            "and must still be counted on the frames after it"
+        );
+    }
+
+    /// A failed scan reports nothing about deleting, because nothing
+    /// was deleted.
+    ///
+    /// The refusal path returns early, and a progress report claiming
+    /// branches were attempted would contradict outcomes that say they
+    /// were not.
+    #[test]
+    fn a_failed_recheck_reports_no_deletion_progress() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let notrepo = tmp.path().join("nope");
+        std::fs::create_dir_all(&notrepo).unwrap();
+
+        let rec = Recorder::default();
+        let out = delete_local_with_progress(notrepo.to_str().unwrap(), &["anything".into()], &rec);
+        assert!(out[0]
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("could not re-check"));
+        assert!(
+            rec.deleting.lock().unwrap().is_empty(),
+            "nothing was deleted, so nothing may be reported as deleted"
+        );
+    }
+
+    /// The remote half reports the same two phases.
+    ///
+    /// Local and remote run back to back for a "delete in both places",
+    /// so a phase shape that differed between them would show the user
+    /// two unrelated progress reports for one action.
+    #[test]
+    fn the_remote_half_reports_both_phases_too() {
+        let (_t, repo) = fixture();
+        run(&repo, &["checkout", "-q", "-b", "shipped"]);
+        commit(&repo, "shipped-work");
+        run(&repo, &["push", "-q", "origin", "shipped"]);
+        squash_merge(&repo, "shipped");
+        run(&repo, &["branch", "-q", "-D", "shipped"]);
+
+        let rec = Recorder::default();
+        let out =
+            delete_remote_with_progress(repo.to_str().unwrap(), &["origin/shipped".into()], &rec);
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert!(
+            !rec.checking.lock().unwrap().is_empty(),
+            "the remote half skipped the checking phase"
+        );
+        assert_eq!(rec.deleting.lock().unwrap().clone(), vec![(1, 1, 0)]);
+    }
+
+    /// The silent path is byte-for-byte the old behaviour.
+    ///
+    /// `delete_local` still exists and still takes no sink, so every
+    /// caller that does not want progress -- and every existing test
+    /// above -- is unchanged by this.
+    #[test]
+    fn reporting_does_not_change_the_answer() {
+        let (_t, repo) = fixture();
+        let names = merged_branches(&repo, 2);
+
+        let quiet = delete_local(repo.to_str().unwrap(), &names[..1]);
+        let loud =
+            delete_local_with_progress(repo.to_str().unwrap(), &names[1..], &Recorder::default());
+        assert_eq!(quiet[0].error, None, "{:?}", quiet[0]);
+        assert_eq!(loud[0].error, None, "{:?}", loud[0]);
     }
 }

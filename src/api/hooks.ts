@@ -8,6 +8,7 @@ import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 
 import type {
   Artifact,
   Branch,
+  BranchDeleteFrame,
   BranchScanFrame,
   CleanupPrefs,
   DockerImage,
@@ -2068,6 +2069,103 @@ export function useBranchScan(repoPath: string | undefined): BranchScanState {
     }),
     [state.branches, state.total, state.classified],
   );
+}
+
+/// What a running branch deletion has reported so far, or `null` when
+/// none is running.
+///
+/// The phase is the point. A deletion re-checks every branch against a
+/// fresh scan before touching anything, and that scan is the slow half
+/// — so a single counter would report 0 of 562 throughout the part
+/// that takes the minutes (#724). `checking` and `deleting` are
+/// separate states so the page can say which wait the user is in.
+export type BranchDeleteState =
+  | { phase: "checking"; done: number; total: number }
+  | { phase: "deleting"; done: number; total: number; failed: number };
+
+/// How far a bulk branch deletion has got, or `null` when idle.
+///
+/// # Why this is not `useRemovalProgress` with different words
+///
+/// The worktree removal is N sequential deletions and one counter
+/// describes it honestly. A branch deletion is not: it opens with a
+/// full uncached scan of the repository — the safety gate, ~64ms per
+/// branch — and only then starts deleting. Reported as one number that
+/// gate would hold the count at zero for minutes, which is exactly the
+/// "ran for ten minutes with no progress" that was reported. Two
+/// phases, because there are two.
+///
+/// Never inferred from whether frames are still arriving: a dead run
+/// stops sending too, so traffic cannot distinguish a stall from an
+/// ending. This clears when the deleting phase reaches its total, and
+/// the caller clears it on settle — the promise resolving is the only
+/// thing that actually proves the run is over.
+///
+/// Frames for another repository are dropped, the same reason
+/// `useBranchScan` drops them: the event is app-global, the work is
+/// per-repository.
+export function useBranchDeleteProgress(
+  repoPath: string | undefined,
+): BranchDeleteState | null {
+  const [state, setState] = useState<(BranchDeleteState & { repo?: string }) | null>(null);
+
+  useEffect(() => {
+    if (!repoPath) return;
+
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    listen<BranchDeleteFrame>("branch-delete-progress", (e) => {
+      const f = e.payload;
+      if (f.repo !== repoPath) return;
+      if (f.kind === "checking") {
+        setState({ repo: repoPath, phase: "checking", done: f.done, total: f.total });
+        return;
+      }
+      // Cleared on the last one rather than leaving "562 of 562" up
+      // after the work is over — the same rule `useRemovalProgress`
+      // follows. The failure count is not lost with it: the outcomes
+      // arrive with the promise and are reported per branch.
+      setState(
+        f.done >= f.total
+          ? null
+          : {
+              repo: repoPath,
+              phase: "deleting",
+              done: f.done,
+              total: f.total,
+              failed: f.failed,
+            },
+      );
+    }).then((fn) => {
+      if (cancelled) safeUnlisten(fn);
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      safeUnlisten(unlisten);
+      unlisten = undefined;
+    };
+  }, [repoPath]);
+
+  // A frame that arrived for the previous repository must not describe
+  // this one. Compared during render rather than reset in an effect,
+  // which would paint the stale phase for a frame first.
+  const live = state !== null && state.repo === repoPath ? state : null;
+
+  // Narrowed on the way out: `repo` is bookkeeping for the reset above,
+  // not something a caller should read or compare against — the same
+  // shape `useBranchScan` returns.
+  return useMemo(() => {
+    if (live === null) return null;
+    return live.phase === "checking"
+      ? { phase: "checking" as const, done: live.done, total: live.total }
+      : {
+          phase: "deleting" as const,
+          done: live.done,
+          total: live.total,
+          failed: live.failed,
+        };
+  }, [live]);
 }
 
 /// Surface the outcome of a background update run.
