@@ -2433,6 +2433,24 @@ function NetworkProcesses() {
   }
 
   const rated = rates !== null;
+
+  if (rows.length === 0) {
+    // Reachable, and not the same fact as an empty reading above: every
+    // process in the newer reading failed to pair with the older one.
+    // The realistic cause is a long stall between readings -- a laptop
+    // that slept -- after which the whole table has turned over. Said
+    // as a sentence rather than as an empty table under headings,
+    // which would read as a panel that failed to paint.
+    return (
+      <p className="text-sm leading-relaxed text-[#8b949e]">
+        None of the {cur.processes.length} processes in this reading were
+        present in the previous one, so none of them has an interval to
+        measure. That usually means a long stall between readings — the whole
+        table has turned over. Rates return with the next pair.
+      </p>
+    );
+  }
+
   return (
     <div>
       <table className="w-full text-sm">

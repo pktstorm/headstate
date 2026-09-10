@@ -666,6 +666,34 @@ describe("the Network page", () => {
       expect(screen.queryByText(/a single reading cannot be a rate/i)).toBeNull();
     });
 
+    /// Two readings that share no process are not an empty table.
+    ///
+    /// Distinct from the empty-reading case below: here processes WERE
+    /// reported, and none of them paired with the previous reading — a
+    /// whole table turned over, which is what a laptop waking from
+    /// sleep looks like. An empty table under live headings would read
+    /// as a panel that failed to paint.
+    it("explains a reading whose processes all turned over", async () => {
+      netProcPollMs.current = 20;
+      let generation = 0;
+      netProcFn.mockImplementation(() => {
+        generation += 1;
+        // Every reading is a completely different set of PIDs, so
+        // nothing ever pairs.
+        return Promise.resolve([
+          netProc(`acme-worker-${generation}`, 1000 + generation, 5_000, 5_000),
+        ]);
+      });
+      renderPage();
+      const note = await screen.findByText(/none of the 1 processes in this reading/i);
+      // The whole explanation, not just the count: WHY there is no rate,
+      // and that it is temporary.
+      expect(note.textContent).toMatch(/none of them has an interval to measure/i);
+      expect(note.textContent).toMatch(/rates return with the next pair/i);
+      // And it is a sentence, not a table with no body rows.
+      expect(screen.queryByRole("columnheader", { name: "In" })).toBeNull();
+    });
+
     /// **A platform with no unprivileged route says so, with the
     /// reason.** #705's precedent: an evidenced "cannot be read" beats
     /// a silently empty panel, which reads as a broken one.
