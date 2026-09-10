@@ -1186,8 +1186,48 @@ fn orphan_gitdir(dir: &Path) -> Option<String> {
 }
 
 /// The repository's default branch, falling back to `main`.
+///
+/// The REMOTE-TRACKING ref where one exists -- `origin/main`, not `main`
+/// (#757). Every caller feeds this straight into a comparison
+/// (`merge-base --is-ancestor`, `git cherry`, the squash and containment
+/// checks), so which of the two refs this names decides every merge
+/// verdict in the view.
+///
+/// The bare short name was the wrong one. `main` is only current if the
+/// user recently PULLED it, and on a machine where all work happens in
+/// worktrees the local `main` can go untouched for weeks -- so the
+/// classifier was asking "did this land?" of a ref that predated the
+/// landing. `origin/main` is only stale if the user has not FETCHED,
+/// which is a much weaker assumption, and it is already on disk: this
+/// stays a local-only check, no network.
+///
+/// Measured on a 34-worktree checkout, same code and same worktrees,
+/// with only the freshness of local `main` differing (20 commits
+/// behind):
+///
+/// | verdict                | stale local `main` | after a fast-forward |
+/// |------------------------|--------------------|----------------------|
+/// | MergedUpstreamDeleted  | 3                  | 12                   |
+/// | Unmerged               | 12                 | 2                    |
+///
+/// A nine-row swing from one stale ref. The failure was silent and in
+/// the safe direction -- fewer removable worktrees, on a page whose
+/// whole purpose is reclaiming disk -- and every affected row carried a
+/// confident, false reason ("branch not merged"). It also defeated #732
+/// and #741, both of which make the classifier smarter and both of which
+/// were comparing against a ref older than the merges they detect.
+///
+/// Falls back to the LOCAL branch when the remote-tracking ref does not
+/// resolve. This code also serves purely-local repositories, where
+/// `origin/main` does not exist and insisting on it would turn every
+/// verdict into `Unknown`.
+///
+/// `is_safe_ref` still guards the remote-controlled half: `origin/HEAD`
+/// is written by the remote, so the short name it yields is validated
+/// BEFORE the `origin/` prefix is put back on. Prefixing first would
+/// hide `--output=EVIL` behind a name that no longer starts with `-`.
 pub(super) fn default_branch(repo: &Path) -> String {
-    git(
+    let short = git(
         repo,
         &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
     )
@@ -1195,7 +1235,18 @@ pub(super) fn default_branch(repo: &Path) -> String {
     .and_then(|s| s.trim().rsplit('/').next().map(str::to_string))
     // Same guard: a hostile `origin/HEAD` yields `--output=EVIL` here.
     .filter(|s| is_safe_ref(s))
-    .unwrap_or_else(|| "main".to_string())
+    .unwrap_or_else(|| "main".to_string());
+
+    let remote = format!("origin/{short}");
+    // `--verify` on the remote-tracking ref, not a guess from whether a
+    // remote is configured: a repo can have an `origin` whose branch was
+    // never fetched, and naming a ref that does not resolve would make
+    // every git call below fail into `Unknown` rather than answer.
+    if git(repo, &["rev-parse", "--verify", "--quiet", &remote]).is_ok() {
+        remote
+    } else {
+        short
+    }
 }
 
 /// Repos and their worktrees, WITHOUT classifying safety.
@@ -3326,6 +3377,241 @@ prunable gitdir file points to non-existent location
             Safety::Safe,
             "a squash-merged branch must be safe to remove"
         );
+    }
+
+    /// A repository whose LOCAL default branch is behind the remote one,
+    /// with a branch whose work landed only on the remote (#757).
+    ///
+    /// The everyday shape on a machine where all work happens in
+    /// worktrees: the checkout fetches (so `origin/main` is current) but
+    /// nothing ever checks out `main` to pull it, so the local branch
+    /// sits at whatever it was when the worktree was created. The issue
+    /// measured a real one 20 commits behind.
+    ///
+    /// The landing is done through a SECOND clone rather than in this
+    /// checkout, which is the point: committing on `main` here would
+    /// move the local branch too and there would be no staleness to
+    /// test. The remote branch is then deleted, exactly as a merged pull
+    /// request does, so the verdict comes through the upstream-deleted
+    /// path (#732).
+    ///
+    /// Real git throughout -- a hand-built fixture could not reproduce
+    /// the divergence between two refs, which IS the bug.
+    fn stale_local_default_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ident = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+        let run_in = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .envs(ident)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        run_in(&remote, &["init", "-q", "--bare", "-b", "main"]);
+
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_in(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        run_in(&repo, &["add", "-A"]);
+        run_in(&repo, &["commit", "-q", "-m", "base"]);
+        run_in(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run_in(&repo, &["push", "-q", "-u", "origin", "main"]);
+
+        // The work, done in a worktree and pushed, as it would be.
+        let wt = tmp.path().join("proj-feature");
+        run_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--track",
+                "-b",
+                "feature",
+                wt.to_str().unwrap(),
+                "main",
+            ],
+        );
+        std::fs::write(wt.join("feature.txt"), "the change\n").unwrap();
+        run_in(&wt, &["add", "-A"]);
+        run_in(&wt, &["commit", "-q", "-m", "add the feature"]);
+        run_in(&wt, &["push", "-q", "-u", "origin", "feature"]);
+
+        // Landed from ELSEWHERE, so this checkout's local `main` never
+        // moves. A separate clone stands in for the merge happening on
+        // the forge.
+        let lander = tmp.path().join("lander");
+        run_in(
+            tmp.path(),
+            &[
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                lander.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(lander.join("feature.txt"), "the change\n").unwrap();
+        run_in(&lander, &["add", "-A"]);
+        run_in(&lander, &["commit", "-q", "-m", "add the feature (#1)"]);
+        run_in(&lander, &["push", "-q", "origin", "main"]);
+
+        // What a merged pull request leaves behind: the remote branch
+        // gone, the tracking config still here, `origin/main` ahead and
+        // local `main` untouched.
+        run_in(&repo, &["push", "-q", "origin", "--delete", "feature"]);
+        run_in(&repo, &["fetch", "-q", "--prune", "origin"]);
+        run_in(&repo, &["remote", "set-head", "origin", "-a"]);
+
+        (tmp, repo)
+    }
+
+    /// The premise the verdict test rests on, pinned separately.
+    ///
+    /// If the fixture ever stops leaving local `main` behind
+    /// `origin/main`, the test below would pass because there is no
+    /// staleness left to be wrong about -- a green light for the bug
+    /// coming back. So the divergence is asserted directly, and so is
+    /// the fact that it is exactly what flips the answer: `git cherry`
+    /// against the remote ref finds the equivalent commit and against
+    /// the local one does not.
+    #[test]
+    fn the_fixture_really_leaves_the_local_default_branch_behind() {
+        let (_t, repo) = stale_local_default_fixture();
+
+        let local = git(&repo, &["rev-parse", "main"]).unwrap();
+        let remote = git(&repo, &["rev-parse", "origin/main"]).unwrap();
+        assert_ne!(
+            local.trim(),
+            remote.trim(),
+            "the fixture no longer reproduces a stale local default branch"
+        );
+
+        let wt = repo.parent().unwrap().join("proj-feature");
+        // `-` means git found an equivalent commit already on the other
+        // ref; `+` means it did not.
+        assert!(
+            git(&wt, &["cherry", "origin/main", "HEAD"])
+                .unwrap()
+                .trim()
+                .starts_with('-'),
+            "the work IS on origin/main"
+        );
+        assert!(
+            git(&wt, &["cherry", "main", "HEAD"])
+                .unwrap()
+                .trim()
+                .starts_with('+'),
+            "and is NOT on the stale local main -- which is the whole bug"
+        );
+    }
+
+    /// The bug this fixes (#757). Every merge verdict was computed
+    /// against the LOCAL default branch, which is only current if the
+    /// user recently pulled it.
+    ///
+    /// Measured on a 34-worktree checkout with local `main` 20 commits
+    /// behind: 12 worktrees reported `Unmerged` and 3
+    /// `MergedUpstreamDeleted`; after a fast-forward and no other change
+    /// those became 2 and 12. A nine-row swing, silent, in the safe
+    /// direction, and with a confident false reason ("branch not
+    /// merged") on every affected row.
+    ///
+    /// Before the fix this branch reports `Unmerged`: `git cherry main
+    /// HEAD` returns `+`, and `aggregate_patch_merged` then searches
+    /// `merge-base..main` -- an EMPTY range, because the stale local
+    /// `main` is the merge-base -- so there is no candidate for the
+    /// squash to match.
+    #[test]
+    fn a_branch_merged_upstream_is_not_called_unmerged_by_a_stale_local_main() {
+        let (_t, repo) = stale_local_default_fixture();
+
+        let wts = classify_repo(repo.to_str().unwrap()).unwrap();
+        let found = wts
+            .iter()
+            .find(|w| w.path.contains("proj-feature"))
+            .expect("worktree not found");
+
+        assert_eq!(
+            found.safety,
+            Safety::MergedUpstreamDeleted,
+            "the work is on origin/main and its remote branch is gone, so it is \
+             removable -- reporting otherwise hides reclaimable disk behind a \
+             reason that is false"
+        );
+    }
+
+    /// The comparison names the remote-tracking ref, not the local
+    /// branch -- the actual change, pinned at its source.
+    ///
+    /// Asserted on the returned string rather than only through a
+    /// verdict, because every downstream check takes this value as a
+    /// bare argv element and a regression here would be visible only as
+    /// verdicts quietly drifting.
+    #[test]
+    fn the_default_branch_is_the_remote_tracking_ref_when_one_exists() {
+        let (_t, repo) = stale_local_default_fixture();
+        assert_eq!(default_branch(&repo), "origin/main");
+    }
+
+    /// A repository with no remote is still served by this code, and
+    /// there `origin/main` does not resolve. Naming it anyway would turn
+    /// every merge check into a failed git call, so the local branch is
+    /// the fallback rather than the prefix being unconditional.
+    #[test]
+    fn a_repository_with_no_remote_falls_back_to_the_local_branch() {
+        let (_t, repo, _wt) = repo_with_worktree("feature");
+        assert_eq!(default_branch(&repo), "main");
+    }
+
+    /// The flag guard survives the prefix (#757 must not undo the
+    /// hardening).
+    ///
+    /// `origin/HEAD` is written by the REMOTE, so its short name is
+    /// validated before `origin/` is put back on. Prefixing first would
+    /// hide `--output=EVIL` behind a string that no longer starts with
+    /// `-`, and git would be handed an arbitrary file write.
+    #[test]
+    fn a_flag_shaped_default_branch_is_rejected_before_it_is_prefixed() {
+        let (_t, repo) = stale_local_default_fixture();
+        // A hostile remote's `origin/HEAD`. `symbolic-ref` accepts it
+        // where `git branch` would refuse.
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/--output=EVIL",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "could not plant the hostile ref");
+
+        let branch = default_branch(&repo);
+        assert!(
+            !branch.contains("--output"),
+            "a flag-shaped ref must never reach git, prefixed or not, got {branch:?}"
+        );
+        assert_eq!(branch, "origin/main", "and the fallback still resolves");
     }
 
     /// #463: the squash must still be found when the default branch has
