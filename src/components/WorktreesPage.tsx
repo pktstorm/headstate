@@ -19,6 +19,7 @@ import {
   useAllWorktreeSizes,
   useRemovalProgress,
   useAssessment,
+  useUnlockWorktree,
 } from "../api/hooks";
 import {
   formatSize,
@@ -38,6 +39,8 @@ import {
   upstreamShort,
   upstreamTone,
   refAge,
+  lockAge,
+  lockHolderNote,
   sortWorktrees,
   WORKTREE_SORT_LABELS,
   type WorktreeSort,
@@ -104,6 +107,7 @@ function Row({
   removing = false,
   assessed = false,
   onForce,
+  onUnlock,
   onRemoveOrphan,
   onPull,
   pulling = false,
@@ -123,6 +127,9 @@ function Row({
   /// moved since. Unlocks the override.
   assessed?: boolean;
   onForce: (wt: Worktree) => void;
+  /// Clear this worktree's lock (#775). Removes nothing; it opens a
+  /// confirmation naming the holder and the age.
+  onUnlock: (wt: Worktree) => void;
   /// Delete an orphaned directory. A different call from `onRemove`:
   /// git cannot remove a worktree whose repository is gone.
   onRemoveOrphan: (wt: Worktree) => void;
@@ -358,6 +365,7 @@ function Row({
         onForget={onForget}
         onRemove={onRemove}
         onForce={onForce}
+        onUnlock={onUnlock}
       />
       </span>
       {/* The disclosure, not a second action: the row keeps its
@@ -768,6 +776,15 @@ export function WorktreesPage() {
   );
 
   const [forcing, setForcing] = useState<Worktree | null>(null);
+  /// The worktree whose lock the user is being asked to confirm
+  /// clearing, or null (#775).
+  ///
+  /// Its own state rather than a flag on `forcing`: the two dialogs say
+  /// opposite things -- one is about losing work irreversibly, the
+  /// other about clearing a reversible guard -- and sharing a slot
+  /// would put them one boolean away from showing the wrong one.
+  const [unlocking, setUnlocking] = useState<Worktree | null>(null);
+  const unlock = useUnlockWorktree();
   const [pullingPath, setPullingPath] = useState<string | null>(null);
   const removeOrphanFn = useRemoveOrphan();
   // Every repository's sizes, only on the all-repositories view. One
@@ -902,6 +919,7 @@ export function WorktreesPage() {
             repoPath=""
             assessed={false}
             onForce={setForcing}
+            onUnlock={setUnlocking}
             onRemoveOrphan={runRemoveOrphan}
             onPull={runPull}
             onRemove={setPending}
@@ -1333,6 +1351,123 @@ export function WorktreesPage() {
         </Dialog>
       ) : null}
 
+      {/* The unlock confirmation (#775).
+
+          #753 declined an unlock action on the grounds that a button
+          beside a row invites clearing a claim without reading it. This
+          dialog is the answer to that objection rather than a way
+          around it: it exists to make the user LOOK at what they are
+          clearing, so it leads with the holder and the age and says
+          what is underneath before offering the button.
+
+          Deliberately NOT styled as a destructive confirmation. Nothing
+          is deleted, `git worktree lock` puts it back, and dressing a
+          reversible action in the red of the one unrecoverable action
+          on this page would teach the user to discount both. The
+          caution here is a different one -- another process may be
+          using that directory -- and it is stated in those words. */}
+      {unlocking && unlocking.safety.kind === "locked" ? (
+        <Dialog open onOpenChange={(o) => !o && setUnlocking(null)}>
+          <DialogContent className="max-w-lg">
+            <DialogTitle>Unlock {pathBasename(unlocking.path)}?</DialogTitle>
+            <ActingOnDesktop />
+            <p className="mt-3 break-all font-mono text-xs text-[#8b949e]">
+              {unlocking.path}
+            </p>
+
+            {/* WHO and WHEN, as two separate lines, because they are
+                two separate pieces of evidence and one of them is much
+                better than the other.
+
+                The age leads. It is the only part that differs per row
+                and that a long-lived parent process cannot fake --
+                measured, the locks on the reporting machine span four
+                days while every one of them names the same pid. */}
+            <p className="mt-3 text-sm text-[#e6edf3]">
+              Locked {lockAge(unlocking.safety.detail) ?? "at an unknown time"}
+              {unlocking.safety.detail.reason === null ? (
+                <>, with no reason given.</>
+              ) : (
+                <>
+                  {" "}
+                  by{" "}
+                  <span className="font-mono text-xs">
+                    {unlocking.safety.detail.reason}
+                  </span>
+                </>
+              )}
+            </p>
+
+            {/* What checking the pid actually established -- phrased so
+                a running process cannot be mistaken for proof that the
+                lock is live. On the reporting machine this reads
+                "still running" for all 20 locks and every one of them
+                is abandoned, which is exactly why the sentence carries
+                its own caveat. */}
+            {lockHolderNote(unlocking.safety.detail) ? (
+              <p className="mt-2 text-sm text-[#8b949e]">
+                {lockHolderNote(unlocking.safety.detail)}
+              </p>
+            ) : null}
+
+            {/* What is UNDERNEATH -- the thing #753 could not tell the
+                user, and the reason unlocking was a blind action. */}
+            <p className="mt-2 text-sm text-[#8b949e]">
+              Underneath the lock, this worktree is{" "}
+              <span className="text-[#e6edf3]">
+                {safetyReason(unlocking.safety.detail.underlying)}
+              </span>
+              .
+            </p>
+
+            {/* The honest caution. Not "this cannot be undone" -- it
+                plainly can -- but the risk that is real: the lock is
+                how another process says it is using this directory. */}
+            <p className="mt-3 text-sm text-[#d29922]">
+              Unlocking deletes nothing and can be undone by locking it
+              again. It does clear the only signal another process has for
+              saying it is working here — so check the holder above before
+              clearing it.
+            </p>
+
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setUnlocking(null)}
+                className="rounded border border-[#30363d] px-3 py-1.5 text-sm hover:bg-[#21262d]"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const target = unlocking;
+                  const name = pathBasename(target.path);
+                  setUnlocking(null);
+                  unlock(selected?.path ?? "", target.path).then(
+                    () =>
+                      toast.success(`Unlocked ${name}`, {
+                        // Says what changed and what did NOT: the row
+                        // is about to re-classify, and the user should
+                        // not read a successful unlock as a removal.
+                        description:
+                          "The worktree is still there — its safety verdict will refresh.",
+                      }),
+                    (e: unknown) =>
+                      toast.error(`Could not unlock ${name}`, {
+                        description: typeof e === "string" ? e : undefined,
+                      }),
+                  );
+                }}
+                className="rounded border border-[#d29922]/40 px-3 py-1.5 text-sm font-medium text-[#d29922] hover:bg-[#d29922]/10"
+              >
+                Unlock it
+              </button>
+            </div>
+          </DialogContent>
+        </Dialog>
+      ) : null}
+
       {bulkOpen ? (
         <Dialog open onOpenChange={(o) => !o && setBulkOpen(false)}>
           <DialogContent className="max-w-2xl">
@@ -1458,6 +1593,7 @@ export function WorktreesPage() {
               pr={prForWorktree(prs, selected?.identity ?? null, wt.branch)}
               assessed={assessed.has(wt.path)}
               onForce={setForcing}
+              onUnlock={setUnlocking}
               onRemoveOrphan={runRemoveOrphan}
               onPull={runPull}
               pulling={pullingPath === wt.path}

@@ -1,4 +1,4 @@
-use super::model::{Repo, Safety, Upstream, Worktree};
+use super::model::{Lock, Repo, Safety, Upstream, Worktree};
 use std::path::Path;
 use std::process::Command;
 
@@ -298,12 +298,35 @@ pub fn worktree_safety(
     // taking it silently would break the only signal a concurrent
     // process has for claiming a directory -- on the reporting machine
     // 13 of 34 worktrees were locked by agents actively working in them.
+    // What #775 adds is UNDERNEATH, not instead. The ordering above is
+    // unchanged and the verdict is still `Locked`; the difference is
+    // that the checks below now also run, and their answer is carried
+    // inside it.
+    //
+    // Deliberately NOT a reorder. Returning the merge verdict for a
+    // locked worktree would send the user to merge something and leave
+    // them refused anyway, which is exactly what #753 reasoned through
+    // and got right. Both facts are wanted, so both are computed, and
+    // the one that governs the button stays on top.
+    //
+    // The recursion terminates because the copy has no lock: the check
+    // above is the only reader of `wt.locked`, and `unlocked` clears
+    // it. So the second pass falls through to the ordinary checks and
+    // can never re-enter this arm.
     if let Some(why) = &wt.locked {
-        // Empty means git emitted a bare `locked` line, i.e. a lock
-        // taken without `--reason`. Reported as "no reason given"
-        // rather than as an empty quotation, which would read like a
-        // display bug.
-        return Safety::Locked((!why.is_empty()).then(|| why.clone()));
+        let mut unlocked = wt.clone();
+        unlocked.locked = None;
+        let underlying = worktree_safety(&unlocked, default_branch, has_upstream, ahead);
+        return Safety::Locked(Lock {
+            // Empty means git emitted a bare `locked` line, i.e. a lock
+            // taken without `--reason`. Reported as "no reason given"
+            // rather than as an empty quotation, which would read like
+            // a display bug.
+            reason: (!why.is_empty()).then(|| why.clone()),
+            age_days: lock_age_days(dir),
+            holder_running: pid_in(why).map(process_is_running),
+            underlying: Box::new(underlying),
+        });
     }
 
     // A branch that was never committed to holds nothing, pushed or
@@ -500,6 +523,86 @@ pub fn worktree_safety(
     // worktrees, calling the other 147 unmerged. Those 147 are exactly
     // the ones filling the disk this view exists to reclaim.
     merged_into(dir, default_branch)
+}
+
+/// How many whole days ago this worktree's lock was taken.
+///
+/// **Measured from git's own `locked` file, not from the reason
+/// string.** The reason string was the obvious source -- the locks on
+/// the reporting machine embed `start <ctime>` -- and it is the wrong
+/// one: all 20 carry the IDENTICAL timestamp, because it dates the
+/// process that took the locks rather than any individual claim. A
+/// column computed from it would show the same number on every row and
+/// would age all 20 in step, which is precisely the false-evidence
+/// problem #775 is about, moved into a new field.
+///
+/// The `locked` file's mtime is per-lock and cannot be faked by a
+/// long-lived parent. Verified against real git: `git worktree lock`
+/// writes the file, and an unlock followed by a re-lock rewrites it, so
+/// the mtime is when the CURRENT claim was made rather than when the
+/// directory was first ever locked.
+///
+/// Found by reading the worktree's `.git` FILE, which holds
+/// `gitdir: <admin dir>` -- the same filesystem-only technique
+/// `orphan_gitdir` uses, and for the same reason: it costs no git
+/// process, and this runs for every locked row on a page where 45% of
+/// them are locked.
+///
+/// `None` on any failure. A lock whose age cannot be read is not a
+/// fresh lock, and a confident 0 here would make an unreadable claim
+/// look like a brand-new one -- the direction that makes clearing it
+/// feel safer than it is.
+fn lock_age_days(dir: &Path) -> Option<u64> {
+    let contents = std::fs::read_to_string(dir.join(".git")).ok()?;
+    let admin = contents.strip_prefix("gitdir:")?.trim();
+    let meta = std::fs::metadata(Path::new(admin).join("locked")).ok()?;
+    let age = std::time::SystemTime::now()
+        .duration_since(meta.modified().ok()?)
+        .ok()?;
+    Some(age.as_secs() / 86_400)
+}
+
+/// The pid a lock reason names, if it names one.
+///
+/// Git imposes no format on `--reason`, so this is a convention rather
+/// than a contract: it looks for `pid <digits>`, which is what the
+/// locks on the reporting machine use and the spelling #753 already
+/// documents. Anything else yields `None`, which the UI reads as
+/// "nothing to check" rather than as "nobody holds it".
+///
+/// Parsed at all only so the app can say what it CHECKED. The pid is
+/// not treated as identifying evidence: see `Lock::holder_running`.
+fn pid_in(reason: &str) -> Option<u32> {
+    let tail = reason.split("pid ").nth(1)?;
+    let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// Whether a pid is a currently-running process.
+///
+/// Through `sysinfo`, which is already a dependency for System Health
+/// and is portable -- rather than a raw `kill(pid, 0)`, which would
+/// mean `unsafe` and a `libc` dependency for one call, and rather than
+/// spawning `ps`, which would mean a process per locked row on a page
+/// where 45% of rows are locked.
+///
+/// Refreshes only the ONE pid, not the process table. The whole
+/// question is "does this exist", and enumerating several hundred
+/// processes to answer it -- once per locked row -- would be the
+/// expensive way to learn one bit.
+///
+/// **Weak evidence, carried honestly.** On the reporting machine this
+/// answers true for all 20 locks and every one of them is abandoned,
+/// because the pid belongs to the surviving parent session rather than
+/// to the worker that took the lock. So a `true` here is worth very
+/// little and the UI must not spend it as proof; a `false` is worth a
+/// great deal, being the one unambiguous signal that the named holder
+/// is gone.
+fn process_is_running(pid: u32) -> bool {
+    let pid = sysinfo::Pid::from_u32(pid);
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    sys.process(pid).is_some()
 }
 
 /// Whether this branch's work is already on `default_branch`.
@@ -1853,6 +1956,27 @@ fn collect_inner(dir: &Path, depth: usize, out: &mut Vec<Repo>, with_safety: boo
 
 #[cfg(test)]
 mod tests {
+    /// A `Lock` for tests that care only about the reason and what is
+    /// underneath.
+    ///
+    /// Age and holder-liveness are left unset because they are
+    /// environment-dependent -- a real fixture's lock is always seconds
+    /// old, and any pid a test names may or may not exist on the
+    /// machine running it. The tests that DO care about those fields
+    /// assert on them individually rather than through equality.
+    ///
+    /// Reasons here are synthetic per `CONTRIBUTING.md`: this
+    /// repository is public, and the real ones name a tool and a
+    /// machine.
+    fn lock_of(reason: Option<&str>, underlying: Safety) -> Lock {
+        Lock {
+            reason: reason.map(str::to_string),
+            age_days: None,
+            holder_running: None,
+            underlying: Box::new(underlying),
+        }
+    }
+
     /// Progress must be reported AFTER each removal, so the count means
     /// "done" rather than "started". A bar that reaches 100% while work
     /// is still running is worse than no bar at all.
@@ -2039,8 +2163,15 @@ prunable gitdir file points to non-existent location
             // may become removable by being new: a locked tree is one
             // git refuses outright, and a prunable one has no directory
             // left for the remove path to act on.
-            Safety::Locked(Some("some tool (pid 123)".into())),
-            Safety::Locked(None),
+            Safety::Locked(lock_of(Some("some tool (pid 123)"), Safety::Unmerged)),
+            Safety::Locked(lock_of(None, Safety::Unmerged)),
+            // THE case #775 could have broken. A lock now carries what
+            // the worktree would be underneath, and here that is `Safe`
+            // -- so if `is_safe` ever learned to look inside the
+            // payload, this row would become one-click deletable while
+            // git still refused it. The verdict on top is the only one
+            // that governs the button.
+            Safety::Locked(lock_of(Some("some tool (pid 123)"), Safety::Safe)),
             Safety::Prunable("gitdir file points to non-existent location".into()),
             Safety::Unknown("x".into()),
         ] {
@@ -2713,11 +2844,38 @@ prunable gitdir file points to non-existent location
             .expect("a locked worktree is still listed");
         let s = worktree_safety(target, &branch, true, Some(0));
 
-        assert_eq!(s, Safety::Locked(Some("some tool (pid 123)".into())));
+        let Safety::Locked(lock) = &s else {
+            panic!("expected Locked, got {s:?}");
+        };
+        assert_eq!(lock.reason.as_deref(), Some("some tool (pid 123)"));
         assert!(!s.is_safe(), "git refuses to remove it: {}", s.reason());
-        // The reason is the whole point of the variant: it is what
-        // tells a live claim from a leftover one.
+        // The reason is still carried verbatim -- it is the locker's
+        // own words, and #775 demoted it rather than dropping it.
         assert!(s.reason().contains("some tool (pid 123)"), "{}", s.reason());
+
+        // #775: the merge state UNDERNEATH the lock. This fixture is
+        // merged and clean, so without the lock it would be removable
+        // -- which is exactly the thing a user needs to know before
+        // deciding whether clearing the claim is worth it.
+        assert!(
+            lock.underlying.is_safe(),
+            "the worktree is merged under the lock: {:?}",
+            lock.underlying
+        );
+        assert!(
+            s.reason().contains("would be safe once unlocked"),
+            "the row must say what is underneath: {}",
+            s.reason()
+        );
+
+        // And it is STILL not removable. Knowing the thing behind the
+        // lock is disposable must not make the lock itself negotiable:
+        // git refuses either way until it is actually unlocked.
+        assert!(
+            !s.is_safe(),
+            "merged underneath is not a licence to remove: {}",
+            s.reason()
+        );
     }
 
     /// Uncommitted work outranks the lock (#753).
@@ -2779,9 +2937,408 @@ prunable gitdir file points to non-existent location
             .unwrap();
         let s = worktree_safety(target, &branch, true, Some(0));
 
-        assert_eq!(s, Safety::Locked(None));
+        let Safety::Locked(lock) = &s else {
+            panic!("expected Locked, got {s:?}");
+        };
+        assert_eq!(lock.reason, None, "a bare lock names nobody");
         assert!(!s.is_safe(), "{}", s.reason());
         assert!(s.reason().contains("no reason given"), "{}", s.reason());
+
+        // With no reason there is no pid to check, and the app must say
+        // "nothing to check" rather than "the holder is gone" -- the
+        // second would read as evidence the lock is stale, which is a
+        // claim nothing here supports (#775).
+        assert_eq!(
+            lock.holder_running, None,
+            "a lock naming no pid yields no liveness verdict"
+        );
+
+        // The age still works for a lock with no reason: it comes from
+        // git's `locked` FILE, not from the reason string. That is the
+        // whole point of taking it from the mtime -- a lock that says
+        // nothing can still be shown to be five days old.
+        assert_eq!(
+            lock.age_days,
+            Some(0),
+            "a lock taken just now is 0 whole days old"
+        );
+        assert!(s.reason().contains("today"), "{}", s.reason());
+    }
+
+    /// The merge state under a lock is computed, and it is the REAL
+    /// one -- not a shortcut that assumes an unmerged branch (#775).
+    ///
+    /// The companion to the `a_locked_worktree_is_never_safe` case: that
+    /// one locks a merged worktree and expects `underlying` to be safe,
+    /// so on its own it would also pass if `underlying` were hardcoded
+    /// optimistically. This locks an UNMERGED one and expects the
+    /// opposite, which is what makes the pair evidence that the check
+    /// actually ran.
+    ///
+    /// It matters because the whole point is informing a decision. A
+    /// row that said "would be safe once unlocked" over unmerged work
+    /// would be worse than saying nothing: it would invite exactly the
+    /// blind unlock #775 exists to prevent, with the app's
+    /// encouragement.
+    #[test]
+    fn an_unmerged_worktree_under_a_lock_does_not_read_as_safe() {
+        let (_t, repo, wt) = repo_with_worktree("held-unmerged");
+        // Real commits, deliberately NOT merged into the default
+        // branch: this is the state that must not be described as
+        // disposable.
+        commit_in(&wt, "work that never landed");
+        git_ok(
+            &repo,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "some tool (pid 123)",
+                wt.to_str().unwrap(),
+            ],
+        );
+
+        let branch = default_branch(&repo);
+        let listed = parse_porcelain(&git(&repo, &["worktree", "list", "--porcelain"]).unwrap());
+        let target = listed
+            .iter()
+            .find(|w| !w.is_main && w.branch == "held-unmerged")
+            .unwrap();
+        let s = worktree_safety(target, &branch, true, Some(0));
+
+        let Safety::Locked(lock) = &s else {
+            panic!("expected Locked, got {s:?}");
+        };
+        assert!(
+            !lock.underlying.is_safe(),
+            "unmerged work must not read as disposable: {:?}",
+            lock.underlying
+        );
+        assert!(
+            !s.reason().contains("would be safe once unlocked"),
+            "the row must not invite an unlock it cannot justify: {}",
+            s.reason()
+        );
+    }
+
+    /// A lock's age comes from git's own `locked` file (#775).
+    ///
+    /// The reason string was the tempting source -- the locks on the
+    /// reporting machine embed `start <date>` -- and it is wrong: all
+    /// 20 there carry the IDENTICAL timestamp, because it dates the
+    /// long-lived parent process rather than any individual claim.
+    ///
+    /// This pins the property that distinguishes the two sources. The
+    /// reason here names a date years in the past while the lock is
+    /// seconds old, so a reader of the reason string would report an
+    /// ancient lock. The mtime reports the truth.
+    #[test]
+    fn the_lock_age_ignores_a_timestamp_in_the_reason() {
+        let (_t, repo, wt) = repo_with_worktree("held-misdated");
+        git_ok(
+            &repo,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                // Synthetic, per CONTRIBUTING.md, but the same SHAPE as
+                // the real ones: a tool, a pid, and a start date that
+                // belongs to the process rather than to this lock.
+                "some tool (pid 123 start Mon Jan  1 00:00:00 2001)",
+                wt.to_str().unwrap(),
+            ],
+        );
+
+        let branch = default_branch(&repo);
+        let listed = parse_porcelain(&git(&repo, &["worktree", "list", "--porcelain"]).unwrap());
+        let target = listed
+            .iter()
+            .find(|w| !w.is_main && w.branch == "held-misdated")
+            .unwrap();
+        let s = worktree_safety(target, &branch, true, Some(0));
+
+        let Safety::Locked(lock) = &s else {
+            panic!("expected Locked, got {s:?}");
+        };
+        assert_eq!(
+            lock.age_days,
+            Some(0),
+            "the lock was taken just now, whatever its reason claims"
+        );
+        assert!(
+            s.reason().contains("today"),
+            "a lock taken now must not read as decades old: {}",
+            s.reason()
+        );
+    }
+
+    /// An OLD lock reports its real age (#775).
+    ///
+    /// Every other age test locks a fixture and sees 0 days, which
+    /// would pass just as well against a function hardcoded to
+    /// `Some(0)` -- and `Some(0)` renders as "today", the most
+    /// reassuring thing the row could possibly say. The stale lock is
+    /// the case the feature exists for, so it gets a test where the
+    /// answer is not 0.
+    ///
+    /// Backdates git's own `locked` file with `filetime`-free plumbing:
+    /// the file is rewritten and its mtime set through `std`. The rest
+    /// of the path is real -- real `git worktree lock` took it, and
+    /// `lock_age_days` finds it the way production does, by reading the
+    /// worktree's `.git` file to reach the admin directory.
+    #[test]
+    fn a_lock_taken_days_ago_reads_as_days_old() {
+        let (_t, repo, wt) = repo_with_worktree("held-a-while");
+        git_ok(
+            &repo,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "some tool (pid 123)",
+                wt.to_str().unwrap(),
+            ],
+        );
+
+        // Reach the lock file exactly as `lock_age_days` does, so this
+        // test also pins the admin-directory lookup rather than
+        // hardcoding a layout git could change.
+        let contents = std::fs::read_to_string(wt.join(".git")).unwrap();
+        let admin = contents.strip_prefix("gitdir:").unwrap().trim();
+        let lock_file = std::path::Path::new(admin).join("locked");
+        assert!(lock_file.is_file(), "git writes the lock file at {admin}");
+
+        // Five days back, which is the age the reporting machine's
+        // oldest locks had reached.
+        let five_days = std::time::Duration::from_secs(5 * 86_400);
+        let then = std::time::SystemTime::now() - five_days;
+        std::fs::File::options()
+            .write(true)
+            .open(&lock_file)
+            .unwrap()
+            .set_modified(then)
+            .unwrap();
+
+        let branch = default_branch(&repo);
+        let listed = parse_porcelain(&git(&repo, &["worktree", "list", "--porcelain"]).unwrap());
+        let target = listed.iter().find(|w| w.branch == "held-a-while").unwrap();
+        let s = worktree_safety(target, &branch, true, Some(0));
+
+        let Safety::Locked(lock) = &s else {
+            panic!("expected Locked, got {s:?}");
+        };
+        assert_eq!(lock.age_days, Some(5), "the lock is five days old");
+        // The prose is the deliverable: a stale lock has to READ as
+        // stale, which is the whole ask of #775's first point.
+        assert!(
+            s.reason().contains("5 days ago"),
+            "a five-day-old lock must say so: {}",
+            s.reason()
+        );
+        assert!(
+            !s.reason().contains("today"),
+            "and must not read as fresh: {}",
+            s.reason()
+        );
+    }
+
+    /// A pid that does not exist is reported as gone (#775).
+    ///
+    /// The one genuinely decisive thing the pid can say. A LIVE pid is
+    /// weak evidence -- on the reporting machine all 20 locks name one
+    /// that is alive because it is the surviving parent -- but a dead
+    /// one is unambiguous, and it is what turns "some tool holds this"
+    /// into "nothing holds this".
+    ///
+    /// Pid 0x7FFF_FFFE is chosen to be absent rather than merely
+    /// unlikely: it sits above every default `pid_max`, so no process
+    /// can legitimately carry it.
+    #[test]
+    fn a_lock_naming_a_dead_process_says_so() {
+        let (_t, repo, wt) = repo_with_worktree("held-by-nobody");
+        git_ok(
+            &repo,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "some tool (pid 2147483646)",
+                wt.to_str().unwrap(),
+            ],
+        );
+
+        let branch = default_branch(&repo);
+        let listed = parse_porcelain(&git(&repo, &["worktree", "list", "--porcelain"]).unwrap());
+        let target = listed
+            .iter()
+            .find(|w| !w.is_main && w.branch == "held-by-nobody")
+            .unwrap();
+        let s = worktree_safety(target, &branch, true, Some(0));
+
+        let Safety::Locked(lock) = &s else {
+            panic!("expected Locked, got {s:?}");
+        };
+        assert_eq!(
+            lock.holder_running,
+            Some(false),
+            "no process carries that pid"
+        );
+
+        // And the process running THIS test is, which is the control:
+        // without it a `process_is_running` that always returned false
+        // would satisfy the assertion above.
+        assert!(
+            process_is_running(std::process::id()),
+            "the test's own process is running"
+        );
+    }
+
+    /// `unlock_worktree` clears the lock and nothing else (#775).
+    ///
+    /// Real `git worktree unlock` against a real repository, following
+    /// the #753 fixtures: the point is that the whole path works, and a
+    /// mocked git would pass while the command failed.
+    ///
+    /// Asserts what it does NOT do as firmly as what it does. Unlocking
+    /// is not removal, and the directory and its branch must both
+    /// survive -- otherwise this would be a second, quieter route to
+    /// the one unrecoverable action in the app.
+    #[test]
+    fn unlocking_clears_the_lock_and_removes_nothing() {
+        let (_t, repo, wt) = repo_with_worktree("held-then-cleared");
+        commit_in(&wt, "the work");
+        git_ok(
+            &repo,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "some tool (pid 123)",
+                wt.to_str().unwrap(),
+            ],
+        );
+
+        let locked = parse_porcelain(&git(&repo, &["worktree", "list", "--porcelain"]).unwrap());
+        assert!(
+            locked
+                .iter()
+                .any(|w| w.branch == "held-then-cleared" && w.locked.is_some()),
+            "the fixture must start out locked, or it tests nothing"
+        );
+
+        unlock_worktree(repo.to_str().unwrap(), wt.to_str().unwrap()).unwrap();
+
+        let after = parse_porcelain(&git(&repo, &["worktree", "list", "--porcelain"]).unwrap());
+        let target = after
+            .iter()
+            .find(|w| w.branch == "held-then-cleared")
+            .expect("the worktree must still be listed -- unlocking is not removal");
+        assert!(target.locked.is_none(), "the lock is gone");
+        assert!(wt.is_dir(), "the directory must survive an unlock");
+        assert!(
+            wt.join("the work").exists() || wt.is_dir(),
+            "the contents must survive an unlock"
+        );
+    }
+
+    /// Unlocking does not make removal easier (#775).
+    ///
+    /// The rule the whole change hangs on. A locked worktree that is
+    /// merged underneath now SAYS it would be safe once unlocked, and
+    /// that must stay a statement about a hypothetical -- the gate has
+    /// to keep refusing until the lock is actually cleared.
+    ///
+    /// Both halves are asserted in one test on purpose: they are one
+    /// claim, and split across two files nothing would notice if the
+    /// "before" stopped being refused.
+    #[test]
+    fn a_merged_worktree_stays_refused_until_it_is_really_unlocked() {
+        let (_t, repo, wt) = repo_with_worktree("held-merged");
+        commit_in(&wt, "the work");
+        git_ok(&repo, &["merge", "-q", "--ff-only", "held-merged"]);
+        git_ok(
+            &repo,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "some tool (pid 123)",
+                wt.to_str().unwrap(),
+            ],
+        );
+        let branch = default_branch(&repo);
+
+        // BEFORE: merged underneath, and still refused.
+        let listed = parse_porcelain(&git(&repo, &["worktree", "list", "--porcelain"]).unwrap());
+        let target = listed.iter().find(|w| w.branch == "held-merged").unwrap();
+        let s = worktree_safety(target, &branch, true, Some(0));
+        let Safety::Locked(lock) = &s else {
+            panic!("expected Locked, got {s:?}");
+        };
+        assert!(lock.underlying.is_safe(), "merged underneath");
+        assert!(!s.is_safe(), "and still refused: {}", s.reason());
+
+        // The gate that actually deletes agrees, which is the one that
+        // matters: `is_safe` is a display concern, `remove_worktree` is
+        // the unrecoverable one.
+        let err = remove_worktree(repo.to_str().unwrap(), wt.to_str().unwrap())
+            .expect_err("a locked worktree must not be removable");
+        assert!(err.contains("locked"), "{err}");
+        assert!(wt.is_dir(), "nothing was removed");
+
+        // AFTER: the same worktree, really unlocked, is really safe.
+        unlock_worktree(repo.to_str().unwrap(), wt.to_str().unwrap()).unwrap();
+        let listed = parse_porcelain(&git(&repo, &["worktree", "list", "--porcelain"]).unwrap());
+        let target = listed.iter().find(|w| w.branch == "held-merged").unwrap();
+        assert!(
+            worktree_safety(target, &branch, true, Some(0)).is_safe(),
+            "clearing the lock reveals the verdict the row promised"
+        );
+    }
+
+    /// `unlock_worktree` refuses a path that is not this repository's
+    /// (#775).
+    ///
+    /// The same rule `remove_inner` applies, for the same reason:
+    /// without it the command is "unlock any path the frontend names".
+    /// Unlocking is not destructive, but a command that acts on
+    /// arbitrary paths is a bad shape regardless of what it does to
+    /// them.
+    #[test]
+    fn unlocking_refuses_a_worktree_of_another_repository() {
+        let (_a, repo_a, _wt_a) = repo_with_worktree("mine");
+        let (_b, _repo_b, wt_b) = repo_with_worktree("theirs");
+
+        let err = unlock_worktree(repo_a.to_str().unwrap(), wt_b.to_str().unwrap())
+            .expect_err("a stranger's worktree is not this repository's to unlock");
+        assert!(err.contains("not a worktree of this repository"), "{err}");
+    }
+
+    /// Unlocking something that is not locked says so, in the app's own
+    /// words (#775).
+    ///
+    /// The scan is a snapshot, so a row can be clicked after somebody
+    /// else has already cleared the lock -- an ordinary race on a page
+    /// where 45% of rows are locked, not a corner case.
+    ///
+    /// Git also refuses this, with `fatal: '<path>' is not locked`, so
+    /// the message alone does not prove the app checked. What the app's
+    /// own guard buys is the FRAMING: reaching git means the user is
+    /// shown "git refused: fatal: ...", which reads as a fault, for
+    /// what is in fact nothing to do. So the assertion is that the
+    /// refusal is NOT git's -- otherwise this test would pass with the
+    /// check deleted, which was confirmed by deleting it.
+    #[test]
+    fn unlocking_an_unlocked_worktree_reports_plainly() {
+        let (_t, repo, wt) = repo_with_worktree("never-held");
+
+        let err = unlock_worktree(repo.to_str().unwrap(), wt.to_str().unwrap())
+            .expect_err("there is no lock to clear");
+        assert!(err.contains("not locked"), "{err}");
+        assert!(
+            !err.contains("git refused") && !err.contains("fatal"),
+            "the app answers this itself rather than relaying a fatal error: {err}"
+        );
     }
 
     /// Unlocking restores the ordinary verdict (#753).
@@ -6182,6 +6739,75 @@ mod live {
         }
     }
 
+    /// What is really underneath the locks on a real machine (#775).
+    ///
+    /// The question the whole change exists to answer, asked of the
+    /// production classifier rather than of a fixture: of the locked
+    /// worktrees on this repository, how many are merged and would be
+    /// removable once the lock were cleared?
+    ///
+    /// `#[ignore]` and env-driven, following
+    /// `live_squash_merged_worktree_is_detected` -- the established way
+    /// to check a fix against a real tree without committing one, since
+    /// the tree it needs cannot exist in a public repository.
+    ///
+    /// Prints the age distribution alongside, because that is the other
+    /// half of the argument: if the locks are all one age the reason
+    /// string would have done, and if they are spread over days then
+    /// the mtime is carrying real information the reason cannot.
+    #[test]
+    #[ignore]
+    fn live_locked_worktree_census() {
+        let Ok(path) = std::env::var("HEADSTATE_REAL_REPO") else {
+            println!("set HEADSTATE_REAL_REPO to a repo with locked worktrees to run this");
+            return;
+        };
+        let repo = std::path::PathBuf::from(path);
+        if !repo.is_dir() {
+            println!("repo absent; nothing to check");
+            return;
+        }
+        let default = default_branch(&repo);
+        let listed = parse_porcelain(&git(&repo, &["worktree", "list", "--porcelain"]).unwrap());
+
+        let t = std::time::Instant::now();
+        let mut locked = 0usize;
+        let mut merged_underneath = 0usize;
+        let mut ages: std::collections::BTreeMap<Option<u64>, usize> = Default::default();
+        let mut holders: std::collections::BTreeMap<Option<bool>, usize> = Default::default();
+        let mut underlying: std::collections::BTreeMap<String, usize> = Default::default();
+        for w in &listed {
+            let mut w = w.clone();
+            classify(&mut w, &repo, &default);
+            let Safety::Locked(lock) = &w.safety else {
+                continue;
+            };
+            locked += 1;
+            if lock.underlying.is_safe() {
+                merged_underneath += 1;
+            }
+            *ages.entry(lock.age_days).or_default() += 1;
+            *holders.entry(lock.holder_running).or_default() += 1;
+            let key = match lock.underlying.as_ref() {
+                Safety::Unknown(m) => format!("Unknown({m})"),
+                Safety::Dirty(_) => "Dirty".into(),
+                Safety::Unpushed(_) => "Unpushed".into(),
+                other => format!("{other:?}"),
+            };
+            *underlying.entry(key).or_default() += 1;
+        }
+
+        println!(
+            "worktrees: {}  locked: {locked}  merged underneath: {merged_underneath}  \
+             classified in {:?}",
+            listed.len(),
+            t.elapsed()
+        );
+        println!("underlying verdicts: {underlying:?}");
+        println!("age in days -> count: {ages:?}");
+        println!("holder running -> count: {holders:?}");
+    }
+
     #[test]
     #[ignore]
     fn live_squash_merged_worktree_is_detected() {
@@ -6440,6 +7066,75 @@ fn remove_inner(repo_path: &str, worktree_path: &str, allow_unsafe: bool) -> Res
     // could be relative or flag-shaped, and the gate above already
     // matched this record.
     git(repo, &["worktree", "remove", "--", &wt.path])
+        .map(|_| ())
+        .map_err(|e| format!("git refused: {e}"))
+}
+
+/// Clear a worktree's lock.
+///
+/// **Not destructive, and deliberately not treated as harmless
+/// either.** Nothing is deleted and the operation is exactly reversible
+/// by `git worktree lock`, so this is not in the same class as
+/// `remove_worktree`. What it removes is a GUARD: the lock is the only
+/// mechanism a concurrent process has for saying "I am using this", and
+/// clearing one that is genuinely live invites a second process into a
+/// directory the first is working in.
+///
+/// #753 declined to offer this at all, reasoning that a one-click
+/// button beside a row invites clearing a claim without reading it.
+/// That reasoning was right for its evidence and #775 changed the
+/// evidence: 20 of 44 worktrees on the reporting machine are locked,
+/// all by one pid that is alive only because it is the parent session,
+/// and `lsof -d cwd` finds nothing working in any of them. At 45% of
+/// the list, refusing to offer the remedy does not protect the user
+/// from a bad decision -- it leaves them with a view they cannot use
+/// and sends them to a terminal to do the same thing unaided.
+///
+/// So it is offered, and the care went into the CONFIRMATION rather
+/// than into withholding the action: the dialog names the holder and
+/// the age and says what is underneath, which is the reading #753
+/// wanted and a bare button would have skipped.
+///
+/// This function does NOT remove anything, and removal does not become
+/// easier by its existence. The gate is untouched: `worktree_safety`
+/// still returns `Locked` while the lock is there, and after this the
+/// worktree is re-classified from scratch and refused or allowed on its
+/// own merits. A merged worktree under a lock is still locked until
+/// this actually runs.
+///
+/// Verifies the target belongs to THIS repository first, exactly as
+/// `remove_inner` does and for the same reason: without it, the command
+/// is "unlock any path the frontend names".
+pub fn unlock_worktree(repo_path: &str, worktree_path: &str) -> Result<(), String> {
+    let repo = Path::new(repo_path);
+    let target = Path::new(worktree_path);
+
+    let list = git(repo, &["worktree", "list", "--porcelain"])
+        .map_err(|e| format!("could not list worktrees: {e}"))?;
+    let known = parse_porcelain(&list);
+
+    // Canonical comparison, for the reasons `canonical_key` documents:
+    // macOS resolves /var to /private/var, so a raw string compare
+    // fails for anything under a temp directory.
+    let target_canon = canonical_key(target);
+    let wt = known
+        .iter()
+        .find(|w| canonical_key(Path::new(&w.path)) == target_canon)
+        .ok_or_else(|| "not a worktree of this repository".to_string())?;
+
+    // Re-checked RIGHT NOW rather than trusted from the scan, which is
+    // a snapshot. Not a safety gate -- unlocking loses nothing -- but
+    // saying "that worktree is not locked" beats git's own error, and
+    // it means a stale click on a row somebody else already unlocked
+    // reports the truth instead of a refusal that reads as a fault.
+    if wt.locked.is_none() {
+        return Err("that worktree is not locked".into());
+    }
+
+    // git's OWN resolved path, with a `--` separator: the caller's raw
+    // string could be relative or flag-shaped, and the gate above has
+    // already matched this record.
+    git(repo, &["worktree", "unlock", "--", &wt.path])
         .map(|_| ())
         .map_err(|e| format!("git refused: {e}"))
 }

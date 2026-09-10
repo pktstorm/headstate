@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
-import type { Safety, Worktree } from "@/types/pr";
+import type { Lock, Safety, Worktree } from "@/types/pr";
 import {
   canClaudify,
   forceWarning,
   formatSize,
   isSafe,
+  lockAge,
+  lockHolderNote,
+  lockReason,
   pathBasename,
   prForWorktree,
   safetyReason,
@@ -13,6 +16,21 @@ import {
   totalSize,
   WORKTREE_SORT_LABELS,
 } from "./worktrees";
+
+/// A lock for tests that care only about some of its fields.
+///
+/// Reasons are synthetic per CONTRIBUTING.md: this repository is
+/// public, and the real ones name a tool and a machine. The default
+/// `underlying` is `unmerged` rather than `safe` so a test that does
+/// not mention it cannot accidentally assert the "would be safe once
+/// unlocked" wording.
+const lock = (over: Partial<Lock> = {}): Lock => ({
+  reason: "some tool (pid 123)",
+  age_days: 0,
+  holder_running: null,
+  underlying: { kind: "unmerged" },
+  ...over,
+});
 
 describe("isSafe", () => {
   // Only `safe` is deletable. Everything else is disabled rather than
@@ -40,8 +58,13 @@ describe("isSafe", () => {
       // #753, both spellings of a lock and the stale registration.
       // Safe-by-default: a locked tree is one git refuses outright,
       // and a prunable one has no directory left to remove.
-      { kind: "locked", detail: "some tool (pid 123)" },
-      { kind: "locked", detail: null },
+      { kind: "locked", detail: lock() },
+      { kind: "locked", detail: lock({ reason: null }) },
+      // #775: a lock whose work IS merged underneath. It must stay
+      // un-removable -- the row now says it "would be safe once
+      // unlocked", and that must remain a statement about a
+      // hypothetical rather than a licence.
+      { kind: "locked", detail: lock({ underlying: { kind: "safe" } }) },
       { kind: "prunable", detail: "gitdir file points to non-existent location" },
       { kind: "unknown", detail: "x" },
     ] as Safety[]) {
@@ -80,19 +103,67 @@ describe("safetyReason", () => {
     expect(reason).not.toBe(safetyReason({ kind: "never_pushed" }));
   });
 
-  // #753: the lock reason is the whole point of the state. "locked"
-  // alone sends the user to a terminal to find out by whom, where
-  // "some tool (pid 123)" is what separates a live claim from one left
-  // behind by a process that died.
-  it("names who holds a lock", () => {
-    const held = safetyReason({ kind: "locked", detail: "some tool (pid 123)" });
-    expect(held).toContain("locked");
+  // #753 named the locker; #775 leads with the AGE instead.
+  //
+  // The reason alone stopped discriminating once locks accumulated:
+  // all 20 on the reporting machine name the same pid, which is alive
+  // only because it is the parent that outlived the workers. The age
+  // is the part that differs per row, so a stale lock has to READ as
+  // stale rather than merely carry a string that looks like evidence.
+  it("leads with a lock's age, and still names the holder", () => {
+    const held = safetyReason({
+      kind: "locked",
+      detail: lock({ age_days: 5 }),
+    });
+    expect(held).toContain("locked 5 days ago");
+    // The reason is demoted, not dropped: it is the locker's own words.
     expect(held).toContain("some tool (pid 123)");
+    // The age comes FIRST. A row that opened with the pid would put
+    // the misleading half in the place the eye lands.
+    expect(held.indexOf("5 days ago")).toBeLessThan(
+      held.indexOf("some tool"),
+    );
+
     // A lock without `--reason` is still a lock, and must not render
     // as an empty quotation that reads like a display bug.
-    const bare = safetyReason({ kind: "locked", detail: null });
+    const bare = safetyReason({
+      kind: "locked",
+      detail: lock({ reason: null }),
+    });
     expect(bare).toContain("locked");
     expect(bare).toContain("no reason given");
+  });
+
+  // #775: the fact that makes unlocking a decision rather than a leap.
+  // 16 of the 18 classifiable locked worktrees measured were merged
+  // underneath, so this is the common case, not a corner.
+  it("says when a locked worktree is merged underneath", () => {
+    const merged = safetyReason({
+      kind: "locked",
+      detail: lock({ underlying: { kind: "safe" } }),
+    });
+    expect(merged).toContain("would be safe once unlocked");
+
+    // And stays silent when it is not true. Claiming it over unmerged
+    // work would invite exactly the blind unlock this exists to stop.
+    const notMerged = safetyReason({
+      kind: "locked",
+      detail: lock({ underlying: { kind: "unmerged" } }),
+    });
+    expect(notMerged).not.toContain("would be safe");
+  });
+
+  // An age the app could not read must not become a reassuring one.
+  // "locked today" over a lock of unknown age is the one wrong answer
+  // that makes clearing it feel safer than it is.
+  it("says nothing about the age it could not read", () => {
+    const unknown = safetyReason({
+      kind: "locked",
+      detail: lock({ age_days: null }),
+    });
+    expect(unknown).toContain("locked");
+    expect(unknown).not.toContain("today");
+    expect(unknown).not.toContain("days ago");
   });
 
   // #753: this used to read "could not determine: directory is
@@ -105,6 +176,74 @@ describe("safetyReason", () => {
     });
     expect(stale).toContain("prunable");
     expect(stale).not.toContain("could not determine");
+  });
+});
+
+describe("lockAge", () => {
+  // Whole days is the resolution the decision needs. Nobody unlocks
+  // differently for 5 days versus 5 days and 3 hours.
+  it("reads as prose, not as a number of days", () => {
+    expect(lockAge(lock({ age_days: 0 }))).toBe("today");
+    expect(lockAge(lock({ age_days: 1 }))).toBe("yesterday");
+    expect(lockAge(lock({ age_days: 5 }))).toBe("5 days ago");
+  });
+
+  // Null, not "today". An age the app could not read is not a lock
+  // taken this second, and that is the direction in which a wrong
+  // guess makes clearing it feel safer than it is.
+  it("says nothing when the age is unknown", () => {
+    expect(lockAge(lock({ age_days: null }))).toBeNull();
+  });
+});
+
+describe("lockHolderNote", () => {
+  // The whole point of #775's first problem. A running pid is TRUE for
+  // all 20 locks on the reporting machine and every one of them is
+  // abandoned, because the pid belongs to the parent session rather
+  // than to the worker that took the lock. So the sentence must carry
+  // its own caveat -- an unqualified "still running" is the app
+  // laundering weak evidence into a strong claim.
+  it("does not present a running process as proof the lock is live", () => {
+    const note = lockHolderNote(lock({ holder_running: true }));
+    expect(note).toContain("still running");
+    expect(note).toContain("weak evidence");
+  });
+
+  // The one unambiguous signal available here, and it deserves saying
+  // plainly rather than hedged like the "true" case.
+  it("says plainly when the named process is gone", () => {
+    const note = lockHolderNote(lock({ holder_running: false }));
+    expect(note).toContain("no longer running");
+    expect(note).not.toContain("weak evidence");
+  });
+
+  // Nothing to check is not the same as "the holder is gone". The
+  // second would read as evidence the lock is stale, which is a claim
+  // nothing supports for a lock that simply names no pid.
+  it("says nothing when there was no pid to check", () => {
+    expect(lockHolderNote(lock({ holder_running: null }))).toBeNull();
+  });
+});
+
+describe("lockReason", () => {
+  // One sentence, shared by the row and the confirmation. #753's
+  // `forceWarning` showed the cost of two copies of a warning: two
+  // chances to drift on the wording that decides whether somebody
+  // clears another process's claim.
+  it("orders the evidence best-first", () => {
+    const line = lockReason(
+      lock({ age_days: 5, underlying: { kind: "safe" } }),
+    );
+    expect(line).toBe(
+      "locked 5 days ago by some tool (pid 123) — merged, would be safe once unlocked",
+    );
+  });
+
+  it("degrades to the fact of the lock when it knows nothing else", () => {
+    const line = lockReason(
+      lock({ age_days: null, reason: null, underlying: { kind: "unmerged" } }),
+    );
+    expect(line).toBe("locked — no reason given");
   });
 });
 
@@ -134,7 +273,7 @@ describe("safetyTone", () => {
   // danger. A lock is an obstacle the user can clear, so amber; a
   // prunable row has no directory left to endanger anything, so grey.
   it("marks locked and prunable as neither safe nor alarming", () => {
-    const locked = safetyTone({ kind: "locked", detail: "some tool (pid 123)" });
+    const locked = safetyTone({ kind: "locked", detail: lock() });
     expect(locked).toContain("d29922");
     expect(locked).not.toContain("3fb950");
     const prunable = safetyTone({ kind: "prunable", detail: "gone" });
@@ -167,7 +306,7 @@ describe("forceWarning", () => {
   // account -- so the general wording would walk the user through a
   // destructive-sounding confirmation and then hand them an error.
   it("tells the truth about a locked worktree", () => {
-    const warning = forceWarning({ kind: "locked", detail: "some tool (pid 123)" });
+    const warning = forceWarning({ kind: "locked", detail: lock() });
     expect(warning).toContain("locked");
     expect(warning).toContain("unlocked");
     expect(warning).not.toContain("does not consider this safe");
@@ -202,8 +341,8 @@ describe("canClaudify", () => {
   // locked BY an agent already working in it -- pointing a second one
   // at that directory is what the lock exists to prevent.
   it("does not send an agent into a locked or missing directory", () => {
-    expect(canClaudify({ kind: "locked", detail: "some tool (pid 123)" })).toBe(false);
-    expect(canClaudify({ kind: "locked", detail: null })).toBe(false);
+    expect(canClaudify({ kind: "locked", detail: lock() })).toBe(false);
+    expect(canClaudify({ kind: "locked", detail: lock({ reason: null }) })).toBe(false);
     expect(canClaudify({ kind: "prunable", detail: "gone" })).toBe(false);
   });
 });

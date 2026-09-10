@@ -1,4 +1,4 @@
-import type { PullRequest, Safety, Upstream, Worktree } from "@/types/pr";
+import type { Lock, PullRequest, Safety, Upstream, Worktree } from "@/types/pr";
 
 /// Only `safe` may be deleted.
 ///
@@ -27,6 +27,69 @@ export function isSafe(s: Safety): boolean {
   // row can say which evidence was used -- `merged_upstream_deleted`
   // cannot be re-checked against a remote that no longer exists.
   return s.kind === "safe" || s.kind === "merged_upstream_deleted";
+}
+
+/// How long ago a lock was taken, as prose, or null if unknown.
+///
+/// Whole days, because that is the resolution the decision needs:
+/// nobody unlocks differently for 5 days versus 5 days and 3 hours, and
+/// a precise figure would imply a precision the source does not carry.
+/// "today" rather than "0 days ago", which reads as a missing value.
+///
+/// Null when the age could not be read. A lock of unknown age is not a
+/// fresh one, and the caller says nothing rather than guessing in the
+/// direction that makes clearing it feel safer.
+export function lockAge(lock: Lock): string | null {
+  if (lock.age_days === null) return null;
+  if (lock.age_days === 0) return "today";
+  if (lock.age_days === 1) return "yesterday";
+  return `${lock.age_days} days ago`;
+}
+
+/// One line describing a lock: when, by whom, and what is underneath.
+///
+/// Mirrors the Rust `Safety::reason` arm for `Locked`. Its own function
+/// rather than inline in `safetyReason` because the confirmation needs
+/// exactly this sentence too, and #753's `forceWarning` showed what two
+/// copies of one warning cost -- two chances to drift on the wording
+/// that decides whether somebody clears another process's claim.
+///
+/// The order is the argument of #775. Age leads because it is the only
+/// part that differs per row and cannot be faked by a long-lived
+/// parent. The reason follows because it is the locker's own words.
+/// The merge state comes last because it is about the worktree rather
+/// than about the lock -- and it is why the sentence is worth reading
+/// before unlocking at all.
+export function lockReason(lock: Lock): string {
+  const age = lockAge(lock);
+  let s = age === null ? "locked" : `locked ${age}`;
+  s += lock.reason === null ? " — no reason given" : ` by ${lock.reason}`;
+  // The fact that turns unlocking from a leap into a decision. Only
+  // said when it is true: silence is the honest default, and claiming
+  // "would be safe" over unmerged work would invite exactly the blind
+  // unlock this exists to prevent.
+  if (isSafe(lock.underlying)) s += " — merged, would be safe once unlocked";
+  return s;
+}
+
+/// What checking the lock's pid actually established, or null when
+/// there was nothing to check.
+///
+/// Deliberately NOT phrased as "the lock is live". A running pid is
+/// weak evidence and the app must not launder it into a strong claim:
+/// on the reporting machine this is true for all 20 locks and every one
+/// of them is abandoned, because the pid belongs to the parent session
+/// rather than to the worker that took the lock. So the "true" wording
+/// says what was checked and immediately says what it does not prove.
+///
+/// The "false" wording is the opposite: a named process that is gone is
+/// the one unambiguous signal available here, and it deserves to be
+/// stated plainly.
+export function lockHolderNote(lock: Lock): string | null {
+  if (lock.holder_running === null) return null;
+  return lock.holder_running
+    ? "The process it names is still running — though that is weak evidence, since a parent process outlives the work that took the lock."
+    : "The process it names is no longer running.";
 }
 
 /// Display-ready prose for a row.
@@ -60,13 +123,19 @@ export function safetyReason(s: Safety): string {
     case "unmerged":
       return "branch not merged";
     case "locked":
-      // Names the locker, because that is the fact the user acts on:
-      // "some tool (pid 123)" answers whether the claim is live or
-      // left behind by a process that died, and a bare "locked" would
-      // send them to a terminal to find out (#753).
-      return s.detail === null
-        ? "locked — no reason given"
-        : `locked: ${s.detail}`;
+      // AGE FIRST, then the locker (#775).
+      //
+      // #753 led with the reason, on the theory that "some tool (pid
+      // 123)" answers whether the claim is live. Measured once locks
+      // accumulated, it does not: all 20 on the reporting machine name
+      // one pid, alive only because it is the parent that outlived the
+      // workers, so the reason reads as live evidence on every row
+      // including every abandoned one.
+      //
+      // The age is what differs per row and what a stale lock cannot
+      // fake, so a five-day-old lock now READS as five days old. The
+      // reason still follows, unrewritten -- demoted, not dropped.
+      return lockReason(s.detail);
     case "prunable":
       // Says the remedy. Unlike the other refusals there IS one, it is
       // safe, and it is one command -- where the old wording for this

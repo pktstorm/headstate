@@ -210,6 +210,7 @@ pub fn run() {
             commands::claudify_command,
             commands::assessed_worktrees,
             commands::remove_worktree_forced,
+            commands::unlock_worktree,
             commands::size_worktrees,
             commands::set_view_needs_github,
             commands::get_cycle_trend,

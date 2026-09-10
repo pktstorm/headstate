@@ -64,6 +64,7 @@ import {
   dockerState,
   deleteHeadBranch,
   removeWorktreeForced,
+  unlockWorktree,
   setAutoMerge,
   removeWorktrees,
   removeArtifacts,
@@ -1439,6 +1440,30 @@ export function useRemoveWorktreeForced() {
         old?.filter((w) => w.path !== worktreePath),
       );
       void qc.invalidateQueries({ queryKey: ["assessed-worktrees"] });
+      void qc.invalidateQueries({ queryKey: ["worktrees"] });
+    });
+}
+
+/// Clear a worktree's lock (#775).
+///
+/// INVALIDATES rather than patching the row, which is the opposite of
+/// what `useRemoveWorktree` does and deliberately so. Removal knows the
+/// answer -- the row is gone -- so it filters the cache and skips
+/// re-running `classify_repo` over every worktree. Unlocking does not:
+/// the whole point is that the verdict underneath was hidden by the
+/// lock, and the row must now be re-classified to show it.
+///
+/// Patching in the `underlying` verdict the lock was carrying would be
+/// the tempting shortcut and would be wrong twice over. It was computed
+/// at scan time and the tree may have moved since; and it would make
+/// the app's own display value into a safety verdict, which is the one
+/// place a stale answer deletes something. The gate re-checks at
+/// removal time regardless, so a wrong row here would only mislead.
+export function useUnlockWorktree() {
+  const qc = useQueryClient();
+  return (repoPath: string, worktreePath: string) =>
+    unlockWorktree(repoPath, worktreePath).then(() => {
+      void qc.invalidateQueries({ queryKey: ["worktree-safety"] });
       void qc.invalidateQueries({ queryKey: ["worktrees"] });
     });
 }

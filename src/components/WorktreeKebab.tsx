@@ -1,4 +1,4 @@
-import { Bot, MoreHorizontal, RotateCcw, Trash2 } from "lucide-react";
+import { Bot, MoreHorizontal, RotateCcw, Trash2, Unlock } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { Worktree } from "../types/pr";
 import { forceWarning, isSafe, safetyReason } from "../lib/worktrees";
@@ -32,6 +32,7 @@ export function WorktreeKebab({
   onForget,
   onRemove,
   onForce,
+  onUnlock,
 }: {
   worktree: Worktree;
   /// This worktree has been handed to Claude Code and the branch has not
@@ -46,6 +47,9 @@ export function WorktreeKebab({
   /// The override, behind the same confirmation the "Remove anyway…"
   /// button opens. It relaxes Headstate's gate, not git's.
   onForce: (wt: Worktree) => void;
+  /// Clear the lock, behind a confirmation naming the holder and the
+  /// age (#775). Only offered on a locked row, and it removes nothing.
+  onUnlock: (wt: Worktree) => void;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -66,6 +70,11 @@ export function WorktreeKebab({
 
   const item =
     "flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-[#e6edf3] hover:bg-[#21262d]";
+  // Same as `item`, but top-aligned: this one carries a second line
+  // under its label, and centring would float the icon against the
+  // middle of a two-line block.
+  const itemStacked =
+    "flex w-full items-start gap-2 rounded px-2 py-1.5 text-left text-xs text-[#e6edf3] hover:bg-[#21262d]";
   // Red, like every other removal affordance on this page. A menu item
   // that deletes a directory must not look like one that copies a
   // string.
@@ -167,6 +176,54 @@ export function WorktreeKebab({
               </button>
               <div className="my-1 border-t border-[#30363d]" />
             </>
+          ) : null}
+
+          {/* Unlock, offered only on a locked row (#775).
+
+              #753 declined this outright, reasoning that a one-click
+              button beside a row invites clearing another process's
+              claim without reading it. That was right for its evidence
+              and the evidence changed: 20 of 44 worktrees on the
+              reporting machine are locked, all by one pid that is alive
+              only because it is the parent session, and nothing is
+              working in any of them. At 45% of the list, withholding
+              the remedy does not protect anyone — it leaves a view that
+              cannot be used and sends the user to a terminal to do the
+              same thing with less information.
+
+              So the care went into the CONFIRMATION rather than into
+              refusing: it names the holder, the age, and what is
+              underneath. This item only opens it.
+
+              ABOVE removal, and not styled as destructive, because it
+              is neither. It deletes nothing and `git worktree lock`
+              puts it back — and it is the action that usually helps,
+              since 16 of the 18 classifiable locked worktrees measured
+              were merged underneath. Painting it red would put a
+              reversible action in the same visual class as the one
+              unrecoverable action on the page. */}
+          {locked ? (
+            <button
+              type="button"
+              role="menuitem"
+              className={itemStacked}
+              onClick={() => {
+                setOpen(false);
+                onUnlock(worktree);
+              }}
+            >
+              <Unlock className="mt-0.5 h-3 w-3 shrink-0" aria-hidden="true" />
+              <span className="min-w-0">
+                Unlock worktree…
+                {/* The lock's own line, so the user reads WHAT they are
+                    clearing before the dialog rather than only in it.
+                    `safetyReason` already leads with the age and says
+                    whether the thing underneath is disposable. */}
+                <span className="mt-0.5 block text-[#8b949e]">
+                  {safetyReason(worktree.safety)}
+                </span>
+              </span>
+            </button>
           ) : null}
 
           {/* Removal, on a surface that does not disappear (#770).

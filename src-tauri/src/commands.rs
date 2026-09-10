@@ -1609,6 +1609,33 @@ pub async fn remove_worktree_forced(
     Ok(())
 }
 
+#[tauri::command]
+/// Clear a worktree's lock (#775).
+///
+/// Reached only from a confirmation that names the holder, the age, and
+/// what the worktree would be underneath -- the reading #753 wanted
+/// before anyone clears a claim, which is why it declined a bare
+/// button.
+///
+/// Removes NOTHING. It clears a guard, and the safety gate is untouched
+/// by it: the worktree is re-classified afterwards and is removable
+/// only if it earns that on its own. Logged at `info` rather than
+/// `warn` for the same reason -- this is a reversible operation, and
+/// reserving `warn` for the unrecoverable one keeps that signal worth
+/// reading.
+///
+/// `spawn_blocking`: two git calls, one of which lists every worktree
+/// in the repository.
+pub async fn unlock_worktree(repo_path: String, worktree_path: String) -> Result<(), String> {
+    let repo = repo_path.clone();
+    let wt = worktree_path.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::worktrees::unlock_worktree(&repo, &wt))
+        .await
+        .map_err(|e| format!("unlock failed to run: {e}"))??;
+    log::info!("{worktree_path} unlocked");
+    Ok(())
+}
+
 /// Everything the app already knows about one worktree's unmerged work.
 ///
 /// `claudify_command` has always computed this whole struct and then

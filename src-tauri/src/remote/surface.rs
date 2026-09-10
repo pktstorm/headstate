@@ -177,6 +177,22 @@ pub const SURFACE: &[(&str, Class)] = &[
     // is not a feature.
     ("apply_updates_in_background", Class::Write),
     ("cancel_update_run", Class::Write),
+    // Clears a worktree's lock (#775). Write, not Destructive, and the
+    // line is drawn where this table draws it everywhere else: nothing
+    // is deleted. The lock is one file git wrote, `git worktree lock`
+    // puts it back, and no work can be lost by clearing it.
+    //
+    // It does remove a GUARD, which is why it is not Read -- but
+    // routing it through step-up would say the phone is about to
+    // destroy something, and the honest warning is a different one:
+    // another process may be using that directory. That belongs in the
+    // confirmation, which names the holder and the age, rather than in
+    // a signature prompt about an unrecoverable action this is not.
+    //
+    // Removal is unaffected. `remove_worktree` stays Destructive and
+    // its gate re-classifies the worktree from scratch, so unlocking
+    // buys a phone no shortcut to deleting anything.
+    ("unlock_worktree", Class::Write),
     // destructive: deletes files, branches, images, or volumes.
     ("delete_head_branch", Class::Destructive),
     ("delete_branches", Class::Destructive),
@@ -568,6 +584,9 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             a.get("worktreePath")?,
         )
         .await),
+        "unlock_worktree" => {
+            res(commands::unlock_worktree(a.get("repoPath")?, a.get("worktreePath")?).await)
+        }
         "remove_artifacts" => res(commands::remove_artifacts(app.clone(), a.get("paths")?).await),
         "remove_venvs" => res(commands::remove_venvs(app.clone(), a.get("paths")?).await),
         "remove_orphan" => res(commands::remove_orphan(a.get("path")?).await),

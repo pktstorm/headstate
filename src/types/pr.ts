@@ -181,6 +181,45 @@ export interface CachedSnapshot {
   stale_secs: number | null;
 }
 
+/// What is known about a worktree's lock, beyond the fact of it.
+///
+/// Mirrors `worktrees::model::Lock` on the Rust side. Every field
+/// exists because the lock REASON, which #753 carried alone, turned out
+/// not to answer the question a user has. Measured on the reporting
+/// machine: 20 of 44 worktrees locked, every lock naming the same pid,
+/// that pid alive only because it is the long-lived parent of workers
+/// that finished days ago, and `lsof -d cwd` finding nothing at work in
+/// any of them.
+export interface Lock {
+  /// Git's own lock reason, verbatim, or null for a lock taken without
+  /// `--reason`. Still the locker's own words; it has simply stopped
+  /// being the headline.
+  reason: string | null;
+  /// Whole days since the lock was taken, or null if unreadable.
+  ///
+  /// The field that actually discriminates, and the one the row leads
+  /// with. Measured from git's `locked` file rather than from the
+  /// `start` date inside the reason -- that one dates the process, and
+  /// is identical across all 20 locks on the reporting machine, where
+  /// the real ages span four days.
+  age_days: number | null;
+  /// Whether the pid named in the reason is running, or null when the
+  /// reason names no pid.
+  ///
+  /// Weak evidence deliberately kept weak. True for all 20 locks on the
+  /// reporting machine, every one abandoned, so the UI must never spend
+  /// it as proof of a live claim. A false is the one decisive signal
+  /// here: the named holder is gone.
+  holder_running: boolean | null;
+  /// What this worktree would be if the lock were cleared.
+  ///
+  /// The reason unlocking stops being a leap (#775). DISPLAY ONLY: the
+  /// verdict that governs the button is still `locked`, and `isSafe`
+  /// never looks inside -- a locked worktree that is merged underneath
+  /// is still locked.
+  underlying: Safety;
+}
+
 /// Why a worktree can or cannot be removed.
 ///
 /// An enum rather than a boolean because the UI has to explain itself:
@@ -206,12 +245,17 @@ export type Safety =
   | { kind: "empty" }
   | { kind: "unmerged" }
   /// Someone locked the worktree, so `git worktree remove` refuses it
-  /// whatever the branch's state (#753). `detail` is git's own lock
-  /// reason -- typically naming a tool and pid, which is what tells a
-  /// live claim from a leftover one -- or null for a lock taken without
-  /// `--reason`. 13 of 34 worktrees on the reporting machine were
-  /// locked, so this is a third of the list, not an edge case.
-  | { kind: "locked"; detail: string | null }
+  /// whatever the branch's state (#753). 20 of 44 worktrees on the
+  /// reporting machine are locked -- 45% of the list, not an edge case.
+  ///
+  /// `detail` grew from a bare reason string to a `Lock` in #775. The
+  /// reason alone was meant to separate a live claim from a leftover
+  /// one and measurably does not: every lock there names the same pid,
+  /// that pid is alive because it is the surviving parent session
+  /// rather than the worker that took the lock, and the `start` date
+  /// embedded in the reason is identical on all 20 for the same reason.
+  /// `Lock` carries the evidence that does discriminate.
+  | { kind: "locked"; detail: Lock }
   /// The directory is gone and git knows the registration is stale;
   /// `git worktree prune` clears it. `detail` is git's reason. Formerly
   /// reported as `unknown: directory is missing`, which read as
