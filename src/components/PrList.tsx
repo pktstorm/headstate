@@ -3,6 +3,7 @@ import { PrRow } from "@/components/PrRow";
 import { HelpButton } from "@/components/HelpButton";
 import { useFilters } from "@/store/filters";
 import { prKey } from "@/components/BulkBar";
+import { deriveStacked } from "@/lib/derive";
 
 /// Renders PRs in whatever order it is given -- sorting is the caller's
 /// responsibility (see `sortPrs` in `@/lib/derive`), so this component has
@@ -61,6 +62,20 @@ export function PrList({
     const [lo, hi] = a <= b ? [a, b] : [b, a];
     setChecked([...new Set([...checked, ...visibleKeys.slice(lo, hi + 1)])]);
   };
+
+  // Resolved HERE for the same reason `selectRange` is: a stack is a
+  // relationship between two rows, and only the list can see both of
+  // them (#743). Computed once per render rather than per row -- the
+  // per-row form is a scan of the whole list inside a map over it.
+  //
+  // Deliberately over `prs`, the FILTERED list, not the unfiltered one.
+  // A marker reading "on #12" has to mean the reader can scroll to #12,
+  // and resolving against rows the filter is hiding would point at PRs
+  // that are not on screen. The cost is that filtering a parent out
+  // silently unmarks its child; the alternative is a marker that lies
+  // about where to look, which is worse for a signal whose only job is
+  // to be trusted.
+  const stacked = deriveStacked(prs);
 
   const toggleAll = () => {
     if (allSelected) {
@@ -136,6 +151,7 @@ export function PrList({
             selectable={selectable}
             onRange={selectRange}
             cursored={cursor === i}
+            stackedOn={stacked.get(pr.id)}
           />
         ))
       )}

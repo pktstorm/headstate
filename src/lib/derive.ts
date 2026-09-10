@@ -302,3 +302,59 @@ export function deriveStats(
     blocked_by_comments: prs.filter(changesRequested).length,
   };
 }
+
+/// Which PRs sit on top of another open PR, and which one.
+///
+/// Keyed by `PullRequest.id` (the GraphQL node id, unique across repos)
+/// and valued with the PARENT's number, so a row can say `on #1234`
+/// rather than only that it is stacked at all.
+///
+/// Structural detection, deliberately (#743): a PR is stacked when its
+/// `base_ref` is the `head_ref` of another open PR in the SAME repo.
+/// `gh stack`, Graphite, `spr` and hand-made stacks all produce that
+/// exact shape, so keying on any one tool's branch-naming convention
+/// would recognise one workflow and quietly miss the other three -- and
+/// would also invent stacks out of branches merely NAMED that way. Two
+/// PRs matching head-to-base is a fact about the graph, not a guess
+/// about the author's tooling.
+///
+/// This cannot be a per-row property, which is why it lives here rather
+/// than beside `needsAttention`: resolving a parent needs the whole
+/// list. `base_ref` alone tells a row its base is some branch; only the
+/// list can say that branch is another open PR.
+///
+/// Scoped per repo because branch names are only unique within one --
+/// without it, a `develop` open in two repositories would make each
+/// repo's PRs read as stacked on the other's.
+///
+/// Note what this deliberately does NOT do: infer from the base name
+/// alone. A base that is not the default branch may be a release train,
+/// a long-lived integration branch, or a fork's `develop` -- none of
+/// them stacks, and the list has no default branch to rule them out
+/// (it is not fetched; see `src/types/pr.ts`). Requiring a matching open
+/// PR is both the stricter test and the only one that can name the
+/// parent. The cost is that a stack whose parent is filtered out of the
+/// list, or has already merged, reads as standalone -- silence, which is
+/// the right failure for a marker whose whole value is being trusted.
+export function deriveStacked(prs: PullRequest[]): Map<string, number> {
+  // head_ref -> the PR that opened it, per repo. Built once rather than
+  // rescanning the list per row: this runs on every render, and GitHub
+  // caps a search at 100 per query but nothing caps the total across the
+  // repositories a user has open.
+  const byHead = new Map<string, PullRequest>();
+  for (const pr of prs) {
+    if (pr.head_ref) byHead.set(`${pr.repo} ${pr.head_ref}`, pr);
+  }
+
+  const stacked = new Map<string, number>();
+  for (const pr of prs) {
+    if (!pr.base_ref) continue;
+    const parent = byHead.get(`${pr.repo} ${pr.base_ref}`);
+    // The identity guard is for the degenerate case of a PR whose head
+    // and base are the same branch. GitHub does not create those, but
+    // the list is whatever the API returned, and a row reading "on #42"
+    // while being #42 is worse than no marker at all.
+    if (parent && parent.id !== pr.id) stacked.set(pr.id, parent.number);
+  }
+  return stacked;
+}

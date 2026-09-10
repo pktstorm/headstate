@@ -120,11 +120,16 @@ describe("PrRow branch pair", () => {
     expect(screen.getByText("→")).toBeTruthy();
   });
 
-  // A stacked PR cannot merge until its base does, and nothing else in
-  // the row says so.
-  it("tints the target when it is not the default branch", () => {
+  // The stack marker moved to a chip in the title area (#743), so the
+  // tint is no longer carrying the fact on its own -- but it is still
+  // what points a reader who saw the chip at WHICH branch is underneath.
+  //
+  // Note the input: `stackedOn` is supplied, because a row cannot see
+  // the other pull requests and therefore cannot know. It used to guess
+  // from `base_ref !== "main"`, which is a different claim.
+  it("tints the target when the base is another open PR's branch", () => {
     const { container } = render(
-      <PrRow pr={pr({ head_ref: "ci_fix_2", base_ref: "ci_fix_1" })} />,
+      <PrRow pr={pr({ head_ref: "ci_fix_2", base_ref: "ci_fix_1" })} stackedOn={41} />,
     );
     const target = Array.from(container.querySelectorAll("span")).find(
       (s) => s.textContent === "ci_fix_1",
@@ -132,22 +137,12 @@ describe("PrRow branch pair", () => {
     expect(target?.className).toContain("#a371f7");
   });
 
-  // The tint above is the same test read through colour. It cannot be the
-  // only signal: the base ref renders identically either way, so without
-  // a word beside it a reader who does not separate purple from grey sees
-  // no difference between a stacked PR and an ordinary one.
-  it("says 'stacked' in text, not only in the tint", () => {
-    render(<PrRow pr={pr({ head_ref: "ci_fix_2", base_ref: "ci_fix_1" })} />);
-    expect(screen.getByText("(stacked)")).toBeTruthy();
-  });
-
-  it("does not call a PR targeting main stacked", () => {
-    render(<PrRow pr={pr({ head_ref: "feature/x", base_ref: "main" })} />);
-    expect(screen.queryByText("(stacked)")).toBeNull();
-  });
-
-  it("does not tint a PR targeting main or master", () => {
-    for (const base of ["main", "master"]) {
+  // The regression the old default-branch guess caused: a repository
+  // whose trunk is neither `main` nor `master`, or one running a release
+  // train, had every single row tinted and suffixed "(stacked)". A
+  // marker that fires on everything says nothing.
+  it("does not tint an unstacked PR whatever its base is called", () => {
+    for (const base of ["main", "master", "develop", "release/2026-09"]) {
       const { container, unmount } = render(
         <PrRow pr={pr({ head_ref: "feature/x", base_ref: base })} />,
       );
