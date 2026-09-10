@@ -16,8 +16,13 @@ describe("isSafe", () => {
   // Only `safe` is deletable. Everything else is disabled rather than
   // warned past: a cleanup tool that occasionally eats a day of work is
   // worse than no cleanup tool.
-  it("is true only for safe", () => {
+  it("is true only for the merged states", () => {
     expect(isSafe({ kind: "safe" })).toBe(true);
+    // #732: merged, then the remote branch was deleted. The work is on
+    // the default branch, so this is as removable as `safe` -- the
+    // whole point of the fix, since treating it as never-pushed left
+    // every merged worktree unremovable.
+    expect(isSafe({ kind: "merged_upstream_deleted" })).toBe(true);
     for (const s of [
       { kind: "main_checkout" },
       { kind: "dirty", detail: 3 },
@@ -48,6 +53,13 @@ describe("safetyReason", () => {
   // worktrees on this machine hold commits that exist nowhere else.
   it("says plainly when commits exist nowhere else", () => {
     expect(safetyReason({ kind: "never_pushed" })).toContain("only here");
+    // Both halves matter: "merged" is why the button is enabled, and
+    // "upstream deleted" is why no remote branch can be pointed at.
+    const gone = safetyReason({ kind: "merged_upstream_deleted" });
+    expect(gone).toContain("merged");
+    expect(gone).toContain("upstream deleted");
+    // It must NOT read like the state it was being confused with.
+    expect(gone).not.toContain("only here");
   });
 
   // The bug in #701: a scratch branch was described as holding commits
@@ -66,6 +78,8 @@ describe("safetyTone", () => {
     expect(safetyTone({ kind: "safe" })).toContain("3fb950");
     expect(safetyTone({ kind: "unmerged" })).not.toContain("3fb950");
     expect(safetyTone({ kind: "never_pushed" })).not.toContain("3fb950");
+    // Green, like `safe`: same verdict, different evidence (#732).
+    expect(safetyTone({ kind: "merged_upstream_deleted" })).toContain("3fb950");
   });
 
   // The main checkout is not a problem, so it must not look like one.

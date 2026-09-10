@@ -22,7 +22,11 @@ export function isOrphaned(s: Safety): boolean {
 }
 
 export function isSafe(s: Safety): boolean {
-  return s.kind === "safe";
+  // Both kinds mean the work is on the default branch and the tree is
+  // clean, so both are removable (#732). They stay separate kinds so the
+  // row can say which evidence was used -- `merged_upstream_deleted`
+  // cannot be re-checked against a remote that no longer exists.
+  return s.kind === "safe" || s.kind === "merged_upstream_deleted";
 }
 
 /// Display-ready prose for a row.
@@ -42,6 +46,12 @@ export function safetyReason(s: Safety): string {
       return `${s.detail} unpushed commit${s.detail === 1 ? "" : "s"}`;
     case "never_pushed":
       return "never pushed — commits exist only here";
+    case "merged_upstream_deleted":
+      // Says both halves. "Merged" is why it is removable; "upstream
+      // deleted" is why the row cannot point at a remote branch to
+      // prove it, and is the fact a user comparing this row against
+      // GitHub would otherwise find missing.
+      return "merged; upstream deleted — safe to delete";
     case "empty":
       // Says what is TRUE of the branch, not what the app will let you
       // do about it: the Remove button stays disabled, deliberately,
@@ -230,7 +240,11 @@ export function upstreamTone(u: Upstream): string {
 /// want; grey for the main checkout, which is not a problem at all.
 export function safetyTone(s: Safety): string {
   switch (s.kind) {
+    // Green for both merged states: the button is enabled for each, and
+    // a different colour would imply a different degree of safety
+    // rather than a different route to the same verdict (#732).
     case "safe":
+    case "merged_upstream_deleted":
       return "text-[#3fb950]";
     case "main_checkout":
       return "text-[#8b949e]";
