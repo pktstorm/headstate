@@ -12,13 +12,21 @@ const state = vi.hoisted(() => ({
   classifying: false,
   assessed: [] as string[],
   prs: [] as import("@/types/pr").PullRequest[],
-  sizes: undefined as Map<string, number> | undefined,
+  // `number | null` values, not `number`: a null VALUE is a worktree
+  // whose walk was abandoned (#769), which is a different fact from an
+  // absent KEY meaning "not measured yet".
+  sizes: undefined as Map<string, number | null> | undefined,
   // Sizes streamed in while the query is still in flight (#754).
-  partialSizes: undefined as Map<string, number> | undefined,
-  allSizes: undefined as Map<string, number> | undefined,
+  partialSizes: undefined as Map<string, number | null> | undefined,
+  allSizes: undefined as Map<string, number | null> | undefined,
   sizesPending: 0,
   sizesTotal: 0,
+  sizesFailed: 0,
   sizing: false,
+  // The whole repository's sizing pass rejected (#769). Until then the
+  // page never read `isError`, so a rejection showed skeletons and then
+  // silently became an em dash.
+  sizingFailed: false,
 }));
 
 const toastSuccess = vi.hoisted(() => vi.fn());
@@ -57,9 +65,10 @@ vi.mock("../api/hooks", () => ({
   // Sizes land one repository at a time on the all-repos view, so the
   // mock carries the progress fields the page renders.
   useAllWorktreeSizes: () => ({
-    sizes: state.allSizes ?? new Map<string, number>(),
+    sizes: state.allSizes ?? new Map<string, number | null>(),
     pending: state.sizesPending ?? 0,
     total: state.sizesTotal ?? 0,
+    failed: state.sizesFailed ?? 0,
   }),
   useDockerImages: () => ({ data: dockerImages() }),
   useRemoveImages: () => removeImagesFn,
@@ -86,9 +95,12 @@ vi.mock("../api/hooks", () => ({
   // been walked, and rows must fill from `partial` before then (#754).
   useWorktreeSizes: () => ({
     data: state.sizes,
-    partial: state.partialSizes ?? new Map<string, number>(),
+    partial: state.partialSizes ?? new Map<string, number | null>(),
     isLoading: state.sizing,
     isFetching: state.sizing,
+    // #769: the page must read this. A mock that omitted it would let
+    // the "rejection shows skeletons forever" bug pass unnoticed.
+    isError: state.sizingFailed,
   }),
 }));
 
@@ -155,7 +167,9 @@ describe("WorktreesPage on a phone", () => {
       allSizes: undefined,
       sizesPending: 0,
       sizesTotal: 0,
+      sizesFailed: 0,
       sizing: false,
+      sizingFailed: false,
       assessed: [],
       prs: [],
     });
@@ -226,6 +240,10 @@ describe("WorktreesPage", () => {
       sizes: undefined,
       partialSizes: undefined,
       sizing: false,
+      // #769. A leaked failure flag turns every later size assertion
+      // into "not measured", which is a confusing way to fail.
+      sizingFailed: false,
+      sizesFailed: 0,
       assessed: [],
       prs: [],
     });
@@ -488,6 +506,116 @@ describe("WorktreesPage", () => {
     });
     render(<WorktreesPage />);
     expect(screen.queryByText("—")).toBeNull();
+  });
+
+  /// A worktree the walk gave up on says so, instead of holding a
+  /// skeleton for the rest of the pass.
+  ///
+  /// #769: a repository with 111 worktrees showed every size cell as a
+  /// skeleton for 15+ minutes while one with 97 finished in ~10 seconds.
+  /// A skeleton is a promise that a number is coming; for a tree the
+  /// walk abandoned, no number is coming, and the row has to stop
+  /// implying otherwise. `sizing` stays TRUE here on purpose -- the rest
+  /// of the repository is still being walked, and a row that has already
+  /// given up must not wait for it.
+  it("says a worktree could not be measured rather than holding its skeleton", () => {
+    Object.assign(state, {
+      repos: [
+        {
+          identity: null,
+          name: "proj",
+          path: "/code/proj",
+          worktrees: [
+            wt({ path: "/code/proj/huge", size_bytes: null, safety: { kind: "safe" } }),
+          ],
+        },
+      ],
+      // An explicit null VALUE: measured, and the answer is "could not".
+      partialSizes: new Map<string, number | null>([["/code/proj/huge", null]]),
+      sizing: true,
+    });
+    render(<WorktreesPage />);
+    expect(screen.getByText(/not measured/i)).not.toBeNull();
+  });
+
+  /// "Could not measure" must not read as "empty".
+  ///
+  /// The size column exists to answer "how much do I get back by
+  /// deleting this?". Rendering an abandoned walk as 0 B invites
+  /// deleting a checkout nobody has measured, which is the worst answer
+  /// this column could give.
+  it("never renders an unmeasured worktree as zero bytes", () => {
+    Object.assign(state, {
+      repos: [
+        {
+          identity: null,
+          name: "proj",
+          path: "/code/proj",
+          worktrees: [
+            wt({ path: "/code/proj/huge", size_bytes: null, safety: { kind: "safe" } }),
+          ],
+        },
+      ],
+      partialSizes: new Map<string, number | null>([["/code/proj/huge", null]]),
+      sizing: true,
+    });
+    render(<WorktreesPage />);
+    expect(screen.queryByText("0 B")).toBeNull();
+  });
+
+  /// A sizing pass that REJECTED is surfaced, not swallowed.
+  ///
+  /// #769: `useWorktreeSizes` exposed `isError` and the page never read
+  /// it, so a rejected walk showed skeletons while TanStack retried and
+  /// then collapsed to an em dash -- claiming a measurement that never
+  /// happened. Here the query has settled (`sizing: false`) and failed,
+  /// and every row must say it was not measured.
+  it("surfaces a failed sizing pass instead of showing a measured-looking dash", () => {
+    Object.assign(state, {
+      repos: [
+        {
+          identity: null,
+          name: "proj",
+          path: "/code/proj",
+          worktrees: [
+            wt({ path: "/code/proj/one", size_bytes: null, safety: { kind: "safe" } }),
+          ],
+        },
+      ],
+      sizing: false,
+      sizingFailed: true,
+    });
+    render(<WorktreesPage />);
+    expect(screen.getByText(/not measured/i)).not.toBeNull();
+  });
+
+  /// One abandoned worktree must not take the others' numbers with it.
+  ///
+  /// The load-bearing guarantee of #769: a parked walk stalled the whole
+  /// column at N-1. The rows that DID measure must show their sizes
+  /// alongside the one that did not.
+  it("keeps showing the other worktrees' sizes when one cannot be measured", () => {
+    Object.assign(state, {
+      repos: [
+        {
+          identity: null,
+          name: "proj",
+          path: "/code/proj",
+          worktrees: [
+            wt({ path: "/code/proj/huge", size_bytes: null, safety: { kind: "safe" } }),
+            wt({ path: "/code/proj/ok", size_bytes: null, safety: { kind: "safe" } }),
+          ],
+        },
+      ],
+      partialSizes: new Map<string, number | null>([
+        ["/code/proj/huge", null],
+        ["/code/proj/ok", 2048],
+      ]),
+      sizing: true,
+    });
+    render(<WorktreesPage />);
+    expect(screen.getByText(/not measured/i)).not.toBeNull();
+    expect(screen.getByText("2.0 KB")).not.toBeNull();
   });
 
   // Safety and size are separate passes; a row whose safety resolved must

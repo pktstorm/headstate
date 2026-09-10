@@ -361,8 +361,13 @@ export const getPrDetail = (repo: string, number: number) =>
 ///
 /// A full tree walk -- ~13s for 147 worktrees -- so it is a separate
 /// query from listing and classification, and arrives last.
+///
+/// `bytes` is null for a worktree whose walk exceeded the Rust side's
+/// per-worktree budget (#769). Null, not absent and not 0: a missing
+/// entry leaves the row on a skeleton forever, which is the bug, and 0
+/// claims an empty tree the walk never actually saw the bottom of.
 export const sizeWorktrees = (repoPath: string) =>
-  call<[string, number][]>("size_worktrees", { repoPath });
+  call<[string, number | null][]>("size_worktrees", { repoPath });
 
 /// Remove a worktree. Rejects anything not provably safe; the gate is
 /// re-evaluated on the Rust side rather than trusted from the last scan.
