@@ -172,10 +172,48 @@ fn blocked(i: &Inner) -> Option<&'static str> {
     }
 }
 
+/// Why EVERY command is refused right now, reads included, or `None`.
+///
+/// Only one condition qualifies: the desktop answered `/v1/hello` with a
+/// protocol version below this app's (#734). That is categorically
+/// different from the other blocked states, and the difference is
+/// whether retrying can change the answer:
+///
+/// - unreachable, connecting, revoked -- transient. A read is how the
+///   phone FINDS OUT the desktop is back, so reads must keep going.
+/// - too old -- settled. Polling a desktop that speaks protocol 1 does
+///   not make it speak protocol 2; it just yields answers this app will
+///   misread. The banner already tells the user to update the desktop.
+///
+/// Strict on purpose, for now. A phone rendering subtly wrong data is
+/// worse than one that plainly says the desktop needs updating, and
+/// reads are the majority of what the phone does. When there is a
+/// capability negotiation rather than one monotonic integer, this can
+/// relax to refusing only the commands that actually differ.
+fn unsupported(i: &Inner) -> Option<&'static str> {
+    // Only meaningful once connected: before that there is no answer
+    // from `/v1/hello` to judge, and `blocked` covers those states.
+    if i.state != State::Connected {
+        return None;
+    }
+    match i.protocol_version {
+        Some(v) if v >= PROTOCOL_VERSION => None,
+        // `None` here means connected without a parsed version, which
+        // is not evidence of support -- treat it as unsupported rather
+        // than assuming the desktop is current.
+        _ => Some("runs an older Headstate; update it before using it from here"),
+    }
+}
+
 impl Connection {
     /// See [`blocked`].
     pub fn actions_blocked(&self) -> Option<&'static str> {
         blocked(&self.inner.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// See [`unsupported`]. Applies to reads as well as writes.
+    pub fn version_blocked(&self) -> Option<&'static str> {
+        unsupported(&self.inner.lock().unwrap_or_else(|e| e.into_inner()))
     }
 }
 

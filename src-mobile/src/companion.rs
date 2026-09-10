@@ -296,11 +296,21 @@ impl Companion {
             let l = live.as_ref().ok_or("not paired with a desktop")?;
             (l.client.clone(), l.events.clone(), l.desktop.name.clone())
         };
-        // Reads go through whatever the state -- the attempt is how the
-        // phone finds out the desktop is back, and `get_cached` has the
-        // snapshot to fall back on. Anything that changes something is
-        // refused while the desktop is away, has revoked this phone, or
-        // is too old to be driven from here.
+        // A desktop too old to speak this protocol is refused for EVERY
+        // command, reads included (#734). Checked before the reachability
+        // gate below because it is the one blocked condition retrying
+        // cannot resolve: polling a desktop that speaks an older protocol
+        // does not upgrade it, it just returns answers this app will
+        // misread -- which surfaces as a broken page rather than as the
+        // version mismatch it actually is.
+        if let Some(why) = self.conn.version_blocked() {
+            return Err(format!("{desktop_name} {why}"));
+        }
+        // Otherwise reads go through whatever the state -- the attempt is
+        // how the phone finds out the desktop is back, and `get_cached`
+        // has the snapshot to fall back on. Anything that changes
+        // something is refused while the desktop is away or has revoked
+        // this phone.
         if matches!(class, Class::Write | Class::Destructive) {
             if let Some(why) = self.conn.actions_blocked() {
                 return Err(format!("{desktop_name} {why}"));
@@ -918,8 +928,16 @@ mod tests {
         assert_eq!(c.subscribe().unwrap_err(), "not paired with a desktop");
     }
 
+    /// #734: an older desktop is refused for EVERYTHING, not just
+    /// writes.
+    ///
+    /// This replaces `an_older_desktop_is_read_only`, which asserted the
+    /// opposite because that was the old behaviour. Letting reads through
+    /// meant the phone rendered pages from a desktop whose answers it
+    /// could misread, and the resulting breakage looked like a phone bug
+    /// rather than a version mismatch.
     #[tokio::test]
-    async fn an_older_desktop_is_read_only() {
+    async fn an_older_desktop_is_refused_entirely() {
         let store = Arc::new(MemoryStore::default());
         let rec = Arc::new(Recorder::default());
         let c = companion(store, rec);
@@ -946,10 +964,15 @@ mod tests {
         let report = c.connection_state();
         assert_eq!(report.protocol_version, Some(0));
         assert!(report.stale, "old desktop: shown as stale");
-        assert_eq!(
-            c.call("get_stats", json!({})).await.unwrap(),
-            json!({"merged_week": 1})
+
+        // The read is refused, and names the desktop and the reason.
+        let err = c.call("get_stats", json!({})).await.unwrap_err();
+        assert!(
+            err.starts_with("octocat's laptop runs an older Headstate"),
+            "a read against an old desktop must be refused: {err}"
         );
+
+        // And the write, as before.
         let err = c
             .call("act_on_pr", json!({"id": "PR_1"}))
             .await
@@ -957,6 +980,40 @@ mod tests {
         assert!(
             err.starts_with("octocat's laptop runs an older Headstate"),
             "{err}"
+        );
+
+        // The refusal happens on the PHONE: nothing was sent to a
+        // desktop that cannot answer it correctly. Asserting on the
+        // request log rather than only on the error keeps this honest --
+        // an error raised after a round trip would pass the checks above
+        // while still driving the old desktop.
+        assert!(
+            !server
+                .requests()
+                .iter()
+                .any(|r| r.path.starts_with("/v1/call/")),
+            "no command may reach an unsupported desktop: {:?}",
+            server
+                .requests()
+                .iter()
+                .map(|r| r.path.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The other half: a CURRENT desktop is unaffected. Without this the
+    /// strict gate could pass by refusing everything.
+    #[tokio::test]
+    async fn a_current_desktop_still_serves_reads() {
+        let (server, _store, _rec, c) = paired().await;
+        server.reply(
+            "/v1/call/get_stats",
+            Reply::json(200, json!({"merged_week": 3})),
+        );
+        assert_eq!(
+            c.call("get_stats", json!({})).await.unwrap(),
+            json!({"merged_week": 3}),
+            "a desktop on the current protocol must still answer reads"
         );
     }
 
