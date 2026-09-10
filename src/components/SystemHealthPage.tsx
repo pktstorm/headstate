@@ -17,14 +17,24 @@ import {
 import { QueryError, errorMessage } from "./QueryError";
 import { formatSize } from "@/lib/worktrees";
 import {
+  CAPACITY_BAR_MAX,
   THERMAL_MEANING,
   barColor,
+  capacityBarFill,
+  capacityColor,
+  capacityMeaning,
+  cycleMeaning,
   formatRate,
   formatUptime,
+  formatWatts,
   interfaceRates,
   netProcessRates,
   peakRate,
+  peakWatts,
   percentOf,
+  powerColor,
+  powerDirection,
+  powerSeries,
   splitOnGaps,
   thermalColor,
   type NetProcessReading,
@@ -35,6 +45,7 @@ import type {
   FootprintProcess,
   FootprintProcessGroup,
   HealthGpu,
+  HealthPowerFlow,
   HealthSample,
 } from "@/types/pr";
 import { IS_MOBILE_BUILD } from "@/lib/target";
@@ -1263,11 +1274,52 @@ export function SystemHealthPage() {
               label="Power"
               value={s.battery === null ? null : s.battery.on_ac ? "On AC" : "On battery"}
             />
+            {/* The RATE, on the overview (#773).
+
+                The issue asks for this here specifically, and the
+                reason is #720: its "discharging while plugged in"
+                alert fires, the user opens this page, and the number
+                that answers "why did I get that alert" should be
+                visible without a click. The detail page has the chart
+                and the current and voltage behind it; this is the one
+                figure.
+
+                Only rendered where there IS a battery -- a desktop's
+                absent rate is not a separate fact from its absent
+                battery, and two "Not measured" rows for one absence is
+                noise. A battery whose platform does not publish the
+                flow gets the row, because that IS a separate fact. */}
+            {s.battery !== null ? (
+              <Stat
+                label="Rate"
+                value={s.battery.power ? formatWatts(s.battery.power.watts) : null}
+                hint={
+                  s.battery.power
+                    ? powerDirection(s.battery.power.watts) === "idle"
+                      ? "Not moving"
+                      : powerDirection(s.battery.power.watts) === "charging"
+                        ? "Into the battery"
+                        : "Out of the battery"
+                    : "This platform does not publish it"
+                }
+              />
+            ) : null}
           </div>
           {s.battery !== null ? (
             <div className="mt-3">
               <Bar percent={s.battery.percent} label="Battery charge" />
             </div>
+          ) : null}
+          {/* The one reading here that is a FAULT rather than a state,
+              said in words on the panel a reader lands on. Colour is
+              never the only cue on this page, and this is the case
+              #720 alerts about -- so the sentence appears wherever the
+              rate does. */}
+          {s.battery?.power && powerDirection(s.battery.power.watts) === "discharging" && s.battery.on_ac ? (
+            <p className="mt-2 text-xs leading-relaxed text-[#f85149]">
+              Losing charge while plugged in: the machine is drawing more than
+              the adapter supplies, or the adapter is not really charging.
+            </p>
           ) : null}
 
           <div className="mt-4">
@@ -1557,7 +1609,7 @@ function DetailPage({
       ) : page === "network" ? (
         <NetworkDetail sample={sample} samples={samples} sampledAt={sampledAt} />
       ) : (
-        <PowerDetail sample={sample} sampledAt={sampledAt} />
+        <PowerDetail sample={sample} samples={samples} sampledAt={sampledAt} />
       )}
 
       {historyFailed ? (
@@ -2990,6 +3042,231 @@ function GpuDeviceDetail({
 }
 
 
+/// The capacity panel, and the reading it must not mis-describe (#772).
+///
+/// # A capacity over 100% is a healthy battery, not a bug
+///
+/// This panel used to hardcode one sentence -- "a battery at N% of its
+/// original capacity still charges to 100%, it just holds less than it
+/// once did" -- which is correct below 100 and false at or above it.
+/// The reading that opened #772 was **103%**, on a new laptop, under
+/// copy telling its owner the cell had degraded.
+///
+/// The number itself is right and is not touched. `DesignCapacity` is a
+/// nameplate figure the manufacturer guarantees rather than a ceiling,
+/// so cells routinely ship a little over it. `capacityMeaning` in
+/// `lib/health` picks the sentence; the branch lives there because it
+/// is a claim about what is true, and it is tested without rendering.
+///
+/// # The bar has its own scale for the same reason
+///
+/// Every other bar on this page runs 0-100 and colours a high reading
+/// as pressure. Both halves of that are wrong here: the value can
+/// exceed 100, and high is HEALTHY. Reusing `Bar` would peg a 103% cell
+/// at a saturated red — "renders as an error state", which #772 asks
+/// for by name. So the track runs to `CAPACITY_BAR_MAX` and the colour
+/// comes from `capacityColor`, which escalates downward.
+function CapacityPanel({
+  percent,
+  cycles,
+}: {
+  percent: number;
+  cycles: number | null;
+}) {
+  const cycleNote = cycleMeaning(percent, cycles);
+  const shown = percent.toFixed(0);
+  return (
+    <Panel title="Battery capacity" subtitle="How much the cell can still hold">
+      <div className="flex flex-wrap gap-6">
+        <Stat label="Of original capacity" value={`${shown}%`} />
+        <Stat label="Charge cycles" value={cycles === null ? null : `${cycles}`} />
+      </div>
+      <div className="mt-3">
+        {/* Not `Bar`: see the note above. The track is wider than the
+            reading's nominal maximum, so a cell above nameplate sits
+            comfortably inside it rather than overflowing its own
+            container. */}
+        <div
+          className="h-2 w-full overflow-hidden rounded-full bg-[#30363d]"
+          role="meter"
+          aria-valuenow={Math.round(percent)}
+          aria-valuemin={0}
+          aria-valuemax={CAPACITY_BAR_MAX}
+          aria-label="Battery capacity relative to design"
+        >
+          <div
+            className="h-full rounded-full"
+            style={{
+              width: `${capacityBarFill(percent)}%`,
+              backgroundColor: capacityColor(percent),
+            }}
+          />
+        </div>
+        {/* The 100% mark, named. Without it the bar is unreadable: a
+            fill that stops four-fifths along means nothing unless the
+            reader knows where the nameplate figure sits, and that is
+            precisely the comparison this panel is about. */}
+        <div className="mt-1 flex justify-between text-[11px] text-[#8b949e]">
+          <span>0%</span>
+          <span>Rated capacity: 100%</span>
+        </div>
+      </div>
+      <p className="mt-2 text-xs leading-relaxed text-[#8b949e]">
+        This is <em>not</em> the charge above. It is how much the battery can
+        hold now compared with when it was made. {capacityMeaning(percent)}
+        {cycleNote ? ` ${cycleNote}` : ""}
+      </p>
+    </Panel>
+  );
+}
+
+/// The battery's power flow: how fast, and which way (#773).
+///
+/// # The gap this closes
+///
+/// #720 added an alert for "discharging while plugged in" and it fires
+/// correctly. But a user who has just been told their machine is
+/// draining on mains power had nowhere in this app to see HOW FAST, or
+/// to watch it while working out why. This is that number.
+///
+/// # The sign carries the direction
+///
+/// Positive is into the cell, negative out of it, normalised in Rust so
+/// neither platform's encoding leaks up here. See `health::PowerFlow`
+/// -- and `collect::power_flow` for the unsigned-`Amperage` trap that
+/// makes a discharge read as roughly 18 quintillion milliamps if it is
+/// taken at face value.
+///
+/// # One reading that is a fault rather than a state
+///
+/// Discharging is ordinary; discharging while `on_ac` is not. That
+/// combination is the only thing on this card coloured red, and it is
+/// said in words as well as in colour -- the same #581/#582 rule the
+/// pressure cards keep.
+function PowerFlowCard({
+  power,
+  onAc,
+}: {
+  power: HealthPowerFlow;
+  onAc: boolean;
+}) {
+  const dir = powerDirection(power.watts);
+  const drainingOnAc = dir === "discharging" && onAc;
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex flex-wrap items-baseline gap-6">
+        <div className="min-w-24">
+          <div className="text-xs text-[#8b949e]">Power flow</div>
+          <div
+            className="text-lg font-semibold tabular-nums"
+            style={{ color: powerColor(power.watts, onAc) }}
+          >
+            {formatWatts(power.watts)}
+          </div>
+          {/* The direction in words as well as in the sign and the
+              colour. A minus sign is easy to miss at a glance and
+              colour is never the only cue on this page. */}
+          <div className="text-xs capitalize text-[#8b949e]">
+            {dir === "idle" ? "Not moving" : dir}
+          </div>
+        </div>
+        {/* The two factors behind the wattage. It is a PRODUCT, and a
+            reader who finds the watts implausible has no way to tell
+            which half is wrong without both. */}
+        <Stat label="Current" value={`${power.milliamps} mA`} />
+        <Stat label="Voltage" value={`${(power.millivolts / 1000).toFixed(2)} V`} />
+      </div>
+      {drainingOnAc ? (
+        // The #720 condition, said on the page that shows the rate.
+        // This is the whole reason #773 asks for the figure: the alert
+        // says it is happening, and this says how fast.
+        <p className="text-xs leading-relaxed text-[#f85149]">
+          Losing charge while plugged in. The machine is drawing more than the
+          adapter supplies, or the adapter is not really charging.
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+/// Why a platform reports no power flow, said rather than left blank.
+///
+/// #705's rule, applied to the one field this issue adds: a panel that
+/// silently vanishes on Windows looks like a bug, and a 0 W would be
+/// worse -- zero watts is a real reading a full battery on mains sits
+/// at, so it is indistinguishable from a measurement.
+function PowerNotMeasured() {
+  return (
+    <>
+      <p className="text-sm">
+        <NotMeasured />
+      </p>
+      <p className="mt-2 text-xs leading-relaxed text-[#8b949e]">
+        Headstate reads the charge and drain rate on macOS (through IOKit) and
+        on Linux (through <code>/sys/class/power_supply</code>), both without
+        elevated privileges. Windows publishes it too, but through an interface
+        Headstate does not yet read — so nothing is claimed here rather than a
+        zero being shown, since zero watts is itself a real reading.
+      </p>
+    </>
+  );
+}
+
+/// The 24-hour power-flow chart (#773).
+///
+/// # Two charts, not one, because the axis has a zero in the middle
+///
+/// Every other sparkline on this page runs 0 to a positive maximum.
+/// This series crosses zero, and `Sparkline` clamps at 0 -- so a single
+/// chart would draw every discharge flat along the bottom, hiding
+/// exactly the half a user came to look at.
+///
+/// Splitting into "into the battery" and "out of the battery", each
+/// scaled to the same peak magnitude, keeps both halves visible and
+/// directly comparable. A sample that was flowing the other way
+/// contributes `null` to the chart it is not on, which `splitOnGaps`
+/// breaks the line across -- which is correct: it was NOT zero watts in
+/// that direction, it was flowing the other way.
+///
+/// This is #719's interface-throughput shape, for the same reason it
+/// took that shape: two directions of one quantity, one shared ceiling.
+function PowerHistory({ series, now }: { series: Point[]; now: number }) {
+  const peak = peakWatts(series);
+  const charge = useMemo(
+    () => series.map((p) => ({ t: p.t, v: p.v !== null && p.v > 0 ? p.v : null })),
+    [series],
+  );
+  const drain = useMemo(
+    () => series.map((p) => ({ t: p.t, v: p.v !== null && p.v < 0 ? -p.v : null })),
+    [series],
+  );
+
+  if (peak === null || peak <= 0) {
+    return (
+      <p className="mt-1 text-xs">
+        <NotMeasured>— no power readings in the last 24 hours</NotMeasured>
+      </p>
+    );
+  }
+
+  return (
+    <div className="mt-1 flex flex-col gap-1">
+      <div>
+        <div className="text-xs text-[#8b949e]">Into the battery (charging)</div>
+        <Sparkline points={charge} max={peak} label="Battery charging" now={now} color="#3fb950" />
+      </div>
+      <div>
+        <div className="text-xs text-[#8b949e]">Out of the battery (draining)</div>
+        <Sparkline points={drain} max={peak} label="Battery draining" now={now} color="#d29922" />
+      </div>
+      <div className="text-xs tabular-nums text-[#8b949e]">
+        Both charts share a ceiling of {formatWatts(peak)}, so the two
+        directions are comparable.
+      </div>
+    </div>
+  );
+}
+
 /// Battery, thermal pressure and uptime — the machine's condition.
 ///
 /// # Why these three share a page
@@ -3011,11 +3288,18 @@ function GpuDeviceDetail({
 /// the three, said once, where all three are on screen.
 function PowerDetail({
   sample: s,
+  samples,
   sampledAt,
 }: {
   sample: HealthSample;
+  /// The 24-hour series, for the power-flow chart (#773). This page
+  /// took no history at all before that issue -- battery was two live
+  /// numbers -- and a rate is the one reading here that is far more
+  /// useful as a shape than as an instant.
+  samples: HealthSample[];
   sampledAt: number;
 }) {
+  const watts = useMemo(() => powerSeries(samples), [samples]);
   return (
     <div className="flex flex-col gap-4">
       <Panel title="Battery" subtitle="Charge and power source">
@@ -3052,6 +3336,34 @@ function PowerDetail({
         )}
       </Panel>
 
+      {/* The RATE (#773), between charge and capacity because that is
+          the order of the questions: how full, how fast is that
+          changing, and how much can it hold at all. Its own panel for
+          the same reason capacity has one -- watts and percentages are
+          different quantities, and a wattage beside a charge bar is
+          read as part of it. */}
+      {s.battery !== null ? (
+        <Panel
+          title="Charge and drain rate"
+          subtitle="How fast power is moving in or out of the cell, right now"
+        >
+          {s.battery.power ? (
+            <PowerFlowCard power={s.battery.power} onAc={s.battery.on_ac} />
+          ) : (
+            <PowerNotMeasured />
+          )}
+          {s.battery.power ? (
+            <div className="mt-4">
+              <div className="text-xs text-[#8b949e]">
+                Power flow over the last 24 hours
+              </div>
+              <PowerHistory series={watts} now={sampledAt} />
+              <GapNote />
+            </div>
+          ) : null}
+        </Panel>
+      ) : null}
+
       {/* CAPACITY, in its own panel, never in the one above.
           "Battery health" normally means capacity relative to design --
           a different number from charge, moving over years rather than
@@ -3061,32 +3373,10 @@ function PowerDetail({
           is somehow at 84%. Separate panel, separate heading, and the
           word "charge" appears in neither. */}
       {s.battery !== null && s.battery.capacity_percent !== null ? (
-        <Panel title="Battery capacity" subtitle="How much the cell can still hold">
-          <div className="flex flex-wrap gap-6">
-            <Stat
-              label="Of original capacity"
-              value={`${s.battery.capacity_percent.toFixed(0)}%`}
-            />
-            <Stat
-              label="Charge cycles"
-              value={
-                s.battery.cycle_count === null
-                  ? null
-                  : `${s.battery.cycle_count}`
-              }
-            />
-          </div>
-          <p className="mt-2 text-xs leading-relaxed text-[#8b949e]">
-            This is <em>not</em> the charge above. It is how much the battery
-            can hold now compared with when it was made, which falls slowly
-            over years — a battery at{" "}
-            {s.battery.capacity_percent.toFixed(0)}% of its original capacity
-            still charges to 100%, it just holds less than it once did.
-            {s.battery.cycle_count !== null
-              ? ` Read alongside the cycle count: wear after ${s.battery.cycle_count} cycles is ordinary ageing.`
-              : ""}
-          </p>
-        </Panel>
+        <CapacityPanel
+          percent={s.battery.capacity_percent}
+          cycles={s.battery.cycle_count}
+        />
       ) : s.battery !== null ? (
         // A battery whose capacity the platform will not report. Said
         // rather than silently omitted: a panel that vanishes on Linux
