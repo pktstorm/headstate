@@ -96,6 +96,45 @@ pub enum Safety {
     Orphaned,
     /// Branch is not merged into the default branch.
     Unmerged,
+    /// Someone locked this worktree; git refuses to remove it (#753).
+    ///
+    /// Carries git's own lock reason, which is the whole point of the
+    /// variant. `git worktree lock --reason` exists so the locker can
+    /// say who they are, and a tool that locks a tree while it works in
+    /// it writes something like "some tool (pid 123)". That string is
+    /// the evidence a user needs to tell a LIVE claim from a leftover
+    /// one -- a process that is still running versus one that died
+    /// without unlocking. `None` when the lock carries no reason, which
+    /// git also permits.
+    ///
+    /// Its own variant rather than a flavour of `Unknown`, because the
+    /// check did not fail: the answer is known, specific, and has an
+    /// obvious remedy. It is also not a flavour of `Dirty` -- a lock
+    /// says nothing about the contents, only that something claimed the
+    /// directory.
+    ///
+    /// NOT removable, and deliberately not force-removable behind the
+    /// scenes: `git worktree remove` suggests `-f -f` to override, and
+    /// passing that silently would defeat the only mechanism git gives a
+    /// concurrent process for saying "I am using this". 13 of 34
+    /// worktrees on the reporting machine were locked by running agents.
+    Locked(Option<String>),
+    /// The directory is gone and git knows the registration is stale.
+    ///
+    /// Git emits `prunable <reason>` for exactly this, and `git worktree
+    /// prune` clears it. Before #753 the missing directory fell through
+    /// to `Unknown("directory is missing")`, which reads as corruption
+    /// -- a true statement that told the user nothing about what to do,
+    /// for what is ordinary, resolvable bookkeeping.
+    ///
+    /// Carries git's reason (typically "gitdir file points to
+    /// non-existent location") rather than the app's own guess, so the
+    /// row reports what git actually said.
+    ///
+    /// NOT removable, though nothing here could be lost: there is no
+    /// directory left to remove, so the remove path is simply the wrong
+    /// action. Pruning is the right one, and it is a different verb.
+    Prunable(String),
     /// Listed, but not yet classified. A transient state the UI shows as
     /// a skeleton rather than as an answer -- distinct from `Unknown`,
     /// which means the check ran and could not decide.
@@ -167,6 +206,17 @@ impl Safety {
             // answered by `is_safe`.
             Safety::Empty => "no commits of its own — nothing to lose".into(),
             Safety::Unmerged => "branch not merged".into(),
+            // Names the locker when git has one. "locked" alone would
+            // send the user to the command line to find out by whom;
+            // the reason is why `--reason` exists, and it is what
+            // separates a live claim from a stale one (#753).
+            Safety::Locked(Some(why)) => format!("locked: {why}"),
+            Safety::Locked(None) => "locked — no reason given".into(),
+            // Says the remedy, because unlike every other refusal here
+            // there is one, it is safe, and it is one command. The old
+            // wording for this state was "could not determine:
+            // directory is missing", which named neither.
+            Safety::Prunable(why) => format!("directory is gone — prunable ({why})"),
             Safety::Pending => "checking…".into(),
             // Says what IS known, not what could not be checked. The
             // parent repository is gone, so nothing about this
@@ -256,6 +306,23 @@ pub struct Worktree {
     /// a branch written weeks before it merged, and the merge date is the
     /// one that answers "is this safe to forget about".
     pub merged_at: Option<String>,
+    /// Git's `locked` line: `Some(reason)`, `Some("")` for a bare lock,
+    /// `None` when the worktree is not locked (#753).
+    ///
+    /// Two levels of Option are not an accident. The OUTER one is the
+    /// question "is this locked", and the inner emptiness is "locked,
+    /// but the locker left no note" -- git permits `git worktree lock`
+    /// with no `--reason`, and emits a bare `locked` line for it.
+    /// Collapsing them would make an unlocked worktree and an
+    /// unexplained lock the same value, and only one of those refuses
+    /// to be removed.
+    #[serde(default)]
+    pub locked: Option<String>,
+    /// Git's `prunable` reason, or `None` when the registration is live.
+    ///
+    /// No inner Option: git always supplies a reason on this line.
+    #[serde(default)]
+    pub prunable: Option<String>,
 }
 
 #[cfg(test)]

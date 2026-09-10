@@ -59,6 +59,20 @@ export function safetyReason(s: Safety): string {
       return "no commits of its own — nothing to lose";
     case "unmerged":
       return "branch not merged";
+    case "locked":
+      // Names the locker, because that is the fact the user acts on:
+      // "some tool (pid 123)" answers whether the claim is live or
+      // left behind by a process that died, and a bare "locked" would
+      // send them to a terminal to find out (#753).
+      return s.detail === null
+        ? "locked — no reason given"
+        : `locked: ${s.detail}`;
+    case "prunable":
+      // Says the remedy. Unlike the other refusals there IS one, it is
+      // safe, and it is one command -- where the old wording for this
+      // state, "could not determine: directory is missing", named
+      // neither the cause nor the cure.
+      return `directory is gone — prunable (${s.detail})`;
     case "pending":
       return "checking…";
     case "orphaned":
@@ -90,6 +104,19 @@ export function forceWarning(s: Safety): string {
       return "These commits are not pushed anywhere. This cannot be undone.";
     case "empty":
       return "This branch has no commits of its own, so nothing on it would be lost. Removing the directory cannot be undone.";
+    case "locked":
+      // Says the truth the general wording would hide: forcing here
+      // does not work. `remove_worktree_forced` relaxes Headstate's
+      // gate but still calls git WITHOUT `--force`, and git refuses a
+      // locked tree on its own account -- so the user would confirm a
+      // destructive-sounding dialog and get an error. Naming the
+      // unlock is not an invitation to ignore the lock; it is the only
+      // route that exists, and the reason is quoted beside it (#753).
+      return "This worktree is locked, and git will refuse to remove it until it is unlocked — check the lock reason above first, in case the process that set it is still running.";
+    case "prunable":
+      // There is no directory to remove, so the destructive framing is
+      // simply wrong here. Nothing can be lost and nothing will be.
+      return "This worktree's directory is already gone; only the stale registration remains. Removing it loses nothing, but `git worktree prune` is the command that clears it.";
     default:
       return "Headstate does not consider this safe to remove. This cannot be undone.";
   }
@@ -125,6 +152,23 @@ export function prForWorktree(
 ///
 /// `pending` is excluded on purpose: offering an action based on a
 /// safety verdict that has not arrived is the bug #190 was.
+///
+/// `locked` and `prunable` are excluded too, and they are the states
+/// where the blanket rule "not removable and not the main checkout"
+/// stops fitting (#753). The action copies a prompt asking a coding
+/// agent to assess the worktree's CONTENT, and neither of these is a
+/// question about content:
+///
+/// - `prunable` has no directory left. There is nothing on disk for an
+///   agent to open, so the prompt would send it somewhere that does
+///   not exist.
+/// - `locked` is a claim by another process -- very often an agent
+///   already working in that tree, which is precisely how the
+///   reporting machine acquired 13 of them. Pointing a second agent at
+///   a directory the first has locked is the one thing the lock exists
+///   to prevent. The lock is also not a property of the branch, so
+///   once it is cleared the row reports its real state and the action
+///   returns on its own.
 export function canClaudify(s: Safety): boolean {
   return (
     s.kind === "unmerged" ||
@@ -263,6 +307,19 @@ export function safetyTone(s: Safety): string {
     case "dirty":
     case "unpushed":
       return "text-[#d29922]";
+    case "locked":
+      // Amber, alongside the other "you can act on this" states. Not
+      // red: a lock endangers nothing -- it is a claim by another
+      // process, and the worst case of ignoring it is that the row
+      // stays. Not grey either, because unlike `empty` this is an
+      // obstacle the user may well want to clear, and on the reporting
+      // machine it covers a third of the rows (#753).
+      return "text-[#d29922]";
+    case "prunable":
+      // Grey. There is no directory left, so there is nothing at risk
+      // and nothing to reclaim -- it is a bookkeeping entry, and amber
+      // would ask for attention that the row does not deserve.
+      return "text-[#8b949e]";
     case "orphaned":
       // Amber, not red: an orphan is not dangerous, it is
       // UNVERIFIABLE. Red would put it beside "commits exist only
