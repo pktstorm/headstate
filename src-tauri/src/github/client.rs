@@ -157,6 +157,47 @@ fn offset_cursor(offset: u32) -> String {
     base64::engine::general_purpose::STANDARD.encode(format!("cursor:{offset}"))
 }
 
+/// Drop pull requests that appear more than once in a merged result.
+///
+/// Offset cursors index a LIVE list. A pull request entering the result
+/// set between page 1 and page 2 shifts every later item UP one, so the
+/// item at the boundary is returned by two pages -- and the merge step
+/// would keep both, rendering one pull request in two rows (#744).
+///
+/// The mirror image, an item leaving mid-fetch, loses one instead. That
+/// one cannot be recovered here; it is accounted for as expected drift
+/// where the shortfall is judged.
+///
+/// A node without an id is KEPT. It cannot be compared, and dropping it
+/// would trade a visible duplicate for an invisible loss.
+fn dedupe_nodes(merged: &mut serde_json::Value) {
+    let Some(nodes) = merged["authored"]["nodes"].as_array_mut() else {
+        return;
+    };
+    let mut seen = std::collections::HashSet::new();
+    nodes.retain(|n| match n["id"].as_str() {
+        Some(id) => seen.insert(id.to_string()),
+        None => true,
+    });
+}
+
+/// How short a paged result may legitimately be without anything having
+/// gone wrong.
+///
+/// One item per page boundary crossed, because an item leaving the
+/// result set mid-fetch costs exactly the item at that boundary; plus a
+/// whole page for each page that failed outright.
+///
+/// Below this, a shortfall is the ordinary consequence of paging a list
+/// that is changing -- the user approving pull requests, which is the
+/// very activity the view exists for. Above it, something else is wrong
+/// and worth saying. 59 of 79 multi-page fetches in a real session log
+/// sat at exactly one, and warning about each of them blamed GitHub for
+/// the user doing their job.
+fn expected_drift(boundaries: u64, failed_pages: u64) -> u64 {
+    boundaries + failed_pages * u64::from(PAGE_SIZE)
+}
+
 /// The two searches the app runs, named once so the poll path and the
 /// review path cannot drift apart.
 const AUTHORED_OPEN: &str = "is:pr is:open author:@me";
@@ -298,9 +339,24 @@ impl GitHubClient {
         }
 
         let mut merged = first;
+        // How many pages failed outright, and the truest total any page
+        // reported. Both feed the shortfall judgement in the caller,
+        // which cannot otherwise tell an expected boundary slip from a
+        // page that never arrived (#744).
+        let mut failed_pages: u32 = 0;
+        // `issueCount` from page 1 is stale the moment the other pages
+        // are issued: they are fetched CONCURRENTLY against a live
+        // result set. Taking the smallest total any page reported keeps
+        // the comparison honest when the list shrank mid-fetch, which is
+        // the common case -- the user is working through the queue, and
+        // every approval removes one.
+        let mut truest_total = total;
         for page in rest {
             match page {
                 Ok(v) => {
+                    if let Some(t) = v["authored"]["issueCount"].as_u64() {
+                        truest_total = truest_total.min(t as u32);
+                    }
                     if let Some(nodes) = v["authored"]["nodes"].as_array() {
                         if let Some(into) = merged["authored"]["nodes"].as_array_mut() {
                             into.extend(nodes.iter().cloned());
@@ -312,9 +368,36 @@ impl GitHubClient {
                 // arrived against `issueCount`, and discarding the pages
                 // that did arrive would turn a partial answer into no
                 // answer -- the mistake v3.2.5 made.
-                Err(e) => log::warn!("a page of the search failed ({e}); the list will be short"),
+                Err(e) => {
+                    failed_pages += 1;
+                    log::warn!("a page of the search failed ({e}); the list will be short");
+                }
             }
         }
+
+        // Offset cursors index a LIVE list. A pull request leaving the
+        // result set between page 1 and page 2 -- approved, merged, or
+        // its review request dismissed -- shifts every later item down
+        // one, so the item at the page boundary is returned by no page
+        // at all. It can also shift the other way and return one item
+        // TWICE, which `extend` would happily keep: a duplicate inflates
+        // the list and renders the same pull request in two rows.
+        //
+        // Deduplicating by node id makes the merge idempotent and costs
+        // one pass over at most `MAX_PAGES * PAGE_SIZE` nodes. A node
+        // without an id cannot be compared, so it is kept -- dropping it
+        // would trade a visible duplicate for an invisible loss.
+        dedupe_nodes(&mut merged);
+
+        // Recorded for the caller: how many boundaries this fetch
+        // crossed, and how many pages were lost. A shortfall no larger
+        // than the number of boundaries is ordinary drift and not worth
+        // a warning; anything beyond that is worth seeing.
+        merged["headstate_paging"] = json!({
+            "boundaries": pages.saturating_sub(1),
+            "failed_pages": failed_pages,
+            "truest_total": truest_total,
+        });
         Ok(merged)
     }
 
@@ -423,9 +506,30 @@ impl GitHubClient {
         // Reported as a shortfall rather than an error: the 50 that did
         // arrive are real and worth showing, and blanking the list over
         // an incomplete one is the exact regression v3.5.1 had to undo.
-        let total = v["authored"]["issueCount"].as_u64().unwrap_or(0);
+        // The smallest total any page reported, not page 1's. See the
+        // paging note in `search_page_with_fallback` (#744).
+        let total = v["headstate_paging"]["truest_total"]
+            .as_u64()
+            .or_else(|| v["authored"]["issueCount"].as_u64())
+            .unwrap_or(0);
         let short = total.saturating_sub(mapped.len() as u64);
-        if short > 0 {
+
+        // A shortfall no larger than the number of page boundaries
+        // crossed is ORDINARY, not a failure: offset cursors index a
+        // live list, and a pull request leaving it mid-fetch costs
+        // exactly one item per boundary. Warning about it blamed GitHub
+        // for the user approving a pull request -- 59 of 79 multi-page
+        // fetches in a real session log were short by exactly one, every
+        // one of them explainable this way, and the noise buried the
+        // failures that mattered.
+        //
+        // A failed page is different and always worth saying: it is
+        // logged where it happens, and it also lifts the threshold here
+        // because a lost page of 25 is a shortfall no amount of drift
+        // explains.
+        let boundaries = v["headstate_paging"]["boundaries"].as_u64().unwrap_or(0);
+        let failed = v["headstate_paging"]["failed_pages"].as_u64().unwrap_or(0);
+        if short > expected_drift(boundaries, failed) {
             log::warn!(
                 "the review list is short: {} of {total} pull requests \
                  (GitHub could not answer the full query)",
@@ -1005,6 +1109,65 @@ async fn graphql_partial_ok(
 
 #[cfg(test)]
 mod tests {
+
+    /// #744: a pull request returned by two pages must appear once.
+    ///
+    /// Offset cursors index a live list, so an item entering mid-fetch
+    /// shifts the boundary and hands the same node to two pages. The
+    /// merge used to keep both.
+    #[test]
+    fn a_node_returned_by_two_pages_appears_once() {
+        let mut merged = serde_json::json!({
+            "authored": { "nodes": [
+                {"id": "PR_1", "title": "first"},
+                {"id": "PR_2", "title": "second"},
+                {"id": "PR_1", "title": "first"},
+            ]}
+        });
+        super::dedupe_nodes(&mut merged);
+        let nodes = merged["authored"]["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 2, "the duplicate is dropped: {nodes:?}");
+        // ORDER preserved, and the FIRST occurrence kept: the list is
+        // sorted by the search, and keeping the later copy would move a
+        // pull request down the page for no reason the user can see.
+        assert_eq!(nodes[0]["id"], "PR_1");
+        assert_eq!(nodes[1]["id"], "PR_2");
+    }
+
+    /// A node with no id cannot be compared. Keeping it risks a visible
+    /// duplicate; dropping it loses a pull request silently, which is
+    /// worse.
+    #[test]
+    fn nodes_without_an_id_are_kept() {
+        let mut merged = serde_json::json!({
+            "authored": { "nodes": [{"title": "a"}, {"title": "b"}] }
+        });
+        super::dedupe_nodes(&mut merged);
+        assert_eq!(merged["authored"]["nodes"].as_array().unwrap().len(), 2);
+    }
+
+    /// A response with no nodes array at all must not panic.
+    #[test]
+    fn dedupe_tolerates_a_missing_nodes_array() {
+        let mut merged = serde_json::json!({"authored": {}});
+        super::dedupe_nodes(&mut merged);
+        let mut empty = serde_json::json!({});
+        super::dedupe_nodes(&mut empty);
+    }
+
+    /// #744: one item per boundary is ordinary drift, and a lost page is
+    /// a whole page.
+    #[test]
+    fn expected_drift_allows_one_item_per_boundary() {
+        // Single page: no boundary, so nothing is expected to go
+        // missing and any shortfall is real.
+        assert_eq!(super::expected_drift(0, 0), 0);
+        // Two pages, one boundary: the 59-of-79 case from the log.
+        assert_eq!(super::expected_drift(1, 0), 1);
+        assert_eq!(super::expected_drift(3, 0), 3);
+        // A failed page is a whole page missing, on top of drift.
+        assert_eq!(super::expected_drift(1, 1), 1 + u64::from(super::PAGE_SIZE));
+    }
 
     /// Serialises the tests that assert an exact `REFUSED_FIELDS` value.
     ///
