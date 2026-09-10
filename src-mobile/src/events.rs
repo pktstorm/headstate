@@ -71,6 +71,22 @@ pub const EVENT_NAMES: &[&str] = &[
     // ten minutes, and a phone feels that hardest -- it has no window
     // to leave open and watch. Counts only: no branch names, no paths.
     "branch-delete-progress",
+    // The twelfth, and the first that carries a PATH (#754). Weighed
+    // rather than waved through, because the two entries above make a
+    // point of carrying counts only.
+    //
+    // What tips it: `size_worktrees`, an already-allowlisted command,
+    // RETURNS these very `(path, bytes)` pairs to this phone over this
+    // transport. The event is the same data arriving earlier, so it
+    // widens no boundary that the command has not already opened -- and
+    // withholding it would not hide a path, only delay it.
+    //
+    // It has to be here at all because the walk is unbounded in
+    // wall-clock terms (MEASURED: 21.40s for one 200 GB checkout), and
+    // the phone is the client that suffers most: it cannot leave a
+    // window open, so what it can show is what arrives while it is in
+    // the foreground.
+    "worktree-size",
 ];
 
 /// The event whose payload is the PR list, cached as the snapshot.

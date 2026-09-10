@@ -644,14 +644,34 @@ pub async fn classify_worktrees(
 
 /// Disk sizes for one repo's worktrees, as `(path, bytes)` pairs.
 ///
-/// Separate from classification because it is a full tree walk -- ~60ms
-/// per worktree, so ~18s across the 296 on this machine. The UI shows the
-/// list, then safety, then sizes.
+/// Separate from classification because it is a full tree walk, and the
+/// walk is the expensive part of this view by a wide margin: MEASURED,
+/// 21.40s for a single 200 GB checkout against 0.78s for a 0.33 GB one.
+/// The cost tracks bytes and file count, not worktree count.
+///
+/// Each pair is ALSO emitted on `worktree-size` as it is measured, so a
+/// view can fill a row in the moment its answer exists rather than
+/// holding every row on a skeleton until the slowest tree finishes --
+/// which is what #754 reported as an indefinite load. The return value
+/// is kept so a caller that only wants the final set can ignore the
+/// events entirely.
 #[tauri::command]
-pub async fn size_worktrees(repo_path: String) -> Result<Vec<(String, u64)>, String> {
-    tauri::async_runtime::spawn_blocking(move || crate::worktrees::size_repo(&repo_path))
-        .await
-        .map_err(|e| e.to_string())?
+pub async fn size_worktrees(
+    app: AppHandle,
+    repo_path: String,
+) -> Result<Vec<(String, u64)>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut out = Vec::new();
+        crate::worktrees::size_repo_streaming(&repo_path, &mut |path, bytes| {
+            // Emitted per worktree rather than batched: batching would
+            // reintroduce exactly the wait this exists to remove.
+            let _ = app.emit("worktree-size", (path, bytes));
+            out.push((path.to_string(), bytes));
+        })?;
+        Ok(out)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Regenerable build output under the configured scan roots.

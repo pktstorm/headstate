@@ -481,7 +481,13 @@ export function WorktreesPage() {
     refetch: retryClassify,
   } = useWorktreeSafety(selected?.path);
   const sizesQuery = useWorktreeSizes(selected?.path);
-  const sizes = sizesQuery.data;
+  // The settled answer when there is one, and the sizes streamed so far
+  // when there is not. Before #754 this was `data` alone, so every row
+  // held a skeleton until the LARGEST tree in the repository had been
+  // walked -- MEASURED at 21.40s for one 200 GB checkout, and minutes
+  // across a repository with 100 worktrees. A row's own size is known
+  // long before that and there was no reason to withhold it.
+  const sizes = sizesQuery.data ?? sizesQuery.partial;
   // `isFetching`, NOT `isLoading`. A DISABLED query reports `isLoading:
   // true` forever in TanStack v5 -- it has no data and never will --
   // so on "All repositories", where no repo is selected and the sizing
@@ -920,8 +926,20 @@ export function WorktreesPage() {
             <HelpButton topic="worktree-safety" />
           </span>
         )}
+        {/* A COUNT, not a bare "measuring sizes…".
+
+            The old label said only that work was happening, which is
+            indistinguishable from a hang once it has said it for ten
+            minutes -- and that is precisely what #754 reported. The walk
+            is unbounded in wall-clock terms (MEASURED: 21.40s for a
+            single 200 GB checkout), so the honest thing is not to
+            promise a finish time but to show it advancing. A number that
+            visibly falls is the difference between "still working" and
+            "broken". */}
         {!classifying && sizing ? (
-          <span className="text-xs text-[#8b949e]">measuring sizes…</span>
+          <span className="text-xs text-[#8b949e]">
+            measuring sizes — {shown.length - measured.length} of {shown.length} to go
+          </span>
         ) : null}
         {/* "at least" until every worktree has been measured. Reported
             here as well as on the rollup, because the per-repo page is

@@ -13,6 +13,8 @@ const state = vi.hoisted(() => ({
   assessed: [] as string[],
   prs: [] as import("@/types/pr").PullRequest[],
   sizes: undefined as Map<string, number> | undefined,
+  // Sizes streamed in while the query is still in flight (#754).
+  partialSizes: undefined as Map<string, number> | undefined,
   allSizes: undefined as Map<string, number> | undefined,
   sizesPending: 0,
   sizesTotal: 0,
@@ -79,8 +81,12 @@ vi.mock("../api/hooks", () => ({
   // Mirrors the real hook: a DISABLED query reports `isLoading: true`
   // forever, so the page reads `isFetching` instead -- and a mock that
   // only carried `isLoading` would hide exactly the bug that caused.
+  // `partial` mirrors the real hook's stream of per-worktree sizes: the
+  // settled `data` is undefined until every tree in the repository has
+  // been walked, and rows must fill from `partial` before then (#754).
   useWorktreeSizes: () => ({
     data: state.sizes,
+    partial: state.partialSizes ?? new Map<string, number>(),
     isLoading: state.sizing,
     isFetching: state.sizing,
   }),
@@ -145,6 +151,7 @@ describe("WorktreesPage on a phone", () => {
       classified: [wt({ safety: { kind: "safe" } })],
       classifying: false,
       sizes: undefined,
+      partialSizes: undefined,
       allSizes: undefined,
       sizesPending: 0,
       sizesTotal: 0,
@@ -217,6 +224,7 @@ describe("WorktreesPage", () => {
       classified: undefined,
       classifying: false,
       sizes: undefined,
+      partialSizes: undefined,
       sizing: false,
       assessed: [],
       prs: [],
@@ -541,6 +549,63 @@ describe("WorktreesPage", () => {
     const { container } = render(<WorktreesPage />);
     const names = [...container.querySelectorAll(".font-mono")].map((n) => n.textContent);
     expect(names[0]).toMatch(/^zzz/);
+  });
+
+  // #754: a row's own size is known long before the repository's
+  // slowest tree has been walked, and there is no reason to withhold it.
+  // Before the fix this view read only the SETTLED query, so every row
+  // held a skeleton for the whole walk -- minutes on a repository with a
+  // 200 GB checkout, which is what "flashing skeletons indefinitely"
+  // was.
+  it("shows a size that has streamed in before the whole repository is measured", () => {
+    Object.assign(state, {
+      repos: [
+        {
+          identity: null,
+          name: "proj",
+          path: "/code/proj",
+          worktrees: [
+            wt({ path: "/code/done", size_bytes: null }),
+            wt({ path: "/code/slow", size_bytes: null }),
+          ],
+        },
+      ],
+      // The query has NOT settled -- this is the state that used to show
+      // two skeletons and nothing else.
+      sizes: undefined,
+      // Exactly 2.5 GiB, so the rendered string is unambiguous.
+      partialSizes: new Map([["/code/done", 2.5 * 1024 ** 3]]),
+      sizing: true,
+    });
+    render(<WorktreesPage />);
+    expect(screen.getByText("2.5 GB")).not.toBeNull();
+  });
+
+  // The other half of #754: whatever the measurement costs, the view has
+  // to say how far along it is. "measuring sizes…" on its own is
+  // indistinguishable from a hang once it has said it for ten minutes.
+  it("counts down the worktrees still to be measured", () => {
+    Object.assign(state, {
+      repos: [
+        {
+          identity: null,
+          name: "proj",
+          path: "/code/proj",
+          worktrees: [
+            wt({ path: "/code/a", size_bytes: null }),
+            wt({ path: "/code/b", size_bytes: null }),
+            wt({ path: "/code/c", size_bytes: null }),
+          ],
+        },
+      ],
+      sizes: undefined,
+      partialSizes: new Map([["/code/a", 1_000]]),
+      sizing: true,
+    });
+    render(<WorktreesPage />);
+    // One of three has landed, so two remain -- a number that falls,
+    // rather than a spinner that says only "something is happening".
+    expect(screen.getByText(/2 of 3 to go/)).not.toBeNull();
   });
 
   // Deleting on an unresolved verdict is the one unrecoverable mistake

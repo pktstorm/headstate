@@ -93,6 +93,20 @@ pub const EVENT_NAMES: &[&str] = &[
     // nothing on screen. Counts only -- no branch names and no paths,
     // the `worktree-removal-progress` rule.
     "branch-delete-progress",
+    // The first entry to break the "counts only" rule above, and the
+    // break is deliberate (#754): this one carries a worktree PATH.
+    //
+    // What makes it acceptable is that `size_worktrees` -- already on
+    // the command allowlist -- RETURNS these same `(path, bytes)` pairs
+    // to the same client over the same transport. The event is that
+    // data arriving per worktree instead of in one batch at the end, so
+    // it opens nothing the command has not already opened.
+    //
+    // It is needed because the walk has no useful upper bound: MEASURED,
+    // 21.40s for a single 200 GB checkout, and the cost tracks bytes
+    // rather than worktree count. Batching at the end is what left a
+    // 100-worktree page showing skeletons for ten minutes.
+    "worktree-size",
 ];
 
 /// The event name the opening snapshot frame is sent under, so the

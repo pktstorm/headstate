@@ -358,7 +358,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "latest_release" => ok(commands::latest_release(app.clone()).await),
         "list_worktrees" => res(commands::list_worktrees(app.clone()).await),
         "classify_worktrees" => res(commands::classify_worktrees(a.get("repoPath")?).await),
-        "size_worktrees" => res(commands::size_worktrees(a.get("repoPath")?).await),
+        "size_worktrees" => res(commands::size_worktrees(app.clone(), a.get("repoPath")?).await),
         "list_branches" => res(commands::list_branches(app.clone(), a.get("repoPath")?).await),
         "scan_artifacts" => res(commands::scan_artifacts(app.clone()).await),
         "size_artifacts" => res(commands::size_artifacts(a.get("paths")?).await),
