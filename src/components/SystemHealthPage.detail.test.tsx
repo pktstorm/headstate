@@ -829,6 +829,174 @@ describe("the Power page", () => {
     await screen.findByText(/macOS only/i);
   });
 
+
+  /// #772, rendered.
+  ///
+  /// The reading that opened the issue: 103% of design on a new laptop,
+  /// under copy telling its owner the battery had degraded. The panel
+  /// must show the number -- it is correct -- and must not attach the
+  /// worn-battery sentence to it.
+  it("does not describe a battery above its design capacity as degraded", async () => {
+    liveFn.mockResolvedValue(
+      sample({
+        battery: {
+          percent: 96,
+          on_ac: true,
+          capacity_percent: 103,
+          cycle_count: 12,
+          power: null,
+        },
+      }),
+    );
+    renderPage();
+
+    await screen.findByText("Battery capacity");
+    // The number is unchanged: #772 is explicit that the calculation is
+    // right and only the description is wrong.
+    expect(screen.getByText("103%")).toBeTruthy();
+
+    // The sentence that was false at this reading is gone...
+    expect(screen.queryByText(/holds less than it once did/i)).toBeNull();
+    // ...and the true one is there instead.
+    await screen.findByText(/holds slightly more than the capacity it was rated for/i);
+    await screen.findByText(/no wear has happened yet/i);
+
+    // The cycle clause presumed wear too, and must not call twelve
+    // cycles on a healthy cell "ordinary ageing".
+    expect(screen.queryByText(/ordinary ageing/i)).toBeNull();
+  });
+
+  /// The visual half of #772: above 100 it must not overflow or read as
+  /// an error state.
+  it("draws a capacity over 100% inside its bar and not in red", async () => {
+    liveFn.mockResolvedValue(
+      sample({
+        battery: {
+          percent: 96,
+          on_ac: true,
+          capacity_percent: 103,
+          cycle_count: 12,
+          power: null,
+        },
+      }),
+    );
+    const { container } = renderPage();
+    await screen.findByText("103%");
+
+    const meter = container.querySelector(
+      '[aria-label="Battery capacity relative to design"]',
+    );
+    expect(meter).toBeTruthy();
+    const fill = meter!.querySelector("div") as HTMLElement;
+    // Inside the track, so it cannot overflow or wrap its container.
+    const width = Number.parseFloat(fill.style.width);
+    expect(width).toBeGreaterThan(0);
+    expect(width).toBeLessThanOrEqual(100);
+    // Green, not the crimson the shared pressure scale would give a
+    // reading this high.
+    expect(fill.style.backgroundColor).not.toBe("rgb(248, 81, 73)");
+  });
+
+  /// A worn battery keeps the wording that was always correct for it,
+  /// so the fix cannot have been made by deleting the sentence.
+  it("still explains wear for a battery below its design capacity", async () => {
+    renderPage();
+    await screen.findByText("Battery capacity");
+    // The default fixture is 84% after 413 cycles.
+    await screen.findByText(/holds less than it once did/i);
+    await screen.findByText(/wear after 413 cycles is ordinary ageing/i);
+  });
+
+  /// #773, on the page the issue asks for it.
+  it("shows how fast the battery is draining, and which way", async () => {
+    liveFn.mockResolvedValue(
+      sample({
+        battery: {
+          percent: 64,
+          on_ac: false,
+          capacity_percent: 84,
+          cycle_count: 413,
+          // A DISCHARGE, which is the sign that would be nonsense if
+          // the Rust side had read `Amperage` as unsigned.
+          power: { watts: -18.4, milliamps: -1454, millivolts: 12654 },
+        },
+      }),
+    );
+    renderPage();
+
+    await screen.findByText("Charge and drain rate");
+    await screen.findByText("-18.4 W");
+    // The direction in words as well as in the sign, since colour and a
+    // minus sign are both easy to miss.
+    await screen.findByText("discharging");
+    // The two factors behind the product, so an implausible wattage can
+    // be traced to whichever half is wrong.
+    expect(screen.getByText("-1454 mA")).toBeTruthy();
+    expect(screen.getByText("12.65 V")).toBeTruthy();
+  });
+
+  /// The #720 case, which is the reason #773 exists: the alert says it
+  /// is happening, and this says how fast.
+  it("calls out a battery draining while plugged in", async () => {
+    liveFn.mockResolvedValue(
+      sample({
+        battery: {
+          percent: 64,
+          on_ac: true,
+          capacity_percent: 84,
+          cycle_count: 413,
+          power: { watts: -6.2, milliamps: -490, millivolts: 12654 },
+        },
+      }),
+    );
+    renderPage();
+
+    await screen.findByText("-6.2 W");
+    await screen.findAllByText(/losing charge while plugged in/i);
+  });
+
+  /// Draining on BATTERY is completely ordinary and must not be
+  /// flagged, or the flag stops meaning anything.
+  it("does not flag an ordinary discharge on battery power", async () => {
+    liveFn.mockResolvedValue(
+      sample({
+        battery: {
+          percent: 64,
+          on_ac: false,
+          capacity_percent: 84,
+          cycle_count: 413,
+          power: { watts: -6.2, milliamps: -490, millivolts: 12654 },
+        },
+      }),
+    );
+    renderPage();
+    await screen.findByText("-6.2 W");
+    expect(screen.queryByText(/losing charge while plugged in/i)).toBeNull();
+  });
+
+  /// #705's rule, applied to the field this issue adds. A zero would be
+  /// worse than a blank here than almost anywhere: zero watts is a real
+  /// reading a full battery on mains sits at.
+  it("says the rate was not measured rather than showing zero watts", async () => {
+    liveFn.mockResolvedValue(
+      sample({
+        battery: {
+          percent: 64,
+          on_ac: true,
+          capacity_percent: 84,
+          cycle_count: 413,
+          power: null,
+        },
+      }),
+    );
+    renderPage();
+
+    await screen.findByText("Charge and drain rate");
+    expect(screen.queryByText("0.0 W")).toBeNull();
+    // And the reason, per #705.
+    await screen.findByText(/Windows publishes it too/i);
+  });
+
   it("couples thermal and battery only when both facts are in hand", async () => {
     liveFn.mockResolvedValue(
       sample({

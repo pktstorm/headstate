@@ -969,6 +969,48 @@ interface HealthBattery {
   /// The context that makes capacity readable: 84% after 400 cycles is
   /// ordinary ageing, and after 40 it is a fault.
   cycle_count: number | null;
+  /// How fast power is moving in or out of the cell right now (#773).
+  ///
+  /// The THIRD distinct number this type carries, and the only one that
+  /// is a rate rather than a level: `percent` is how full,
+  /// `capacity_percent` is how full it can get, and this is which way
+  /// and how fast it is moving.
+  ///
+  /// `null` where the platform does not publish it (every platform but
+  /// macOS and Linux), and never a 0 standing in for that -- zero watts
+  /// is a real reading, since a full battery on mains draws nothing.
+  ///
+  /// OPTIONAL as well as nullable, for the same version-skew reason as
+  /// `HealthGpu.renderer_percent`: a sample stored before this shipped,
+  /// or a desktop released before it, carries no such key at all.
+  power?: HealthPowerFlow | null;
+}
+
+/// The power moving in or out of the battery at one instant (#773).
+///
+/// Mirrors the Rust `health::PowerFlow`. Exported because
+/// `SystemHealthPage` renders a card for it and therefore has to name
+/// the type.
+///
+/// # The sign is the whole point
+///
+/// `watts` is POSITIVE charging and NEGATIVE discharging. The two
+/// platforms encode that very differently -- macOS prints a
+/// two's-complement integer as unsigned, Linux publishes a magnitude
+/// with the direction in a separate string -- and both are normalised
+/// to this convention in Rust, so nothing here needs to know which
+/// machine it is describing.
+export interface HealthPowerFlow {
+  /// Watts. Positive into the cell, negative out of it.
+  watts: number;
+  /// Milliamps, on the same sign convention as `watts`.
+  milliamps: number;
+  /// Millivolts at the terminals, always positive.
+  ///
+  /// Carried alongside the wattage because the wattage is a PRODUCT: a
+  /// reader who sees an implausible figure has no way to tell which
+  /// half is wrong without both factors.
+  millivolts: number;
 }
 
 interface HealthInterface {

@@ -464,3 +464,240 @@ export function peakRate(points: RatePoint[]): number | null {
   }
   return peak;
 }
+
+/// # Battery capacity above 100% is normal, not a fault (#772)
+///
+/// `capacity_percent` is `NominalChargeCapacity / DesignCapacity`, and
+/// `DesignCapacity` is a NAMEPLATE figure the manufacturer guarantees
+/// -- not a ceiling the cell cannot exceed. New cells routinely measure
+/// a few points above it, and 103% was the reading that opened #772.
+///
+/// The panel used to hardcode one sentence: "a battery at N% of its
+/// original capacity still charges to 100%, it just holds less than it
+/// once did". Below 100 that is correct. At 103 it is false in both
+/// halves, and it tells someone with a brand-new laptop that their
+/// battery has degraded.
+///
+/// So the wording branches on which side of 100 the reading falls, and
+/// the branch lives here rather than inline in the view for the same
+/// reason `splitOnGaps` does: it is a decision about what is TRUE, and
+/// it should be testable without rendering anything.
+
+/// Which of the three things a capacity reading means.
+///
+/// Three cases, not two. "Above" and "at" are collapsed easily and
+/// should not be: a cell at exactly its nameplate has nothing to
+/// report, while one above it is worth saying is above it -- otherwise
+/// the number looks like a bug to the person reading it, which is
+/// exactly what #772 describes.
+export type CapacityStanding = "above" | "at" | "worn";
+
+/// Where a capacity reading stands relative to its design figure.
+///
+/// The rounding is deliberate and matters: the panel prints
+/// `toFixed(0)`, so a cell at 100.4% displays as "100%" and must not
+/// then be described as holding MORE than its rated capacity -- the
+/// sentence would be arguing with the number beside it. Both the
+/// wording and the display therefore round the same way.
+export function capacityStanding(percent: number): CapacityStanding {
+  const shown = Math.round(percent);
+  if (shown > 100) return "above";
+  if (shown === 100) return "at";
+  return "worn";
+}
+
+/// What the capacity panel says about a reading, in one sentence.
+///
+/// Written out per case rather than assembled from fragments: the three
+/// sentences say genuinely different things, and a template with a
+/// swapped adjective in the middle would be how the #772 wording drifts
+/// back toward claiming wear.
+export function capacityMeaning(percent: number): string {
+  switch (capacityStanding(percent)) {
+    case "above":
+      // The #772 case. Note what this does NOT say: nothing about
+      // charging to 100%, nothing about holding less. A cell above its
+      // nameplate has lost nothing, and the reason the number can
+      // exceed 100 is worth one clause -- otherwise it reads as an
+      // arithmetic error.
+      return (
+        "This cell holds slightly more than the capacity it was rated for. " +
+        "That rating is a figure the manufacturer guarantees rather than a " +
+        "ceiling, so a new battery measuring a little over it is normal and " +
+        "means no wear has happened yet."
+      );
+    case "at":
+      return "This cell still holds the full capacity it was rated for — there is no wear to report.";
+    case "worn":
+      // The original sentence, which was always correct here.
+      return (
+        "It still charges to 100%, it just holds less than it once did — " +
+        "which is ordinary, and happens slowly over years."
+      );
+  }
+}
+
+/// What the cycle count adds, given where the capacity stands.
+///
+/// `null` when there is nothing worth saying, which the caller renders
+/// as nothing at all rather than as an empty sentence.
+///
+/// The old copy appended "wear after N cycles is ordinary ageing"
+/// unconditionally, which presumes wear -- the same #772 bug one clause
+/// further on. A cell at or above its nameplate has no wear to call
+/// ordinary, so the count is reported as context for how much use the
+/// battery has had instead.
+export function cycleMeaning(
+  percent: number,
+  cycles: number | null,
+): string | null {
+  if (cycles === null) return null;
+  return capacityStanding(percent) === "worn"
+    ? `Read alongside the cycle count: wear after ${cycles} cycles is ordinary ageing.`
+    : `It has been through ${cycles} charge ${cycles === 1 ? "cycle" : "cycles"} so far.`;
+}
+
+/// How far along its bar a capacity reading sits, 0-100.
+///
+/// # Why a capacity bar is not a percentage bar
+///
+/// Every other bar on this page fills toward 100 as "full". This one
+/// cannot: the reading itself can exceed 100, and #772 asks that it
+/// "should not overflow, wrap, or render as an error state".
+///
+/// So the bar's track is not 0-100 but 0-[`CAPACITY_BAR_MAX`], and a
+/// healthy new cell simply sits a little past the four-fifths mark
+/// rather than bursting out of a full one. The reading is still printed
+/// as text beside it, so nothing is lost to the rescaling -- the bar
+/// only has to carry "is this a lot or a little", and it does that
+/// correctly in both directions.
+export const CAPACITY_BAR_MAX = 120;
+
+/// The bar's fill for a capacity reading, as a percentage of its track.
+export function capacityBarFill(percent: number): number {
+  return Math.max(0, Math.min(100, (percent / CAPACITY_BAR_MAX) * 100));
+}
+
+/// The colour of a capacity bar.
+///
+/// NOT `barColor`, and the inversion is the reason: `barColor` reads a
+/// high percentage as pressure and turns it red, which is exactly
+/// backwards for capacity, where high is healthy. A cell at 103% would
+/// come out crimson -- the "renders as an error state" #772 names.
+///
+/// The bands are the ones Apple's own guidance implies: 80% of design
+/// is where a battery is considered due for service, so that is the
+/// amber threshold, and half its rated capacity is a cell that has
+/// genuinely failed.
+///
+/// Ordered LOWEST first, unlike `barColor`. Both orderings read
+/// naturally and only one is correct for each function -- capacity is
+/// better when higher, pressure is worse when higher -- and getting it
+/// backwards here makes every band after the first unreachable.
+export function capacityColor(percent: number): string {
+  if (percent < 50) return "#f85149";
+  if (percent < 80) return "#d29922";
+  return "#3fb950";
+}
+
+/// # Battery power flow: the rate, not the level (#773)
+
+/// A wattage in words a person reads, with its direction in the sign.
+///
+/// Signed rather than "12.8 W in" / "12.8 W out": the minus sign is
+/// read instantly and universally, and a chart axis crossing zero needs
+/// the number to agree with it. One decimal place, because the reading
+/// genuinely moves at that resolution and two would be false precision
+/// from a gauge that reports whole milliamps.
+export function formatWatts(watts: number): string {
+  // `-0.0 W` is what `toFixed` produces for a tiny negative, and it
+  // reads as a typo. Zero has no direction, so it prints without one.
+  const v = Math.abs(watts) < 0.05 ? 0 : watts;
+  return `${v.toFixed(1)} W`;
+}
+
+/// The band around zero that counts as no flow at all, in watts.
+///
+/// A tenth of a watt. Comfortably below any real charge or draw -- a
+/// sleeping laptop draws several watts, a charging one tens -- and
+/// comfortably above the jitter of a topped-up cell.
+const IDLE_WATTS = 0.1;
+
+/// Which way power is flowing, as a word.
+///
+/// The dead band matters. A battery sitting full on mains hovers within
+/// a few tens of milliwatts of zero and flickers between a tiny charge
+/// and a tiny discharge, and a label that flipped between "Charging"
+/// and "Discharging" every five seconds would be alarming and
+/// meaningless. Anything inside it is called idle, which is what it is.
+export function powerDirection(watts: number): "charging" | "discharging" | "idle" {
+  if (watts > IDLE_WATTS) return "charging";
+  if (watts < -IDLE_WATTS) return "discharging";
+  return "idle";
+}
+
+/// The colour a power reading takes.
+///
+/// Direction, not magnitude: a fast charge is not worse than a slow
+/// one, so there is no escalation here of the kind `barColor` has.
+/// Discharging is amber rather than red because being on battery is
+/// completely normal -- red is reserved for the thing that is actually
+/// wrong, which is discharging WHILE PLUGGED IN, and that is a
+/// combination the panel checks rather than a wattage.
+export function powerColor(watts: number, onAc: boolean): string {
+  const dir = powerDirection(watts);
+  // The #720 condition, and the one reading on this panel that is a
+  // fault rather than a state: the adapter is not keeping up, or is not
+  // really charging.
+  if (dir === "discharging" && onAc) return "#f85149";
+  if (dir === "discharging") return "#d29922";
+  if (dir === "charging") return "#3fb950";
+  return "#8b949e";
+}
+
+/// The battery power series, as points a chart can draw.
+///
+/// # Why this is not a `counterRates` job
+///
+/// `Interface.rx_bytes` is cumulative and has to be DIFFERENCED into a
+/// rate. Watts are already a rate: each sample carries the flow
+/// measured at that instant, so the series is a straight read with no
+/// arithmetic across intervals at all -- and therefore none of
+/// `counterRates`' reset handling either, since there is no counter to
+/// reset.
+///
+/// What it does share is the `null` rule. A sample from before #773
+/// shipped, or from a platform that does not publish the flow, has no
+/// reading -- and that is an unknown `splitOnGaps` must break the line
+/// across, exactly like a closed lid. It is emphatically not zero
+/// watts, which is a real state a full plugged-in battery sits in.
+export function powerSeries(
+  samples: {
+    sampled_at: string;
+    battery: { power?: { watts: number } | null } | null;
+  }[],
+): Point[] {
+  return samples.map((s) => ({
+    t: Date.parse(s.sampled_at),
+    v: s.battery?.power?.watts ?? null,
+  }));
+}
+
+/// The largest ABSOLUTE flow in a series, for a chart's axis.
+///
+/// Absolute because the axis has to hold both directions: a series that
+/// charged at 60 W and discharged at 12 W needs a ceiling of 60 either
+/// side, or the discharge half would be drawn against a different scale
+/// from the charge half and the two would not be comparable.
+///
+/// `null` when nothing was measured, which the caller renders as "Not
+/// measured" rather than as a chart scaled to zero.
+export function peakWatts(points: Point[]): number | null {
+  let peak: number | null = null;
+  for (const p of points) {
+    if (p.v === null) continue;
+    const m = Math.abs(p.v);
+    if (peak === null || m > peak) peak = m;
+  }
+  return peak;
+}

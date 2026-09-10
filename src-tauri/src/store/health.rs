@@ -202,6 +202,16 @@ mod tests {
             on_ac: true,
             capacity_percent: Some(84.0),
             cycle_count: Some(413),
+            // A DISCHARGE, so the sign is part of what is being
+            // asserted. The power flow lives only in the `detail` JSON
+            // -- it has no column of its own -- and a serialisation
+            // that dropped or unsigned it would turn every historical
+            // discharge into a charge on the #773 chart.
+            power: Some(crate::health::PowerFlow {
+                watts: -12.8,
+                milliamps: -1008,
+                millivolts: 12654,
+            }),
         });
         record(&c, &s).unwrap();
 
@@ -210,6 +220,10 @@ mod tests {
         assert_eq!(b.percent, 62.0, "charge");
         assert_eq!(b.capacity_percent, Some(84.0), "capacity, not charge");
         assert_eq!(b.cycle_count, Some(413));
+        let p = b.power.expect("the power flow survives the round trip");
+        assert_eq!(p.watts, -12.8, "still a discharge, not a charge");
+        assert_eq!(p.milliamps, -1008);
+        assert_eq!(p.millivolts, 12654);
 
         // And the column carries the CAPACITY, not the charge -- the
         // detail JSON round-tripping correctly would hide a swap here.
@@ -238,12 +252,17 @@ mod tests {
             on_ac: false,
             capacity_percent: None,
             cycle_count: None,
+            power: None,
         });
         record(&c, &s).unwrap();
         let got = history(&c).unwrap();
         let b = got[0].battery.as_ref().unwrap();
         assert_eq!(b.capacity_percent, None, "absent is never zero");
         assert_eq!(b.cycle_count, None);
+        // Zero watts is a REAL reading -- a full battery on mains draws
+        // nothing -- so an unread power flow must come back absent
+        // rather than as a plausible-looking 0 W.
+        assert!(b.power.is_none(), "absent is never zero watts");
     }
 
     /// Per-interface counters survive, which is the raw material #719

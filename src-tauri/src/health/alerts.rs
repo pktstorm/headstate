@@ -417,6 +417,7 @@ mod tests {
                     on_ac: *on_ac,
                     capacity_percent: Some(84.0),
                     cycle_count: Some(413),
+                    power: None,
                 });
                 s
             })
@@ -479,6 +480,7 @@ mod tests {
                 on_ac: false,
                 capacity_percent: None,
                 cycle_count: None,
+                power: None,
             });
             samples.push(s);
         }
@@ -491,6 +493,7 @@ mod tests {
                 on_ac: false,
                 capacity_percent: None,
                 cycle_count: None,
+                power: None,
             });
             samples.push(s);
         }

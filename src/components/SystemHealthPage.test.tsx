@@ -465,6 +465,78 @@ describe("SystemHealthPage", () => {
     expect(screen.getByText(/No battery on this machine/)).toBeTruthy();
   });
 
+
+  /// #773's second half: the rate on the OVERVIEW, not only behind a
+  /// click.
+  ///
+  /// The issue is explicit about why. #720's alert fires, the user
+  /// opens this page, and the number that answers "why did I get that
+  /// alert" should be on the panel they land on.
+  it("shows the drain rate on the overview, not only on the detail page", async () => {
+    liveFn.mockResolvedValue(
+      sample({
+        battery: {
+          percent: 64,
+          on_ac: false,
+          capacity_percent: 84,
+          cycle_count: 413,
+          power: { watts: -18.4, milliamps: -1454, millivolts: 12654 },
+        },
+      }),
+    );
+    show();
+    await screen.findByText("-18.4 W");
+    expect(screen.getByText("Out of the battery")).toBeTruthy();
+  });
+
+  /// The #720 condition, said in words on the overview panel too --
+  /// colour is never the only cue on this page.
+  it("says on the overview when a plugged-in machine is losing charge", async () => {
+    liveFn.mockResolvedValue(
+      sample({
+        battery: {
+          percent: 64,
+          on_ac: true,
+          capacity_percent: 84,
+          cycle_count: 413,
+          power: { watts: -6.2, milliamps: -490, millivolts: 12654 },
+        },
+      }),
+    );
+    show();
+    await screen.findByText(/losing charge while plugged in/i);
+  });
+
+  /// Absent is not zero, in the field where it is hardest to see: a
+  /// full battery on mains genuinely draws 0 W, so a fabricated zero
+  /// here is indistinguishable from a measurement.
+  it("reports an unpublished rate as not measured, never as zero watts", async () => {
+    liveFn.mockResolvedValue(
+      sample({
+        battery: {
+          percent: 64,
+          on_ac: true,
+          capacity_percent: 84,
+          cycle_count: 413,
+          power: null,
+        },
+      }),
+    );
+    show();
+    await screen.findByText("64%");
+    expect(screen.queryByText("0.0 W")).toBeNull();
+    expect(screen.getByText(/This platform does not publish it/)).toBeTruthy();
+  });
+
+  /// A desktop's absent rate is not a separate fact from its absent
+  /// battery, and two "Not measured" rows for one absence is noise.
+  it("does not add a rate row for a machine with no battery at all", async () => {
+    liveFn.mockResolvedValue(sample({ battery: null }));
+    show();
+    await screen.findByText(/No battery on this machine/);
+    expect(screen.queryByText("Rate")).toBeNull();
+  });
+
   /// Windows reports no load average at all. Three silent dashes would
   /// look like a bug in Headstate rather than a platform limit.
   it("explains a platform with no load average instead of showing zeros", async () => {

@@ -158,6 +158,58 @@ pub struct Battery {
     /// ageing, and after 40 it is a fault.
     #[serde(default)]
     pub cycle_count: Option<u32>,
+    /// How fast power is moving in or out of the cell RIGHT NOW (#773).
+    ///
+    /// The third distinct thing this struct carries, and the only one
+    /// that is a RATE rather than a level. `percent` says how full,
+    /// `capacity_percent` says how full it can get, and this says which
+    /// way and how fast it is moving -- which is the question #720's
+    /// "discharging while plugged in" alert raises and nothing in the
+    /// app could answer.
+    ///
+    /// `None` where the platform does not publish it. Never a zero
+    /// standing in for that: zero watts is a REAL and common reading --
+    /// a full battery on mains draws nothing -- so a fabricated zero
+    /// here is indistinguishable from a measurement.
+    #[serde(default)]
+    pub power: Option<PowerFlow>,
+}
+
+/// The power moving in or out of the battery at one instant (#773).
+///
+/// # The sign is the whole point
+///
+/// `watts` is POSITIVE when power is flowing INTO the cell (charging)
+/// and NEGATIVE when it is flowing out (discharging). One signed number
+/// rather than a magnitude plus a direction enum, because every
+/// consumer -- the chart, the card, the sentence under it -- wants to
+/// compare against zero, and a magnitude that has to be re-signed at
+/// each site is a sign error waiting to happen at one of them.
+///
+/// The platforms disagree about how they encode that sign, and neither
+/// encoding survives being assumed: macOS prints a two's-complement
+/// `i64` as an unsigned decimal, and Linux publishes an unsigned
+/// magnitude with the direction in a separate string. Both are
+/// normalised to this convention where they are read, so nothing
+/// downstream has to know which machine it is describing. See
+/// `collect::power_flow` and `collect::linux_power`.
+///
+/// # Why the current and voltage come too
+///
+/// The wattage is the answer, but it is a PRODUCT, and a reader who
+/// sees an implausible one has no way to tell which half is wrong.
+/// Carrying both factors makes the detail page able to show its
+/// working, at the cost of two integers per sample.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct PowerFlow {
+    /// Watts. Positive into the cell, negative out of it.
+    pub watts: f64,
+    /// Milliamps, on the same sign convention as `watts`.
+    pub milliamps: i64,
+    /// Millivolts at the terminals. Always positive -- a non-positive
+    /// voltage is a platform that did not answer, and produces `None`
+    /// for the whole reading rather than a zero-watt product.
+    pub millivolts: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
