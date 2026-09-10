@@ -90,19 +90,56 @@ fn run_login_shell(program: &str) -> Option<PathBuf> {
     // metacharacters cannot become a command. The names are ours
     // (`Ecosystem::program`), but that is a property of the caller
     // rather than of this function.
+    // The answer is DELIMITED rather than inferred from line structure
+    // (#774). Taking "the last line starting with /" looked safe and was
+    // not: an interactive shell with iTerm2 shell integration emits OSC
+    // escape sequences (ESC ] 1337 ; ... BEL) with NO trailing newline,
+    // so `command -v`'s output is concatenated onto the end of a control
+    // sequence. The resulting line begins with an escape byte, and on a
+    // real machine `grep -c "^/"` over that output returns ZERO -- every
+    // node tool read as missing while resolving perfectly in the same
+    // shell.
+    //
+    // `-i` is what invites it: shell integration only announces itself
+    // interactively. Dropping `-i` would fix this case and break the
+    // setups the flag was added for, so the parsing is what changes.
+    //
+    // Markers a profile will not emit by accident, printed with no
+    // newline of their own so nothing downstream can split them.
+    let script = "printf '<<<headstate:%s>>>' \"$(command -v \"$1\")\"";
     let out = std::process::Command::new(shell)
-        .args(["-lic", "command -v \"$1\"", "--", program])
+        .args(["-lic", script, "--", program])
         .output()
         .ok()?;
-    let path = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(str::trim)
-        // A profile can print banners, so take the LAST line that looks
-        // like a path rather than the first line of output.
-        .rfind(|l| l.starts_with('/'))?
-        .to_string();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let path = between_markers(&stdout)?;
+    // An empty result means `command -v` found nothing: the markers are
+    // still printed, which is how "asked and it is absent" is told apart
+    // from "the shell never ran".
+    if path.is_empty() {
+        return None;
+    }
     let p = PathBuf::from(path);
     p.is_file().then_some(p)
+}
+
+/// The text between the sentinels, or `None` if they are not both there.
+///
+/// Split out so the parsing is testable without spawning a shell -- the
+/// bug in #774 was entirely in this step, and a test that has to launch
+/// the user's real profile could not have pinned it.
+///
+/// Takes the LAST opening marker: a profile that echoes its own commands
+/// (`set -x`, or a verbose plugin) can print the script text before
+/// running it, so the first occurrence may be the literal `printf` line
+/// rather than its output.
+fn between_markers(out: &str) -> Option<&str> {
+    const OPEN: &str = "<<<headstate:";
+    const CLOSE: &str = ">>>";
+    let start = out.rfind(OPEN)? + OPEN.len();
+    let rest = &out[start..];
+    let end = rest.find(CLOSE)?;
+    Some(rest[..end].trim())
 }
 
 /// Where package managers land when PATH does not carry them.
@@ -168,6 +205,58 @@ pub fn child_path(bin: &Path) -> std::ffi::OsString {
 
 #[cfg(test)]
 mod tests {
+
+    /// #774: the exact shape that broke the old parser.
+    ///
+    /// Captured from a real machine. iTerm2 shell integration emits OSC
+    /// sequences (ESC ] 1337 ; ... BEL) with NO trailing newline, so the
+    /// answer is concatenated onto the end of a control sequence and no
+    /// line in the output begins with `/`. The old `rfind(starts_with
+    /// '/'))` found nothing and every node tool read as missing.
+    #[test]
+    fn a_path_survives_shell_integration_escape_sequences() {
+        let out = "\u{1b}]1337;RemoteHost=@host\u{7}\u{1b}]1337;CurrentDir=/code/proj\u{7}\u{1b}]1337;ShellIntegrationVersion=14;shell=zsh\u{7}<<<headstate:/home/octocat/.nvm/versions/node/v24.3.0/bin/yarn>>>";
+        // The premise: this is genuinely the broken shape. If any line
+        // started with `/` the old parser would have coped and this test
+        // would be pinning nothing.
+        assert!(
+            !out.lines().any(|l| l.starts_with('/')),
+            "fixture must reproduce the no-line-starts-with-slash shape"
+        );
+        assert_eq!(
+            super::between_markers(out),
+            Some("/home/octocat/.nvm/versions/node/v24.3.0/bin/yarn")
+        );
+    }
+
+    /// A profile that prints a banner BEFORE the answer, on its own
+    /// lines. The common case the old parser was written for; it must
+    /// keep working.
+    #[test]
+    fn a_banner_before_the_answer_is_ignored() {
+        let out = "Welcome to your shell\nLast login: today\n<<<headstate:/usr/local/bin/npm>>>";
+        assert_eq!(super::between_markers(out), Some("/usr/local/bin/npm"));
+    }
+
+    /// `command -v` found nothing: the markers are still printed with an
+    /// empty body. That is "asked, and it is absent" -- distinct from
+    /// the shell never having run, which yields no markers at all.
+    #[test]
+    fn an_empty_answer_is_distinguishable_from_no_answer() {
+        assert_eq!(super::between_markers("<<<headstate:>>>"), Some(""));
+        assert_eq!(super::between_markers("nothing here"), None);
+        // A truncated marker is not an answer.
+        assert_eq!(super::between_markers("<<<headstate:/usr/bin/npm"), None);
+    }
+
+    /// A profile with `set -x`, or a verbose plugin, echoes the script
+    /// before running it -- so the literal `printf` text appears first
+    /// and the real output second. The LAST opening marker is the answer.
+    #[test]
+    fn an_echoed_script_does_not_shadow_the_real_answer() {
+        let out = "+ printf '<<<headstate:%s>>>' /wrong/from/trace\n<<<headstate:/usr/bin/yarn>>>";
+        assert_eq!(super::between_markers(out), Some("/usr/bin/yarn"));
+    }
     use super::*;
 
     /// The fallback branch is the whole point, so it is tested without
