@@ -628,7 +628,323 @@ fn aggregate_patch_merged(dir: &Path, default_branch: &str) -> Safety {
     // shows no improvement, because the shell forks differently than
     // `Command::spawn`. That result is an artefact of the harness, not
     // of the code.
-    batch_contains_patch(dir, &candidates, &branch_pid)
+    match batch_contains_patch(dir, &candidates, &branch_pid) {
+        // An exact aggregate match is the strongest evidence there is,
+        // and it is cheap. It only fails to fire when the branch's diff
+        // is not byte-identical to any single commit on the default
+        // branch -- which is the rebased-then-squashed case (#741).
+        Safety::Safe => Safety::Safe,
+        Safety::Unknown(e) => Safety::Unknown(e),
+        _ => content_landed(dir, default_branch, base),
+    }
+}
+
+/// Whether every file this branch changed already looks, on the default
+/// branch, like the branch left it (#741).
+///
+/// The case `aggregate_patch_merged` structurally cannot see. That
+/// compares the branch's WHOLE `merge-base..HEAD` diff against single
+/// commits on the default branch, which is exactly right for a plain
+/// squash -- and wrong the moment the branch was rebased after being
+/// pushed. A rebase pulls in whatever landed first, so the branch's
+/// aggregate diff contains files the squash commit never touched and no
+/// patch-id can ever match.
+///
+/// Measured on the repository that prompted this: a branch's aggregate
+/// diff spanned 15 files while its squash commit touched 12, the three
+/// extra having arrived from an earlier PR being rebased in. Of those 15
+/// files, 14 were byte-identical to the default branch and the 15th
+/// differed only because LATER work added to it.
+///
+/// So this asks the question a human asks -- "is my work in?" -- per
+/// file, and is immune to how the commits were arranged:
+///
+/// - the branch's blob and the default branch's blob are IDENTICAL, or
+/// - they differ, but every substantive line the branch ADDED to that
+///   file is present on the default branch's copy (later work added
+///   more around it), or
+/// - the branch DELETED the file and it is gone from the default branch
+///   too.
+///
+/// One path failing any of those is enough to refuse: this returns
+/// `Unmerged` on the first file whose work cannot be accounted for.
+///
+/// This LOOSENS a gate that guards deletion, so the two ways it could
+/// wrongly say "merged" are closed deliberately:
+///
+/// - A branch that is a strict SUBSET of a larger change that was never
+///   merged -- its lines are all on the default branch, but as somebody
+///   else's work. Line presence alone would call that merged, so
+///   `descends_from_branch` additionally requires the default branch to
+///   have MOVED on the branch's own files since they diverged. Work that
+///   was already there before the branch existed cannot have come from
+///   it.
+/// - A vacuous match, where the branch changed nothing that carries
+///   meaning -- whitespace, a moved brace, a file reverted to what the
+///   default branch already had. Trivial lines are not evidence, so
+///   `TRIVIAL_LEN` excludes short fragments and `MIN_EVIDENCE` requires
+///   a real quantity of them before any verdict of merged.
+///
+/// The conservative direction is left alone on purpose. A file the
+/// branch changed that the default branch has since changed
+/// INCOMPATIBLY reports `Unmerged`, which wastes disk and loses
+/// nothing; the opposite mistake deletes work that exists nowhere else.
+fn content_landed(dir: &Path, default_branch: &str, base: &str) -> Safety {
+    /// Shorter than this, flattened of whitespace, a line is punctuation
+    /// or boilerplate -- `}`, `///`, `.map(|r| {`. Such lines appear in
+    /// almost any file, so treating them as evidence would let a branch
+    /// match by coincidence. They are skipped rather than required,
+    /// because their ABSENCE is equally uninformative: a real merge that
+    /// reflowed a brace must not be called unmerged over it.
+    const TRIVIAL_LEN: usize = 12;
+
+    /// Below this many substantive lines accounted for, there is not
+    /// enough evidence to overturn `Unmerged`. Guards the vacuous match:
+    /// a branch whose entire change is trivial has nothing this function
+    /// can verify, and "I could not find anything to check" must not
+    /// read as "the work is in".
+    const MIN_EVIDENCE: usize = 3;
+
+    // `-M` so a rename is one entry to reason about rather than a delete
+    // and an add that each look like missing work.
+    let Ok(status) = git(dir, &["diff", "--name-status", "-M", "-z", base, "HEAD"]) else {
+        return Safety::Unmerged;
+    };
+
+    let entries = parse_name_status(&status);
+    if entries.is_empty() {
+        // No files changed means nothing to establish. Claiming merged
+        // on an empty comparison would greenlight a deletion whose
+        // premise was never checked.
+        return Safety::Unmerged;
+    }
+
+    let mut evidence = 0usize;
+    for (change, path) in &entries {
+        match change {
+            Change::Deleted => {
+                // The branch removed it; the default branch must agree.
+                // A file still present there is work that did not land.
+                if git(
+                    dir,
+                    &["cat-file", "-e", &format!("{default_branch}:{path}")],
+                )
+                .is_ok()
+                {
+                    return Safety::Unmerged;
+                }
+                // A deletion is real work, but it carries no lines to
+                // count, so it deliberately adds no evidence.
+            }
+            Change::Present => {
+                let branch_blob = git(dir, &["rev-parse", &format!("HEAD:{path}")]);
+                let main_blob = git(dir, &["rev-parse", &format!("{default_branch}:{path}")]);
+                let (Ok(branch_blob), Ok(main_blob)) = (branch_blob, main_blob) else {
+                    // The path does not exist on the default branch at
+                    // all, so this file's work is simply not there.
+                    return Safety::Unmerged;
+                };
+
+                let added = added_lines(dir, base, path, TRIVIAL_LEN);
+
+                if branch_blob.trim() == main_blob.trim() {
+                    // Identical blobs: the strongest per-file evidence.
+                    evidence += added.len();
+                    continue;
+                }
+
+                // The default branch changed this file further. The
+                // branch's own additions must still all be present, or
+                // its work was not absorbed -- it was superseded, or
+                // never landed.
+                if added.is_empty() {
+                    // Nothing substantive to verify on a file that
+                    // nonetheless differs. Cannot establish anything.
+                    return Safety::Unmerged;
+                }
+                let Ok(theirs) = git(dir, &["show", &format!("{default_branch}:{path}")]) else {
+                    return Safety::Unmerged;
+                };
+                let theirs: String = theirs.chars().filter(|c| !c.is_whitespace()).collect();
+                if !added.iter().all(|l| theirs.contains(l.as_str())) {
+                    return Safety::Unmerged;
+                }
+                evidence += added.len();
+            }
+        }
+    }
+
+    if evidence < MIN_EVIDENCE {
+        return Safety::Unmerged;
+    }
+
+    // Every file checks out. The remaining question is whether that is
+    // because this branch's work landed, or because the branch happens
+    // to be a subset of somebody else's.
+    descends_from_branch(dir, default_branch, base)
+}
+
+/// Which side of `--name-status` an entry falls on.
+///
+/// Only the deleted/not-deleted distinction matters here: added,
+/// modified, renamed and copied paths are all "the branch's version of
+/// this path must be reflected on the default branch", and differ only
+/// in which name to ask about.
+enum Change {
+    Deleted,
+    Present,
+}
+
+/// Parse `git diff --name-status -M -z` into (change, path) pairs.
+///
+/// `-z` because a NUL-delimited stream is the only form that survives a
+/// path with a space, a quote or a newline in it -- git QUOTES such
+/// paths in the human-readable form, and a check that guards deletion
+/// must not be reading a mangled filename.
+///
+/// Rename and copy records carry TWO paths (old then new); the new one
+/// is the branch's version and the one to compare.
+fn parse_name_status(out: &str) -> Vec<(Change, String)> {
+    let mut fields = out.split('\0').filter(|f| !f.is_empty());
+    let mut entries = Vec::new();
+    while let Some(status) = fields.next() {
+        let code = status.as_bytes().first().copied().unwrap_or(b'?');
+        // R and C spend their first path on the SOURCE, which the branch
+        // no longer has; the destination is what to check.
+        if code == b'R' || code == b'C' {
+            let _from = fields.next();
+        }
+        let Some(path) = fields.next() else { break };
+        let change = if code == b'D' {
+            Change::Deleted
+        } else {
+            Change::Present
+        };
+        entries.push((change, path.to_string()));
+    }
+    entries
+}
+
+/// The substantive lines this branch ADDED to `path`, whitespace-flattened.
+///
+/// Whitespace is stripped rather than compared because reindentation is
+/// routine when work is rebased or reviewed, and a merge that only moved
+/// a line left or right is still a merge. Lines shorter than `trivial`
+/// once flattened, or carrying no alphanumeric character at all, are
+/// dropped: they are punctuation and boilerplate that would match
+/// anywhere.
+fn added_lines(dir: &Path, base: &str, path: &str, trivial: usize) -> Vec<String> {
+    // `-U0` because only the added lines matter here; context lines
+    // would be counted as the branch's work when they are not.
+    let Ok(diff) = git(dir, &["diff", "-U0", base, "HEAD", "--", path]) else {
+        return Vec::new();
+    };
+    diff.lines()
+        .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+        .map(|l| {
+            l[1..]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>()
+        })
+        .filter(|l: &String| l.len() >= trivial && l.chars().any(char::is_alphanumeric))
+        .collect()
+}
+
+/// Whether the default branch actually descends from THIS branch's work,
+/// as opposed to merely containing lines that look like it.
+///
+/// The subset guard. Consider a branch that adds one line, where the
+/// default branch separately gained a larger change that happens to
+/// include that same line. Every per-file check above passes -- the line
+/// really is there -- yet the branch never merged and deleting it
+/// destroys the only copy.
+///
+/// `git cherry` answers it: it compares PATCH-IDS, so it reports whether
+/// an equivalent of each of the branch's commits exists on the default
+/// branch regardless of SHA. A branch whose commits were squashed still
+/// has its individual commits come back `+` (unmatched), which is why
+/// this cannot be the primary check -- but it is decisive in the other
+/// direction, so it is used here only to distinguish "the work landed,
+/// rearranged" from "somebody else wrote something similar".
+///
+/// The distinguishing evidence is WHERE on the default branch the
+/// content lives. A branch that was rebased onto newer work and then
+/// squash-merged had its content added to the default branch AFTER the
+/// merge-base -- the squash commit is one of the commits in
+/// `base..default`. A branch that merely resembles a subset of existing
+/// work has its lines already present AT the merge-base, because they
+/// were there before it ever diverged.
+///
+/// So: at least one file the branch changed must have been touched by
+/// the default branch since the merge-base. That is cheap to ask, it is
+/// exactly the difference between the two cases, and it fails in the
+/// safe direction when it cannot be established.
+fn descends_from_branch(dir: &Path, default_branch: &str, base: &str) -> Safety {
+    // How far the default branch has moved since this branch diverged.
+    // An empty range means the branch is fully up to date with the
+    // default branch, so the content there IS the branch's own.
+    let Ok(ahead) = git(
+        dir,
+        &["rev-list", "--count", &format!("{base}..{default_branch}")],
+    ) else {
+        return Safety::Unmerged;
+    };
+    if ahead.trim() == "0" {
+        return Safety::Safe;
+    }
+
+    // The branch's commits, and whether the default branch has an
+    // equivalent of each. `-` means an equivalent patch is upstream.
+    let Ok(cherry) = git(dir, &["cherry", default_branch, "HEAD"]) else {
+        return Safety::Unmerged;
+    };
+    let unmatched = cherry
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('+'))
+        .count();
+    if unmatched == 0 {
+        // Every commit has an equivalent upstream: unambiguously merged.
+        return Safety::Safe;
+    }
+
+    // Unmatched commits are the squash case -- but they are also what a
+    // never-merged subset looks like, so this is where the two must be
+    // told apart.
+    //
+    // The branch's own content had to ARRIVE on the default branch at
+    // some point after the merge-base for the branch to be its source.
+    // If the default branch has not touched a single one of the files
+    // this branch changed since they diverged, then everything matched
+    // above was already there before the branch existed, and the branch
+    // is a coincidental subset rather than the origin of the work.
+    let Ok(status) = git(dir, &["diff", "--name-status", "-M", "-z", base, "HEAD"]) else {
+        return Safety::Unmerged;
+    };
+    let paths: Vec<String> = parse_name_status(&status)
+        .into_iter()
+        .map(|(_, p)| p)
+        .collect();
+    if paths.is_empty() {
+        return Safety::Unmerged;
+    }
+
+    let range = format!("{base}..{default_branch}");
+    let mut args: Vec<&str> = vec!["log", "--oneline", "-1", &range, "--"];
+    for p in &paths {
+        args.push(p.as_str());
+    }
+    match git(dir, &args) {
+        // The default branch changed at least one of these files after
+        // the branch diverged, and every one of them now reflects the
+        // branch's work: that is the rebased-then-squashed shape.
+        Ok(s) if !s.trim().is_empty() => Safety::Safe,
+        // Nothing the branch touched has moved on the default branch
+        // since. The content matched because it predates the branch.
+        Ok(_) => Safety::Unmerged,
+        Err(_) => Safety::Unmerged,
+    }
 }
 
 /// Whether any candidate commit has `want` as its patch-id.
@@ -2662,6 +2978,769 @@ HEAD 8ed50a741e1696d1a0c9506f2e033cf2887bb144
             .find(|w| w.path.contains("proj-feature"))
             .expect("worktree not found");
         assert_eq!(found.safety, Safety::Unmerged);
+    }
+
+    /// Real git for the #741 shape: pushed, REBASED onto newer work,
+    /// then squash-merged, then the remote branch deleted.
+    ///
+    /// The rebase is what defeats `aggregate_patch_merged`. It replays
+    /// the branch on top of whatever landed first, so the branch's
+    /// `merge-base..HEAD` diff carries that other PR's files too, and
+    /// the branch's aggregate diff can no longer equal any single
+    /// commit on main.
+    ///
+    /// A LATER PR then adds to a file the branch also changed. That is
+    /// the other half of the real case, and it is load-bearing: without
+    /// it the squash commit is byte-identical to the branch's aggregate
+    /// diff, the old patch-id check answers correctly, and a test built
+    /// on it would prove nothing. It is also why the fix cannot be
+    /// strict tree equality -- that file's blob no longer matches.
+    ///
+    /// Real git throughout, including a real rebase and a real squash: a
+    /// synthetic fixture would let this pass for the wrong reason, and
+    /// the verdict decides whether someone's work is deleted.
+    fn rebased_squash_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ident = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+        let run_in = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .envs(ident)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        run_in(&remote, &["init", "-q", "--bare", "-b", "main"]);
+
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_in(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        // The file BOTH this branch and a later PR will add to.
+        std::fs::write(repo.join("shared.txt"), "shared header line one\n").unwrap();
+        run_in(&repo, &["add", "-A"]);
+        run_in(&repo, &["commit", "-q", "-m", "base"]);
+        run_in(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run_in(&repo, &["push", "-q", "-u", "origin", "main"]);
+
+        // Our branch does its work in a worktree and pushes it.
+        let wt = tmp.path().join("proj-feature");
+        run_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--track",
+                "-b",
+                "feature",
+                wt.to_str().unwrap(),
+                "main",
+            ],
+        );
+        std::fs::write(
+            wt.join("feature.txt"),
+            "the feature implementation body line\nsecond feature implementation line\n",
+        )
+        .unwrap();
+        std::fs::write(
+            wt.join("shared.txt"),
+            "shared header line one\nfeature contribution to the shared file\n",
+        )
+        .unwrap();
+        run_in(&wt, &["add", "-A"]);
+        run_in(&wt, &["commit", "-q", "-m", "add the feature"]);
+        run_in(&wt, &["push", "-q", "-u", "origin", "feature"]);
+
+        // The rebase is onto ANOTHER PR's branch, not onto main, and
+        // that detail is the whole bug.
+        //
+        // Rebasing onto main would move the merge-base FORWARD past the
+        // earlier work, which drops `earlier.txt` back out of
+        // `merge-base..HEAD` and leaves the aggregate patch-id matching
+        // the squash exactly -- the old check would then answer
+        // correctly and this fixture would prove nothing. Verified by
+        // building it that way first: the diff came back 2 files and the
+        // patch-id matched.
+        //
+        // Rebasing onto the earlier PR's unmerged branch is what people
+        // actually do to build on work that has not landed yet. The
+        // earlier PR is then squash-merged to main under a NEW sha, so
+        // the merge-base stays BEHIND it and the branch's aggregate diff
+        // keeps carrying `earlier.txt` -- which is exactly the state
+        // #741 describes.
+        run_in(&repo, &["branch", "-q", "earlier", "main"]);
+        let earlier_wt = tmp.path().join("proj-earlier");
+        run_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                earlier_wt.to_str().unwrap(),
+                "earlier",
+            ],
+        );
+        std::fs::write(
+            earlier_wt.join("earlier.txt"),
+            "an earlier pull request landed this file first\nwith a second line of its own\n",
+        )
+        .unwrap();
+        run_in(&earlier_wt, &["add", "-A"]);
+        run_in(&earlier_wt, &["commit", "-q", "-m", "the earlier work"]);
+        let earlier_tip = git(&earlier_wt, &["rev-parse", "HEAD"]).unwrap();
+
+        run_in(&wt, &["rebase", "-q", earlier_tip.trim()]);
+
+        // The earlier PR is squash-merged to main under its own new sha.
+        run_in(&repo, &["checkout", "-q", "main"]);
+        std::fs::write(
+            repo.join("earlier.txt"),
+            "an earlier pull request landed this file first\nwith a second line of its own\n",
+        )
+        .unwrap();
+        run_in(&repo, &["add", "-A"]);
+        run_in(&repo, &["commit", "-q", "-m", "an earlier PR (#1)"]);
+
+        // Squash-merge ours, exactly as GitHub does: the branch's
+        // content lands on main as ONE new commit touching only ITS
+        // files -- not the earlier PR's.
+        std::fs::write(
+            repo.join("feature.txt"),
+            "the feature implementation body line\nsecond feature implementation line\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("shared.txt"),
+            "shared header line one\nfeature contribution to the shared file\n",
+        )
+        .unwrap();
+        run_in(&repo, &["add", "-A"]);
+        run_in(&repo, &["commit", "-q", "-m", "add the feature (#2)"]);
+
+        // A LATER PR adds to the same file, so the branch's blob and
+        // main's blob stop being identical -- the exact reason strict
+        // tree equality would still report this unmerged, and the reason
+        // the aggregate patch-id can no longer match.
+        std::fs::write(
+            repo.join("shared.txt"),
+            "shared header line one\nfeature contribution to the shared file\na later pull request appended this line\n",
+        )
+        .unwrap();
+        run_in(&repo, &["add", "-A"]);
+        run_in(&repo, &["commit", "-q", "-m", "a later PR (#3)"]);
+        run_in(&repo, &["push", "-q", "origin", "main"]);
+
+        // GitHub deletes the branch after merging; tracking config stays.
+        run_in(&remote, &["branch", "-D", "feature"]);
+        run_in(&repo, &["fetch", "-q", "--prune", "origin"]);
+
+        (tmp, repo, wt)
+    }
+
+    /// #741: the bug itself.
+    ///
+    /// A branch that was pushed, rebased onto newer work, then
+    /// squash-merged, with a later PR adding to a file it also changed.
+    /// Both halves are needed to defeat `aggregate_patch_merged`:
+    ///
+    /// - the REBASE pulls the earlier PR's file into the branch's
+    ///   `merge-base..HEAD` diff, so that diff spans more files than the
+    ///   squash commit touched;
+    /// - the LATER PR moves one of those files on, so the branch's diff
+    ///   is not byte-identical to the squash commit either.
+    ///
+    /// Without the later PR the squash commit still matches the branch's
+    /// aggregate diff exactly and the old code answers correctly -- so
+    /// that variant would test nothing. The premise assertions below
+    /// pin exactly that, and they are what caught it.
+    #[test]
+    fn a_rebased_then_squashed_branch_is_recognised_as_merged() {
+        let (_t, _repo, wt) = rebased_squash_fixture();
+
+        // The premise, asserted rather than assumed: if any of these
+        // stop holding, the fixture no longer reproduces #741 and the
+        // verdict below would be passing for the wrong reason.
+        assert!(
+            git(&wt, &["merge-base", "--is-ancestor", "HEAD", "origin/main"]).is_err(),
+            "ancestry must not see this merge, or it is not a squash"
+        );
+        let base = git(&wt, &["merge-base", "HEAD", "origin/main"]).unwrap();
+
+        // The premise that makes this #741 rather than a plain squash:
+        // the branch's whole-diff patch-id matches NO commit on main, so
+        // the pre-existing check cannot answer it. Asserted against the
+        // patch-id comparison directly, because `aggregate_patch_merged`
+        // now falls through to the fix and would report Safe either way.
+        let branch_pid = patch_id(&wt, base.trim(), "HEAD").expect("branch must have a diff");
+        let candidates = git(&wt, &["rev-list", &format!("{}..origin/main", base.trim())]).unwrap();
+        assert_eq!(
+            batch_contains_patch(&wt, &candidates, &branch_pid),
+            Safety::Unmerged,
+            "the aggregate patch-id must NOT match, or this is not the #741 shape"
+        );
+        let spans = git(&wt, &["diff", "--name-only", base.trim(), "HEAD"]).unwrap();
+        assert!(
+            spans.contains("earlier.txt"),
+            "the rebase must leave the earlier PR's file in the branch's \
+             aggregate diff, or the bug is not reproduced: {spans}"
+        );
+        assert!(
+            !git(&wt, &["diff", "--name-only", base.trim(), "origin/main"])
+                .unwrap()
+                .is_empty(),
+            "main must have moved since the merge-base"
+        );
+
+        assert_eq!(
+            content_landed(&wt, "origin/main", base.trim()),
+            Safety::Safe,
+            "every file this branch changed is on main; it merged"
+        );
+    }
+
+    /// The file a later PR also changed is what rules out strict tree
+    /// equality as the fix -- the real case from #741, where 14 of 15
+    /// files were byte-identical to main and the 15th differed only
+    /// because later work appended to it. Requiring every blob to match
+    /// would still call that branch unmerged.
+    #[test]
+    fn a_file_a_later_pr_also_changed_does_not_hide_the_merge() {
+        let (_t, _repo, wt) = rebased_squash_fixture();
+        let base = git(&wt, &["merge-base", "HEAD", "origin/main"]).unwrap();
+
+        // The premise: the branch's copy of that file is NOT identical
+        // to main's, so only the added-line path can account for it.
+        let differs = git(
+            &wt,
+            &[
+                "diff",
+                "--name-only",
+                "HEAD",
+                "origin/main",
+                "--",
+                "shared.txt",
+            ],
+        )
+        .unwrap();
+        assert!(
+            differs.contains("shared.txt"),
+            "a later PR must have changed the shared file, or this test \
+             is indistinguishable from the one above"
+        );
+
+        assert_eq!(
+            content_landed(&wt, "origin/main", base.trim()),
+            Safety::Safe,
+            "later work on a shared file must not hide a real merge"
+        );
+    }
+
+    /// The whole verdict, through `worktree_safety` rather than the
+    /// helper -- the branch merged, its remote was deleted, and it must
+    /// come out removable and labelled as such.
+    ///
+    /// Unlike the two tests above this one does NOT fail with the fix
+    /// reverted, and the reason is worth recording rather than hiding:
+    /// this fixture's branch keeps one commit per file, so `git cherry`
+    /// finds an equivalent patch upstream for each and `squash_merged`
+    /// answers `Safe` before `content_landed` is ever consulted. That is
+    /// a correct answer by an older route.
+    ///
+    /// It is kept because it pins the LABEL -- `MergedUpstreamDeleted`
+    /// rather than a bare `Safe` -- across the whole ordering in
+    /// `worktree_safety`, which the helper-level tests cannot see. The
+    /// tests that prove the fix are the `content_landed` ones.
+    #[test]
+    fn a_rebased_squashed_worktree_becomes_removable() {
+        let (_t, _repo, wt) = rebased_squash_fixture();
+        let w = Worktree {
+            path: wt.to_string_lossy().into_owned(),
+            branch: "feature".into(),
+            ..Default::default()
+        };
+        let s = worktree_safety(&w, "origin/main", false, Some(0));
+        assert_eq!(
+            s,
+            Safety::MergedUpstreamDeleted,
+            "a rebased-then-squashed branch whose remote is gone must be \
+             removable, got {s:?}"
+        );
+        assert!(s.is_safe(), "it must be removable: {}", s.reason());
+    }
+
+    /// THE test that matters: the looser check must never call genuinely
+    /// unmerged work merged. Deleting one of these destroys commits that
+    /// exist nowhere else, which is strictly worse than the bug #741
+    /// describes.
+    ///
+    /// Same rebase-onto-newer-work shape as the fixture above, but the
+    /// branch is never merged -- its own file never reaches main.
+    #[test]
+    fn a_rebased_but_unmerged_branch_is_still_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ident = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+        let run_in = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .envs(ident)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        run_in(&remote, &["init", "-q", "--bare", "-b", "main"]);
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_in(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        run_in(&repo, &["add", "-A"]);
+        run_in(&repo, &["commit", "-q", "-m", "base"]);
+        run_in(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run_in(&repo, &["push", "-q", "-u", "origin", "main"]);
+
+        let wt = tmp.path().join("proj-feature");
+        run_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--track",
+                "-b",
+                "feature",
+                wt.to_str().unwrap(),
+                "main",
+            ],
+        );
+        std::fs::write(
+            wt.join("feature.txt"),
+            "work that exists only on this branch and nowhere else\n\
+             a second line that never reached the default branch\n",
+        )
+        .unwrap();
+        run_in(&wt, &["add", "-A"]);
+        run_in(&wt, &["commit", "-q", "-m", "unmerged work"]);
+        run_in(&wt, &["push", "-q", "-u", "origin", "feature"]);
+
+        // Newer work lands on main, and the branch is rebased onto it --
+        // the same history shape as the merged case.
+        run_in(&repo, &["checkout", "-q", "main"]);
+        std::fs::write(
+            repo.join("earlier.txt"),
+            "an earlier pull request landed this file first\nwith a second line of its own\n",
+        )
+        .unwrap();
+        run_in(&repo, &["add", "-A"]);
+        run_in(&repo, &["commit", "-q", "-m", "an earlier PR (#1)"]);
+        run_in(&repo, &["push", "-q", "origin", "main"]);
+        run_in(&wt, &["rebase", "-q", "main"]);
+
+        // The branch's OWN work is never merged. The remote branch is
+        // deleted anyway, so it travels the #732 path too.
+        run_in(&remote, &["branch", "-D", "feature"]);
+        run_in(&repo, &["fetch", "-q", "--prune", "origin"]);
+
+        let base = git(&wt, &["merge-base", "HEAD", "origin/main"]).unwrap();
+        assert_eq!(
+            content_landed(&wt, "origin/main", base.trim()),
+            Safety::Unmerged,
+            "work that never reached main must never be called merged"
+        );
+
+        let w = Worktree {
+            path: wt.to_string_lossy().into_owned(),
+            branch: "feature".into(),
+            ..Default::default()
+        };
+        let s = worktree_safety(&w, "origin/main", false, Some(0));
+        assert!(
+            !s.is_safe(),
+            "unmerged work must not become removable: {s:?}"
+        );
+    }
+
+    /// A branch strictly AHEAD of the default branch holds work that
+    /// exists nowhere else, and must be refused.
+    ///
+    /// This pins the one path in `descends_from_branch` that answers
+    /// `Safe` without inspecting anything further -- the empty
+    /// `base..default` range, which is what a stale local copy of
+    /// already-merged work looks like. It is only ever reached AFTER
+    /// `content_landed` has accounted for every changed file, and this
+    /// test is the proof: the same empty range with genuinely new work
+    /// is refused before that early return can be consulted.
+    #[test]
+    fn a_branch_ahead_of_the_default_branch_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ident = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+        let run_in = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .envs(ident)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_in(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("f.txt"), "one\n").unwrap();
+        run_in(&repo, &["add", "-A"]);
+        run_in(&repo, &["commit", "-q", "-m", "base"]);
+
+        let wt = tmp.path().join("proj-ahead");
+        run_in(
+            &repo,
+            &["worktree", "add", "-q", "-b", "ahead", wt.to_str().unwrap()],
+        );
+        std::fs::write(
+            wt.join("f.txt"),
+            "one\nbrand new unmerged line of real substantive content\n",
+        )
+        .unwrap();
+        run_in(&wt, &["add", "-A"]);
+        run_in(&wt, &["commit", "-q", "-m", "work not on main"]);
+
+        let base = git(&wt, &["merge-base", "HEAD", "main"]).unwrap();
+        // The premise: the range `descends_from_branch` early-returns on
+        // really is empty here, so this exercises that path's guard.
+        assert_eq!(
+            git(
+                &wt,
+                &["rev-list", "--count", &format!("{}..main", base.trim())]
+            )
+            .unwrap()
+            .trim(),
+            "0",
+            "main must be an ancestor, or this does not test the early return"
+        );
+
+        assert_eq!(
+            content_landed(&wt, "main", base.trim()),
+            Safety::Unmerged,
+            "work that is only on this branch must never be called merged"
+        );
+    }
+
+    /// The subset trap the issue calls out: a branch whose changes are a
+    /// strict SUBSET of a larger change that is on the default branch,
+    /// but which was never merged. Every line it added really is on
+    /// main -- as somebody else's work.
+    ///
+    /// Line presence alone would call this merged and delete the only
+    /// copy. It must stay refused.
+    #[test]
+    fn a_branch_that_is_only_a_subset_of_other_work_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ident = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+        let run_in = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .envs(ident)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_in(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("f.txt"), "one\ntwo\nthree\n").unwrap();
+        run_in(&repo, &["add", "-A"]);
+        run_in(&repo, &["commit", "-q", "-m", "base"]);
+        let base = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+
+        // Main gains a larger change that INCLUDES the subset's line.
+        std::fs::write(
+            repo.join("f.txt"),
+            "one\ntwo\nthree\n\
+             alpha marker line belonging to the larger change\n\
+             beta marker line belonging to the larger change\n",
+        )
+        .unwrap();
+        run_in(&repo, &["add", "-A"]);
+        run_in(&repo, &["commit", "-q", "-m", "the larger change (#1)"]);
+
+        // The branch adds ONLY part of that, and never merged.
+        let wt = tmp.path().join("proj-subset");
+        run_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "subset",
+                wt.to_str().unwrap(),
+                base.trim(),
+            ],
+        );
+        std::fs::write(
+            wt.join("f.txt"),
+            "one\ntwo\nthree\nalpha marker line belonging to the larger change\n",
+        )
+        .unwrap();
+        run_in(&wt, &["add", "-A"]);
+        run_in(&wt, &["commit", "-q", "-m", "a coincidental subset"]);
+
+        // The premise: its added line really IS on main, so the
+        // per-file content check alone would be satisfied.
+        let added = git(&wt, &["diff", "-U0", base.trim(), "HEAD"]).unwrap();
+        assert!(
+            added.contains("alpha marker line"),
+            "the subset must add the shared line, or it tests nothing"
+        );
+
+        assert_eq!(
+            content_landed(&wt, "main", base.trim()),
+            Safety::Unmerged,
+            "a coincidental subset of someone else's work is NOT merged"
+        );
+    }
+
+    /// A branch whose whole change is trivial -- whitespace and
+    /// punctuation -- carries nothing this check can verify. "I found
+    /// nothing to check" must not read as "the work is in".
+    #[test]
+    fn a_vacuous_change_is_not_enough_evidence() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ident = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+        let run_in = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .envs(ident)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_in(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("f.txt"), "one\ntwo\n").unwrap();
+        run_in(&repo, &["add", "-A"]);
+        run_in(&repo, &["commit", "-q", "-m", "base"]);
+        let base = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+
+        let wt = tmp.path().join("proj-trivial");
+        run_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "trivial",
+                wt.to_str().unwrap(),
+                base.trim(),
+            ],
+        );
+        // Only punctuation and blank lines: nothing substantive.
+        std::fs::write(wt.join("f.txt"), "one\ntwo\n}\n\n").unwrap();
+        run_in(&wt, &["add", "-A"]);
+        run_in(&wt, &["commit", "-q", "-m", "trivial"]);
+
+        assert_eq!(
+            content_landed(&wt, "main", base.trim()),
+            Safety::Unmerged,
+            "a change with no substantive lines proves nothing"
+        );
+    }
+
+    /// A file the branch DELETED that the default branch still has is
+    /// work that did not land. Deletions carry no lines, so they cannot
+    /// be verified by content -- only by absence.
+    #[test]
+    fn a_deletion_that_did_not_land_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ident = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+        let run_in = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .envs(ident)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_in(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("keep.txt"), "kept\n").unwrap();
+        std::fs::write(
+            repo.join("doomed.txt"),
+            "this file was deleted on the branch but not on main\n",
+        )
+        .unwrap();
+        run_in(&repo, &["add", "-A"]);
+        run_in(&repo, &["commit", "-q", "-m", "base"]);
+        let base = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+
+        let wt = tmp.path().join("proj-del");
+        run_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "del",
+                wt.to_str().unwrap(),
+                base.trim(),
+            ],
+        );
+        std::fs::remove_file(wt.join("doomed.txt")).unwrap();
+        std::fs::write(
+            wt.join("keep.txt"),
+            "kept\nand a substantive added line of real content here\n",
+        )
+        .unwrap();
+        run_in(&wt, &["add", "-A"]);
+        run_in(&wt, &["commit", "-q", "-m", "delete a file"]);
+
+        // main still has the file the branch removed.
+        assert_eq!(
+            content_landed(&wt, "main", base.trim()),
+            Safety::Unmerged,
+            "a deletion still absent from main means the work did not land"
+        );
+    }
+
+    /// `--name-status -z` is parsed, not guessed: a rename carries TWO
+    /// paths and the DESTINATION is the branch's version. Reading the
+    /// source name would ask about a path the branch no longer has.
+    #[test]
+    fn a_rename_is_checked_by_its_destination() {
+        let out = "R100\0old/name.rs\0new/name.rs\0M\0other.rs\0";
+        let got = parse_name_status(out);
+        let paths: Vec<&str> = got.iter().map(|(_, p)| p.as_str()).collect();
+        assert_eq!(paths, vec!["new/name.rs", "other.rs"]);
+        assert!(matches!(got[0].0, Change::Present));
+    }
+
+    /// A deleted path is the one case where the verdict inverts: it must
+    /// be ABSENT from the default branch rather than present.
+    #[test]
+    fn a_deleted_path_is_parsed_as_a_deletion() {
+        let got = parse_name_status("D\0gone.rs\0");
+        assert_eq!(got.len(), 1);
+        assert!(matches!(got[0].0, Change::Deleted));
+        assert_eq!(got[0].1, "gone.rs");
+    }
+
+    /// Trivial lines are not evidence. `}` and `///` appear in almost
+    /// every file, so counting them would let a branch match by
+    /// coincidence -- the failure mode that makes content comparison
+    /// dangerous rather than merely loose.
+    #[test]
+    fn trivial_lines_are_not_counted_as_evidence() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ident = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+        let run_in = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .envs(ident)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_in(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("f.rs"), "fn a() {}\n").unwrap();
+        run_in(&repo, &["add", "-A"]);
+        run_in(&repo, &["commit", "-q", "-m", "base"]);
+        let base = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(
+            repo.join("f.rs"),
+            "fn a() {}\n}\n///\n\na substantive line of genuine content here\n",
+        )
+        .unwrap();
+        run_in(&repo, &["add", "-A"]);
+        run_in(&repo, &["commit", "-q", "-m", "more"]);
+
+        let lines = added_lines(&repo, base.trim(), "f.rs", 12);
+        assert!(
+            lines.iter().all(|l| l.len() >= 12),
+            "short fragments must be dropped: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("substantive")),
+            "the real line must survive: {lines:?}"
+        );
     }
 
     /// `git cherry` prints nothing for a branch with no commits relative
