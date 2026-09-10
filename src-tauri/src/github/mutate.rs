@@ -150,6 +150,14 @@ impl ReviewVerdict {
     }
 }
 
+/// GitHub's refusal when the pull request is already queued.
+///
+/// A substring rather than the whole message: `ClientError::Graphql`
+/// carries GitHub's text verbatim, and the transport may wrap it. The
+/// phrase is still specific enough that no other merge-queue refusal in
+/// the reported log contains it.
+const ALREADY_QUEUED: &str = "Pull request is already in the queue";
+
 /// What a mutation does to a pull request.
 ///
 /// An enum rather than free-form strings so the UI cannot ask for an
@@ -250,6 +258,32 @@ impl PrAction {
             )),
             _ => Ok(()),
         }
+    }
+
+    /// Whether a refusal actually describes the state the caller wanted.
+    ///
+    /// `enqueuePullRequest` fails with "Pull request is already in the
+    /// queue" when the pull request is ALREADY queued -- which is the
+    /// end state the action asks for. Reporting it as a failure told
+    /// the user their request was rejected while the thing they wanted
+    /// was already true; a six-day log carried six of these (#746).
+    ///
+    /// Two ways to arrive here even though `PrActions` and `PrKebab`
+    /// both offer `dequeue` rather than `enqueue` once `in_merge_queue`
+    /// is set: a row whose queue state is older than the queue itself
+    /// (the polls behind it can lag, #744), and `BulkBar`, which
+    /// applies one action to an entire selection without filtering out
+    /// the rows already in it.
+    ///
+    /// Deliberately the NARROWEST possible match. Every other
+    /// merge-queue refusal in that same log is honest and must keep
+    /// failing -- "N of M required status checks are expected", a
+    /// transport `Service Error`, and the stacked-PR refusal that needs
+    /// a different API (#743). Matching on the exact sentence rather
+    /// than on "queue" is what keeps those failing.
+    fn is_already_satisfied(self, e: &ClientError) -> bool {
+        self == PrAction::Enqueue
+            && matches!(e, ClientError::Graphql(m) if m.contains(ALREADY_QUEUED))
     }
 
     /// Whether this destroys work if done by mistake.
@@ -374,12 +408,20 @@ impl GitHubClient {
             action.field(),
             action.result_selection()
         );
-        let data = self
+        let data = match self
             .graphql_mutation_data(&json!({
                 "query": query,
                 "variables": { "id": id }
             }))
-            .await?;
+            .await
+        {
+            Ok(data) => data,
+            // Asking for a state that already holds is not a failure --
+            // see `is_already_satisfied` for why only this one refusal
+            // is forgiven.
+            Err(e) if action.is_already_satisfied(&e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
         action.verify(&data[action.field()])
     }
 
@@ -714,6 +756,61 @@ mod tests {
         assert!(PrAction::Enqueue
             .verify(&json!({ "mergeQueueEntry": { "state": "SOME_NEW_STATE" } }))
             .is_ok());
+    }
+
+    /// The refusal that means the request already got what it asked
+    /// for: the pull request is queued, so a failure toast is wrong
+    /// (#746).
+    #[test]
+    fn already_in_the_queue_is_not_a_failure() {
+        let e = ClientError::Graphql("Pull request is already in the queue".into());
+        assert!(PrAction::Enqueue.is_already_satisfied(&e));
+    }
+
+    /// The other merge-queue refusals from the same log. Each is an
+    /// honest "no" -- checks really are missing, and the stacked-PR case
+    /// needs a different API (#743) -- so each must keep reaching the
+    /// user as a failure.
+    #[test]
+    fn the_genuine_merge_queue_refusals_still_fail() {
+        for message in [
+            "Pull request 1 of 2 required status checks are expected.",
+            "This pull request is part of a stack and must be enqueued using \
+             the asynchronous merge REST API.",
+            "Pull request is not mergeable",
+        ] {
+            let e = ClientError::Graphql(message.into());
+            assert!(
+                !PrAction::Enqueue.is_already_satisfied(&e),
+                "{message} is a real refusal and must keep failing"
+            );
+        }
+    }
+
+    /// A transport failure carries no GraphQL message at all, so it can
+    /// never be mistaken for the queued state.
+    #[test]
+    fn a_transport_failure_is_never_forgiven() {
+        let e = ClientError::NotJson("Service Error: client error (SendRequest)".into());
+        assert!(!PrAction::Enqueue.is_already_satisfied(&e));
+    }
+
+    /// Scoped to enqueue. "Already in the queue" coming back from a
+    /// DEQUEUE would mean the pull request did not leave, which is a
+    /// failure and must not be swallowed by a message match alone.
+    #[test]
+    fn only_enqueue_forgives_the_already_queued_message() {
+        let e = ClientError::Graphql("Pull request is already in the queue".into());
+        for a in [
+            PrAction::Merge,
+            PrAction::Close,
+            PrAction::Reopen,
+            PrAction::ConvertToDraft,
+            PrAction::MarkReady,
+            PrAction::Dequeue,
+        ] {
+            assert!(!a.is_already_satisfied(&e), "{a:?} must not forgive this");
+        }
     }
 
     /// The check is enqueue-specific. Every other action's payload is an

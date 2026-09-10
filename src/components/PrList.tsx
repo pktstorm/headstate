@@ -18,6 +18,7 @@ export function PrList({
   prs,
   hasFilters = false,
   total,
+  fetched,
   onOpen,
   canWrite = true,
   selectable = false,
@@ -25,9 +26,22 @@ export function PrList({
 }: {
   prs: PullRequest[];
   hasFilters?: boolean;
-  /// GitHub's true match count when it exceeds the page size, else
-  /// undefined. Shown so a truncated list never passes for a complete one.
+  /// GitHub's true open-PR count when the poll could not fetch them all,
+  /// else undefined (or 0, once a later poll came back complete). Shown
+  /// so a truncated list never passes for a complete one.
   total?: number;
+  /// How many pull requests the poll actually FETCHED, before this
+  /// component's filters narrowed them.
+  ///
+  /// `prs` is the visible list, so it is the filtered count -- and the
+  /// marker read "showing 3 of 29" when 29 arrived and a filter hid 26
+  /// of them, inventing a truncation that never happened. `total` comes
+  /// from GitHub and knows nothing about filters, so the number it is
+  /// compared against must not know about them either (#745).
+  ///
+  /// Defaults to `prs.length` for the unfiltered call sites and tests
+  /// where the two are the same.
+  fetched?: number;
   /// Called with the clicked PR. Omitted where rows are not clickable.
   onOpen?: (pr: PullRequest) => void;
   canWrite?: boolean;
@@ -41,6 +55,9 @@ export function PrList({
   unreachable?: boolean;
 }) {
   const { checked, setChecked, cursor } = useFilters();
+
+  // What the poll got, not what survived the filters.
+  const shown = fetched ?? prs.length;
 
   // Select-all acts on what is ON SCREEN, not the unfiltered list.
   // Selecting rows the user cannot see and then bulk-closing them is the
@@ -113,9 +130,21 @@ export function PrList({
               that teaches people to ignore all of them. */}
           <HelpButton topic="pending-reviewers" />
         </span>
-        {total !== undefined && total > prs.length ? (
-          <span className="text-xs text-[#d29922]">
-            showing {prs.length} of {total} — GitHub returns at most 100
+        {shown < (total ?? 0) ? (
+          // Amber, on the list header rather than above the list, for
+          // the same reason `StaleRibbon` sits on the data it doubts: a
+          // notice one scroll away from the rows it qualifies is a
+          // notice that gets scrolled past. The rows here are real; what
+          // is wrong is the list's implicit claim to be all of them.
+          //
+          // Says the CAUSE, not a page size. Truncation now means pages
+          // of the search failed -- the poll fans out to fetch every
+          // page (#744's slowness is the same fault) -- so "GitHub
+          // returns at most 100" named a limit that is no longer the
+          // reason and pointed the user at nothing they could act on. A
+          // refresh genuinely is the fix.
+          <span role="status" className="text-xs text-[#d29922]">
+            Showing {shown} of {total} — the rest did not load. Refresh to try again.
           </span>
         ) : null}
       </div>

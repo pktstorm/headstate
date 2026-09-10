@@ -753,13 +753,15 @@ pub fn spawn(
                     }
 
                     previous = prs.clone();
-                    // Only interesting when GitHub says there are more than
-                    // it returned; the UI stays silent otherwise.
-                    if total > prs.len() as u64 {
+                    // Emitted on EVERY tick, including the complete one
+                    // -- see `truncation_payload` for why the zero
+                    // matters as much as the count.
+                    let truncated = truncation_payload(prs.len() as u64, total);
+                    if truncated > 0 {
                         log::warn!("truncated: showing {} of {total} open PRs", prs.len());
-                        if let Err(e) = app.emit("prs-truncated", total) {
-                            log::warn!("failed to emit prs-truncated: {e}");
-                        }
+                    }
+                    if let Err(e) = app.emit("prs-truncated", truncated) {
+                        log::warn!("failed to emit prs-truncated: {e}");
                     }
                     // The heartbeat that makes "it stopped updating"
                     // answerable: if the log ends here, the loop died or
@@ -839,8 +841,57 @@ pub fn spawn(
     });
 }
 
+/// What to tell the frontend about truncation on this tick.
+///
+/// GitHub's true count while the list is short, and `0` once it is
+/// complete.
+///
+/// The zero is the point. This used to be emitted ONLY while the list
+/// was short, and `useTruncation` holds the last value it received --
+/// so a poll that recovered and returned everything left "showing 8 of
+/// 29" sitting over a complete list until the app was relaunched, which
+/// is a false warning where there had been a true one (#745).
+/// `prs-incomplete` already emits its zero for exactly this reason;
+/// truncation was the one advisory that could not take itself back.
+///
+/// One event carrying zero rather than a second "cleared" event, so the
+/// two states cannot arrive out of order and disagree.
+///
+/// `saturating_sub` because the two numbers come from different parts of
+/// the same response: `issueCount` is GitHub's, the length is what
+/// survived mapping, and a list LONGER than the count is not a negative
+/// truncation.
+fn truncation_payload(fetched: u64, total: u64) -> u64 {
+    if total.saturating_sub(fetched) > 0 {
+        total
+    } else {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// The worst case in the six-day log: 8 fetched of 29 open (#745).
+    #[test]
+    fn a_short_list_reports_githubs_own_count() {
+        assert_eq!(truncation_payload(8, 29), 29);
+    }
+
+    /// The regression this function exists for: a recovered poll has to
+    /// TAKE BACK the notice, or the frontend keeps rendering the last
+    /// count it was given over a list that is now complete.
+    #[test]
+    fn a_complete_list_clears_the_notice() {
+        assert_eq!(truncation_payload(29, 29), 0);
+    }
+
+    /// A list longer than the count is still complete, not a negative
+    /// shortfall.
+    #[test]
+    fn more_fetched_than_counted_is_not_a_truncation() {
+        assert_eq!(truncation_payload(30, 29), 0);
+    }
+
     /// The consequence of classifying a parse failure as transient: one
     /// stays quiet, two in a row is still named.
     ///
