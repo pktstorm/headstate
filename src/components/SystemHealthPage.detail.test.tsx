@@ -9,6 +9,7 @@ import type {
   FootprintProcessGroup,
   HealthGpu,
   HealthSample,
+  NetProcess,
   Venv,
   WorktreeRepo,
 } from "@/types/pr";
@@ -29,7 +30,19 @@ import { stubViewport } from "@/test-utils";
 /// invented names (`acme-render`, `widget-daemon`) rather than a
 /// capture from any machine. Per `CONTRIBUTING.md`.
 
+/// The Network page's own cadence (#718), restated for the mock and
+/// pinned against the real module by a test below.
+const { MOCK_POLL_MS, MOCK_SAMPLE_MS } = vi.hoisted(() => ({
+  MOCK_POLL_MS: 15_000,
+  MOCK_SAMPLE_MS: 5_000,
+}));
+
 const liveFn = vi.hoisted(() => vi.fn<() => Promise<HealthSample>>());
+const netProcFn = vi.hoisted(() => vi.fn<() => Promise<NetProcess[]>>());
+/// Off by default, so no test pays for a second reading it did not ask
+/// for. The one test about the single-to-two-readings transition turns
+/// it on.
+const netProcPollMs = vi.hoisted(() => ({ current: false as number | false }));
 const historyFn = vi.hoisted(() => vi.fn<() => Promise<HealthSample[]>>());
 const footprintFn = vi.hoisted(() => vi.fn<() => Promise<Footprint>>());
 const disk = vi.hoisted(() => ({
@@ -112,6 +125,27 @@ vi.mock("../api/hooks", () => ({
   },
   useDockerDiskUsage: (enabled: boolean) =>
     useQuery({ queryKey: ["docker-disk"], queryFn: disk.dockerDisk, enabled, retry: false }),
+  // The per-process network table (#718). The cadence constants have
+  // to be restated here because the module is mocked wholesale -- and
+  // restating them is a drift risk, so `the cadence constants this file
+  // restates match the real ones` below imports the real module and
+  // pins them. Without that, a test asserting the page says "15
+  // seconds" would keep passing after the shipped cadence changed.
+  NET_PROCESSES_POLL_MS: MOCK_POLL_MS,
+  NET_PROCESSES_SAMPLE_MS: MOCK_SAMPLE_MS,
+  // `refetchInterval` is kept, at a test-sized 20ms rather than the
+  // real fifteen seconds: the panel's whole reason for existing is what
+  // happens when the SECOND reading lands, and a mock that only ever
+  // fetches once could not exercise it. The interval is the one thing
+  // shrunk; everything else is the real hook's shape.
+  useNetworkProcesses: (enabled: boolean) =>
+    useQuery({
+      queryKey: ["system-network-processes"],
+      queryFn: netProcFn,
+      enabled,
+      refetchInterval: enabled ? netProcPollMs.current : false,
+      retry: false,
+    }),
   // The sidebar renders `ViewSwitcher`, which reads the hidden-views
   // preference. Nothing hidden, so the switcher offers every view --
   // this file's subject is the class list beneath it.
@@ -271,6 +305,12 @@ beforeEach(() => {
   liveFn.mockResolvedValue(sample());
   historyFn.mockResolvedValue([]);
   footprintFn.mockResolvedValue(footprint());
+  // The majority platform by default: no unprivileged per-process
+  // network attribution exists on Linux and none is built on Windows,
+  // so an empty list is what most machines report. Tests that want the
+  // macOS answer opt into it, exactly as `gpus` works above.
+  netProcFn.mockResolvedValue([]);
+  netProcPollMs.current = false;
   disk.worktrees.mockResolvedValue([]);
   disk.artifacts.mockResolvedValue([]);
   disk.venvs.mockResolvedValue([]);
@@ -540,6 +580,191 @@ describe("the Network page", () => {
     // more than one measured run, which is what `data-runs` carries.
     const chart = screen.getByTestId("sparkline-en0 received");
     expect(Number(chart.getAttribute("data-runs"))).toBeGreaterThan(1);
+  });
+
+  /// #718: the panel that names what is using the network.
+  ///
+  /// Every process name in these fixtures is invented — see the file
+  /// header.
+  describe("what is using the network (#718)", () => {
+    /// Synthetic rows, in the shape `nettop` reports after parsing.
+    const netProc = (
+      name: string,
+      pid: number | null,
+      bytes_in: number,
+      bytes_out: number,
+    ): NetProcess => ({ name, pid, bytes_in, bytes_out });
+
+    /// **The ~5-second first reading is EXPLAINED, not spun through.**
+    ///
+    /// This is a state every user sees every time they open this page,
+    /// and it lasts five seconds. A spinner that sits that long with no
+    /// explanation is its own bug — the user's next move is to
+    /// conclude the app has hung.
+    it("says how long the first reading takes rather than spinning silently", async () => {
+      // Never resolves: the panel is held in its waiting state for the
+      // duration of the assertion, which is exactly the five seconds a
+      // real user spends looking at it.
+      netProcFn.mockReturnValue(new Promise<NetProcess[]>(() => {}));
+      renderPage();
+      await screen.findByText("What is using the network");
+      // The duration is named, and so is the reason — "measuring" alone
+      // would still leave the length of the wait a mystery.
+      await screen.findByText(/takes about 5 seconds/i);
+      await screen.findByText(/sampling for a full interval/i);
+      await screen.findByText(/nothing is stuck/i);
+    });
+
+    /// **One reading is a TOTAL, and must not be presented as a rate.**
+    ///
+    /// `nettop` reports cumulative bytes since each process started, so
+    /// the first reading can only rank by lifetime traffic. Labelling
+    /// that "In/Out" per second would be a fabricated rate; the page
+    /// says what the numbers are and when real rates arrive.
+    it("labels the first reading as lifetime totals, not speeds", async () => {
+      netProcFn.mockResolvedValue([
+        netProc("acme-sync", 501, 6_000_000_000, 1_000_000),
+        netProc("widget-daemon", 502, 1_000, 2_000),
+      ]);
+      renderPage();
+      await screen.findByText("acme-sync");
+      // The headings say quantity, not speed.
+      expect(screen.getByRole("columnheader", { name: "Received" })).toBeTruthy();
+      expect(screen.queryByRole("columnheader", { name: "In" })).toBeNull();
+      // And the caveat is stated in words, including WHY and for how
+      // long it applies.
+      await screen.findByText(/lifetime totals/i);
+      await screen.findByText(/a single reading cannot be a rate/i);
+      await screen.findByText(/outranks one saturating the link right now/i);
+    });
+
+    /// Two readings ARE a rate, and the panel switches to saying so.
+    ///
+    /// The mutation this catches: a panel that always shows cumulative
+    /// totals, never differencing, would keep the "lifetime totals"
+    /// wording forever and quietly never answer the question the page
+    /// exists for.
+    it("shows a rate once a second reading lands", async () => {
+      // The real cadence compressed to 20ms; see the mock. The counter
+      // keeps climbing so every reading differences to a real rate.
+      netProcPollMs.current = 20;
+      let cumulative = 1_000;
+      netProcFn.mockImplementation(() => {
+        cumulative += 150_000;
+        return Promise.resolve([netProc("acme-sync", 501, cumulative, 500)]);
+      });
+      renderPage();
+      // First reading: totals only, because one reading is not a rate.
+      await screen.findByText(/lifetime totals/i);
+      // Second reading: the wording switches, and the "In"/"Out"
+      // headings replace "Received"/"Sent".
+      await screen.findByText(/rates over the last interval/i);
+      expect(screen.getByRole("columnheader", { name: "In" })).toBeTruthy();
+      expect(screen.queryByRole("columnheader", { name: "Received" })).toBeNull();
+      // And the "lifetime totals" caveat is gone: leaving it up beside
+      // real rates would be the same misreading in reverse.
+      expect(screen.queryByText(/a single reading cannot be a rate/i)).toBeNull();
+    });
+
+    /// Two readings that share no process are not an empty table.
+    ///
+    /// Distinct from the empty-reading case below: here processes WERE
+    /// reported, and none of them paired with the previous reading — a
+    /// whole table turned over, which is what a laptop waking from
+    /// sleep looks like. An empty table under live headings would read
+    /// as a panel that failed to paint.
+    it("explains a reading whose processes all turned over", async () => {
+      netProcPollMs.current = 20;
+      let generation = 0;
+      netProcFn.mockImplementation(() => {
+        generation += 1;
+        // Every reading is a completely different set of PIDs, so
+        // nothing ever pairs.
+        return Promise.resolve([
+          netProc(`acme-worker-${generation}`, 1000 + generation, 5_000, 5_000),
+        ]);
+      });
+      renderPage();
+      const note = await screen.findByText(/none of the 1 processes in this reading/i);
+      // The whole explanation, not just the count: WHY there is no rate,
+      // and that it is temporary.
+      expect(note.textContent).toMatch(/none of them has an interval to measure/i);
+      expect(note.textContent).toMatch(/rates return with the next pair/i);
+      // And it is a sentence, not a table with no body rows.
+      expect(screen.queryByRole("columnheader", { name: "In" })).toBeNull();
+    });
+
+    /// **A platform with no unprivileged route says so, with the
+    /// reason.** #705's precedent: an evidenced "cannot be read" beats
+    /// a silently empty panel, which reads as a broken one.
+    it("names the reason on a platform that cannot be read unprivileged", async () => {
+      netProcFn.mockResolvedValue([]);
+      renderPage();
+      await screen.findByText("What is using the network");
+      // Not an empty table, and not "no processes are using the
+      // network" — which on a booted machine would be a claim nobody
+      // measured.
+      expect(screen.queryByRole("columnheader", { name: "Process" })).toBeNull();
+      await screen.findByText(/only macos reports network use per process/i);
+      await screen.findByText(/per-namespace rather than per-process/i);
+      await screen.findByText(/CAP_NET_ADMIN/);
+    });
+
+    /// A row whose label carried no parseable PID shows a dash rather
+    /// than a fabricated number. The same "absent is not zero" rule as
+    /// everywhere else here, and here it matters more than usual: a PID
+    /// is the column a reader copies into `kill`.
+    it("shows no pid rather than inventing one", async () => {
+      netProcFn.mockResolvedValue([netProc("acme-relay", null, 5_000, 5_000)]);
+      renderPage();
+      const row = (await screen.findByText("acme-relay")).closest("tr");
+      expect(row).not.toBeNull();
+      expect(within(row as HTMLElement).getByText("Not measured")).toBeTruthy();
+      expect(within(row as HTMLElement).queryByText("0")).toBeNull();
+    });
+
+    /// **The five-second reading must never reach the shared health
+    /// timer.** #661's rule, and this is the worst case of it: one
+    /// reading is as long as the whole poll interval, so on that timer
+    /// the subprocesses would overlap forever.
+    ///
+    /// Asserted as "the page states its own cadence", which is the
+    /// user-visible consequence: a panel driven by the health poll
+    /// could not truthfully say it re-reads every fifteen seconds.
+    it("states its own slower cadence and why", async () => {
+      netProcFn.mockResolvedValue([netProc("acme-sync", 501, 1_000, 500)]);
+      renderPage();
+      await screen.findByText("acme-sync");
+      await screen.findByText(
+        new RegExp(`re-read every ${MOCK_POLL_MS / 1000} seconds`, "i"),
+      );
+      await screen.findByText(/only while this page is open/i);
+      await screen.findByText(/too expensive for the poll driving the rest/i);
+    });
+
+    /// And it must not run on any OTHER page. The containment is that
+    /// the component only mounts here; a panel added to the overview,
+    /// or a hook enabled unconditionally, would put a five-second
+    /// subprocess on every page in the view.
+    it("does not read the per-process table from any other page", async () => {
+      useFilters.setState({ healthPage: "cpu" });
+      renderPage();
+      await screen.findByText("What is using the CPU");
+      expect(netProcFn).not.toHaveBeenCalled();
+    });
+
+    /// The cadence constants this file restates for the mock must match
+    /// the real module's. Without this the prose assertions above would
+    /// keep passing against numbers the shipped page no longer uses.
+    it("restates the real cadence constants", async () => {
+      const real = await vi.importActual<typeof import("@/api/hooks")>("@/api/hooks");
+      expect(real.NET_PROCESSES_POLL_MS).toBe(MOCK_POLL_MS);
+      expect(real.NET_PROCESSES_SAMPLE_MS).toBe(MOCK_SAMPLE_MS);
+      // One reading must fit comfortably inside one interval, or two
+      // `nettop` processes would be alive at once — the exact failure
+      // that kept this off the five-second health poll.
+      expect(real.NET_PROCESSES_SAMPLE_MS * 2).toBeLessThan(real.NET_PROCESSES_POLL_MS);
+    });
   });
 
   it("says the bars are a share of traffic, not saturation", async () => {

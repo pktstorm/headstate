@@ -96,6 +96,16 @@ pub const SURFACE: &[(&str, Class)] = &[
     // desktop, and this answers "is the app I am driving why that
     // machine is busy". Reads the process table and nothing else.
     ("system_footprint", Class::Read),
+    // Which processes are using the DESKTOP's network (#718). A read,
+    // and exposed for the same reason `system_footprint` is: the phone
+    // drives a desktop, and "what is saturating that machine's link" is
+    // a question you ask about the machine you left running.
+    //
+    // It costs ~5 SECONDS on the desktop, uniquely among these -- see
+    // `health::netproc`. That is why it is its own command rather than
+    // part of `system_health`, and the phone must call it on the
+    // Network page's slow cadence only, never beside the health poll.
+    ("system_network_processes", Class::Read),
     ("docker_disk_usage", Class::Read),
     ("docker_dangling_volumes", Class::Read),
     ("docker_running_containers", Class::Read),
@@ -370,6 +380,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "system_health" => res(commands::system_health(app.state()).await),
         "system_health_history" => res(commands::system_health_history(app.clone()).await),
         "system_footprint" => res(commands::system_footprint(app.state()).await),
+        "system_network_processes" => res(commands::system_network_processes().await),
         "docker_disk_usage" => res(commands::docker_disk_usage().await),
         // The sync Docker commands shell out. Inline they would stall the
         // listener's worker for every other request (#496 was this bug

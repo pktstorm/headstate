@@ -2310,6 +2310,38 @@ pub async fn system_footprint(
     .map_err(|e| e.to_string())
 }
 
+/// Which processes are using the network, right now (#718).
+///
+/// # This blocks for about FIVE SECONDS on macOS, by construction
+///
+/// `nettop` samples for a full interval before it prints, and `-L 1`
+/// waits that interval out -- measured at 5.06-5.25 s across every
+/// flag combination that might have shortened it, against 0.08 s of
+/// CPU. It is a sleep, not work, and there is no faster route to
+/// per-process attribution without elevation. `health::netproc` carries
+/// the full table and the reasoning.
+///
+/// # So this is NOT `system_health`, and must never be called beside it
+///
+/// The live view polls `system_health` every five seconds
+/// (`HEALTH_POLL_MS`). A 5.1-second subprocess on a 5-second timer
+/// means each call outlives the interval that spawned it: `nettop`
+/// processes would overlap continuously for as long as the app was
+/// open. That is #661's failure -- a slow command on a shared timer --
+/// so this is a SEPARATE command driven by the Network detail page's own
+/// slower cadence, and it exists separately from `system_health`
+/// precisely so it cannot be folded into that sample by accident.
+///
+/// Returns an empty list on every platform but macOS, which is the
+/// honest answer rather than a zero: no unprivileged per-process
+/// attribution exists on Linux, and Windows' is real unwritten work.
+#[tauri::command]
+pub async fn system_network_processes() -> Result<Vec<crate::health::NetProcess>, String> {
+    tauri::async_runtime::spawn_blocking(crate::health::netproc::read)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// The event name a branch scan reports its progress under.
 ///
 /// One name, two frame shapes, because it is one stream: a `listed`

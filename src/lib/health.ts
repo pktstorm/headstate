@@ -322,6 +322,112 @@ export function interfaceRates(
   return out;
 }
 
+/// One reading of the per-process network table (#718).
+///
+/// Structural rather than importing `NetProcess`, keeping this module
+/// free of the API types the way the rest of it is.
+export interface NetProcessReading {
+  /// Epoch milliseconds at which this reading was taken.
+  t: number;
+  processes: {
+    name: string;
+    pid: number | null;
+    bytes_in: number;
+    bytes_out: number;
+  }[];
+}
+
+/// One process's traffic between two readings.
+export interface NetProcessRate {
+  name: string;
+  pid: number | null;
+  /// Bytes per second received across the interval.
+  in_rate: number;
+  /// Bytes per second sent across the interval.
+  out_rate: number;
+  /// Cumulative totals from the NEWER reading, carried alongside the
+  /// rate because they answer a different and also real question: "what
+  /// has this process moved altogether", which a rate cannot.
+  bytes_in: number;
+  bytes_out: number;
+}
+
+/// Turn two readings of the per-process table into rates.
+///
+/// # Why this function has to exist at all
+///
+/// `nettop` reports CUMULATIVE bytes since each process started, so a
+/// single reading ranks a process that pulled 6 GB last week above one
+/// saturating the link right now. Only the difference between two
+/// readings is a rate, which is the entire reason the Network page is
+/// ~20 seconds from opening to its first meaningful ordering rather
+/// than ~5 -- and why the view must say so instead of looking broken.
+///
+/// # Matching by PID, then by name
+///
+/// A process is the same process across two readings when the PID
+/// matches. Falling back to the NAME for a row with no PID is
+/// deliberate but strictly second: PIDs are recycled, so matching on
+/// name alone would difference two unrelated programs and produce a
+/// spectacular fake rate. Where both readings carry PIDs, the name is
+/// never consulted.
+///
+/// # What is NOT emitted, and why
+///
+/// - **A process only in the newer reading** (it started since) gets no
+///   rate. Its cumulative total is not a delta from zero: it may have
+///   been running and simply absent from the earlier table.
+/// - **A process only in the older reading** (it exited) gets no rate.
+///   There is nothing to difference, and reporting its last total as a
+///   rate would attribute a week of traffic to fifteen seconds.
+/// - **A counter that went backwards** gets no rate. Same reasoning as
+///   `counterRates`: a PID recycled onto a different program looks
+///   exactly like this, and a clamped zero would claim a measurement.
+/// - **A non-positive interval** gets no rate, since dividing by it
+///   yields `Infinity`.
+///
+/// Absent is not zero throughout: a process that cannot be turned into
+/// a rate is simply not in the result, so the view can say how many
+/// were dropped rather than showing them at 0 B/s.
+export function netProcessRates(
+  older: NetProcessReading,
+  newer: NetProcessReading,
+): NetProcessRate[] {
+  const seconds = (newer.t - older.t) / 1000;
+  if (!(seconds > 0)) return [];
+
+  // PID first, name as the fallback key for rows that carry none. The
+  // two key spaces are kept apart by the prefix, so a process named
+  // "42" can never be matched against PID 42.
+  const key = (p: { name: string; pid: number | null }) =>
+    p.pid === null ? `n:${p.name}` : `p:${p.pid}`;
+  const before = new Map(older.processes.map((p) => [key(p), p]));
+
+  const out: NetProcessRate[] = [];
+  for (const cur of newer.processes) {
+    const prev = before.get(key(cur));
+    // Started since the older reading, or matched nothing. No interval,
+    // so no rate -- not a delta from zero.
+    if (prev === undefined) continue;
+    const dIn = cur.bytes_in - prev.bytes_in;
+    const dOut = cur.bytes_out - prev.bytes_out;
+    // Backwards on either counter means this is not the same process's
+    // continuing accounting -- most likely a recycled PID. Dropped
+    // rather than clamped, for the same reason `counterRates` emits
+    // null on a reset.
+    if (dIn < 0 || dOut < 0) continue;
+    out.push({
+      name: cur.name,
+      pid: cur.pid,
+      in_rate: dIn / seconds,
+      out_rate: dOut / seconds,
+      bytes_in: cur.bytes_in,
+      bytes_out: cur.bytes_out,
+    });
+  }
+  return out;
+}
+
 /// A bytes-per-second figure in words a person reads.
 ///
 /// Separate from `formatSize` in `lib/worktrees` rather than wrapping

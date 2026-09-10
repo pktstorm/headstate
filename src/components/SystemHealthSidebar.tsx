@@ -54,7 +54,12 @@ export const HEALTH_PAGES: {
     blurb: "Utilization, memory, and the pipeline stages",
     Icon: MonitorCog,
   },
-  { id: "network", label: "Network", blurb: "Every interface, since boot", Icon: Network },
+  {
+    id: "network",
+    label: "Network",
+    blurb: "Every interface, and what is using it",
+    Icon: Network,
+  },
   {
     id: "power",
     label: "Power and uptime",

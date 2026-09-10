@@ -23,6 +23,16 @@
 //! same rule as everything else here. [`gpu`] carries the evidence
 //! behind each verdict.
 //!
+//! **Per-process network, on every platform but macOS.** macOS answers
+//! through `nettop`, at a cost of ~5 SECONDS a reading -- two orders of
+//! magnitude past anything else here, and equal to the whole live poll
+//! interval. So it is deliberately NOT part of [`Sample`] and not on
+//! this timer at all: it has its own command and runs only while the
+//! Network detail page is open. Linux has no unprivileged route and
+//! Windows' is real work nobody has done; both report nothing and the
+//! view says why. [`netproc`] carries the measurements and the
+//! per-platform evidence.
+//!
 //! # Absent is not zero
 //!
 //! Every optional field is `None` when the platform does not expose it,
@@ -47,9 +57,11 @@ pub mod alerts;
 pub mod collect;
 pub mod footprint;
 pub mod gpu;
+pub mod netproc;
 
 pub use footprint::Footprint;
 pub use gpu::Gpu;
+pub use netproc::NetProcess;
 
 /// One moment, as the UI consumes it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

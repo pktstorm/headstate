@@ -978,6 +978,46 @@ interface HealthInterface {
   tx_bytes: number;
 }
 
+/// One process's network totals, mirroring the Rust
+/// `health::NetProcess` in `src-tauri/src/health/netproc.rs` (#718).
+///
+/// Exported, unlike the four `HealthSample` helpers above, for the same
+/// reason as `FootprintProcess` and `HealthGpu`: `SystemHealthPage`
+/// renders a row per process and therefore has to name the type.
+///
+/// # These are NOT part of `HealthSample`, deliberately
+///
+/// Every other reading on this page rides the five-second health poll.
+/// This one costs ~5 SECONDS per reading on macOS -- `nettop` samples
+/// for a whole interval before printing anything -- which is the entire
+/// poll interval, so it has its own command and its own slower cadence
+/// and runs only while the Network detail page is open. Folding it into
+/// `HealthSample` would put a five-second subprocess on a five-second
+/// timer, which is #661's failure in its worst available form.
+///
+/// # Cumulative, so ONE reading is not a rate
+///
+/// `bytes_in` and `bytes_out` are totals since each PROCESS started --
+/// the same contract as `HealthInterface`, whose counters are totals
+/// since boot. A rate needs two readings differenced, which is why the
+/// page is roughly TWENTY seconds from opening to its first rate — one
+/// ~5s reading, the 15s cadence, then a second ~5s reading — and why it
+/// has to say so rather than looking broken for that long.
+export interface NetProcess {
+  /// The process as the platform names it, PID stripped off. It matches
+  /// the names the CPU and Memory pages list, which is what lets a
+  /// reader follow one busy process across the three pages.
+  name: string;
+  /// The PID, or `null` when the platform's label carried no parseable
+  /// one. Never invented: a row whose identity could not be established
+  /// still has real byte counts worth showing.
+  pid: number | null;
+  /// Bytes received since the process started. Cumulative.
+  bytes_in: number;
+  /// Bytes sent since the process started. Cumulative.
+  bytes_out: number;
+}
+
 /// What Headstate itself is costing at one instant, mirroring the Rust
 /// `health::Footprint` in `src-tauri/src/health/footprint.rs`.
 ///

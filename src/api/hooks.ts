@@ -14,6 +14,7 @@ import type {
   DockerImage,
   Footprint,
   HealthSample,
+  NetProcess,
   PrDetail,
   PullRequest,
   Venv,
@@ -46,6 +47,7 @@ import {
   systemHealth,
   systemHealthHistory,
   systemFootprint,
+  systemNetworkProcesses,
   type UpdateRunDone,
   listWorktrees,
   removeWorktree,
@@ -2536,5 +2538,97 @@ export function useSystemFootprint(enabled: boolean) {
     enabled,
     refetchInterval: enabled ? HEALTH_POLL_MS : false,
     staleTime: HEALTH_POLL_MS - 1_000,
+  });
+}
+
+/// How long ONE per-process network reading takes, on macOS.
+///
+/// Not a guess and not a timeout: `nettop` samples for a full interval
+/// before it prints anything, and `-L 1` waits that interval out.
+/// Measured at 5.06-5.25s across every flag combination that might have
+/// shortened it (`-s 1`, `-d`), against 0.08s of CPU -- it is a sleep,
+/// not work.
+///
+/// Exported for the view, which needs it to tell the user how long the
+/// wait will be. A page that says "about five seconds" while the code
+/// believes something else is a page that will eventually lie, so the
+/// number the UI quotes and the number this cadence is built on are one
+/// constant.
+export const NET_PROCESSES_SAMPLE_MS = 5_000;
+
+/// How often the Network page re-reads which processes are using the
+/// network (#718).
+///
+/// # Not `HEALTH_POLL_MS`, and this is the whole design decision
+///
+/// The shared health poll is five seconds. One reading here takes ~5.1
+/// seconds, so on that timer every call would OUTLIVE the interval that
+/// spawned it: `nettop` processes would overlap continuously and the
+/// machine would permanently host one or more of them for as long as
+/// the app was open. That is #661's rule -- a slow command on a shared
+/// timer is the failure -- met in its worst available form, so this
+/// reading gets its own command and its own cadence.
+///
+/// # Why fifteen seconds
+///
+/// It has to be comfortably more than one reading takes, so at most one
+/// `nettop` is ever alive: 15s leaves ~10s of quiet between readings,
+/// which absorbs a slow machine without the two ever overlapping. And
+/// it cannot be much longer, because the rates on this panel come from
+/// DIFFERENCING consecutive readings -- a 60s cadence would average
+/// every burst over a minute and show a link that spiked as a link that
+/// hummed.
+///
+/// The duty cycle that buys: about a third of wall-clock time with a
+/// `nettop` running, but at 0.08s of CPU per reading it is ~0.5% of one
+/// core -- and only while somebody is looking at this one page.
+///
+/// # `enabled` is what makes that acceptable
+///
+/// This is the most expensive reading in the app that is on any timer
+/// at all, so the timer must not exist unless the page is open. The
+/// Network detail component is the only caller and passes `true` only
+/// while it is mounted; TanStack genuinely suspends the
+/// `refetchInterval` of a disabled query rather than merely discarding
+/// its results, so navigating away stops the subprocess rather than
+/// hiding it.
+///
+/// `refetchIntervalInBackground` stays at its default of false: a
+/// minimised window must not keep spawning these, and unlike the health
+/// sampler there is no history being filled in the meantime, so nothing
+/// is lost by stopping.
+export const NET_PROCESSES_POLL_MS = 15_000;
+
+/// Which processes are using the network, on the Network page's own
+/// cadence (#718).
+///
+/// # The two honesty problems this hook's shape exists to serve
+///
+/// 1. **The first reading takes ~5 seconds to arrive.** `isPending` is
+///    therefore a five-second state, not a flicker, and the view is
+///    required to explain it rather than spin. `NET_PROCESSES_SAMPLE_MS`
+///    is exported so it can quote the real number.
+/// 2. **One reading is not a rate.** The counts are cumulative since
+///    each process started, so a rate needs two readings differenced --
+///    putting the first rate ~20s after the page opens (one 5s reading,
+///    a 15s cadence, a second 5s reading). The view says so.
+///
+/// `keepPreviousData` is deliberately NOT used, and `staleTime` is set
+/// so a remount inside one cadence paints from cache instead of firing
+/// another five-second subprocess.
+export function useNetworkProcesses(enabled: boolean) {
+  return useQuery<NetProcess[]>({
+    queryKey: ["system-network-processes"],
+    queryFn: systemNetworkProcesses,
+    enabled,
+    refetchInterval: enabled ? NET_PROCESSES_POLL_MS : false,
+    // Just under the cadence, for the same reason as the health poll --
+    // and it matters more here, because the extra call it prevents is
+    // a five-second subprocess rather than a kernel read.
+    staleTime: NET_PROCESSES_POLL_MS - 1_000,
+    // One reading is expensive enough that retrying a failure three
+    // times would cost fifteen seconds of subprocesses to reach the
+    // same error message. The cadence itself is the retry.
+    retry: false,
   });
 }
