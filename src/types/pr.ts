@@ -1000,8 +1000,9 @@ interface HealthInterface {
 /// `bytes_in` and `bytes_out` are totals since each PROCESS started --
 /// the same contract as `HealthInterface`, whose counters are totals
 /// since boot. A rate needs two readings differenced, which is why the
-/// page is roughly ten seconds from opening to its first rate, and why
-/// it has to say so rather than looking broken for that long.
+/// page is roughly TWENTY seconds from opening to its first rate — one
+/// ~5s reading, the 15s cadence, then a second ~5s reading — and why it
+/// has to say so rather than looking broken for that long.
 export interface NetProcess {
   /// The process as the platform names it, PID stripped off. It matches
   /// the names the CPU and Memory pages list, which is what lets a

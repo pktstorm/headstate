@@ -59,10 +59,15 @@
 //! nothing since outranks one saturating the link right now.
 //!
 //! Turning that into a rate needs TWO readings differenced, which the
-//! view does with the same `counterRates` it already uses for
-//! interfaces -- and which is why the page is roughly ten seconds from
-//! opening to its first meaningful rate rather than five. The view is
-//! required to say so; see `SystemHealthPage`.
+//! view does in `netProcessRates` (`lib/health.ts`) -- the per-process
+//! sibling of the `counterRates` it already uses for interfaces, which
+//! differs in having to MATCH processes across the two readings before
+//! anything can be differenced at all.
+//!
+//! That is why the page is roughly TWENTY seconds from opening to its
+//! first meaningful rate rather than five: one ~5s reading, then the
+//! 15s cadence, then a second ~5s reading. The view is required to say
+//! so rather than looking broken for that long; see `SystemHealthPage`.
 //!
 //! Deltas are deliberately not asked of `nettop` itself (`-d`). It
 //! costs the same five seconds, and a delta over an interval `nettop`
