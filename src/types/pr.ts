@@ -205,6 +205,18 @@ export type Safety =
   /// row said it beside "0 commits ahead".
   | { kind: "empty" }
   | { kind: "unmerged" }
+  /// Someone locked the worktree, so `git worktree remove` refuses it
+  /// whatever the branch's state (#753). `detail` is git's own lock
+  /// reason -- typically naming a tool and pid, which is what tells a
+  /// live claim from a leftover one -- or null for a lock taken without
+  /// `--reason`. 13 of 34 worktrees on the reporting machine were
+  /// locked, so this is a third of the list, not an edge case.
+  | { kind: "locked"; detail: string | null }
+  /// The directory is gone and git knows the registration is stale;
+  /// `git worktree prune` clears it. `detail` is git's reason. Formerly
+  /// reported as `unknown: directory is missing`, which read as
+  /// corruption rather than as resolvable bookkeeping (#753).
+  | { kind: "prunable"; detail: string }
   /// The repository that owned this worktree is gone, so nothing about
   /// the checkout can be classified -- there is no git to run in it.
   | { kind: "orphaned" }
@@ -241,6 +253,17 @@ export interface Worktree {
   /// RFC 3339 timestamp of the branch tip's own commit. Not `merged_at`,
   /// which is when the work reached the default branch.
   last_commit: string | null;
+  /// Git's lock reason, `""` for a lock taken without one, or null when
+  /// the worktree is not locked (#753).
+  ///
+  /// Optional in the TYPE so the many existing fixtures need not
+  /// enumerate it; `undefined` reads the same as `null` at every use.
+  /// The safety verdict is the load-bearing copy of this fact -- these
+  /// raw fields exist so a row can show git's own words rather than
+  /// re-derive them.
+  locked?: string | null;
+  /// Git's prunable reason, or null when the registration is live.
+  prunable?: string | null;
 }
 
 export interface WorktreeRepo {

@@ -166,6 +166,14 @@ pub(super) fn is_safe_ref(r: &str) -> bool {
 /// without a branch is detached HEAD, which is still a real worktree
 /// occupying real disk -- so it is kept, with an empty branch, rather
 /// than dropped.
+///
+/// `locked` and `prunable` are read too, and dropping them was #753.
+/// Both are attributes git only emits when they apply, and both change
+/// the verdict: a locked worktree cannot be removed no matter how
+/// merged and clean it is, and a prunable one has no directory left to
+/// remove. Reading only `worktree`/`HEAD`/`branch` meant a third of the
+/// rows on the reporting machine were marked removable and then refused
+/// by git at the moment the user acted.
 pub fn parse_porcelain(out: &str) -> Vec<Worktree> {
     let mut all = Vec::new();
     let mut cur = Worktree::default();
@@ -187,6 +195,17 @@ pub fn parse_porcelain(out: &str) -> Vec<Worktree> {
             } else {
                 log::warn!("ignoring a branch name that reads as a flag: {b:?}");
             }
+        } else if line == "locked" || line.starts_with("locked ") {
+            // Matched in two forms because git emits two. With
+            // `--reason` the line is `locked <reason>`; without one it
+            // is the bare word `locked`, with no trailing space. A
+            // `strip_prefix("locked ")` alone would silently miss every
+            // unexplained lock -- which is the same class of miss as
+            // #753 itself, and would leave those worktrees marked
+            // removable.
+            cur.locked = Some(line["locked".len()..].trim_start().to_string());
+        } else if let Some(p) = line.strip_prefix("prunable ") {
+            cur.prunable = Some(p.to_string());
         }
     }
     if !cur.path.is_empty() {
@@ -217,6 +236,22 @@ pub fn worktree_safety(
         return Safety::MainCheckout;
     }
     let dir = Path::new(&wt.path);
+
+    // FIRST among the non-main checks, because everything below it runs
+    // `git` inside `dir` and there is no `dir`. Git already told us why
+    // in the porcelain listing, so prefer its reason to the app's own
+    // `is_dir` guess: "prunable: gitdir file points to non-existent
+    // location" names a stale registration and implies `git worktree
+    // prune`, where the old `Unknown("directory is missing")` read as
+    // corruption and implied nothing (#753).
+    //
+    // The `is_dir` fallback stays underneath it for the case git did
+    // NOT flag: a directory can vanish between the listing and this
+    // check, and a missing directory we cannot explain is still not
+    // something to classify as safe.
+    if let Some(why) = &wt.prunable {
+        return Safety::Prunable(why.clone());
+    }
     if !dir.is_dir() {
         return Safety::Unknown("directory is missing".into());
     }
@@ -229,6 +264,38 @@ pub fn worktree_safety(
             }
         }
         Err(e) => return Safety::Unknown(e),
+    }
+
+    // Locked: git will refuse `worktree remove` outright, whatever the
+    // branch's merge state (#753). Checked AFTER `Dirty` and BEFORE
+    // everything below, and both halves of that are deliberate:
+    //
+    // - After `Dirty`, because the two facts answer different
+    //   questions and only one of them is about losing work. A locked,
+    //   dirty tree reported as merely "locked" would hide uncommitted
+    //   edits behind an obstacle the user is about to clear -- they
+    //   unlock, remove, and the edits go. Dirty is the fact that
+    //   survives the remedy, so it is the one to say. This matches the
+    //   existing rule that dangerous conditions outrank inconvenient
+    //   ones: `Dirty` is about content, `Locked` is about permission.
+    // - Before the push and merge checks, because those decide whether
+    //   removal is DESIRABLE while this decides whether it is POSSIBLE.
+    //   A locked worktree that is merged, clean, and pushed was
+    //   previously the exact bug: reported `Safe`, then refused by git
+    //   at the moment of removal. Reporting "branch not merged" for a
+    //   locked tree would be no better -- the user would merge it and
+    //   still be refused.
+    //
+    // The lock is NOT overridden with `-f -f`. Git offers that, and
+    // taking it silently would break the only signal a concurrent
+    // process has for claiming a directory -- on the reporting machine
+    // 13 of 34 worktrees were locked by agents actively working in them.
+    if let Some(why) = &wt.locked {
+        // Empty means git emitted a bare `locked` line, i.e. a lock
+        // taken without `--reason`. Reported as "no reason given"
+        // rather than as an empty quotation, which would read like a
+        // display bug.
+        return Safety::Locked((!why.is_empty()).then(|| why.clone()));
     }
 
     // A branch that was never committed to holds nothing, pushed or
@@ -1371,6 +1438,16 @@ fn collect_inner(dir: &Path, depth: usize, out: &mut Vec<Repo>, with_safety: boo
                     merged_at: None,
                     upstream: None,
                     last_commit: None,
+                    // Both are unknowable here for the same reason the
+                    // safety verdict is `Orphaned`: they come from the
+                    // parent repository's `worktree list`, and there is
+                    // no parent repository to ask. `None` means "not
+                    // locked / not prunable" everywhere else, and that
+                    // is the safe reading here too -- `Orphaned` is
+                    // already un-removable, so neither field can widen
+                    // a gate by being absent.
+                    locked: None,
+                    prunable: None,
                 }],
             });
         }
@@ -1507,6 +1584,59 @@ HEAD 8ed50a741e1696d1a0c9506f2e033cf2887bb144
         assert_eq!(w[2].head, "8ed50a741e1696d1a0c9506f2e033cf2887bb144");
     }
 
+    /// #753: an unlocked, live worktree must not acquire either
+    /// attribute from a parser that guesses. The SAMPLE has neither
+    /// line, so both fields must come back empty -- if they did not,
+    /// every ordinary row would stop being removable.
+    #[test]
+    fn an_ordinary_worktree_is_neither_locked_nor_prunable() {
+        let w = parse_porcelain(SAMPLE);
+        assert!(w.iter().all(|w| w.locked.is_none()));
+        assert!(w.iter().all(|w| w.prunable.is_none()));
+    }
+
+    /// The dropped fields, in the exact shapes git emits them (#753).
+    ///
+    /// Three records, because the bare `locked` line is the one a
+    /// `strip_prefix("locked ")` would silently miss -- git writes it
+    /// with no trailing space when the lock was taken without
+    /// `--reason`, and missing it would leave that worktree marked
+    /// removable.
+    #[test]
+    fn parses_locked_and_prunable_attributes() {
+        let out = "\
+worktree /home/u/code/octo-api
+HEAD 3d2216e643c827fb1dfad5c3fa58d9a14421e236
+branch refs/heads/main
+
+worktree /home/u/code/octo-api-held
+HEAD 48fa2124c6fd90bc07881e32037db99ce5b194c4
+branch refs/heads/feature-held
+locked some tool (pid 123)
+
+worktree /home/u/code/octo-api-bare-lock
+HEAD 48fa2124c6fd90bc07881e32037db99ce5b194c4
+branch refs/heads/feature-bare
+locked
+
+worktree /home/u/code/octo-api-stale
+HEAD 8ed50a741e1696d1a0c9506f2e033cf2887bb144
+branch refs/heads/feature-stale
+prunable gitdir file points to non-existent location
+";
+        let w = parse_porcelain(out);
+        assert_eq!(w.len(), 4);
+        assert_eq!(w[1].locked.as_deref(), Some("some tool (pid 123)"));
+        // Some(""), NOT None: locked-without-a-reason is still locked,
+        // and collapsing the two would make it removable.
+        assert_eq!(w[2].locked.as_deref(), Some(""));
+        assert_eq!(
+            w[3].prunable.as_deref(),
+            Some("gitdir file points to non-existent location")
+        );
+        assert!(w[3].locked.is_none());
+    }
+
     /// #702: the verdicts are computed against refs on disk, and the
     /// user was never told how old those refs are. Measured on this
     /// machine, one repository's were 12 days stale while its rows read
@@ -1547,6 +1677,13 @@ HEAD 8ed50a741e1696d1a0c9506f2e033cf2887bb144
             Safety::Unpushed(2),
             Safety::NeverPushed,
             Safety::Unmerged,
+            // Both #753 states, and both spellings of a lock. Neither
+            // may become removable by being new: a locked tree is one
+            // git refuses outright, and a prunable one has no directory
+            // left for the remove path to act on.
+            Safety::Locked(Some("some tool (pid 123)".into())),
+            Safety::Locked(None),
+            Safety::Prunable("gitdir file points to non-existent location".into()),
             Safety::Unknown("x".into()),
         ] {
             assert!(!s.is_safe(), "{s:?} must not be deletable");
@@ -2139,6 +2276,215 @@ HEAD 8ed50a741e1696d1a0c9506f2e033cf2887bb144
         assert_eq!(
             worktree_safety(target, &branch, false, Some(0)),
             Safety::Dirty(1)
+        );
+    }
+
+    /// Run git in `dir`, asserting success. For the #753 fixtures,
+    /// which lock and unlock real worktrees.
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .envs([
+                ("GIT_AUTHOR_NAME", "octocat"),
+                ("GIT_COMMITTER_NAME", "octocat"),
+                ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+                ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// THE bug in #753: a locked worktree was reported `Safe`, and git
+    /// refused it at the moment the user acted on that verdict.
+    ///
+    /// Real `git worktree lock`, not a hand-written porcelain string:
+    /// the point is that the attribute survives the whole path from
+    /// git's own output to the verdict, and a synthetic fixture would
+    /// let this pass while the real listing still dropped the line.
+    ///
+    /// The worktree is otherwise as safe as one gets -- clean tree,
+    /// branch merged into main -- so `Safe` is exactly what the old
+    /// code returned.
+    #[test]
+    fn a_locked_worktree_is_never_safe() {
+        let (_t, repo, wt) = repo_with_worktree("held");
+        // Real work, really merged: `repo_with_worktree` hands back a
+        // branch with no commits, which is `Empty` rather than `Safe`,
+        // and an empty branch would prove nothing about the state this
+        // test is named for.
+        commit_in(&wt, "the work");
+        git_ok(&repo, &["merge", "-q", "--ff-only", "held"]);
+        let branch = default_branch(&repo);
+
+        // The premise: with no lock this worktree IS safe. Without
+        // this the test could pass because of some unrelated refusal.
+        let listed = parse_porcelain(&git(&repo, &["worktree", "list", "--porcelain"]).unwrap());
+        let before = listed
+            .iter()
+            .find(|w| !w.is_main && w.branch == "held")
+            .expect("the worktree must be listed");
+        assert!(
+            worktree_safety(before, &branch, true, Some(0)).is_safe(),
+            "fixture must start out removable, or it tests nothing"
+        );
+
+        // A synthetic reason: this repository is public, and the real
+        // one from the report names a tool and a machine.
+        git_ok(
+            &repo,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "some tool (pid 123)",
+                wt.to_str().unwrap(),
+            ],
+        );
+
+        let listed = parse_porcelain(&git(&repo, &["worktree", "list", "--porcelain"]).unwrap());
+        let target = listed
+            .iter()
+            .find(|w| !w.is_main && w.branch == "held")
+            .expect("a locked worktree is still listed");
+        let s = worktree_safety(target, &branch, true, Some(0));
+
+        assert_eq!(s, Safety::Locked(Some("some tool (pid 123)".into())));
+        assert!(!s.is_safe(), "git refuses to remove it: {}", s.reason());
+        // The reason is the whole point of the variant: it is what
+        // tells a live claim from a leftover one.
+        assert!(s.reason().contains("some tool (pid 123)"), "{}", s.reason());
+    }
+
+    /// Uncommitted work outranks the lock (#753).
+    ///
+    /// Both facts are true and both block removal, but only one
+    /// survives the obvious remedy: the user unlocks, removes, and the
+    /// uncommitted edits go with the directory. So `Dirty` is the fact
+    /// the row must show -- the same rule that puts `Dirty` ahead of
+    /// `Empty` just above it.
+    #[test]
+    fn uncommitted_work_outranks_a_lock() {
+        let (_t, repo, wt) = repo_with_worktree("held-dirty");
+        std::fs::write(wt.join("wip.txt"), "not committed yet\n").unwrap();
+        git_ok(
+            &repo,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "some tool (pid 123)",
+                wt.to_str().unwrap(),
+            ],
+        );
+
+        let branch = default_branch(&repo);
+        let listed = parse_porcelain(&git(&repo, &["worktree", "list", "--porcelain"]).unwrap());
+        let target = listed
+            .iter()
+            .find(|w| !w.is_main && w.branch == "held-dirty")
+            .unwrap();
+        assert_eq!(
+            worktree_safety(target, &branch, true, Some(0)),
+            Safety::Dirty(1),
+            "the edits are what the user loses; the lock is what they clear"
+        );
+    }
+
+    /// A lock taken without `--reason` still blocks removal (#753).
+    ///
+    /// Git emits a bare `locked` line for these -- no trailing space --
+    /// so a parser matching only `locked ` would drop it and leave the
+    /// worktree marked removable. Real git, so the exact byte shape of
+    /// that line is what is under test.
+    #[test]
+    fn a_lock_without_a_reason_still_blocks_removal() {
+        let (_t, repo, wt) = repo_with_worktree("held-bare");
+        // Merged, so the lock is the ONLY thing standing between this
+        // worktree and removal -- otherwise `Empty` would answer first
+        // and the bare-lock parsing would go untested.
+        commit_in(&wt, "the work");
+        git_ok(&repo, &["merge", "-q", "--ff-only", "held-bare"]);
+        git_ok(&repo, &["worktree", "lock", wt.to_str().unwrap()]);
+
+        let branch = default_branch(&repo);
+        let listed = parse_porcelain(&git(&repo, &["worktree", "list", "--porcelain"]).unwrap());
+        let target = listed
+            .iter()
+            .find(|w| !w.is_main && w.branch == "held-bare")
+            .unwrap();
+        let s = worktree_safety(target, &branch, true, Some(0));
+
+        assert_eq!(s, Safety::Locked(None));
+        assert!(!s.is_safe(), "{}", s.reason());
+        assert!(s.reason().contains("no reason given"), "{}", s.reason());
+    }
+
+    /// Unlocking restores the ordinary verdict (#753).
+    ///
+    /// The lock is a property of the moment, not of the branch, so the
+    /// refusal must lift when it does -- otherwise clearing a lock
+    /// would leave the row permanently stuck and the state would be a
+    /// trap rather than an obstacle.
+    #[test]
+    fn unlocking_makes_a_worktree_removable_again() {
+        let (_t, repo, wt) = repo_with_worktree("held-then-free");
+        // Merged work, as above: the point is that the ordinary verdict
+        // returns, so the ordinary verdict has to be `Safe`.
+        commit_in(&wt, "the work");
+        git_ok(&repo, &["merge", "-q", "--ff-only", "held-then-free"]);
+        let branch = default_branch(&repo);
+        git_ok(&repo, &["worktree", "lock", wt.to_str().unwrap()]);
+        git_ok(&repo, &["worktree", "unlock", wt.to_str().unwrap()]);
+
+        let listed = parse_porcelain(&git(&repo, &["worktree", "list", "--porcelain"]).unwrap());
+        let target = listed
+            .iter()
+            .find(|w| !w.is_main && w.branch == "held-then-free")
+            .unwrap();
+        assert!(
+            worktree_safety(target, &branch, true, Some(0)).is_safe(),
+            "an unlocked worktree is an ordinary one again"
+        );
+    }
+
+    /// #753's other half: a deleted directory is stale bookkeeping, not
+    /// an unexplained failure.
+    ///
+    /// The directory is really removed, so git really marks the
+    /// registration prunable -- which is what the old code saw as
+    /// `Unknown("directory is missing")`, a message that reads as
+    /// corruption for something one command fixes.
+    #[test]
+    fn a_deleted_directory_reports_as_prunable() {
+        let (_t, repo, wt) = repo_with_worktree("stale");
+        std::fs::remove_dir_all(&wt).unwrap();
+
+        let branch = default_branch(&repo);
+        let listed = parse_porcelain(&git(&repo, &["worktree", "list", "--porcelain"]).unwrap());
+        let target = listed
+            .iter()
+            .find(|w| !w.is_main && w.branch == "stale")
+            .expect("git still lists a worktree whose directory is gone");
+        let s = worktree_safety(target, &branch, true, Some(0));
+
+        assert!(
+            matches!(s, Safety::Prunable(_)),
+            "expected Prunable, got {s:?}"
+        );
+        assert!(!s.is_safe(), "safe-by-default: {}", s.reason());
+        // The remedy, which is the fact the old wording never carried.
+        assert!(s.reason().contains("prunable"), "{}", s.reason());
+        assert!(
+            !s.reason().contains("could not determine"),
+            "it is determined, and git said why: {}",
+            s.reason()
         );
     }
 
@@ -3894,6 +4240,8 @@ mod live {
                 Safety::MergedUpstreamDeleted => "merged_upstream_deleted",
                 Safety::Empty => "empty",
                 Safety::Unmerged => "unmerged",
+                Safety::Locked(_) => "locked",
+                Safety::Prunable(_) => "prunable",
                 Safety::Pending => "pending",
                 Safety::Orphaned => "orphaned",
                 Safety::Unknown(_) => "unknown",

@@ -35,6 +35,12 @@ describe("isSafe", () => {
       // asked for. The forced path stays available.
       { kind: "empty" },
       { kind: "unmerged" },
+      // #753, both spellings of a lock and the stale registration.
+      // Safe-by-default: a locked tree is one git refuses outright,
+      // and a prunable one has no directory left to remove.
+      { kind: "locked", detail: "some tool (pid 123)" },
+      { kind: "locked", detail: null },
+      { kind: "prunable", detail: "gitdir file points to non-existent location" },
       { kind: "unknown", detail: "x" },
     ] as Safety[]) {
       expect(isSafe(s)).toBe(false);
@@ -71,6 +77,33 @@ describe("safetyReason", () => {
     expect(reason).not.toContain("only here");
     expect(reason).not.toBe(safetyReason({ kind: "never_pushed" }));
   });
+
+  // #753: the lock reason is the whole point of the state. "locked"
+  // alone sends the user to a terminal to find out by whom, where
+  // "some tool (pid 123)" is what separates a live claim from one left
+  // behind by a process that died.
+  it("names who holds a lock", () => {
+    const held = safetyReason({ kind: "locked", detail: "some tool (pid 123)" });
+    expect(held).toContain("locked");
+    expect(held).toContain("some tool (pid 123)");
+    // A lock without `--reason` is still a lock, and must not render
+    // as an empty quotation that reads like a display bug.
+    const bare = safetyReason({ kind: "locked", detail: null });
+    expect(bare).toContain("locked");
+    expect(bare).toContain("no reason given");
+  });
+
+  // #753: this used to read "could not determine: directory is
+  // missing" -- true, but it names neither the cause nor the cure for
+  // something one safe command fixes.
+  it("explains a stale registration rather than hedging", () => {
+    const stale = safetyReason({
+      kind: "prunable",
+      detail: "gitdir file points to non-existent location",
+    });
+    expect(stale).toContain("prunable");
+    expect(stale).not.toContain("could not determine");
+  });
 });
 
 describe("safetyTone", () => {
@@ -94,6 +127,18 @@ describe("safetyTone", () => {
     expect(safetyTone({ kind: "empty" })).toContain("8b949e");
     expect(safetyTone({ kind: "empty" })).not.toBe(safetyTone({ kind: "never_pushed" }));
   });
+
+  // #753: neither new state may look removable, and neither is a
+  // danger. A lock is an obstacle the user can clear, so amber; a
+  // prunable row has no directory left to endanger anything, so grey.
+  it("marks locked and prunable as neither safe nor alarming", () => {
+    const locked = safetyTone({ kind: "locked", detail: "some tool (pid 123)" });
+    expect(locked).toContain("d29922");
+    expect(locked).not.toContain("3fb950");
+    const prunable = safetyTone({ kind: "prunable", detail: "gone" });
+    expect(prunable).toContain("8b949e");
+    expect(prunable).not.toContain("3fb950");
+  });
 });
 
 describe("forceWarning", () => {
@@ -113,6 +158,26 @@ describe("forceWarning", () => {
   it("falls back to the general form for everything else", () => {
     expect(forceWarning({ kind: "unmerged" })).toContain("does not consider this safe");
   });
+
+  // #753: forcing does not work here, and the dialog must say so.
+  // The forced path relaxes Headstate's gate but still calls git
+  // without `--force`, and git refuses a locked tree on its own
+  // account -- so the general wording would walk the user through a
+  // destructive-sounding confirmation and then hand them an error.
+  it("tells the truth about a locked worktree", () => {
+    const warning = forceWarning({ kind: "locked", detail: "some tool (pid 123)" });
+    expect(warning).toContain("locked");
+    expect(warning).toContain("unlocked");
+    expect(warning).not.toContain("does not consider this safe");
+  });
+
+  // Nothing can be lost when the directory is already gone, so the
+  // destructive framing would be simply false.
+  it("does not threaten loss for a directory that is already gone", () => {
+    const warning = forceWarning({ kind: "prunable", detail: "gone" });
+    expect(warning).toContain("loses nothing");
+    expect(warning).not.toContain("cannot be undone");
+  });
 });
 
 describe("canClaudify", () => {
@@ -127,6 +192,17 @@ describe("canClaudify", () => {
     expect(canClaudify({ kind: "safe" })).toBe(false);
     expect(canClaudify({ kind: "main_checkout" })).toBe(false);
     expect(canClaudify({ kind: "pending" })).toBe(false);
+  });
+
+  // #753: the two states where "not removable and not the main
+  // checkout" stops implying "offer the agent". A prunable row has no
+  // directory for an agent to open, and a locked one is very often
+  // locked BY an agent already working in it -- pointing a second one
+  // at that directory is what the lock exists to prevent.
+  it("does not send an agent into a locked or missing directory", () => {
+    expect(canClaudify({ kind: "locked", detail: "some tool (pid 123)" })).toBe(false);
+    expect(canClaudify({ kind: "locked", detail: null })).toBe(false);
+    expect(canClaudify({ kind: "prunable", detail: "gone" })).toBe(false);
   });
 });
 
