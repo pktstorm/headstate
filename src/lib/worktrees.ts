@@ -1,4 +1,4 @@
-import type { PullRequest, Safety, Upstream } from "@/types/pr";
+import type { PullRequest, Safety, Upstream, Worktree } from "@/types/pr";
 
 /// Only `safe` may be deleted.
 ///
@@ -418,4 +418,124 @@ export function refAge(fetchedAt: string | null, now = new Date()): string | nul
   const days = Math.floor((now.getTime() - at) / 86_400_000);
   if (days < 1) return null;
   return `as of a fetch ${days} day${days === 1 ? "" : "s"} ago`;
+}
+
+/// The orderings the worktree list offers (#771).
+///
+/// Three axes because three are already on every row -- name, size and
+/// age -- and no new data is needed for any of them. The page exists to
+/// answer "which of these is biggest" on a repository with 100+
+/// worktrees, and until now that question could only be answered by
+/// reading every row.
+///
+/// Each axis is bidirectional. Size descending is what reclaims disk;
+/// size ascending finds the scratch trees worth clearing wholesale. Age
+/// descending surfaces the safe wins -- a worktree last touched four
+/// months ago is a far easier delete than one from this morning,
+/// whatever the safety verdict says.
+export type WorktreeSort =
+  | "name-asc"
+  | "name-desc"
+  | "size-desc"
+  | "size-asc"
+  | "age-desc"
+  | "age-asc";
+
+/// What the sort control offers, in the order it offers it.
+///
+/// Prose rather than a bare column name, the same choice `ArtifactsPage`
+/// made with "Least recently written": "oldest" invites reading the age
+/// as a creation date, when what is actually ordered is the last commit.
+///
+/// Size leads because it is the question the view exists for.
+export const WORKTREE_SORT_LABELS: Record<WorktreeSort, string> = {
+  "size-desc": "Largest first",
+  "size-asc": "Smallest first",
+  "age-desc": "Least recently committed",
+  "age-asc": "Most recently committed",
+  "name-asc": "Name (A–Z)",
+  "name-desc": "Name (Z–A)",
+};
+
+/// Order one repository's worktree rows.
+///
+/// Two invariants survive every sort, because neither is a preference:
+///
+/// The MAIN CHECKOUT is always first. It is not a peer of the rows below
+/// it -- every one of those is a removal candidate and it never is, so
+/// sorting it among them invites reading it as one. Its row also carries
+/// the upstream prose ("behind by 40"), which is the reason the
+/// worktrees under it are stale, and an explanation belongs above the
+/// thing it explains.
+///
+/// ASSESSED rows come next. The user has just come back from reading a
+/// verdict, and finding that row again among 124 candidates is the part
+/// that made this flow feel unfinished. A size sort must not bury the
+/// one row they were mid-decision on.
+///
+/// UNKNOWN VALUES SORT LAST, in both directions, and that is the whole
+/// reason this comparator is not a one-liner. Sizes arrive
+/// asynchronously (#754, #758) and can be genuinely absent -- still
+/// pending, or measured and failed. Treating a missing size as zero
+/// would rank every unmeasured row as the smallest on the page, which
+/// under "Largest first" hides exactly the directories that might be
+/// huge. That is the ordering bug #360 describes, and putting unknowns
+/// last is the answer `ArtifactsPage` already reached.
+///
+/// Last means last in BOTH directions. Under "Smallest first" an
+/// unknown is still not a claim of 0 B, so it does not get to lead
+/// either -- an unknown is absent from the ordering, not an extreme of
+/// it. Ties, including ties among unknowns, fall back to the path, so
+/// the result is stable rather than arbitrary.
+///
+/// Name never has this problem: a worktree always has a path. That
+/// makes a name sort the one ordering fully known at first render, and
+/// a genuine escape hatch while sizes are still landing.
+export function sortWorktrees<T extends Worktree>(
+  worktrees: T[],
+  sort: WorktreeSort,
+  assessed: ReadonlySet<string> = new Set(),
+): T[] {
+  /// The value this row offers on the chosen axis, or null when it
+  /// cannot answer. Age is the last commit as epoch milliseconds; an
+  /// absent or unparseable timestamp is null rather than 0, which would
+  /// date the row to 1970 and pin it to one end of the list.
+  const key = (w: T): number | null => {
+    if (sort === "size-asc" || sort === "size-desc") return w.size_bytes ?? null;
+    if (sort === "age-asc" || sort === "age-desc") {
+      if (!w.last_commit) return null;
+      const at = Date.parse(w.last_commit);
+      return Number.isNaN(at) ? null : at;
+    }
+    return null;
+  };
+  // A larger epoch is MORE recent, so "least recently committed" wants
+  // the SMALLEST number first -- the inverse of size, where "largest
+  // first" wants the biggest. Spelled out rather than folded into the
+  // comparator: getting it backwards yields a list that looks plausibly
+  // sorted and is exactly wrong.
+  const biggestFirst = sort === "size-desc" || sort === "age-asc";
+
+  return [...worktrees].sort((a, b) => {
+    if (a.is_main !== b.is_main) return a.is_main ? -1 : 1;
+    const aa = assessed.has(a.path) ? 0 : 1;
+    const bb = assessed.has(b.path) ? 0 : 1;
+    if (aa !== bb) return aa - bb;
+
+    if (sort === "name-asc" || sort === "name-desc") {
+      // The basename, not the whole path: it is what the row shows, and
+      // ordering by a prefix every row in a repository shares would be
+      // ordering by nothing.
+      const cmp = pathBasename(a.path).localeCompare(pathBasename(b.path));
+      return sort === "name-asc" ? cmp : -cmp;
+    }
+
+    const va = key(a);
+    const vb = key(b);
+    if (va === null && vb === null) return a.path.localeCompare(b.path);
+    if (va === null) return 1;
+    if (vb === null) return -1;
+    if (va === vb) return a.path.localeCompare(b.path);
+    return biggestFirst ? vb - va : va - vb;
+  });
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { Safety } from "@/types/pr";
+import type { Safety, Worktree } from "@/types/pr";
 import {
   canClaudify,
   forceWarning,
@@ -9,7 +9,9 @@ import {
   prForWorktree,
   safetyReason,
   safetyTone,
+  sortWorktrees,
   totalSize,
+  WORKTREE_SORT_LABELS,
 } from "./worktrees";
 
 describe("isSafe", () => {
@@ -311,5 +313,211 @@ describe("totalSize", () => {
 
   it("is a real total when everything is measured", () => {
     expect(totalSize([w(1024), w(2048)])).toBe(3072);
+  });
+});
+
+/// #771: the list rendered name, size and age on every row and could
+/// order by none of them.
+describe("sortWorktrees", () => {
+  const w = (over: Partial<Worktree>): Worktree => ({
+    path: "/code/octocat-hello-world",
+    branch: "feature",
+    head: "abc",
+    size_bytes: 1024,
+    safety: { kind: "unmerged" },
+    is_main: false,
+    merged_at: null,
+    upstream: null,
+    last_commit: null,
+    ...over,
+  });
+  const names = (list: Worktree[]) => list.map((x) => pathBasename(x.path));
+
+  describe("size", () => {
+    const list = [
+      w({ path: "/code/small", size_bytes: 10 }),
+      w({ path: "/code/huge", size_bytes: 9_000_000 }),
+      w({ path: "/code/middling", size_bytes: 5_000 }),
+    ];
+
+    it("puts the biggest first on size-desc", () => {
+      expect(names(sortWorktrees(list, "size-desc"))).toEqual(["huge", "middling", "small"]);
+    });
+
+    it("puts the smallest first on size-asc", () => {
+      expect(names(sortWorktrees(list, "size-asc"))).toEqual(["small", "middling", "huge"]);
+    });
+
+    /// THE ordering bug this has to avoid (#360, and the reason
+    /// `ArtifactsPage` answers it the same way). A null size treated as
+    /// zero ranks the unmeasured rows as the SMALLEST on the page,
+    /// which under "Largest first" buries exactly the directory that
+    /// might be the biggest thing on the disk.
+    it("sorts an unmeasured size last rather than as zero", () => {
+      const withUnknown = [
+        w({ path: "/code/unmeasured", size_bytes: null }),
+        w({ path: "/code/small", size_bytes: 10 }),
+        w({ path: "/code/huge", size_bytes: 9_000_000 }),
+      ];
+      expect(names(sortWorktrees(withUnknown, "size-desc"))).toEqual([
+        "huge",
+        "small",
+        "unmeasured",
+      ]);
+    });
+
+    /// The other direction, which is the half a "nulls are zero"
+    /// implementation gets accidentally right and a "nulls are
+    /// infinity" one gets wrong. An unknown is ABSENT from the
+    /// ordering, not an extreme of it, so it does not lead here either
+    /// -- ranking it first would claim it is the smallest.
+    it("still sorts an unmeasured size last when smallest leads", () => {
+      const withUnknown = [
+        w({ path: "/code/unmeasured", size_bytes: null }),
+        w({ path: "/code/small", size_bytes: 10 }),
+        w({ path: "/code/huge", size_bytes: 9_000_000 }),
+      ];
+      expect(names(sortWorktrees(withUnknown, "size-asc"))).toEqual([
+        "small",
+        "huge",
+        "unmeasured",
+      ]);
+    });
+
+    /// A repository mid-measurement is mostly unknowns, and an
+    /// arbitrary order among them would reshuffle on every render.
+    it("orders unmeasured rows among themselves by path, stably", () => {
+      const allUnknown = [
+        w({ path: "/code/ccc", size_bytes: null }),
+        w({ path: "/code/aaa", size_bytes: null }),
+        w({ path: "/code/bbb", size_bytes: null }),
+      ];
+      expect(names(sortWorktrees(allUnknown, "size-desc"))).toEqual(["aaa", "bbb", "ccc"]);
+    });
+
+    /// A measured zero is an ANSWER -- an empty checkout really does
+    /// hold nothing -- so it must outrank an unknown rather than share
+    /// its place at the bottom.
+    it("ranks a measured zero above an unmeasured row", () => {
+      const list0 = [
+        w({ path: "/code/unmeasured", size_bytes: null }),
+        w({ path: "/code/empty", size_bytes: 0 }),
+      ];
+      expect(names(sortWorktrees(list0, "size-desc"))).toEqual(["empty", "unmeasured"]);
+    });
+  });
+
+  describe("age", () => {
+    const list = [
+      w({ path: "/code/recent", last_commit: "2026-09-01T00:00:00Z" }),
+      w({ path: "/code/ancient", last_commit: "2025-01-01T00:00:00Z" }),
+      w({ path: "/code/middling", last_commit: "2026-01-01T00:00:00Z" }),
+    ];
+
+    /// The safe wins first: a worktree last touched four months ago is
+    /// a far easier delete than one from this morning.
+    it("puts the least recently committed first on age-desc", () => {
+      expect(names(sortWorktrees(list, "age-desc"))).toEqual(["ancient", "middling", "recent"]);
+    });
+
+    it("puts the most recently committed first on age-asc", () => {
+      expect(names(sortWorktrees(list, "age-asc"))).toEqual(["recent", "middling", "ancient"]);
+    });
+
+    /// A null timestamp read as epoch 0 would date the row to 1970 and
+    /// pin it to the top of "least recently committed" -- a confident
+    /// claim that the app has no evidence for.
+    it("sorts an unknown last commit last rather than as 1970", () => {
+      const withUnknown = [
+        w({ path: "/code/undated", last_commit: null }),
+        ...list,
+      ];
+      expect(names(sortWorktrees(withUnknown, "age-desc"))).toEqual([
+        "ancient",
+        "middling",
+        "recent",
+        "undated",
+      ]);
+    });
+
+    /// Garbage from git is the same kind of absence as no value at all,
+    /// and `Date.parse` answers NaN rather than throwing -- which would
+    /// otherwise poison every comparison it took part in.
+    it("treats an unparseable timestamp as unknown, not as NaN", () => {
+      const withJunk = [
+        w({ path: "/code/junk", last_commit: "not a date" }),
+        w({ path: "/code/recent", last_commit: "2026-09-01T00:00:00Z" }),
+      ];
+      expect(names(sortWorktrees(withJunk, "age-desc"))).toEqual(["recent", "junk"]);
+    });
+  });
+
+  describe("name", () => {
+    const list = [
+      w({ path: "/code/charlie" }),
+      w({ path: "/code/alpha" }),
+      w({ path: "/code/bravo" }),
+    ];
+
+    it("orders A to Z, and back again", () => {
+      expect(names(sortWorktrees(list, "name-asc"))).toEqual(["alpha", "bravo", "charlie"]);
+      expect(names(sortWorktrees(list, "name-desc"))).toEqual(["charlie", "bravo", "alpha"]);
+    });
+
+    /// Ordering by the whole path would order by a prefix every row in
+    /// a repository shares, which is ordering by nothing.
+    it("orders by the basename the row shows, not the full path", () => {
+      const nested = [
+        w({ path: "/code/zzz/alpha" }),
+        w({ path: "/code/aaa/bravo" }),
+      ];
+      expect(names(sortWorktrees(nested, "name-asc"))).toEqual(["alpha", "bravo"]);
+    });
+
+    /// Name is the one axis that is fully known at first render, which
+    /// is what makes it the escape hatch while sizes are still landing.
+    it("is unaffected by a missing size", () => {
+      const unmeasured = [
+        w({ path: "/code/bravo", size_bytes: null }),
+        w({ path: "/code/alpha", size_bytes: null }),
+      ];
+      expect(names(sortWorktrees(unmeasured, "name-asc"))).toEqual(["alpha", "bravo"]);
+    });
+  });
+
+  describe("the invariants no sort may break", () => {
+    /// The main checkout is not a peer of the rows below it -- every
+    /// one of those is a removal candidate and it never is -- and its
+    /// row carries the upstream prose that explains why the others are
+    /// stale.
+    it("keeps the main checkout first whatever the axis", () => {
+      const list = [
+        w({ path: "/code/huge", size_bytes: 9_000_000 }),
+        w({ path: "/code/zzz-main", size_bytes: 1, is_main: true }),
+      ];
+      for (const sort of Object.keys(WORKTREE_SORT_LABELS) as (keyof typeof WORKTREE_SORT_LABELS)[]) {
+        expect(names(sortWorktrees(list, sort))[0]).toBe("zzz-main");
+      }
+    });
+
+    /// The user has just come back from reading a verdict; a size sort
+    /// must not bury the one row they were mid-decision on.
+    it("keeps an assessed row above the unassessed ones", () => {
+      const list = [
+        w({ path: "/code/huge", size_bytes: 9_000_000 }),
+        w({ path: "/code/tiny", size_bytes: 1 }),
+      ];
+      const order = sortWorktrees(list, "size-desc", new Set(["/code/tiny"]));
+      expect(names(order)).toEqual(["tiny", "huge"]);
+    });
+
+    it("does not mutate the array it was given", () => {
+      const list = [
+        w({ path: "/code/bravo", size_bytes: 1 }),
+        w({ path: "/code/alpha", size_bytes: 9 }),
+      ];
+      sortWorktrees(list, "size-desc");
+      expect(names(list)).toEqual(["bravo", "alpha"]);
+    });
   });
 });
