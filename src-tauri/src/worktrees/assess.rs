@@ -49,7 +49,14 @@ pub struct Assessment {
 pub fn assess(repo_path: &str, worktree_path: &str, branch: &str) -> Assessment {
     let repo = Path::new(repo_path);
     let dir = Path::new(worktree_path);
-    let base = format!("origin/{}", default_branch(repo));
+    // NOT `origin/{}`. `default_branch` now returns the remote-tracking
+    // ref itself (#757), so re-prefixing here would ask git for
+    // `origin/origin/main` and every count, diff and log below would
+    // come back absent -- an assessment that silently states nothing.
+    // The one repository shape that loses the remote is the purely-local
+    // one, where `default_branch` falls back to the local branch and
+    // this comparison is against the only ref there is.
+    let base = default_branch(repo);
 
     // Three dots: the merge-base comparison, which shows what this BRANCH
     // added. Two dots would fold in everything the default branch gained
@@ -397,5 +404,88 @@ mod tests {
             (Some(11), Some(240), Some(18))
         );
         assert_eq!(parse_shortstat(""), (None, None, None));
+    }
+
+    /// The base ref is used as git gives it, not re-prefixed (#757).
+    ///
+    /// `default_branch` used to return the bare short name, so this
+    /// module built `origin/{}` itself. Now that it returns the
+    /// remote-tracking ref, that same line would ask git for
+    /// `origin/origin/main` -- and every field here comes from a git
+    /// call that would simply fail, so the assessment would come back
+    /// silently EMPTY rather than wrong-looking: no commit count, no
+    /// diffstat, no subjects. An agent handed that prompt is told the
+    /// branch did nothing.
+    ///
+    /// Nothing else covers this. `live_assess_a_real_worktree` is
+    /// `#[ignore]`d and every other test here builds an `Assessment`
+    /// literal, so a real repository is the only way to catch it.
+    #[test]
+    fn the_assessment_compares_against_the_remote_ref_without_doubling_it() {
+        let ident = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+        let run_in = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .envs(ident)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        run_in(&remote, &["init", "-q", "--bare", "-b", "main"]);
+
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_in(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        run_in(&repo, &["add", "-A"]);
+        run_in(&repo, &["commit", "-q", "-m", "base"]);
+        run_in(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run_in(&repo, &["push", "-q", "-u", "origin", "main"]);
+        run_in(&repo, &["remote", "set-head", "origin", "-a"]);
+
+        let wt = tmp.path().join("proj-feature");
+        run_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                wt.to_str().unwrap(),
+                "main",
+            ],
+        );
+        std::fs::write(wt.join("feature.txt"), "one\ntwo\n").unwrap();
+        run_in(&wt, &["add", "-A"]);
+        run_in(&wt, &["commit", "-q", "-m", "add the feature"]);
+
+        let a = assess(repo.to_str().unwrap(), wt.to_str().unwrap(), "feature");
+        assert_eq!(
+            a.commits_ahead,
+            Some(1),
+            "an unresolvable base makes every count absent, not zero"
+        );
+        assert_eq!(a.files_changed, Some(1));
+        assert_eq!(a.insertions, Some(2));
+        assert_eq!(a.subjects, vec!["add the feature".to_string()]);
     }
 }
