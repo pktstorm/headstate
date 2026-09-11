@@ -4,13 +4,16 @@ import type { Filters } from "../lib/derive";
 
 /// zustand holds UI state only. Server data lives in TanStack Query and is
 /// never duplicated here.
-/// The three top-level views.
-///
-/// A separate axis from `panel`: "which view am I in" and "am I looking at
-/// the list or the stats" were previously one enum, which is what made the
-/// sidebar highlight logic awkward -- `reviewing` and `dashboard` were
-/// peers of `list` despite being different kinds of thing.
+
 /// Every top-level view, in sidebar order.
+///
+/// `view` and `panel` are separate axes because "which view am I in" and
+/// "which sub-page of it" were once one enum, which is what made the
+/// sidebar highlight logic awkward -- `reviewing` and `dashboard` were
+/// peers of `list` despite being different kinds of thing. (The stats half
+/// of that story has come full circle: #794 made it a view again, but as a
+/// peer of `my-prs` rather than of `list`, which is the distinction the
+/// split was about.)
 ///
 /// The single source of truth: `View` is derived from it, and the
 /// migration's completeness test iterates it rather than repeating the
@@ -67,11 +70,12 @@ export const MOBILE_HIDDEN_VIEWS: ReadonlySet<View> = new Set<View>(["pr-stats"]
 /// memory is at 88%, the Memory page says which processes.
 ///
 /// A separate axis from `panel` rather than three more values in it.
-/// `panel` is the My PRs list-versus-stats and Docker images-versus-
-/// builds switch; widening it would mean every consumer of `panel` had
-/// to know about pages that only exist inside one view, and a health
-/// page persisted there would decide what Docker shows. Views that do
-/// not have sub-pages should not have to name these.
+/// `panel` is Docker's images-versus-builds switch (it was the My PRs
+/// list-versus-stats switch too, until #794 made Stats a view); widening
+/// it would mean every consumer of `panel` had to know about pages that
+/// only exist inside one view, and a health page persisted there would
+/// decide what Docker shows. Views that do not have sub-pages should not
+/// have to name these.
 export const ALL_HEALTH_PAGES = [
   "overview",
   "cpu",
