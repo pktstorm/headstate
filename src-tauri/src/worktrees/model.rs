@@ -206,16 +206,31 @@ pub struct Lock {
     /// age is not a lock taken this second, and that is exactly the
     /// direction in which a wrong guess would make removal feel safer.
     pub age_days: Option<u64>,
-    /// Whether the pid named in the reason is running right now, or
-    /// `None` when the reason names no pid to check.
+    /// Whether the process the reason names is still the process that
+    /// took the lock, or `None` when the reason names no process to
+    /// check.
     ///
-    /// Deliberately NOT called "the lock is live". A live pid is weak
+    /// Deliberately NOT called "the lock is live". A live holder is weak
     /// evidence here and the app must not launder it into a strong
     /// claim: on the reporting machine this is `Some(true)` for all 20
     /// locks, every one of them abandoned, because the pid belongs to
     /// the surviving parent. It is carried so the UI can say what was
     /// checked -- and so a `Some(false)` can say the one genuinely
-    /// decisive thing, that the process named is gone.
+    /// decisive thing, that the process named is gone. `Lock::holder_is_gone`
+    /// is the predicate that reads it, and it exists so the three
+    /// consumers cannot drift on which of the three values is decisive.
+    ///
+    /// "The process that took it" and not merely "a process with that
+    /// pid" (#792). Pids are recycled, so a pid-only check reads a lock
+    /// naming a long-dead worker as LIVE the moment something unrelated
+    /// inherits its number -- and the reporting machine had rebooted
+    /// between taking these locks and reading them, which is exactly
+    /// when every pid in the space gets handed out again. Our lock
+    /// reasons already record the holder's start time beside the pid, so
+    /// `holder_is_running` compares the pair; see it for the tolerance
+    /// and the local-time reading. A reason with no start time degrades
+    /// to a bare existence check, which is what lockers other than our
+    /// own tooling get.
     pub holder_running: Option<bool>,
     /// What this worktree would be if the lock were cleared.
     ///

@@ -124,10 +124,16 @@ export function isDeadLock(wt: Worktree): boolean {
   return wt.safety.kind === "locked" && lockHolderIsGone(wt.safety.detail);
 }
 
-/// What checking the lock's pid actually established, or null when
+/// What checking the lock's holder actually established, or null when
 /// there was nothing to check.
 ///
-/// Deliberately NOT phrased as "the lock is live". A running pid is
+/// The LONG form, for the unlock confirmation. `lockReason` carries the
+/// short one on the row -- four words, appended after git's reason, and
+/// only for the decisive case. Both exist because the two places need
+/// different lengths of the same fact: a row is a glance and a
+/// confirmation is where the caveat has room to be read.
+///
+/// Deliberately NOT phrased as "the lock is live". A running holder is
 /// weak evidence and the app must not launder it into a strong claim:
 /// on the reporting machine this is true for all 20 locks and every one
 /// of them is abandoned, because the pid belongs to the parent session
@@ -136,12 +142,20 @@ export function isDeadLock(wt: Worktree): boolean {
 ///
 /// The "false" wording is the opposite: a named process that is gone is
 /// the one unambiguous signal available here, and it deserves to be
-/// stated plainly.
+/// stated plainly. It says (pid, start_time) was checked rather than
+/// just the pid, because that is what makes it sound: pids are recycled,
+/// and a bare pid check would call a recycled number a live holder
+/// (#792).
 export function lockHolderNote(lock: Lock): string | null {
   if (lock.holder_running === null) return null;
   return lock.holder_running
     ? "The process it names is still running — though that is weak evidence, since a parent process outlives the work that took the lock."
-    : "The process it names is no longer running.";
+    : // Says it checked the START TIME too, because that is what makes
+      // this the decisive line rather than a guess (#792). Without it a
+      // reader who knows pids are recycled has no reason to trust
+      // "no longer running", and the whole point of this sentence is
+      // that it can be trusted.
+      "The process it names is no longer running — checked by its process id and the start time the lock recorded, so a reused id is not mistaken for it.";
 }
 
 /// Display-ready prose for a row.

@@ -217,6 +217,11 @@ describe("lockHolderNote", () => {
     const note = lockHolderNote(lock({ holder_running: false }));
     expect(note).toContain("no longer running");
     expect(note).not.toContain("weak evidence");
+    // And says WHY it can be trusted (#792). Pids are recycled, so a
+    // reader who knows that has no reason to believe "no longer
+    // running" unless the sentence says the start time was checked too
+    // -- and being believable is this line's entire job.
+    expect(note).toContain("start time");
   });
 
   // Nothing to check is not the same as "the holder is gone". The
