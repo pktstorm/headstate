@@ -74,6 +74,35 @@ pub enum Safety {
     /// bug: a branch whose PR merged and whose remote was then deleted
     /// was reported as commits existing only on this machine.
     MergedUpstreamDeleted,
+    /// A branchless checkout whose HEAD is already on the default
+    /// branch (#819). Removable.
+    ///
+    /// Carries what the sha resolves to in ref-relative terms, e.g.
+    /// `v1.13.0~30`, or the bare word "detached" when no ref reaches it.
+    /// That string is the difference between a row the user can act on
+    /// and one they cannot: "detached at v1.13.0~30" identifies the
+    /// checkout, where "detached" only says what it lacks.
+    ///
+    /// Its own variant rather than `Safe`, and the reason is what #776
+    /// is about. `Safe` means "merged, pushed", and for a checkout with
+    /// no branch the second half is a claim no evidence was gathered for
+    /// -- there is no tracking config to read. `MergedUpstreamDeleted`
+    /// would be worse: it specifically means the tracking config
+    /// outlived the remote branch, describing evidence that never
+    /// existed here. This variant says only the two things that were
+    /// actually established -- the content is on the default branch, and
+    /// there is no branch -- and keeps the set of verdicts a branchless
+    /// checkout can produce a finite, greppable list.
+    ///
+    /// In `is_safe` deliberately. A clean checkout contained in the
+    /// default branch has nothing to lose, and arguably less than a
+    /// merged branch does: there is no branch ref to forget about. The
+    /// evidence required is `merged_into`'s, unchanged -- ancestry or an
+    /// exact patch-id match -- so this widens which ROWS can present
+    /// that evidence, not what counts as evidence. Before #819 these
+    /// rows were `Unknown`, with no action at all: four on the reporting
+    /// machine, every one provably an ancestor of the default branch.
+    DetachedMerged(String),
     /// The branch was created and never committed to.
     ///
     /// Its own state rather than a flavour of `Safe` or `NeverPushed`,
@@ -327,10 +356,30 @@ impl Safety {
     /// a confirmation that quotes this reason -- is exactly the path
     /// for "the app is being careful and I have read why".
     pub fn is_safe(&self) -> bool {
-        // Both arms mean the work is on the default branch and the tree
-        // is clean. They are separate variants so the row can say which
-        // evidence was used, not because one is safer than the other.
-        matches!(self, Safety::Safe | Safety::MergedUpstreamDeleted)
+        // Every arm means the same thing: the work is on the default
+        // branch and the tree is clean. They are separate variants so the
+        // row can say which evidence was used, not because one is safer
+        // than another.
+        //
+        // `DetachedMerged` joined them in #819, and it is the one
+        // addition here that is a WIDENING of the allowlist rather than a
+        // renaming, so the argument is worth stating. The evidence is
+        // `merged_into`'s and is unchanged: ancestry, or an exact
+        // patch-id match, the identical bar `Safe` clears. What the
+        // detached row lacks is a BRANCH, and a branch is what you would
+        // lose by removing a worktree -- so its absence makes removal
+        // safer, not riskier. Those rows were previously `Unknown` with
+        // no action offered at all, which is the dead end #819 reports.
+        //
+        // `Prunable` and `Empty` stay out, and for reasons that do not
+        // apply here: see `Safety::Prunable` (remove is the wrong verb
+        // when there is no directory) and the note on `Empty` above (a
+        // large previously-refused population must not be promoted as a
+        // side effect of a wording fix).
+        matches!(
+            self,
+            Safety::Safe | Safety::MergedUpstreamDeleted | Safety::DetachedMerged(_)
+        )
     }
 
     /// Display-ready prose for the row, so the UI does not re-derive it.
@@ -344,6 +393,26 @@ impl Safety {
             }
             Safety::NeverPushed => "never pushed — commits exist only here".into(),
             Safety::MergedUpstreamDeleted => "merged; upstream deleted".into(),
+            // MERGED FIRST, then the detachment (#819).
+            //
+            // The old wording for this row was "could not determine:
+            // detached HEAD", which led with a failure and named a
+            // missing branch. Both halves were the wrong way round: the
+            // user's question is "can I clear this", the answer is yes,
+            // and the detachment is the caveat rather than the headline.
+            //
+            // The name carries the `at <ref>` when one was resolvable,
+            // so the row reads "merged into main — detached at
+            // v1.13.0~30". That identifies the checkout, which "detached
+            // HEAD" never did.
+            //
+            // Says "no branch to delete" rather than stopping at
+            // "detached", because the reassurance is the part the user
+            // came for: the usual worry about removing a worktree is
+            // losing the branch, and here there is none.
+            Safety::DetachedMerged(at) => {
+                format!("merged — {at}, no branch to delete")
+            }
             // Says what is TRUE of the branch, not what the app will
             // let you do about it. "Nothing to lose" is the fact the
             // user was trying to establish by hand; whether the Remove
@@ -532,6 +601,56 @@ pub struct Worktree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole `is_safe` allowlist, stated once so that widening it is
+    /// a deliberate edit to a test rather than a side effect.
+    ///
+    /// Mirrored by `isSafe` in `src/lib/worktrees.ts`, whose own test
+    /// asserts the same membership kind by kind. The two MUST agree: this
+    /// one is the gate the remove command checks, that one greys the
+    /// button, and a disagreement is either a button that lies or a
+    /// command that refuses what the page offered.
+    ///
+    /// `DetachedMerged` joined in #819 and is the only widening since
+    /// #732. Written out beside the refusals rather than asserted alone,
+    /// because the property worth pinning is the BOUNDARY -- that
+    /// `Prunable` and `Empty` did not come with it, and that `Unknown`
+    /// (which is what an unmerged detached checkout reports) did not
+    /// either.
+    #[test]
+    fn the_safe_allowlist_is_exactly_the_merged_states() {
+        for s in [
+            Safety::Safe,
+            Safety::MergedUpstreamDeleted,
+            Safety::DetachedMerged("detached at v1.13.0~30".into()),
+        ] {
+            assert!(s.is_safe(), "{s:?} is one of the merged states");
+        }
+        for s in [
+            Safety::MainCheckout,
+            Safety::Dirty(3),
+            Safety::Unpushed(2),
+            Safety::NeverPushed,
+            // Nothing on the branch could be lost, and it is still not
+            // one-click removable: #701 reported that the WORDING was
+            // wrong, and widening the app's only unrecoverable action on
+            // the back of a copy fix is not what was asked for.
+            Safety::Empty,
+            Safety::Unmerged,
+            // This allowlist stays strict: there is no directory to
+            // remove, so remove is the wrong verb, and prune is
+            // repo-wide.
+            Safety::Prunable("gitdir file points to non-existent location".into()),
+            Safety::Orphaned,
+            Safety::Pending,
+            // What an unmerged detached checkout reports (#819). It must
+            // stay out: those commits may exist nowhere else, and having
+            // no branch is not evidence that they landed.
+            Safety::Unknown("detached HEAD at v1.13.0~30 — not found on main".into()),
+        ] {
+            assert!(!s.is_safe(), "{s:?} must not be one-click removable");
+        }
+    }
 
     /// The default must never be deletable. A partially-constructed
     /// `Worktree` is what a bug leaves behind, and this is the one place

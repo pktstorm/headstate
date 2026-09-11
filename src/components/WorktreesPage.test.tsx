@@ -2043,6 +2043,87 @@ describe("WorktreesPage", () => {
     });
   });
 
+  /// #819: four detached worktrees read "could not determine: detached
+  /// HEAD" while git could answer their merge status instantly. A row
+  /// that says "I cannot tell you anything" is the dead end the issue
+  /// reports, and the acceptance criterion is that such a row gets a real
+  /// action.
+  describe("merged detached worktrees", () => {
+    const detachedMergedWt = () =>
+      wt({
+        path: "/code/enc-ui-aws-city-asn",
+        // Empty, which is the whole point: there is no branch, and the
+        // row must still be classifiable and actionable.
+        branch: "",
+        safety: { kind: "detached_merged", detail: "detached at v1.13.0~26" },
+      });
+
+    /// The action, asserted where the user looks for it. Before #819 this
+    /// row was `unknown`: a grey verdict, a disabled Remove, and no
+    /// Claudify -- the kebab's Claudify was gated on `assessed`, which
+    /// only the Claudify toast sets, which could not be reached. A closed
+    /// loop, broken here by the row being genuinely removable.
+    it("counts a merged detached worktree as safe and offers Remove", () => {
+      state.classified = [detachedMergedWt()];
+      render(<WorktreesPage />);
+      expect(screen.getByText(/1 safe to remove/i)).toBeTruthy();
+      const remove = screen.getByRole("button", { name: /^remove$/i });
+      expect(remove.hasAttribute("disabled")).toBe(false);
+    });
+
+    /// The prose, in the order #819 asks for: the answer, then what the
+    /// sha is, then the reassurance. "detached at v1.13.0~26" is what
+    /// makes the row identifiable -- `git name-rev` resolved all four of
+    /// the reported worktrees to a tag in milliseconds, and "detached"
+    /// alone says only what the checkout lacks.
+    it("leads with merged and names what the sha resolves to", () => {
+      state.classified = [detachedMergedWt()];
+      render(<WorktreesPage />);
+      const verdict = screen.getByText(/^merged —/);
+      expect(verdict.textContent).toContain("v1.13.0~26");
+      expect(verdict.textContent).toContain("no branch to delete");
+      expect(verdict.className).toContain("3fb950");
+    });
+
+    /// The #776 property, asserted at the UI boundary too.
+    ///
+    /// That fix exists because detached rows used to report
+    /// `NeverPushed` -- "commits exist only here", the app's strongest
+    /// refusal -- over checkouts whose commits were on the default branch
+    /// and on the remote, measured at 12 of 43 real rows. #819 answers the
+    /// merge question for these rows and must not reintroduce any claim
+    /// about push state, which genuinely needs a branch.
+    it("never claims a branchless checkout holds unique commits", () => {
+      state.classified = [detachedMergedWt()];
+      render(<WorktreesPage />);
+      expect(screen.queryByText(/only here/i)).toBeNull();
+      expect(screen.queryByText(/could not determine/i)).toBeNull();
+    });
+
+    /// An UNMERGED detached checkout stays unknown and stays refused.
+    ///
+    /// Without this the feature would be indistinguishable from "call
+    /// every detached row safe", which is the opposite of what #819 asks:
+    /// it asks that "unknown" be said only about what is genuinely
+    /// unknown. A commit that exists nowhere but this directory is
+    /// exactly that.
+    it("still refuses a detached checkout that is not on the default branch", () => {
+      state.classified = [
+        wt({
+          path: "/code/scratch",
+          branch: "",
+          safety: {
+            kind: "unknown",
+            detail: "detached HEAD at v1.13.0~26 — not found on main",
+          },
+        }),
+      ];
+      render(<WorktreesPage />);
+      expect(screen.getByText(/0 safe to remove/i)).toBeTruthy();
+      expect(screen.getByRole("button", { name: /^remove$/i }).hasAttribute("disabled")).toBe(true);
+    });
+  });
+
   /// #793: the app diagnosed prunable worktrees, named `git worktree
   /// prune` in its own confirmation copy, and never ran it anywhere.
   describe("stale registrations", () => {
