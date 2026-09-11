@@ -528,9 +528,19 @@ async fn load_tree_inner(client: &GitHubClient) -> Result<Tree, ClientError> {
     budget.record(&orgs_v);
     let mut refused = refused_fields_of(&orgs_v);
 
+    // An ERROR, not a default. The viewer's login is the Personal section's
+    // whole scope value: `Scope::Personal(login)` spells `user:<login>`, so
+    // an empty string here would send `user:` to GitHub -- a malformed
+    // qualifier that returns nothing, rendering a Personal section whose
+    // "All repos" silently answers for nobody. There is no honest fallback
+    // (the viewer cannot be guessed), and every other field in this tree is
+    // optional in a way this one is not.
     let viewer = orgs_v["viewer"]["login"]
         .as_str()
-        .unwrap_or_default()
+        .filter(|l| !l.is_empty())
+        .ok_or_else(|| {
+            ClientError::NotJson("GitHub returned no viewer login for the scope tree".into())
+        })?
         .to_string();
     let orgs_conn = &orgs_v["viewer"]["organizations"];
     let orgs_total = orgs_conn["totalCount"].as_u64().unwrap_or(0);
@@ -939,6 +949,23 @@ mod tests {
         );
         assert_eq!(rows[1].pushed_at, None);
         assert!(rows[2].is_archived);
+    }
+
+    /// An empty viewer login must not become `Scope::Personal("")`.
+    ///
+    /// The qualifier for a personal scope is `user:<login>`, so an empty
+    /// login spells `user:` -- which GitHub answers with nothing rather than
+    /// an error, rendering a Personal section whose "All repos" silently
+    /// reports for nobody. `load_tree_inner` refuses instead, and this pins
+    /// the reason by showing what the malformed scope would look like.
+    #[test]
+    fn an_empty_viewer_login_would_make_a_meaningless_personal_scope() {
+        let bad = super::super::scope::Scope::Personal(String::new());
+        assert_eq!(bad.qualifier(), "user:");
+        // Which is why the loader treats an absent login as an error rather
+        // than defaulting it. A good login gives a usable qualifier.
+        let good = super::super::scope::Scope::Personal("octocat".into());
+        assert_eq!(good.qualifier(), "user:octocat");
     }
 
     /// A row's identity is exactly what `Scope::Repo` consumes, so a click
