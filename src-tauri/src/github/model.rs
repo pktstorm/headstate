@@ -407,6 +407,33 @@ pub struct PrDetail {
     /// would let the header disagree with the list beneath it.
     #[serde(default)]
     pub review_threads: Vec<ReviewThread>,
+    /// GitHub's own count of review threads, so a TRUNCATED list can say
+    /// what it is missing (#802).
+    ///
+    /// Paired with `review_threads` exactly as `checks_total` is paired
+    /// with `checks`, and for the same reason -- render what arrived and
+    /// annotate the gap rather than presenting a subset as complete. The
+    /// failure this guards is the one `append_remaining_checks` documents
+    /// one level up: a list that does not LOOK truncated. Twenty of
+    /// twenty-five threads reads as the whole conversation, so an
+    /// unresolved blocking comment can sit outside the window while the
+    /// view looks finished.
+    ///
+    /// NOT a replacement for `unresolved_threads`, which stays the source
+    /// of the header's count. That number is derived from the threads
+    /// that arrived and is therefore a FLOOR when this total exceeds
+    /// `review_threads.len()` -- which is the honest reading, and why the
+    /// view annotates the list rather than adjusting the header to a
+    /// number it cannot know.
+    ///
+    /// A count SMALLER than `review_threads.len()` is possible in
+    /// principle (a thread resolved and hidden between GitHub computing
+    /// the total and serialising the nodes), so readers must treat the
+    /// difference as saturating rather than trusting it to be
+    /// non-negative -- the same care `checks_total` and
+    /// `poll::truncation_payload` take.
+    #[serde(default)]
+    pub review_threads_total: u64,
     pub checks: Vec<CheckRun>,
     /// GitHub's own count of check contexts on the head commit, so a
     /// CAPPED list can say what it is missing (#790).
