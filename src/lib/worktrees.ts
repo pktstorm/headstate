@@ -64,6 +64,20 @@ export function lockReason(lock: Lock): string {
   const age = lockAge(lock);
   let s = age === null ? "locked" : `locked ${age}`;
   s += lock.reason === null ? " — no reason given" : ` by ${lock.reason}`;
+  // APPENDED after git's reason, never folded into it (#792).
+  //
+  // `holder_running` was computed on every scan from the beginning and
+  // read by nothing but `lockHolderNote` in the unlock dialog -- so the
+  // user learned the holder was dead only AFTER deciding to unlock and
+  // opening the confirmation, which is the wrong end of the decision.
+  // The row is where the decision is made.
+  //
+  // After the reason rather than replacing it, because the reason is
+  // the locker's own words and rewriting them would be the app
+  // inventing a claim on another process's behalf. So the row reads
+  // "locked 2 days ago by claude agent … — holder process is gone":
+  // git's sentence, then ours.
+  if (lockHolderIsGone(lock)) s += " — holder process is gone";
   // The fact that turns unlocking from a leap into a decision. Only
   // said when it is true: silence is the honest default, and claiming
   // "would be safe" over unmerged work would invite exactly the blind
@@ -72,10 +86,54 @@ export function lockReason(lock: Lock): string {
   return s;
 }
 
-/// What checking the lock's pid actually established, or null when
+/// Whether the process a lock names is PROVABLY gone.
+///
+/// Mirrors `Lock::holder_is_gone` in `src-tauri/src/worktrees/model.rs`.
+/// Its own predicate, in both languages, because three places now turn
+/// on this one fact -- the row's prose, the row's colour, and which rows
+/// a bulk unlock may touch -- and `=== false` written out three times is
+/// three chances to drift into `!== true` (#792).
+///
+/// That distinction is the whole point. `false` is the one decisive
+/// signal available here: the reason named a process and it is not
+/// running. `null` means the reason named no process to check, and it
+/// must NOT read as "nothing holds it" -- most locks not written by our
+/// own tooling land there, and treating an unasked question as a
+/// negative answer is how a live claim gets cleared. `true` is weak
+/// evidence in the other direction and is not spent as proof either;
+/// see `lockHolderNote`.
+export function lockHolderIsGone(lock: Lock): boolean {
+  return lock.holder_running === false;
+}
+
+/// Whether this worktree is locked by a holder that is provably gone.
+///
+/// The selector the bulk unlock is built on (#792), and the reason it is
+/// a function rather than an inline pair of comparisons: it is read by
+/// the header's count, by the dialog's list, and by the button that
+/// sends the batch, and those three MUST agree -- a count that includes
+/// a row the batch then skips is a count the user cannot trust about an
+/// action on another process's claim.
+///
+/// Deliberately narrower than "locked". A lock whose holder is running,
+/// or whose reason named nobody to check, is excluded: the batch exists
+/// for the case where the evidence is decisive, and a bulk action over
+/// claims that might be live is precisely what #753 refused to offer.
+/// Those rows keep the single-row unlock and its confirmation.
+export function isDeadLock(wt: Worktree): boolean {
+  return wt.safety.kind === "locked" && lockHolderIsGone(wt.safety.detail);
+}
+
+/// What checking the lock's holder actually established, or null when
 /// there was nothing to check.
 ///
-/// Deliberately NOT phrased as "the lock is live". A running pid is
+/// The LONG form, for the unlock confirmation. `lockReason` carries the
+/// short one on the row -- four words, appended after git's reason, and
+/// only for the decisive case. Both exist because the two places need
+/// different lengths of the same fact: a row is a glance and a
+/// confirmation is where the caveat has room to be read.
+///
+/// Deliberately NOT phrased as "the lock is live". A running holder is
 /// weak evidence and the app must not launder it into a strong claim:
 /// on the reporting machine this is true for all 20 locks and every one
 /// of them is abandoned, because the pid belongs to the parent session
@@ -84,12 +142,20 @@ export function lockReason(lock: Lock): string {
 ///
 /// The "false" wording is the opposite: a named process that is gone is
 /// the one unambiguous signal available here, and it deserves to be
-/// stated plainly.
+/// stated plainly. It says (pid, start_time) was checked rather than
+/// just the pid, because that is what makes it sound: pids are recycled,
+/// and a bare pid check would call a recycled number a live holder
+/// (#792).
 export function lockHolderNote(lock: Lock): string | null {
   if (lock.holder_running === null) return null;
   return lock.holder_running
     ? "The process it names is still running — though that is weak evidence, since a parent process outlives the work that took the lock."
-    : "The process it names is no longer running.";
+    : // Says it checked the START TIME too, because that is what makes
+      // this the decisive line rather than a guess (#792). Without it a
+      // reader who knows pids are recycled has no reason to trust
+      // "no longer running", and the whole point of this sentence is
+      // that it can be trusted.
+      "The process it names is no longer running — checked by its process id and the start time the lock recorded, so a reused id is not mistaken for it.";
 }
 
 /// Display-ready prose for a row.
@@ -157,13 +223,15 @@ export function safetyReason(s: Safety): string {
 /// What the force-removal confirmation warns about, for one safety
 /// state.
 ///
-/// Three cases, not two, because #701 showed what the missing one
-/// costs. `never_pushed` names the specific loss -- commits that exist
-/// nowhere else. `empty` has no loss to name, so it says so plainly
-/// rather than inheriting a warning about commits it does not have;
-/// that sentence is the whole reason this state exists. Everything else
-/// gets the general form, which is honest about the app's uncertainty
-/// without inventing a danger.
+/// Four named cases, not two, because #701 and #798 each showed what a
+/// missing one costs. `never_pushed` names the specific loss -- commits
+/// that exist nowhere else. `dirty` names the count, because it can and
+/// because the generic line was what a user with a 153-package lockfile
+/// bump in the balance actually read (#798). `empty` has no loss to
+/// name, so it says so plainly rather than inheriting a warning about
+/// commits it does not have; that sentence is the whole reason this
+/// state exists. Everything else gets the general form, which is honest
+/// about the app's uncertainty without inventing a danger.
 ///
 /// Every branch still ends in "this cannot be undone": the directory
 /// goes either way, and the user is one click from it.
@@ -171,21 +239,62 @@ export function forceWarning(s: Safety): string {
   switch (s.kind) {
     case "never_pushed":
       return "These commits are not pushed anywhere. This cannot be undone.";
+    case "dirty":
+      // Names the NUMBER, which the app already knows and used to
+      // throw away at exactly the moment it mattered (#798). This case
+      // fell through to the generic "Headstate does not consider this
+      // safe to remove", which describes the app's opinion rather than
+      // the user's loss -- and the forced path could not even carry it
+      // out, so the sentence the user read was wrong about the stakes
+      // AND about the outcome. Now the stakes are specific and the
+      // removal works, which is the pair that makes the confirmation
+      // worth reading.
+      //
+      // "deleted permanently" rather than "lost": these are files on
+      // disk that no git object holds a copy of, so there is no reflog
+      // and no stash to recover them from.
+      return `${s.detail} uncommitted file${s.detail === 1 ? "" : "s"} will be deleted permanently. This cannot be undone.`;
     case "empty":
       return "This branch has no commits of its own, so nothing on it would be lost. Removing the directory cannot be undone.";
     case "locked":
       // Says the truth the general wording would hide: forcing here
-      // does not work. `remove_worktree_forced` relaxes Headstate's
-      // gate but still calls git WITHOUT `--force`, and git refuses a
-      // locked tree on its own account -- so the user would confirm a
-      // destructive-sounding dialog and get an error. Naming the
-      // unlock is not an invitation to ignore the lock; it is the only
-      // route that exists, and the reason is quoted beside it (#753).
+      // does not work, and that is now a CHOICE rather than a defect.
+      //
+      // Until #798 the reason was that `remove_worktree_forced` never
+      // passed git's `--force` at all. It does now -- and still only
+      // once, where a locked worktree needs `--force --force`. That
+      // second force is deliberately withheld: a lock is the only
+      // signal another process has for saying it is working in a
+      // directory, and on the reporting machine 13 of 34 worktrees
+      // were locked by agents actively doing so. So git refuses, by
+      // design, and the user would otherwise confirm a
+      // destructive-sounding dialog and get an error.
+      //
+      // Naming the unlock is not an invitation to ignore the lock; it
+      // is the route that makes the user read the claim first, and the
+      // reason is quoted beside it (#753).
       return "This worktree is locked, and git will refuse to remove it until it is unlocked — check the lock reason above first, in case the process that set it is still running.";
     case "prunable":
       // There is no directory to remove, so the destructive framing is
       // simply wrong here. Nothing can be lost and nothing will be.
-      return "This worktree's directory is already gone; only the stale registration remains. Removing it loses nothing, but `git worktree prune` is the command that clears it.";
+      //
+      // UNREACHABLE from the UI as of #793, and kept anyway. The kebab
+      // no longer offers removal on a prunable row -- that route ran
+      // `git worktree remove` against a directory that is not there --
+      // and `canClaudify` has always excluded the state, so no force
+      // confirmation can open over one. `safetyReason` is what a
+      // prunable row actually reads now, and the kebab points at the
+      // header's Prune action.
+      //
+      // Retained because `forceWarning` is a total function over
+      // `Safety` and the exhaustiveness is the safety property: if some
+      // future path does reach a prunable row, the sentence it gets
+      // should be this one and not the generic "Headstate does not
+      // consider this safe to remove. This cannot be undone." -- which
+      // would threaten a loss that cannot happen. Updated to name the
+      // action that now exists rather than the command the user used to
+      // have to retype in a terminal.
+      return "This worktree's directory is already gone; only the stale registration remains. Nothing can be lost — use “Prune stale registrations” above the list, which runs `git worktree prune`.";
     default:
       return "Headstate does not consider this safe to remove. This cannot be undone.";
   }
@@ -377,13 +486,27 @@ export function safetyTone(s: Safety): string {
     case "unpushed":
       return "text-[#d29922]";
     case "locked":
-      // Amber, alongside the other "you can act on this" states. Not
-      // red: a lock endangers nothing -- it is a claim by another
-      // process, and the worst case of ignoring it is that the row
-      // stays. Not grey either, because unlike `empty` this is an
-      // obstacle the user may well want to clear, and on the reporting
-      // machine it covers a third of the rows (#753).
-      return "text-[#d29922]";
+      // A dead holder is GREY, and the rest of the locks stay amber
+      // (#792).
+      //
+      // Amber on this page means "you may want to act on this, and
+      // there is a judgement to make". That is exactly right for a lock
+      // whose holder might be working in the directory, and exactly
+      // wrong for one whose named process is provably gone: there is no
+      // judgement left, only a leftover file. Colouring both the same
+      // is what made five stale locks on the reporting machine read as
+      // live claims and the Remove button look blocked for a reason.
+      //
+      // Grey is the shade `prunable` already uses for the other state
+      // that is pure stale bookkeeping, which is the comparison worth
+      // making -- not a new colour, because a sixth shade on this row
+      // would have to be learned where this one is already understood.
+      //
+      // Not green, though the row is now easy to clear: green on this
+      // page means one-click removable, and a dead-holder lock is not.
+      // It takes an unlock first, and `is_safe` deliberately still
+      // excludes it.
+      return lockHolderIsGone(s.detail) ? "text-[#8b949e]" : "text-[#d29922]";
     case "prunable":
       // Grey. There is no directory left, so there is nothing at risk
       // and nothing to reclaim -- it is a bookkeeping entry, and amber

@@ -148,6 +148,16 @@ pub const SURFACE: &[(&str, Class)] = &[
     // unrecoverable action this is not. Removal is unaffected: its own
     // gate re-classifies the worktree from scratch afterwards.
     ("unlock_worktree", Class::Write),
+    // Clears a repository's stale worktree registrations (#793). Write,
+    // not Destructive, and strictly less destructive than the unlock
+    // above: `git worktree prune` removes entries under `.git/worktrees/`
+    // whose directory git has ALREADY reported gone, so no file leaves
+    // the disk, no branch is touched, and no commit becomes unreachable.
+    // Not Destructive despite reading like `docker_prune_cache`, which
+    // is: that deletes build cache a later build would reuse, this
+    // deletes a dangling pointer. Spending the step-up prompt on
+    // bookkeeping is how it stops being read on the removals that matter.
+    ("prune_worktrees", Class::Write),
     // destructive: deletes files, branches, images, or volumes.
     ("delete_head_branch", Class::Destructive),
     ("delete_branches", Class::Destructive),

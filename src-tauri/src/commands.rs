@@ -1692,6 +1692,39 @@ pub async fn unlock_worktree(repo_path: String, worktree_path: String) -> Result
     Ok(())
 }
 
+#[tauri::command]
+/// Clear a repository's stale worktree registrations (#793).
+///
+/// Takes no worktree path, and that is the whole shape of the thing:
+/// `git worktree prune` is repo-wide, so a per-row command would have
+/// promised a scope git does not offer. The UI matches it with one
+/// header affordance carrying the count.
+///
+/// No confirmation dialog behind it, unlike every other cleanup command
+/// here. There is nothing to confirm: each registration it clears
+/// describes a directory git has already reported gone, so there is no
+/// tree to lose work from and no branch or commit is touched. A dialog
+/// asking "are you sure?" about an operation with no recoverable loss
+/// teaches the user to click through the dialogs that do matter.
+///
+/// Logged at `info` rather than `warn` for the same reason
+/// `unlock_worktree` is: `warn` is reserved here for the unrecoverable
+/// action, and spending it on bookkeeping makes that signal worth less.
+/// The COUNT is logged, because "pruned 0" and "pruned 12" are different
+/// events on a support log and a bare "pruned" is neither.
+///
+/// `spawn_blocking`: three git calls, two of which list every worktree
+/// in the repository -- ~150 on a real one.
+pub async fn prune_worktrees(repo_path: String) -> Result<u64, String> {
+    let repo = repo_path.clone();
+    let cleared =
+        tauri::async_runtime::spawn_blocking(move || crate::worktrees::prune_worktrees(&repo))
+            .await
+            .map_err(|e| format!("prune failed to run: {e}"))??;
+    log::info!("{repo_path}: pruned {cleared} stale worktree registration(s)");
+    Ok(cleared)
+}
+
 /// Everything the app already knows about one worktree's unmerged work.
 ///
 /// `claudify_command` has always computed this whole struct and then
