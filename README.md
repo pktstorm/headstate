@@ -188,9 +188,11 @@ matter how many aliases it carries, so a month of history is cheaper than
 one page of paginated results.
 
 The series is fetched in chunks of five days, concurrently. GitHub returns 502 Bad Gateway
-on a query carrying too many concurrent search aliases — measured
-intermittently from around 44 — so requests stay well under that rather
-than retrying into a server-side timeout.
+on a query that takes too long to evaluate, and search aliases are evaluated
+serially — so alias count drives elapsed time rather than being a limit of its
+own. Measured: every 502 landed at around eleven seconds regardless of shape,
+while 80 count-only aliases answered in under that and 48 node-heavy ones did
+not. Requests stay well under the deadline rather than retrying into it.
 
 **Filters and repo sidebar.** A sidebar of repos with open PR counts, plus a
 filter bar for labels, review state, and drafts.

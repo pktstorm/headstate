@@ -70,6 +70,16 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("get_periods", Class::Read),
     ("get_cycle_trend", Class::Read),
     ("get_merged_detail", Class::Read),
+    // The hardened stats layer (#824). A Read: it issues `search` and
+    // `repository.pullRequests` queries and returns counts.
+    //
+    // Exposed because the phone's stats page asks the same questions the
+    // desktop's does, and the alternative is a second copy of the
+    // slicing, metering and concurrency rules in `src-mobile` -- which
+    // is precisely the drift `health_alerts` above refuses for the same
+    // reason. The desktop's wall-clock ceiling and read-concurrency cap
+    // are inside the command, so a phone's `remote_call` inherits both.
+    ("stats_count", Class::Read),
     ("get_reviewing", Class::Read),
     ("count_reviewing", Class::Read),
     ("get_pr_detail", Class::Read),
@@ -419,6 +429,16 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "get_periods" => res(commands::get_periods(app.state()).await),
         "get_cycle_trend" => res(commands::get_cycle_trend(app.state()).await),
         "get_merged_detail" => res(commands::get_merged_detail(app.state()).await),
+        "stats_count" => res(commands::stats_count(
+            app.clone(),
+            app.state(),
+            a.get("subject")?,
+            a.get("scopeKind")?,
+            a.get("scopeValue")?,
+            a.get("measure")?,
+            a.get("days")?,
+        )
+        .await),
         "get_reviewing" => res(commands::get_reviewing(app.clone(), app.state()).await),
         "count_reviewing" => res(commands::count_reviewing(app.state()).await),
         "get_pr_detail" => {
