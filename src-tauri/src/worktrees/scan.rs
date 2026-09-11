@@ -116,7 +116,12 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
 /// without the file. All three are "we do not know", which is what the
 /// UI must say; a fabricated timestamp here would be worse than the
 /// silence it replaced (#702).
-fn fetched_at(dir: &Path) -> Option<String> {
+/// `pub(super)` for `assess`, which labels its prompt with the same
+/// instant so an agent knows its inputs are as-of-a-fetch rather than
+/// live (#815). One reader, one writer, one definition -- a second
+/// `FETCH_HEAD` stat in `assess` could drift from this one's fallback
+/// order and report a different age for the same repository.
+pub(super) fn fetched_at(dir: &Path) -> Option<String> {
     let meta = std::fs::metadata(dir.join(".git").join("FETCH_HEAD"))
         .or_else(|_| std::fs::metadata(dir.join("FETCH_HEAD")))
         .ok()?;

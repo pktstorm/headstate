@@ -599,16 +599,55 @@ export function totalSize(items: { size_bytes: number | null }[]): number | null
 /// repository's refs were 12 days old while its rows read like the
 /// present tense (#702).
 ///
-/// Silent below a day. Under that the note is noise -- a fetch this
-/// morning is not a caveat -- and a caveat shown always is a caveat
-/// nobody reads. `null` fetch time is NOT silent: never fetched is the
-/// stalest state there is, not the freshest.
+/// Silent only below an HOUR (#815). It used to be silent below a DAY,
+/// which made this read as reassurance in exactly the window where the
+/// bug lives: on a repository whose `main` lands PRs hourly, refs fetched
+/// 23 hours ago are stale enough to make a merged branch look unmerged,
+/// and the page said nothing at all. #815 reports that loop happening
+/// "many times" -- an agent assessed stale refs, did the work, and found
+/// it already upstream at PR time.
+///
+/// An hour rather than "any non-zero age", which #815 floats as the
+/// better option. Rejected: a fetch 90 seconds ago is genuinely current,
+/// and a caveat on every row of every repository all the time is a
+/// caveat nobody reads -- the failure the old day-long threshold was
+/// guarding against, and the reason there is still a threshold at all.
+/// An hour is the shortest window in which this repository's `main` can
+/// actually move, which is the quantity being estimated.
+///
+/// Hours up to a day, then days. Not "2026-09-11T08:00:00Z": the reader
+/// is deciding whether to trust a verdict on screen right now, and a
+/// duration answers that where an instant makes them do the arithmetic.
+/// (The Claudify PROMPT makes the opposite choice and prints the absolute
+/// instant, because it may be pasted a day after it was copied, at which
+/// point a duration computed at copy time would be a lie.)
+///
+/// `null` fetch time is NOT silent: never fetched is the stalest state
+/// there is, not the freshest.
+///
+/// No fetch button beside it yet, though #815 asks for one (item 3) and
+/// it is the right answer. Not done here because the only render site is
+/// `WorktreesPage.tsx`, which another change owns concurrently; a button
+/// also needs a command to call, and there is no production fetch
+/// anywhere in this app -- the six in `scan.rs` are all test fixtures.
+/// That is a Rust command, a surface-allowlist entry in three places, a
+/// mutation hook and a re-scan on completion, which is its own change
+/// rather than a rider on this one. What this function can do alone is
+/// stop being silent while the refs go stale, and that is what changed.
 export function refAge(fetchedAt: string | null, now = new Date()): string | null {
   if (fetchedAt === null) return "never fetched";
   const at = Date.parse(fetchedAt);
   if (Number.isNaN(at)) return "never fetched";
-  const days = Math.floor((now.getTime() - at) / 86_400_000);
-  if (days < 1) return null;
+  const hours = Math.floor((now.getTime() - at) / 3_600_000);
+  if (hours < 1) return null;
+  // A future timestamp -- a clock that jumped, or an `mtime` ahead of
+  // now -- gives a negative `hours` and is caught by the `< 1` return
+  // above, so it goes SILENT rather than rendering "-3 hours ago". Silent
+  // is the right failure here: "we cannot tell how stale this is" is not
+  // a claim of staleness, and the one state that must never go silent
+  // (never fetched) is handled before any arithmetic runs.
+  if (hours < 24) return `as of a fetch ${hours} hour${hours === 1 ? "" : "s"} ago`;
+  const days = Math.floor(hours / 24);
   return `as of a fetch ${days} day${days === 1 ? "" : "s"} ago`;
 }
 
