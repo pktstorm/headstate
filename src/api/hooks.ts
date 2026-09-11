@@ -1503,7 +1503,25 @@ export function useUnlockWorktrees() {
         await unlockWorktree(repoPath, path);
         outcomes.push({ path, error: null });
       } catch (e) {
-        outcomes.push({ path, error: typeof e === "string" ? e : String(e) });
+        // The same unwrapping `errorMessage` does in `QueryError.tsx`,
+        // inlined rather than imported: this is the api layer and that is
+        // a component module, so importing it here would invert the
+        // layering for four lines. A bare `String(e)` would render
+        // "Error: that worktree is not locked" -- git's own words with
+        // a class name bolted on -- where the rest of the app shows the
+        // message alone.
+        //
+        // Falls back to a fixed sentence rather than to `String(e)` for
+        // anything else: a thrown object stringifies to "[object
+        // Object]", and a row in a failure list reading that tells the
+        // user strictly less than "it failed" does.
+        const msg =
+          typeof e === "string"
+            ? e
+            : e instanceof Error
+              ? e.message
+              : "the unlock failed for an unknown reason";
+        outcomes.push({ path, error: msg });
       }
     }
     void qc.invalidateQueries({ queryKey: ["worktree-safety"] });

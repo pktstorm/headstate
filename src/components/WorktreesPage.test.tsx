@@ -2152,6 +2152,28 @@ describe("WorktreesPage", () => {
       );
     });
 
+    /// A partial failure is reported, never swallowed. The scan is a
+    /// snapshot, so a row somebody else unlocked in between is an
+    /// ordinary race -- and a bare "Unlocked 2" over one refusal would
+    /// misreport which locks are still in place.
+    it("names the locks that could not be cleared", async () => {
+      unlockManyFn.mockResolvedValue([
+        { path: "/code/a", error: null },
+        { path: "/code/b", error: "that worktree is not locked" },
+      ]);
+      state.classified = [deadLockWt("/code/a"), deadLockWt("/code/b")];
+      render(<WorktreesPage />);
+      fireEvent.click(screen.getByRole("button", { name: /unlock 2 abandoned locks/i }));
+      fireEvent.click(screen.getByRole("button", { name: /^unlock 2 locks$/i }));
+      await waitFor(() =>
+        expect(toastError).toHaveBeenCalledWith(
+          expect.stringMatching(/1 of 2 could not be unlocked/i),
+          expect.objectContaining({ description: "b: that worktree is not locked" }),
+        ),
+      );
+      expect(toastSuccess).not.toHaveBeenCalled();
+    });
+
     /// Removal does not become easier. `is_safe()` still excludes
     /// `locked`, so the row's own button stays disabled -- the lock
     /// becomes EASY TO CLEAR, not silently removable.
