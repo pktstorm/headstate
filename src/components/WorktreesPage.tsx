@@ -178,8 +178,31 @@ function Row({
   // action -- so the verdict can wrap instead of truncating and the
   // action is never squeezed against the path.
   const isMobile = useIsMobile();
+  /// A FLOOR under the name, so it cannot be squeezed to nothing
+  /// (#818).
+  ///
+  /// Constraining the verdict cell is most of the fix, but `flex-1` on
+  /// this cell is `flex-basis: 0%` -- it is still the first thing a
+  /// flex row takes width from, and two long cells competing would
+  /// leave the name a few characters wide. The identifier is the one
+  /// cell that is useless partially: "agent-a1..." does not distinguish
+  /// the row from the nine others beside it, which is the whole failure
+  /// the issue reported. 12rem is about 20 monospace characters -- long
+  /// enough for the agent-worktree names this page is full of to stay
+  /// told apart, and it only binds on a genuinely narrow desktop window
+  /// (the phone stacks instead).
+  ///
+  /// A `min-width` rather than a basis, because shrink applies AFTER
+  /// the basis and would walk straight back through it -- `min-width`
+  /// is the only one of the two that is a floor. It does not defeat the
+  /// `truncate` beside it: truncation needs the box to be allowed
+  /// narrower than its TEXT, which a floor well under the text's width
+  /// still allows. The phone keeps `min-w-0`, since a stacked name has
+  /// the whole row and no competitor to be floored against.
   const nameCell = (
-      <span className="min-w-0 flex-1 truncate font-mono text-[#e6edf3]">
+      <span
+        className={`${isMobile ? "min-w-0" : "min-w-48"} flex-1 truncate font-mono text-[#e6edf3]`}
+      >
         {pathBasename(wt.path)}
         {wt.branch ? (
           <span className="ml-2 text-xs text-[#8b949e]">{wt.branch}</span>
@@ -188,9 +211,74 @@ function Row({
         )}
       </span>
   );
+  /// The verdict as ONE plain string, for the desktop cell's tooltip.
+  ///
+  /// The cell below renders the same facts as composite JSX -- a PR
+  /// link, a coloured signal, a relative time -- and `title` takes only
+  /// text, so the pieces are re-joined here rather than read back off
+  /// the DOM. Built from the same expressions the cell uses, in the
+  /// same order, because a tooltip that disagrees with the row it
+  /// explains is worse than no tooltip: this is the ONLY place the
+  /// truncated tail survives (#818), so it has to be complete.
+  const safetyTitle = [
+    pending ? null : safetyReason(wt.safety),
+    wt.merged_at ? `merged ${wt.merged_at}` : null,
+    wt.upstream && wt.is_main ? upstreamReason(wt.upstream) : null,
+    wt.upstream && !wt.is_main ? upstreamShort(wt.upstream) : null,
+    pr ? `#${pr.number}` : null,
+    signal ? signal.label : null,
+    wt.last_commit && !wt.is_main ? relativeTime(wt.last_commit) : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
   const safetyCell = (
       <span
-        className={`${isMobile ? "" : "shrink-0 "}text-xs ${safetyTone(wt.safety)}`}
+        // TRUNCATES, and yields before the name does (#818).
+        //
+        // This cell used to be `shrink-0` with no width bound, which on
+        // a flex row means "claim my full intrinsic width and give none
+        // of it back". The name was the only `flex-1` cell, so it
+        // absorbed all the pressure: a lock reason carrying a pid and a
+        // start time squeezed the worktree's own name to nothing and
+        // pushed the Remove button and kebab clean out of the bordered
+        // box. You could neither tell which checkout the row was nor
+        // reach its actions -- on the one page where the action deletes
+        // a directory.
+        //
+        // So the reason now shrinks (`min-w-0`) and clips (`truncate`),
+        // and the name keeps its `flex-1`. The priority is deliberate,
+        // not incidental: of the three desktop cells the verdict is the
+        // most expendable at narrow widths, because it is a SENTENCE --
+        // its first clause carries the decision ("merged, pushed", "3
+        // uncommitted files") and the tail is elaboration -- whereas the
+        // name is an identifier that means nothing partially and the
+        // action cell is a button that has to be clickable. A clipped
+        // sentence still reads; half a name does not.
+        //
+        // `flex-auto` rather than `flex-1` for the basis: `flex-1` is
+        // `flex: 1 1 0%`, which would give the verdict an equal share of
+        // the row with the name no matter how short either one is, so a
+        // two-word verdict beside a long name would sit in a half-row of
+        // whitespace. `flex-auto` is `flex: 1 1 auto` -- sized from its
+        // content, as it effectively was while `shrink-0`, and the
+        // change is only that it can now give width back under
+        // pressure. The wide row therefore looks exactly as it did
+        // before this fix; only the tight one differs.
+        //
+        // Nothing is LOST: `title` carries the whole string. That is
+        // what makes truncating honest here rather than the app hiding
+        // a fact it computed -- and the mouse-free route to it is the
+        // row's own disclosure, which shows the assessment in full.
+        //
+        // The phone is untouched. It already stacks the cells so the
+        // verdict wraps instead of truncating, which is why this bug
+        // was desktop-only; see the comment on the cells above.
+        className={`${isMobile ? "" : "min-w-0 flex-auto truncate "}text-xs ${safetyTone(wt.safety)}`}
+        // Only on the desktop, and only because that is the layout that
+        // clips. Adding it on the phone would put a tooltip on text
+        // already shown in full, and on a touch screen a `title` is
+        // reachable by nothing.
+        title={isMobile ? undefined : safetyTitle}
         // The whole row is one live region while it fills in, so a
         // screen reader hears the resolved value once rather than
         // announcing each cell as it lands.
@@ -1876,7 +1964,24 @@ export function WorktreesPage() {
         </Dialog>
       ) : null}
 
-      <div className="rounded-md border border-[#30363d]">
+      {/* `overflow-hidden` is a BACKSTOP, not the fix (#818).
+
+          The fix is that every cell in a row can now yield; this is what
+          happens if some future cell cannot. Without it the border is
+          decoration that content walks straight through: the row that
+          reported this issue rendered its Remove button and kebab
+          outside the box entirely, to the right of the border, where
+          they looked like they belonged to nothing. With it, an
+          unbounded cell degrades to being clipped at the edge -- still
+          wrong, but visibly wrong inside the frame instead of silently
+          scattering controls across the page.
+
+          Clipping rather than `overflow-x-auto`: a horizontal
+          scrollbar on the list would mean the action buttons can be
+          scrolled OUT of view, and the whole complaint was that they
+          were unreachable. `rounded-md` also only actually rounds the
+          first and last rows' corners once the box clips them. */}
+      <div className="overflow-hidden rounded-md border border-[#30363d]">
         {shown.length === 0 ? (
           <div className="px-4 py-12 text-center text-sm text-[#8b949e]">
             No worktrees in this repository.

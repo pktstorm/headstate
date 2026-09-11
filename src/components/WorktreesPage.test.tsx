@@ -1183,6 +1183,64 @@ describe("WorktreesPage", () => {
       expect(body).toContain("merged 2026-08-01");
       expect(body).toContain("3 months ago");
     });
+
+    /// The longest verdict this page can actually produce must not cost
+    /// the row its name or its actions (#818).
+    ///
+    /// The reported row was a lock: `lockReason` wraps git's own free
+    /// text -- here the real string from the issue, pid and start time
+    /// and all -- and then appends both of its own clauses, so this
+    /// fixture is the worst case rather than a long string invented to
+    /// make a point. It used to push the name out of view to the left
+    /// and the Remove button and kebab out of the bordered box to the
+    /// right, because the verdict cell was `shrink-0` with no width
+    /// bound and the name was the only cell that could give.
+    ///
+    /// Asserted on PRESENCE, not on pixels: jsdom does no layout, so
+    /// there is no width here to measure. What a unit test can pin is
+    /// that the fix is structural -- the name and the actions are still
+    /// rendered, the verdict carries `truncate` plus a `title` so the
+    /// clipped tail is still reachable, and the list clips rather than
+    /// letting content escape. Those are the four things that regressed
+    /// in the bug and the four a careless class change would undo.
+    it("keeps the name and the actions when the verdict is as long as it gets", () => {
+      const longest = lockOf({
+        age_days: 0,
+        // Verbatim from #818, and the shape our own agents write.
+        reason:
+          "claude agent agent-a0cc35ddcbc894eda (pid 14779 start Fri Sep 11 09:43:48 2026)",
+        holder_running: false,
+        // Earns the second appended clause -- "merged, would be safe
+        // once unlocked" -- so both of `lockReason`'s additions are in
+        // play, not just one.
+        underlying: { kind: "safe" },
+      });
+      state.classified = [
+        wt({ path: "/code/agent-a0cc35ddcbc894eda", safety: { kind: "locked", detail: longest } }),
+      ];
+      const { container } = render(<WorktreesPage />);
+
+      // The row still says WHICH worktree it is.
+      expect(screen.getByText(/^agent-a0cc35ddcbc894eda/)).toBeTruthy();
+      // ...and still offers the way to act on it. A locked row's action
+      // is the kebab, which is the control the issue reported escaping
+      // the table alongside Remove.
+      expect(screen.getByRole("button", { name: /more actions/i })).toBeTruthy();
+
+      // The verdict yields instead of the name: it truncates, and the
+      // whole sentence survives in the tooltip. Without the `title`
+      // this assertion would pass while the tail was simply lost, which
+      // is the failure mode the issue called out by name.
+      const verdict = container.querySelector(".truncate[title]") as HTMLElement;
+      expect(verdict).toBeTruthy();
+      expect(verdict.title).toContain("pid 14779");
+      expect(verdict.title).toContain("holder process is gone");
+      expect(verdict.title).toContain("merged, would be safe once unlocked");
+
+      // The backstop: a cell that somehow still overflows is clipped at
+      // the border rather than rendered outside it.
+      expect(container.querySelector(".overflow-hidden.rounded-md")).toBeTruthy();
+    });
   });
 
   // 106 of 268 worktrees are safe on a real machine, mostly concentrated
