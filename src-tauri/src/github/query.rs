@@ -438,7 +438,16 @@ query($owner: String!, $repo: String!, $number: Int!) {
           # the same, because GitHub charges the connection -- so asking
           # for the largest page is free and cuts the number of follow-up
           # requests to nearly always zero.
+          # `totalCount` so a CAPPED check list can say how many it is
+          # missing rather than rendering a plausible-looking subset.
+          # #790 cut the page budget from 20 to 3, which means the cap
+          # is now reachable on a real pull request -- and the whole
+          # reason the pagination exists (see `append_remaining_checks`)
+          # is that a truncated check list does not look truncated.
+          # Free: GitHub charges the connection, not the fields on it,
+          # and the detail query still totals 1 point.
           contexts(first: 100) {
+            totalCount
             pageInfo { hasNextPage endCursor }
             nodes {
             ... on CheckRun {
@@ -473,6 +482,13 @@ query ChecksPage($owner: String!, $repo: String!, $number: Int!, $after: String!
       commits(last: 1) {
         nodes { commit { statusCheckRollup {
           contexts(first: 100, after: $after) {
+            # Re-selected per page so the merged value is the one from
+            # the LAST page fetched. A rollup that grows mid-pagination
+            # (a workflow that queues more jobs) would otherwise report
+            # a total from before the growth, understating what is
+            # missing -- and understating is the failure mode #790's cap
+            # is specifically guarding against.
+            totalCount
             pageInfo { hasNextPage endCursor }
             nodes {
               ... on CheckRun {
