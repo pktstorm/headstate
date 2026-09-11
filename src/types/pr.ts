@@ -1104,46 +1104,43 @@ export interface NetProcess {
   bytes_out: number;
 }
 
-/// What Headstate itself is costing at one instant, mirroring the Rust
+/// What is using this machine at one instant, mirroring the Rust
 /// `health::Footprint` in `src-tauri/src/health/footprint.rs`.
+///
+/// # Why it is still called a "footprint"
+///
+/// It began as Headstate's OWN cost (#665): three fields -- `app`,
+/// `children`, `docker_daemon` -- behind a "What Headstate is costing"
+/// panel on the System Health overview. #795 removed that panel and
+/// those fields, for the reason argued in the Rust module: a
+/// once-a-second sample of our own processes almost never catches the
+/// bursty `git` fan-out that is the actual cost, so a calm 2% row told
+/// users we were cheap, confidently and wrongly.
+///
+/// The NAME did not change with the fields. Renaming the command would
+/// break the remote surface, whose allowlist names `system_footprint` as
+/// a literal string in two separate copies (desktop and phone), and that
+/// is a real compatibility cost for a word. So this reads as a misnomer
+/// and this paragraph is the fix.
 ///
 /// # Absent is not zero, again
 ///
-/// The same rule as `HealthSample`, and here it is easier to get wrong,
-/// because every field that can be missing is missing in the ORDINARY
-/// case rather than the exotic one. `git` is not running most of the
-/// time; most machines have no Docker daemon up. So a UI that defaults
-/// any of these to a zero does not merely mislead in an edge case -- it
-/// tells almost every user, almost always, that a tool is running and
-/// idle when it never started.
+/// The same rule as `HealthSample`, and the shape the absence takes here
+/// is a failed MEASUREMENT rather than a missing process: every row below
+/// is a process that demonstrably exists. `ProcessGroup.cpu_unmeasured`
+/// is that rule's only remaining expression on this type -- a group whose
+/// sum is over fewer processes than its count says so, rather than
+/// folding an unreadable one in as a zero.
 export interface Footprint {
   /// RFC 3339, stamped by the Rust side at the moment of the reading.
   sampled_at: string;
-  /// The Tauri host process, or `null` if the platform would not report
-  /// our own PID. Not expected anywhere this ships, but a fabricated
-  /// zero for "we could not find ourselves" would read as an idle app.
-  app: FootprintProcess | null;
-  /// One entry per LIVE `git` / `gh` / `du` / `docker` process.
-  ///
-  /// Empty means none were running at that instant, which is the
-  /// ordinary state between refreshes -- NOT a row of zeroes. Several
-  /// entries may share a `name`: a worktree scan runs many `git` at
-  /// once, and the Rust side deliberately does not collapse them,
-  /// because that fan-out is the thing this panel exists to show.
-  ///
-  /// Already sorted biggest-first with ties broken by PID, so the
-  /// caller neither has to sort nor should: the stable order is what
-  /// stops the list reshuffling between five-second polls.
-  children: FootprintProcess[];
-  /// The Docker daemon, or `null` when Docker is not running -- which
-  /// is the common answer, and precisely why it must not be a zero.
-  docker_daemon: FootprintProcess | null;
   /// The biggest CPU consumers on the WHOLE machine, biggest first
   /// (#687).
   ///
-  /// Not Headstate's -- the three fields above are ours. This is what
-  /// the CPU detail page shows, because "CPU is at 80%" is a symptom
-  /// and "these are the processes" is the answer.
+  /// The machine's processes, Headstate's own included on the same terms
+  /// as everything else. This is what the CPU detail page shows, because
+  /// "CPU is at 80%" is a symptom and "these are the processes" is the
+  /// answer.
   ///
   /// A bounded TOP N (eight), never the full list: 1400-odd rows is not
   /// an answer to "what is using my CPU", it is the same filtering
@@ -1268,8 +1265,11 @@ export interface FootprintProcess {
   /// `git.exe` on Windows. Never a full path.
   name: string;
   /// CPU use as a percentage of ONE core, so legitimately above 100 for
-  /// a process using more than one, which `git` does. The UI must not
-  /// clamp this the way it can clamp `HealthSample.cpu_percent`.
+  /// a process using more than one -- a parallel build or a compiler
+  /// routinely does. The UI must not clamp this the way it can clamp
+  /// `HealthSample.cpu_percent`: clamping would report the busiest
+  /// process on the machine as merely saturated, on the page whose whole
+  /// job is to name it.
   cpu_percent: number;
   /// Resident set size in bytes: physical RAM held right now. Not
   /// virtual size, which on anything linking a webview is a large

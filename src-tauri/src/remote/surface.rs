@@ -91,10 +91,18 @@ pub const SURFACE: &[(&str, Class)] = &[
     // signature and neither can reach the nonce path (#656).
     ("system_health", Class::Read),
     ("system_health_history", Class::Read),
-    // What Headstate is costing the DESKTOP (#665). Exposed because
-    // that is the whole point on the phone: the companion drives a
-    // desktop, and this answers "is the app I am driving why that
-    // machine is busy". Reads the process table and nothing else.
+    // What is using the DESKTOP's processors and memory (#687, #721) --
+    // the machine's top processes, which the CPU and Memory detail pages
+    // show. Exposed because that is the whole point on the phone: the
+    // companion drives a desktop you left running, and "what is pinning
+    // that machine's cores" is a question you ask about a machine you
+    // are not sitting at. Reads the process table and nothing else.
+    //
+    // Named `footprint` for historical reasons only: it answered "is
+    // Headstate itself why that machine is busy" until #795 removed that
+    // panel. The name is load-bearing HERE specifically -- this row
+    // matches on the literal command string, and `src-mobile`'s copy of
+    // this list has to agree with it -- so it was not renamed.
     ("system_footprint", Class::Read),
     // Which processes are using the DESKTOP's network (#718). A read,
     // and exposed for the same reason `system_footprint` is: the phone

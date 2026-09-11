@@ -2319,21 +2319,43 @@ pub async fn system_health_history(app: AppHandle) -> Result<Vec<crate::health::
     .map_err(|e| e.to_string())?
 }
 
-/// What Headstate itself is costing, right now (#665).
+/// What is using this machine, right now (#687, #721).
 ///
-/// The LIVE half of that panel only: our process, the `git`/`gh`/Docker
-/// subprocesses we spawn, and the Docker daemon if it is up. A kernel
-/// read of the process table -- no subprocess and no directory walk --
-/// so it is safe to call as often as the view refreshes.
+/// Feeds the System Health CPU and Memory detail pages, and nothing
+/// else: the machine's top processes by CPU and by resident set, the
+/// same two summed by process name, and how many processes were running
+/// in total so each page can say what it is NOT showing.
 ///
-/// The DISK half is deliberately not here. Worktree, artifact, venv and
-/// Docker sizes come from `size_worktrees`, `size_artifacts`,
-/// `size_venvs` and `docker_disk_usage`, which already exist and are
-/// what the Worktrees, Artifacts and Docker views show. There is no
-/// combined command on purpose: those four take seconds to tens of
-/// seconds (`size_worktrees` was the #661 timeout), so they belong
-/// behind an explicit "Measure" and must never share a call site with
-/// something this cheap.
+/// A kernel read of the already-open process table -- no subprocess, no
+/// directory walk -- so it is safe to call as often as those pages
+/// refresh, and `health::footprint` carries a test asserting it stays
+/// that way.
+///
+/// # The name is historical, and deliberately not fixed
+///
+/// This was #665's "What Headstate is costing" panel: our own process,
+/// the `git`/`gh`/Docker subprocesses we spawn, and the Docker daemon.
+/// #795 removed that panel and those three fields -- a once-a-second
+/// sample could not catch the bursty `git` fan-out that is our real
+/// cost, so it reported us as cheap, confidently and wrongly.
+///
+/// The command kept the name. Renaming it would mean changing a literal
+/// string in two remote-surface allowlists (`remote::surface` here and
+/// `src-mobile/src/surface.rs`), which a phone build pinned to an older
+/// desktop cannot follow -- a wire break for a word. So the misnomer
+/// stays and this paragraph is the fix.
+///
+/// # No disk sizing here, still
+///
+/// Worktree, artifact, venv and Docker sizes come from `size_worktrees`,
+/// `size_artifacts`, `size_venvs` and `docker_disk_usage`, which the
+/// Worktrees, Artifacts and Docker views own. There is no combined
+/// command on purpose: those four take seconds to tens of seconds
+/// (`size_worktrees` was the #661 timeout) and must never share a call
+/// site with something this cheap. #796 removed the one view that
+/// summed them into a "what of this is ours" figure, so nothing calls
+/// them together any more -- which makes the rule easier to keep, not
+/// less necessary.
 #[tauri::command]
 pub async fn system_footprint(
     footprints: State<'_, std::sync::Arc<crate::health::footprint::Footprints>>,
