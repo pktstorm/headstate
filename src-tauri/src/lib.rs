@@ -71,6 +71,35 @@ fn notify_battery(app: &tauri::AppHandle, alert: &health::alerts::Alert) {
     }
 }
 
+/// Show one CPU runaway alert (#791).
+///
+/// A sibling of `notify_battery` for the same reason that one is a
+/// sibling of `poll::notify_breakage`: the three take three unrelated
+/// types, and one function widened to accept "a battery or a pull
+/// request or a process" would describe nothing. What IS shared is the
+/// part that must not drift -- `poll::notification_allowed`, the
+/// ask-once permission gate.
+///
+/// Only `health::runaway::Alert` reaches here, which is the one tier
+/// that ships. `runaway::Shadow` has no path to this function by
+/// design; see that module's docs on shadow mode.
+fn notify_runaway(app: &tauri::AppHandle, alert: &health::runaway::Alert) {
+    use tauri_plugin_notification::NotificationExt;
+
+    if !poll::notification_allowed(app) {
+        return;
+    }
+    if let Err(e) = app
+        .notification()
+        .builder()
+        .title(alert.title())
+        .body(alert.body())
+        .show()
+    {
+        log::warn!("failed to show a CPU notification: {e}");
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Before anything builds a TLS config. Two rustls providers are
@@ -354,9 +383,66 @@ pub fn run() {
                     // opened the app and a standing alert is worth one
                     // restatement, not a permanent silence.
                     let mut fired = health::alerts::Fired::default();
+                    // The CPU runaway rules (#791). Three pieces, all
+                    // in memory and none of them a schema change:
+                    //
+                    // - `table` reads the process table for the
+                    //   aggregate rule's "no single process explains
+                    //   it" clause and for the shadow log. Its own
+                    //   `sysinfo::System`, held across ticks for the
+                    //   same reason `collector` is: CPU use is a delta
+                    //   since the previous refresh of the SAME
+                    //   instance, so a fresh one would report an idle
+                    //   machine forever.
+                    // - `watcher` approximates per-process duration for
+                    //   the shadow log only. #791's persisted
+                    //   `(pid, start_time)` tracking is deferred with
+                    //   the tiers that would notify from it -- a
+                    //   forgotten accumulation is one missing log line,
+                    //   and that does not justify a migration.
+                    // - `last_pass` is what makes the duration honest:
+                    //   the watcher is told how long it has been since
+                    //   the previous pass and refuses to credit a span
+                    //   wider than `GAP_MS`. Across a closed lid that
+                    //   span is hours, and crediting it would hand
+                    //   every hot process half a day of "sustained"
+                    //   burn the instant the app reopens.
+                    //
+                    // The first pass is discarded along with the first
+                    // `collector.sample` above, and for the same
+                    // reason: sysinfo needs two refreshes before CPU
+                    // use means anything.
+                    let table = health::runaway::Table::new();
+                    let _ = table.read();
+                    let mut watcher = health::runaway::Watcher::default();
+                    let mut last_pass = std::time::Instant::now();
                     loop {
                         std::thread::sleep(std::time::Duration::from_secs(60));
                         let sample = collector.sample(&chrono::Utc::now().to_rfc3339());
+
+                        // Read and logged BEFORE the database work, and
+                        // unconditionally. Both halves matter: the
+                        // process table's CPU figures are a delta since
+                        // the previous refresh, so skipping a tick when
+                        // SQLite is unhappy would make the next
+                        // reading an average over two minutes rather
+                        // than one -- and the shadow log is the point
+                        // of this release, so a failed metric write
+                        // must not be what silences it.
+                        let (observations, aggregate) = table.read();
+                        let elapsed = last_pass.elapsed().as_millis();
+                        last_pass = std::time::Instant::now();
+
+                        // SHADOW ONLY. These lines are the distribution
+                        // #791 asks for before tiers 1 and 2 are
+                        // allowed to interrupt anyone; nothing here
+                        // notifies, and `Shadow` has no path to a
+                        // notification even by accident.
+                        let minutes = watcher
+                            .observe(&observations, i64::try_from(elapsed).unwrap_or(i64::MAX));
+                        for would in health::runaway::shadow(&observations, minutes) {
+                            log::info!("{}", would.line());
+                        }
                         // A failed sample is logged and skipped, never
                         // fatal: a gap in the chart is a far better
                         // outcome than an app that stops because it
@@ -391,6 +477,31 @@ pub fn run() {
                                     .map(|b| b.percent);
                                 for alert in fired.take_new(&alerts, charge) {
                                     notify_battery(&app_handle, &alert);
+                                }
+
+                                // Tier 3, the one rule that notifies,
+                                // on the same history the battery
+                                // rules just used -- so both see
+                                // exactly the series the charts draw,
+                                // and neither can claim a duration the
+                                // picture refuses to show.
+                                let cpu_alerts =
+                                    health::runaway::evaluate(&history, Some(&aggregate));
+                                // The SAME `Fired` the battery alerts
+                                // use, so there is one record of what
+                                // has already been said rather than
+                                // two that can disagree. `take_new_keys`
+                                // is the key-only half of the same
+                                // transition filter: a machine grinding
+                                // for an hour is announced once, not
+                                // sixty times.
+                                let present: Vec<&'static str> =
+                                    cpu_alerts.iter().map(|a| a.key()).collect();
+                                let new = fired.take_new_keys(&["diffuse_cpu"], &present);
+                                for alert in &cpu_alerts {
+                                    if new.contains(&alert.key()) {
+                                        notify_runaway(&app_handle, alert);
+                                    }
                                 }
                             }
                             Err(e) => log::warn!("system health: could not record a sample: {e}"),

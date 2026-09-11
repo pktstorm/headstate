@@ -245,6 +245,47 @@ impl Fired {
         }
         out
     }
+
+    /// The same transition-only filter for keys this module does not
+    /// own: `keys` is the complete set of keys the caller's rules can
+    /// produce, and `present` the subset currently true.
+    ///
+    /// Added for the CPU runaway rules (#791) rather than giving them a
+    /// second `Fired` type, because "announce a transition, not a
+    /// standing condition" is one piece of state per app and two copies
+    /// of it would be two places to forget to re-arm. What it does NOT
+    /// share is [`take_new`]'s hysteresis: that is specific to a battery
+    /// hovering at a user-set threshold, and the rules here are already
+    /// sustained over many samples so they cannot flap on one reading
+    /// -- the same reasoning that gives `fast_discharge` no margin.
+    ///
+    /// Returns the keys that are NEW, in `present`'s order, and re-arms
+    /// every key in `keys` that is absent from it. `keys` is passed
+    /// whole rather than inferred from `present` for the reason the
+    /// doc on [`take_new`] gives: a caller that suppressed but never
+    /// re-armed would announce a condition once per app lifetime, and
+    /// the user would conclude the feature does not work.
+    ///
+    /// [`take_new`]: Fired::take_new
+    pub fn take_new_keys(
+        &mut self,
+        keys: &[&'static str],
+        present: &[&'static str],
+    ) -> Vec<&'static str> {
+        for key in keys {
+            if !present.contains(key) {
+                self.clear(key);
+            }
+        }
+        let mut out = Vec::new();
+        for key in present {
+            if !self.has(key) {
+                self.set(key);
+                out.push(*key);
+            }
+        }
+        out
+    }
 }
 
 /// One measured interval between two consecutive samples.
@@ -752,6 +793,51 @@ mod tests {
         assert_eq!(low_percent(15), 15);
         assert_eq!(low_percent(99), 90, "clamped");
         assert_eq!(low_percent(1), 5, "clamped");
+    }
+
+    /// The key-only filter the CPU rules use (#791): the same
+    /// announce-once-then-re-arm discipline, with no hysteresis.
+    #[test]
+    fn a_standing_condition_on_a_borrowed_key_is_announced_once() {
+        let mut fired = Fired::default();
+        let all = ["diffuse_cpu"];
+        assert_eq!(
+            fired.take_new_keys(&all, &["diffuse_cpu"]),
+            vec!["diffuse_cpu"],
+            "the first one is news"
+        );
+        assert!(
+            fired.take_new_keys(&all, &["diffuse_cpu"]).is_empty(),
+            "the second is not"
+        );
+        // Cleared, then true again: a second episode is news.
+        assert!(fired.take_new_keys(&all, &[]).is_empty());
+        assert_eq!(
+            fired.take_new_keys(&all, &["diffuse_cpu"]),
+            vec!["diffuse_cpu"]
+        );
+    }
+
+    /// The two filters share one `Fired` without interfering: a battery
+    /// alert must not re-arm a CPU one, or either would be announced
+    /// twice.
+    #[test]
+    fn the_two_filters_do_not_clear_each_others_keys() {
+        let mut fired = Fired::default();
+        let low = vec![Alert::Low {
+            percent: 24.0,
+            threshold: 25,
+        }];
+        assert_eq!(fired.take_new(&low, Some(24.0)).len(), 1);
+        assert_eq!(
+            fired.take_new_keys(&["diffuse_cpu"], &["diffuse_cpu"]),
+            vec!["diffuse_cpu"]
+        );
+        // Neither call re-announces the other's standing condition.
+        assert!(fired.take_new(&low, Some(24.0)).is_empty());
+        assert!(fired
+            .take_new_keys(&["diffuse_cpu"], &["diffuse_cpu"])
+            .is_empty());
     }
 
     /// The gap rule here and the gap rule in the charts must agree.

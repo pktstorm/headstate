@@ -58,6 +58,9 @@ pub mod collect;
 pub mod footprint;
 pub mod gpu;
 pub mod netproc;
+/// The CPU runaway rules (#791): the aggregate alert that ships, and
+/// the shadow log for the two per-process tiers that do not yet.
+pub mod runaway;
 
 pub use footprint::Footprint;
 pub use gpu::Gpu;
