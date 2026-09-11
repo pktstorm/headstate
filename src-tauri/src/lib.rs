@@ -357,12 +357,19 @@ pub fn run() {
             let collector = Arc::new(health::collect::Collector::default());
             app.manage(collector.clone());
 
-            // What Headstate itself is costing (#665). Its own reader
-            // rather than a field on `Collector`, for the same reason it
-            // is a separate command: the machine sample and the process
-            // sample refresh different kernel state on different
-            // schedules, and one mutex across both would make each wait
-            // on the other's read for nothing.
+            // The process-table reader behind the System Health CPU and
+            // Memory detail pages (#687, #721): what is using this
+            // machine, as a bounded top-N. Its own reader rather than a
+            // field on `Collector`, for the same reason it is a separate
+            // command -- the machine sample and the process sample
+            // refresh different kernel state on different schedules, and
+            // one mutex across both would make each wait on the other's
+            // read for nothing.
+            //
+            // Still spelled `footprint` because the command and the wire
+            // type are: it began as #665's "what Headstate is costing"
+            // panel, which #795 removed. See `commands::system_footprint`
+            // for why renaming it would be a remote-surface break.
             //
             // Not on the once-a-minute sampler and not written to
             // SQLite: this is a live reading the view asks for, and

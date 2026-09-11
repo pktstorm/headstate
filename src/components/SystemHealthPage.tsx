@@ -2,17 +2,10 @@ import { useMemo, useState } from "react";
 import {
   NET_PROCESSES_POLL_MS,
   NET_PROCESSES_SAMPLE_MS,
-  useAllWorktreeSizes,
-  useArtifactSizes,
-  useArtifacts,
-  useDockerDiskUsage,
   useNetworkProcesses,
   useSystemFootprint,
   useSystemHealth,
   useSystemHealthHistory,
-  useVenvSizes,
-  useVenvs,
-  useWorktrees,
 } from "@/api/hooks";
 import { QueryError, errorMessage } from "./QueryError";
 import { formatSize } from "@/lib/worktrees";
@@ -297,14 +290,20 @@ function Sparkline({
   );
 }
 
-/// One process, as the live half of the footprint panel lists it.
+/// One process, as the CPU and Memory detail pages list it.
 ///
 /// CPU is NOT clamped to 100 and NOT drawn as a `Bar`, unlike every
-/// other percentage on this page. `Footprint.cpu_percent` is a share of
-/// one core, so a `git` using three of them legitimately reads 280% --
-/// a bar would peg at full and hide exactly the fan-out worth seeing,
-/// and clamping the number would report a busy process as a saturated
-/// one.
+/// other percentage on this page. `FootprintProcess.cpu_percent` is a
+/// share of one core, so a process using three of them legitimately
+/// reads 280% -- a bar would peg at full and hide exactly the process
+/// worth seeing, and clamping the number would report a busy process as
+/// a merely saturated one.
+///
+/// Rendered by the individual (un-grouped) table on both detail pages;
+/// `ProcessGroupRow` is its grouped counterpart and is deliberately a
+/// second component rather than a mode of this one -- see there. The
+/// two tables there carry their own `<thead>` rather than sharing one,
+/// because a group has no PID column (#721).
 function ProcessRow({ p, hint }: { p: FootprintProcess; hint?: string }) {
   return (
     <tr className="border-t border-[#30363d]">
@@ -326,387 +325,6 @@ function ProcessRow({ p, hint }: { p: FootprintProcess; hint?: string }) {
         {formatSize(p.memory)}
       </td>
     </tr>
-  );
-}
-
-/// The header row shared by the process tables, so the two cannot drift.
-function ProcessHead() {
-  return (
-    <thead>
-      <tr className="text-left text-xs text-[#8b949e]">
-        <th className="font-normal">Process</th>
-        <th className="font-normal text-right">PID</th>
-        {/* Named "CPU (of one core)" rather than "CPU" precisely
-            because the number goes above 100. A reader who sees 280%
-            under a bare "CPU" heading concludes the app is broken; the
-            heading is the cheapest place to say what the unit is. */}
-        <th className="font-normal text-right">CPU (of one core)</th>
-        <th className="font-normal text-right">Memory</th>
-      </tr>
-    </thead>
-  );
-}
-
-/// A disk figure, and the state it is in.
-///
-/// FOUR states, not two, and the ones that are not a number are the
-/// reason this exists: a figure can be un-measured, measuring, measured,
-/// or measured-and-there-was-nothing. Rendering the first as `0 B` is
-/// the "absent is never zero" rule applied to the disk half -- "we have
-/// not walked your worktrees yet" and "your worktrees are empty" are
-/// opposite claims, and the second one would send someone looking for
-/// files that are exactly where they left them.
-///
-/// The fourth state is the mirror of that mistake. Once the scan HAS
-/// run and found nothing, saying "not measured" reports a completed
-/// look as a failure to look -- so an honest "none found" belongs
-/// there, and only there.
-function DiskRow({
-  label,
-  bytes,
-  hint,
-  measuring,
-  empty,
-  progress,
-}: {
-  label: string;
-  /// `null` when nothing has been measured yet, or when the source
-  /// could not answer. Never coerced to 0.
-  bytes: number | null;
-  hint?: string;
-  measuring: boolean;
-  /// True when the scan ran and found nothing of this kind to size.
-  ///
-  /// A fourth answer, distinct from a byte count, from "measuring",
-  /// and from "not measured". A machine with no virtualenvs is not an
-  /// unmeasured machine -- we looked, and there was nothing there --
-  /// and leaving it on "Not measured" after a completed pass reports
-  /// our own success as a failure to look. This is the one place a
-  /// "nothing" is honest, precisely because it answers a question that
-  /// was actually asked.
-  empty?: boolean;
-  /// "3 of 41 repositories" while a batched source is still landing.
-  /// The number that makes a partly-filled row legible rather than
-  /// looking stuck, the same way `ArtifactsPage` reports it.
-  progress?: string;
-}) {
-  return (
-    <div className="flex items-baseline justify-between gap-2 border-t border-[#30363d] py-1.5">
-      <span className="text-sm text-[#e6edf3]">
-        {label}
-        {hint ? <span className="ml-2 text-xs text-[#8b949e]">{hint}</span> : null}
-      </span>
-      <span className="shrink-0 text-sm tabular-nums">
-        {bytes === null ? (
-          measuring ? (
-            <span className="text-[#8b949e]">Measuring…</span>
-          ) : empty ? (
-            // We looked and there was nothing. Distinct from both a
-            // zero and a "not measured", and the only one of the three
-            // that is a real answer.
-            <span className="text-[#8b949e]">None found</span>
-          ) : (
-            <NotMeasured />
-          )
-        ) : (
-          <>
-            {/* "at least" while batches are outstanding, for the same
-                reason `ArtifactsPage` says it: a total over a partial
-                set is not the total, and presenting it as one is wrong
-                in the single place the reader is looking. */}
-            <span className="text-[#e6edf3]">
-              {progress ? "at least " : ""}
-              {formatSize(bytes)}
-            </span>
-            {progress ? (
-              <span className="ml-2 text-xs text-[#8b949e]">{progress}</span>
-            ) : null}
-          </>
-        )}
-      </span>
-    </div>
-  );
-}
-
-/// The DISK half of the footprint panel, behind an explicit action.
-///
-/// # Why this is a separate component with its own state
-///
-/// The four sources here take seconds to tens of seconds --
-/// `size_worktrees` alone is ~13s for 147 worktrees, which is #661
-/// exactly: a slow command over the remote surface timing out at 120s.
-/// So none of them may run because a view opened.
-///
-/// `measured` is what enforces that, and it is deliberately a piece of
-/// state in this component rather than a prop or a hook option: every
-/// query below is gated on it, it starts `false`, and the ONLY thing
-/// that sets it is the button's onClick. There is no code path that
-/// reaches these commands without a click, which is a stronger
-/// guarantee than "we remembered to pass enabled: false" -- and it is
-/// what the test asserts, because a regression here is invisible on a
-/// developer machine with three worktrees and catastrophic on a real
-/// one with 147.
-///
-/// Nothing here re-measures on a timer either. The hooks' own long
-/// `staleTime`s (5 minutes for worktrees and artifacts, 30 for venvs)
-/// are what make a second visit free, and they are the same cache
-/// entries the Worktrees, Artifacts and Docker pages fill -- so opening
-/// this after those pages costs nothing, and the numbers agree with
-/// them because they ARE them.
-///
-/// # No sizing code
-///
-/// Every byte below comes from a command that already exists and is
-/// already what another view shows. This component sums; it does not
-/// measure. Anything else would be a second implementation of sizing
-/// that could disagree with the first, and a user comparing two pages
-/// would have no way to tell which was lying.
-function DiskFootprint() {
-  const [measured, setMeasured] = useState(false);
-
-  // Discovery is gated too, not just sizing. `scan_artifacts` and
-  // `scan_venvs` are seconds in their own right (measured: ~1.5s for
-  // 178 directories, 9-40s for virtualenvs), so letting them run on
-  // mount would reintroduce the cost this panel is avoiding, just in a
-  // cheaper-looking place.
-  const repos = useWorktrees(measured);
-  const artifacts = useArtifacts(measured);
-  const venvs = useVenvs(measured);
-
-  const repoPaths = useMemo(() => (repos.data ?? []).map((r) => r.path), [repos.data]);
-  const artifactList = useMemo(() => artifacts.data ?? [], [artifacts.data]);
-  const venvList = useMemo(() => venvs.data ?? [], [venvs.data]);
-
-  // The same hooks the three pages use, on the same query keys, so this
-  // shares their cache rather than racing it.
-  const worktreeSizes = useAllWorktreeSizes(repoPaths, measured && repoPaths.length > 0);
-  const artifactSizes = useArtifactSizes(artifactList, measured && artifactList.length > 0);
-  const venvSizes = useVenvSizes(venvList, measured && venvList.length > 0);
-  const docker = useDockerDiskUsage(measured);
-
-  /// Sum a size map, or `null` when nothing has landed.
-  ///
-  /// The `null` is the point. A map with no entries yet sums to 0, and
-  /// returning that would print "0 B" over a measurement still in
-  /// flight -- the absent-is-not-zero failure in its most plausible
-  /// disguise, because the number is briefly true-looking.
-  // A null VALUE is a worktree whose walk was abandoned (#769), and it
-  // is skipped rather than counted as 0: the total is already a
-  // "measured so far" figure, and folding an unmeasured tree in as zero
-  // would understate the reclaimable bytes by exactly the trees most
-  // worth reclaiming -- the ones too large to finish walking.
-  const sum = (sizes: Map<string, number | null>): number | null =>
-    sizes.size === 0
-      ? null
-      : [...sizes.values()].reduce<number>((n, v) => n + (v ?? 0), 0);
-
-  const progress = (pending: number, total: number, unit: string) =>
-    pending > 0 ? `${total - pending} of ${total} ${unit}` : undefined;
-
-  // Docker's own accounting, not a directory walk: images plus build
-  // cache plus volumes, the three figures the Docker page shows. A
-  // failed read is `null` and says so -- Docker being off is the
-  // ordinary case, and "0 B of images" would claim we asked and it was
-  // empty.
-  const dockerBytes = docker.data
-    ? docker.data.images_bytes +
-      docker.data.build_cache_bytes +
-      docker.data.volumes_bytes
-    : null;
-
-  if (!measured) {
-    return (
-      <div>
-        {/* The cost is stated BEFORE the click, not after. This walks
-            every worktree, artifact directory and virtualenv on the
-            machine and takes tens of seconds on a real one; a button
-            that says only "Measure" and then appears to hang is how a
-            user learns to distrust the view. */}
-        <p className="text-sm leading-relaxed text-[#8b949e]">
-          Headstate can add up the disk its worktrees, build artifacts,
-          virtualenvs and Docker images are using. That means walking every one
-          of them, which takes tens of seconds on a large machine, so it only
-          runs when you ask.
-        </p>
-        <button
-          type="button"
-          onClick={() => setMeasured(true)}
-          className="mt-3 rounded-md border border-[#30363d] bg-[#21262d] px-3 py-1.5 text-sm text-[#e6edf3] hover:border-[#8b949e]"
-        >
-          Measure disk use
-        </button>
-      </div>
-    );
-  }
-
-  return (
-    <div>
-      <div className="flex flex-col">
-        {/* `empty` is asserted from the DISCOVERY query, not from the
-            size map: "the scan succeeded and found no repositories" is
-            a fact only discovery knows. An empty size map means merely
-            that nothing has landed, which is also true mid-flight. */}
-        <DiskRow
-          label="Worktrees"
-          bytes={sum(worktreeSizes.sizes)}
-          measuring={repos.isFetching || worktreeSizes.pending > 0}
-          empty={repos.isSuccess && repoPaths.length === 0}
-          progress={progress(worktreeSizes.pending, worktreeSizes.total, "repositories")}
-        />
-        <DiskRow
-          label="Build artifacts"
-          hint="target/, node_modules/, and the rest"
-          bytes={sum(artifactSizes.sizes)}
-          measuring={artifacts.isFetching || artifactSizes.pending > 0}
-          empty={artifacts.isSuccess && artifactList.length === 0}
-          progress={progress(artifactSizes.pending, artifactSizes.total, "repositories")}
-        />
-        <DiskRow
-          label="Virtualenvs"
-          bytes={sum(venvSizes.sizes)}
-          measuring={venvs.isFetching || venvSizes.measuring}
-          empty={venvs.isSuccess && venvList.length === 0}
-          progress={progress(venvSizes.pending, venvSizes.total, "batches")}
-        />
-        <DiskRow
-          label="Docker"
-          hint="Images, build cache and volumes"
-          bytes={dockerBytes}
-          measuring={docker.isFetching}
-        />
-      </div>
-
-      {/* Docker off is not an error and must not be dressed as one --
-          most machines do not have it running, and a red row would send
-          people to fix something that is not broken. */}
-      {docker.isError ? (
-        <p className="mt-2 text-xs text-[#8b949e]">
-          Docker did not answer, so its disk use is not included. That is
-          normal when Docker is not running.
-        </p>
-      ) : null}
-
-      {/* Where each number came from. The panel summarises the other
-          three views rather than measuring anything itself, and saying
-          so is what lets a reader who sees a different figure on the
-          Worktrees page know which one to trust: they are the same
-          number, from the same command, out of the same cache. */}
-      <p className="mt-3 text-xs leading-relaxed text-[#8b949e]">
-        The same figures the Worktrees, Artifacts and Docker views show, from
-        the same measurements — not a second count. Sizes are cached, so those
-        views will not re-walk anything you have measured here.
-      </p>
-    </div>
-  );
-}
-
-/// The LIVE half: what Headstate's processes cost right now.
-///
-/// Split from the disk half so the two halves' failure modes stay
-/// separate. This one polls and is cheap; that one is manual and slow,
-/// and a single component would make it far too easy for a later edit
-/// to put a directory walk on a five-second timer.
-function LiveFootprint() {
-  const fp = useSystemFootprint(true);
-
-  if (fp.isError && fp.data === undefined) {
-    return (
-      <p className="text-sm text-[#8b949e]">
-        Could not read what Headstate is costing: {errorMessage(fp.error)}
-      </p>
-    );
-  }
-  const f = fp.data;
-  if (!f) {
-    return <p className="text-sm text-[#8b949e]">Reading…</p>;
-  }
-
-  return (
-    <div>
-      <div>
-        <div className="text-xs text-[#8b949e]">This app</div>
-        {f.app === null ? (
-          // Not expected on any platform this ships to, but a zero here
-          // would read as an idle app rather than as a failed lookup.
-          <p className="mt-1 text-sm">
-            <NotMeasured>— this machine did not report our own process.</NotMeasured>
-          </p>
-        ) : (
-          <table className="mt-1 w-full text-sm">
-            <ProcessHead />
-            <tbody>
-              <ProcessRow p={f.app} hint="the Headstate window" />
-            </tbody>
-          </table>
-        )}
-      </div>
-
-      <div className="mt-4">
-        <div className="text-xs text-[#8b949e]">Tools Headstate is running</div>
-        {f.children.length === 0 ? (
-          // The most important sentence in this panel.
-          //
-          // An empty list is the ORDINARY state -- `git` runs in bursts
-          // and is gone between refreshes -- so it must read as "none
-          // right now", not as a row of tools sitting at 0%. A zeroed
-          // table here would tell a user their fan-out is idle when it
-          // never started, which is the failure the Rust module docs
-          // are about and the reason `children` is a list of the living
-          // rather than a fixed set of rows.
-          <p className="mt-1 text-sm text-[#8b949e]">
-            None running at this moment. Headstate starts <code>git</code> and{" "}
-            <code>gh</code> in bursts, so this is usually empty between
-            refreshes — it does not mean they are idle.
-          </p>
-        ) : (
-          <table className="mt-1 w-full text-sm">
-            <ProcessHead />
-            <tbody>
-              {/* Keyed on the PID, which is what actually identifies a
-                  row: several `git` share a name during a scan, and
-                  keying on the name would make React reuse one row's
-                  DOM for another process. */}
-              {f.children.map((c) => (
-                <ProcessRow key={c.pid} p={c} />
-              ))}
-            </tbody>
-          </table>
-        )}
-        {f.children.length > 1 ? (
-          <p className="mt-2 text-xs text-[#8b949e]">
-            {f.children.length} running at once. A worktree scan starts many{" "}
-            <code>git</code> in parallel, which is where a machine that feels
-            slow because of Headstate usually is.
-          </p>
-        ) : null}
-      </div>
-
-      <div className="mt-4">
-        <div className="text-xs text-[#8b949e]">Docker daemon</div>
-        {f.docker_daemon === null ? (
-          // Absent, never zero -- and this is the common answer, so it
-          // gets a plain sentence rather than a warning colour.
-          <p className="mt-1 text-sm text-[#8b949e]">Not running.</p>
-        ) : (
-          <table className="mt-1 w-full text-sm">
-            <ProcessHead />
-            <tbody>
-              <ProcessRow p={f.docker_daemon} />
-            </tbody>
-          </table>
-        )}
-        {/* Why a process we did not start is on this list at all. The
-            daemon is not ours and not our child, but Headstate is why
-            the user started it, and a daemon holding 4 GB is a cost
-            they will attribute to this app -- so it is reported, and
-            reported separately so the attribution stays honest. */}
-        <p className="mt-2 text-xs leading-relaxed text-[#8b949e]">
-          Not started by Headstate and not one of its processes, but its memory
-          is a cost the Docker view is usually the reason for — so it is listed
-          apart from the two groups above rather than added to them.
-        </p>
-      </div>
-    </div>
   );
 }
 
@@ -1420,34 +1038,6 @@ export function SystemHealthPage() {
             </p>
           </div>
         </Panel>
-        {/* Full width, and last.
-
-            The five panels above describe the MACHINE; this one is the
-            only panel about Headstate, so it reads as an answer to what
-            they raise -- "the machine is busy" then "and here is
-            whether we are why". Given both columns because its two
-            halves are each a table's width and squeezing them into one
-            column would wrap every row.
-
-            The two halves are separate components rather than one:
-            the live half polls and is cheap, the disk half is manual
-            and takes tens of seconds, and keeping that boundary in the
-            component tree is what makes it hard for a later edit to
-            put a directory walk on the five-second timer. */}
-        <div className="md:col-span-2">
-          <Panel
-            title="What Headstate is costing"
-            subtitle="Its processes right now, and the disk it is using"
-          >
-            <LiveFootprint />
-            <div className="mt-6 border-t border-[#30363d] pt-4">
-              <h3 className="text-xs font-semibold text-[#e6edf3]">Disk</h3>
-              <div className="mt-2">
-                <DiskFootprint />
-              </div>
-            </div>
-          </Panel>
-        </div>
       </div>
 
       {history.isError ? (
@@ -2170,16 +1760,32 @@ function MemoryDetail({
   );
 }
 
-/// The Disk page: every volume, and the footprint measurement folded in.
+/// The Disk page: every volume on this machine, and nothing else.
 ///
-/// The issue asks for the existing footprint disk measurement to live
-/// here, and it does -- `DiskFootprint`, the same component, unchanged
-/// and still behind its own button. It is NOT removed from the overview:
-/// that panel is what the footprint issue (#665) asked for and the
-/// overview is explicitly unchanged. Rendering the same component twice
-/// is safe and cheap precisely because it measures nothing until
-/// clicked, and the two instances share the query cache -- so measuring
-/// on one page means the other is already filled in.
+/// # Why there is no "which of this is ours" panel (#796)
+///
+/// There was one, behind a Measure button, summing worktrees, build
+/// artifacts, virtualenvs and Docker images. It was removed, and the
+/// absence is the design rather than an omission.
+///
+/// This page answers a MACHINE question -- "is this disk filling up" --
+/// and every volume above is part of that answer. "Which of that is
+/// Headstate's" is a different question, and it was already answered in
+/// three places that can act on the answer: the Worktrees page removes
+/// a worktree, the Artifacts page prunes a build directory, the Docker
+/// page reclaims image and cache space. This panel could only report,
+/// and it reported worse -- figures stale the moment they were taken,
+/// behind a click, restating three pages that were already correct.
+///
+/// The rejected alternative was keeping it and making it actionable
+/// (remove buttons, per-row drill-ins). That is the three pages, built
+/// a second time on a summary, and the second implementation is the one
+/// that disagrees with the first.
+///
+/// Removing it also dropped a caller of `size_worktrees`, which is the
+/// ~13s call on a real 147-worktree machine (#661). Nothing on this
+/// page is slow now, which is why there is no Measure affordance left
+/// anywhere in this view.
 function DiskDetail({ sample: s }: { sample: HealthSample }) {
   return (
     <div className="flex flex-col gap-4">
@@ -2234,20 +1840,16 @@ function DiskDetail({ sample: s }: { sample: HealthSample }) {
         </p>
       </Panel>
 
-      {/* No process list here, deliberately. The kernel does not
+      {/* No process list here, deliberately, and the reason is not the
+          one the CPU and Memory pages have. The kernel does not
           attribute disk USE to a process the way it attributes CPU and
           resident memory -- a file belongs to whoever wrote it, which
           may be a process that exited months ago. Naming "the processes
           using the disk" would mean per-process I/O rates, which is a
           different measurement, needs elevated privileges on macOS, and
-          answers "who is writing" rather than "what is full". What
-          Headstate CAN honestly attribute is its own footprint, below. */}
-      <Panel
-        title="What Headstate is using"
-        subtitle="Its worktrees, build artifacts, virtualenvs and Docker images"
-      >
-        <DiskFootprint />
-      </Panel>
+          answers "who is writing" rather than "what is full". So the
+          volumes above are the whole page: see the doc comment for why
+          "which of this is Headstate's" is not here either (#796). */}
     </div>
   );
 }

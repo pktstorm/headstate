@@ -2802,20 +2802,28 @@ export function useSystemHealthHistory(enabled: boolean) {
   });
 }
 
-/// What Headstate itself is costing, polled with the rest of the view.
+/// What is using this machine, polled with the rest of the view.
+///
+/// Read by the System Health CPU and Memory detail pages, which show the
+/// machine's top processes. Named `footprint` after the "What Headstate
+/// is costing" panel it once fed; #795 removed that panel and the
+/// command kept its name -- see `systemFootprint` in `api/tauri.ts`.
 ///
 /// Shares `HEALTH_POLL_MS` with `useSystemHealth` deliberately. The two
-/// answer halves of one question -- "is the machine busy" and "are we
-/// why" -- and a reader compares them; on different cadences the pair
-/// would be describing two different instants, so a `git` fan-out could
-/// appear beside a CPU figure taken before it started.
+/// answer halves of one question -- "is the machine busy" and "what is
+/// making it busy" -- and a reader compares them directly: the CPU page
+/// puts a percentage above the process list that explains it. On
+/// different cadences that pair would describe two different instants,
+/// so a process could appear at 400% beside a CPU figure taken before it
+/// started.
 ///
 /// Safe on that cadence because the Rust side is a kernel read of the
-/// already-open process table: no subprocess, no directory walk. The
-/// DISK half of the same panel is not here and must never be -- those
-/// four commands take seconds, and the whole point of #661 is that a
-/// slow command on a timer is the failure. The panel drives them from
-/// its own explicit action instead.
+/// already-open process table: no subprocess, no directory walk. No
+/// disk-sizing hook shares this timer and none may -- `size_worktrees`
+/// and its three siblings take seconds to tens of seconds, and the whole
+/// point of #661 is that a slow command on a timer is the failure. They
+/// are driven from explicit actions on the Worktrees, Artifacts and
+/// Docker pages instead.
 ///
 /// `enabled` for the same reason as its two neighbours: a disabled
 /// query has its `refetchInterval` suspended by TanStack, so passing

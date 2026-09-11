@@ -723,26 +723,38 @@ export const systemHealth = () => call<HealthSample>("system_health");
 export const systemHealthHistory = () =>
   call<HealthSample[]>("system_health_history");
 
-/// What Headstate itself is costing, right now.
+/// What is using this machine, right now (#687, #721).
 ///
-/// The LIVE half of that panel only: this process, the `git`/`gh`/
-/// Docker subprocesses we spawn, and the Docker daemon if it is up. A
-/// kernel read of the already-open process table -- no subprocess, no
-/// directory walk -- so it is as cheap as `systemHealth` and safe to
-/// poll beside it.
+/// The machine's top processes by CPU and by resident set, the same two
+/// summed by name, and the total process count. A kernel read of the
+/// already-open process table -- no subprocess, no directory walk -- so
+/// it is as cheap as `systemHealth` and safe to poll beside it.
 ///
-/// There is deliberately no companion wrapper for the DISK half. Those
+/// # The name is a leftover, on purpose
+///
+/// It fed #665's "What Headstate is costing" panel, which reported our
+/// own process, the `git`/`gh`/Docker subprocesses we spawn, and the
+/// Docker daemon. #795 removed the panel and those three fields: a
+/// once-a-second sample could not catch the bursty `git` fan-out that is
+/// our real cost, so it told users we were cheap when we were not
+/// measurable this way.
+///
+/// The COMMAND STRING could not follow. It is matched as a literal in
+/// two remote-surface allowlists, one of which ships in the phone app on
+/// its own release tag, so renaming it breaks a phone paired with an
+/// older desktop. A misnomer with a paragraph beats a wire break.
+///
+/// There is deliberately no companion wrapper for disk sizing. Those
 /// figures come from `sizeWorktrees`, `sizeArtifacts`, `sizeVenvs` and
 /// `dockerDiskUsage`, which already exist above and are what the
-/// Worktrees, Artifacts and Docker views show -- so the panel summarises
-/// the same commands rather than measuring anything a second time. They
-/// take seconds to tens of seconds (`size_worktrees` was the #661
-/// timeout at ~13s for 147 worktrees), which is why they stay behind an
-/// explicit action in `SystemHealthPage` and must never share a call
-/// site with something this cheap.
+/// Worktrees, Artifacts and Docker views show. They take seconds to tens
+/// of seconds (`size_worktrees` was the #661 timeout at ~13s for 147
+/// worktrees) and must never share a call site with something this
+/// cheap. #796 removed the last view that summed all four.
 ///
-/// `Class::Read`, so the phone can ask a paired desktop for this and
-/// get the DESKTOP's cost -- the only reading that makes sense there.
+/// `Class::Read`, so the phone can ask a paired desktop for this and get
+/// the DESKTOP's answer -- which is the only reading that makes sense
+/// there: it is the machine you left running.
 export const systemFootprint = () => call<Footprint>("system_footprint");
 
 /// Which processes are using the network, right now (#718).

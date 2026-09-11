@@ -2,16 +2,12 @@ import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-quer
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
-  Artifact,
-  DockerDiskUsage,
   Footprint,
   FootprintProcess,
   FootprintProcessGroup,
   HealthGpu,
   HealthSample,
   NetProcess,
-  Venv,
-  WorktreeRepo,
 } from "@/types/pr";
 import { stubViewport } from "@/test-utils";
 
@@ -45,19 +41,16 @@ const netProcFn = vi.hoisted(() => vi.fn<() => Promise<NetProcess[]>>());
 const netProcPollMs = vi.hoisted(() => ({ current: false as number | false }));
 const historyFn = vi.hoisted(() => vi.fn<() => Promise<HealthSample[]>>());
 const footprintFn = vi.hoisted(() => vi.fn<() => Promise<Footprint>>());
-const disk = vi.hoisted(() => ({
-  worktrees: vi.fn<() => Promise<WorktreeRepo[]>>(),
-  worktreeSizes: vi.fn<(path: string) => Promise<Map<string, number>>>(),
-  artifacts: vi.fn<() => Promise<Artifact[]>>(),
-  artifactSizes: vi.fn<() => Promise<Map<string, number>>>(),
-  venvs: vi.fn<() => Promise<Venv[]>>(),
-  venvSizes: vi.fn<() => Promise<Map<string, number>>>(),
-  dockerDisk: vi.fn<() => Promise<DockerDiskUsage>>(),
-}));
 
 // Only the hooks this page uses, keeping the real TanStack behaviour so
 // `enabled` genuinely decides whether a query function runs -- the same
 // reasoning as the overview's suite.
+//
+// The seven disk hooks that used to be stubbed here are gone with the
+// "What Headstate is using" panel (#796): the Disk page now shows only
+// the machine's volumes, which come out of `useSystemHealth` like the
+// rest of the sample. The Worktrees, Artifacts and Docker pages own
+// those measurements and test them.
 vi.mock("../api/hooks", () => ({
   useSystemHealth: (enabled: boolean) =>
     useQuery({ queryKey: ["system-health"], queryFn: liveFn, enabled, retry: false }),
@@ -75,56 +68,6 @@ vi.mock("../api/hooks", () => ({
       enabled,
       retry: false,
     }),
-  useWorktrees: (enabled = true) =>
-    useQuery({ queryKey: ["worktrees"], queryFn: disk.worktrees, enabled, retry: false }),
-  useArtifacts: (enabled: boolean) =>
-    useQuery({ queryKey: ["artifacts"], queryFn: disk.artifacts, enabled, retry: false }),
-  useVenvs: (enabled: boolean) =>
-    useQuery({ queryKey: ["venvs"], queryFn: disk.venvs, enabled, retry: false }),
-  useAllWorktreeSizes: (paths: string[], enabled: boolean) => {
-    const q = useQuery({
-      queryKey: ["worktree-sizes", paths.join()],
-      queryFn: () => disk.worktreeSizes(paths.join()),
-      enabled: enabled && paths.length > 0,
-      retry: false,
-    });
-    return {
-      sizes: q.data ?? new Map<string, number>(),
-      pending: q.isFetching ? 1 : 0,
-      total: paths.length,
-    };
-  },
-  useArtifactSizes: (artifacts: Artifact[], enabled: boolean) => {
-    const q = useQuery({
-      queryKey: ["artifact-sizes"],
-      queryFn: disk.artifactSizes,
-      enabled: enabled && artifacts.length > 0,
-      retry: false,
-    });
-    return {
-      sizes: q.data ?? new Map<string, number>(),
-      ages: new Map<string, number>(),
-      pending: q.isFetching ? 1 : 0,
-      total: 1,
-    };
-  },
-  useVenvSizes: (venvs: Venv[], enabled: boolean) => {
-    const q = useQuery({
-      queryKey: ["venv-sizes"],
-      queryFn: disk.venvSizes,
-      enabled: enabled && venvs.length > 0,
-      retry: false,
-    });
-    return {
-      sizes: q.data ?? new Map<string, number>(),
-      idle: new Map<string, number>(),
-      measuring: q.isFetching,
-      pending: q.isFetching ? 1 : 0,
-      total: 1,
-    };
-  },
-  useDockerDiskUsage: (enabled: boolean) =>
-    useQuery({ queryKey: ["docker-disk"], queryFn: disk.dockerDisk, enabled, retry: false }),
   // The per-process network table (#718). The cadence constants have
   // to be restated here because the module is mocked wholesale -- and
   // restating them is a drift risk, so `the cadence constants this file
@@ -244,11 +187,17 @@ const group = (
   cpu_unmeasured,
 });
 
+/// The machine's processes, as the CPU and Memory pages read them.
+///
+/// `headstate` is in both lists on purpose: our own processes are
+/// candidates on the same terms as everything else, and a page that hid
+/// the app from its own top-eight would be the one view that lies about
+/// the app. The three "are we why" fields this fixture used to carry
+/// (`app`, `children`, `docker_daemon`) went with the footprint panel in
+/// #795 -- what replaced the "is Headstate why" question is the plain
+/// fact that we rank like anyone else.
 const footprint = (over: Partial<Footprint> = {}): Footprint => ({
   sampled_at: new Date().toISOString(),
-  app: proc(4242, "headstate", 3, 220),
-  children: [proc(5001, "git", 180, 64)],
-  docker_daemon: null,
   top_cpu: [
     proc(701, "acme-render", 412, 900),
     proc(702, "widget-daemon", 96, 120),
@@ -311,9 +260,6 @@ beforeEach(() => {
   // macOS answer opt into it, exactly as `gpus` works above.
   netProcFn.mockResolvedValue([]);
   netProcPollMs.current = false;
-  disk.worktrees.mockResolvedValue([]);
-  disk.artifacts.mockResolvedValue([]);
-  disk.venvs.mockResolvedValue([]);
   useFilters.setState({ healthPage: "overview" });
 });
 
@@ -333,12 +279,27 @@ describe("the overview is still the landing page", () => {
     ).toBeNull();
   });
 
-  it("keeps the footprint panel on the overview", async () => {
-    // The Disk page folds the footprint measurement in, but the panel
-    // #665 asked for stays where it was. "Moved" and "also available"
-    // are different changes and the issue asked for the second.
+  /// The inverse of what this asserted before (#795).
+  ///
+  /// It used to pin "What Headstate is costing" to the overview -- first
+  /// because #665 put it there, then because the Disk page's copy of the
+  /// disk half must not be read as having MOVED it. Both panels are gone
+  /// now, and the absence is asserted rather than simply untested: the
+  /// panel's value proposition ("is Headstate why this machine is slow")
+  /// is the kind a reasonable person re-adds, and a failing test is a
+  /// cheaper place to read the argument than an issue thread.
+  it("has no panel claiming to say whether Headstate is the problem", async () => {
     renderPage();
-    await screen.findByText("What Headstate is costing");
+    // Landed, and fully: the pressure cards are the overview's own.
+    await screen.findByRole("group", { name: /system pressure at a glance/i });
+    expect(screen.queryByText("What Headstate is costing")).toBeNull();
+    // Nor its two halves under any other heading. The live half named
+    // our own process and the tools we spawn; the disk half sat behind
+    // a Measure button.
+    expect(screen.queryByText(/Tools Headstate is running/)).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /measure disk use/i }),
+    ).toBeNull();
   });
 });
 
@@ -475,17 +436,26 @@ describe("the Disk page", () => {
     expect(badges[0].className).toContain("rounded");
   });
 
-  it("folds in the footprint measurement, still behind its button", async () => {
+  /// The inverse of what this asserted before (#796).
+  ///
+  /// It used to pin "What Headstate is using" to this page, behind a
+  /// Measure button. The panel is gone: this page answers "is this disk
+  /// filling up", a machine question the volumes above settle, while
+  /// "which of that is ours" is answered better by the Worktrees,
+  /// Artifacts and Docker pages -- which can act on it rather than only
+  /// report it.
+  ///
+  /// Asserted rather than left untested, because the removal took the
+  /// ~13s `size_worktrees` of #661 off this page entirely. An edit that
+  /// brought any disk summary back would put it behind a button again,
+  /// which is the shape that was already judged not worth having.
+  it("shows the machine's volumes and nothing about Headstate's own use", async () => {
     renderPage();
-    await screen.findByText("What Headstate is using");
-    // Gated exactly as it is on the overview: this is the ~13s
-    // `size_worktrees` of #661, and a drill-down must not become the
-    // place it runs unasked.
-    await screen.findByRole("button", { name: /measure disk use/i });
-    expect(disk.worktrees).not.toHaveBeenCalled();
-    expect(disk.artifacts).not.toHaveBeenCalled();
-    expect(disk.venvs).not.toHaveBeenCalled();
-    expect(disk.dockerDisk).not.toHaveBeenCalled();
+    await screen.findByText("Volumes");
+    expect(screen.queryByText("What Headstate is using")).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /measure disk use/i }),
+    ).toBeNull();
   });
 });
 

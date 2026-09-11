@@ -56,8 +56,15 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("docker_state", Class::Read),
     ("docker_builds", Class::Read),
     ("docker_images", Class::Read),
-    // System Health (#663) and what Headstate is costing (#665). All
-    // reads, so none carries a step-up signature.
+    // System Health (#663) and what is using the desktop's processors
+    // and memory (#687, #721). All reads, so none carries a step-up
+    // signature.
+    //
+    // `system_footprint` is named for the "what Headstate is costing"
+    // panel it once fed; #795 removed that panel and the command kept
+    // the name, because this list and the desktop's copy of it match on
+    // the literal string and a phone build pinned to an older desktop
+    // could not follow a rename.
     ("system_health", Class::Read),
     ("system_health_history", Class::Read),
     // The evaluated health conditions (#789): the rules run on the
