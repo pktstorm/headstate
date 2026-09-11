@@ -253,6 +253,13 @@ impl Assessment {
     /// and a relative phrase computed at copy time would then be a lie
     /// with no way for the reader to notice. An absolute instant stays
     /// true however long the clipboard holds it.
+    ///
+    /// The staleness line is printed only when there ARE numbers to
+    /// label. Every git call can fail, and a lone "These numbers are as
+    /// of a fetch at ..." above an empty list is a confident sentence
+    /// about nothing -- the same failure the `Option` fields exist to
+    /// avoid, one level up. The FIRST block still tells the agent to
+    /// refresh in that case, which is what matters.
     pub fn prompt(&self) -> String {
         let mut out = format!(
             "Assess the git worktree at {}, branch {}.\n\n",
@@ -280,16 +287,6 @@ impl Assessment {
             branch = self.branch,
         ));
 
-        // Stated even when the refresh above will supersede it: the agent
-        // reads the facts whether or not it runs the commands, and an
-        // unlabelled number reads as current.
-        out.push_str(&match &self.fetched_at {
-            Some(at) => format!("These numbers are as of a fetch at {at}:\n\n"),
-            // The stalest state there is, not the freshest -- the same
-            // rule `refAge` follows on the page (#702).
-            None => "These numbers come from refs that have NEVER been fetched:\n\n".to_string(),
-        });
-
         let mut facts = Vec::new();
         if let Some(n) = self.commits_ahead {
             facts.push(format!("  {n} commit{} ahead of {}", plural(n), self.base));
@@ -316,7 +313,25 @@ impl Assessment {
             // it is read rather than buried among the counts.
             facts.push("  NOT PUSHED -- these commits exist only on this machine".to_string());
         }
+        // The staleness header goes WITH the facts, inside this guard,
+        // rather than above it. When every git call failed there are no
+        // numbers, and "These numbers are as of a fetch at ..." followed
+        // by nothing is a sentence about an empty set -- the same
+        // confident-statement-of-nothing the `Option` fields exist to
+        // avoid. Labelled here, or not printed at all.
+        //
+        // Stated even though the FIRST block tells the agent to refresh:
+        // the agent reads these numbers whether or not it runs the
+        // commands, and an unlabelled number reads as current.
         if !facts.is_empty() {
+            out.push_str(&match &self.fetched_at {
+                Some(at) => format!("These numbers are as of a fetch at {at}:\n\n"),
+                // The stalest state there is, not the freshest -- the same
+                // rule `refAge` follows on the page (#702).
+                None => {
+                    "These numbers come from refs that have NEVER been fetched:\n\n".to_string()
+                }
+            });
             out.push_str(&facts.join("\n"));
             out.push_str("\n\n");
         }
@@ -624,6 +639,34 @@ mod tests {
     fn the_prompt_dates_the_numbers_it_quotes() {
         let p = base().prompt();
         assert!(p.contains("as of a fetch at 2026-09-11T08:00:00Z"), "{p}");
+    }
+
+    /// No numbers means no sentence ABOUT the numbers.
+    ///
+    /// Every git call in `assess` can fail, and when they all do there is
+    /// nothing under the heading. "These numbers are as of a fetch at
+    /// 2026-09-11T08:00:00Z:" followed by a blank is a confident
+    /// statement about an empty set -- the same class of defect as the
+    /// "0 commits ahead" the `Option` fields exist to prevent. The
+    /// refresh instruction is unaffected, which is the part that matters.
+    #[test]
+    fn the_staleness_line_is_dropped_when_there_are_no_facts_to_label() {
+        let p = Assessment {
+            commits_ahead: None,
+            files_changed: None,
+            insertions: None,
+            deletions: None,
+            last_activity: None,
+            uncommitted: 0,
+            has_upstream: true,
+            ..base()
+        }
+        .prompt();
+        assert!(!p.contains("as of a fetch"), "{p}");
+        assert!(!p.contains("NEVER been fetched"), "{p}");
+        // Still told to refresh and still told to stop if it landed.
+        assert!(p.contains("git fetch origin"), "{p}");
+        assert!(p.contains("STOP"), "{p}");
     }
 
     /// Never fetched is the STALEST state, not the freshest -- the same
