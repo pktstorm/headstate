@@ -2043,6 +2043,87 @@ describe("WorktreesPage", () => {
     });
   });
 
+  /// #819: four detached worktrees read "could not determine: detached
+  /// HEAD" while git could answer their merge status instantly. A row
+  /// that says "I cannot tell you anything" is the dead end the issue
+  /// reports, and the acceptance criterion is that such a row gets a real
+  /// action.
+  describe("merged detached worktrees", () => {
+    const detachedMergedWt = () =>
+      wt({
+        path: "/code/enc-ui-aws-city-asn",
+        // Empty, which is the whole point: there is no branch, and the
+        // row must still be classifiable and actionable.
+        branch: "",
+        safety: { kind: "detached_merged", detail: "detached at v1.13.0~26" },
+      });
+
+    /// The action, asserted where the user looks for it. Before #819 this
+    /// row was `unknown`: a grey verdict, a disabled Remove, and no
+    /// Claudify -- the kebab's Claudify was gated on `assessed`, which
+    /// only the Claudify toast sets, which could not be reached. A closed
+    /// loop, broken here by the row being genuinely removable.
+    it("counts a merged detached worktree as safe and offers Remove", () => {
+      state.classified = [detachedMergedWt()];
+      render(<WorktreesPage />);
+      expect(screen.getByText(/1 safe to remove/i)).toBeTruthy();
+      const remove = screen.getByRole("button", { name: /^remove$/i });
+      expect(remove.hasAttribute("disabled")).toBe(false);
+    });
+
+    /// The prose, in the order #819 asks for: the answer, then what the
+    /// sha is, then the reassurance. "detached at v1.13.0~26" is what
+    /// makes the row identifiable -- `git name-rev` resolved all four of
+    /// the reported worktrees to a tag in milliseconds, and "detached"
+    /// alone says only what the checkout lacks.
+    it("leads with merged and names what the sha resolves to", () => {
+      state.classified = [detachedMergedWt()];
+      render(<WorktreesPage />);
+      const verdict = screen.getByText(/^merged —/);
+      expect(verdict.textContent).toContain("v1.13.0~26");
+      expect(verdict.textContent).toContain("no branch to delete");
+      expect(verdict.className).toContain("3fb950");
+    });
+
+    /// The #776 property, asserted at the UI boundary too.
+    ///
+    /// That fix exists because detached rows used to report
+    /// `NeverPushed` -- "commits exist only here", the app's strongest
+    /// refusal -- over checkouts whose commits were on the default branch
+    /// and on the remote, measured at 12 of 43 real rows. #819 answers the
+    /// merge question for these rows and must not reintroduce any claim
+    /// about push state, which genuinely needs a branch.
+    it("never claims a branchless checkout holds unique commits", () => {
+      state.classified = [detachedMergedWt()];
+      render(<WorktreesPage />);
+      expect(screen.queryByText(/only here/i)).toBeNull();
+      expect(screen.queryByText(/could not determine/i)).toBeNull();
+    });
+
+    /// An UNMERGED detached checkout stays unknown and stays refused.
+    ///
+    /// Without this the feature would be indistinguishable from "call
+    /// every detached row safe", which is the opposite of what #819 asks:
+    /// it asks that "unknown" be said only about what is genuinely
+    /// unknown. A commit that exists nowhere but this directory is
+    /// exactly that.
+    it("still refuses a detached checkout that is not on the default branch", () => {
+      state.classified = [
+        wt({
+          path: "/code/scratch",
+          branch: "",
+          safety: {
+            kind: "unknown",
+            detail: "detached HEAD at v1.13.0~26 — not found on main",
+          },
+        }),
+      ];
+      render(<WorktreesPage />);
+      expect(screen.getByText(/0 safe to remove/i)).toBeTruthy();
+      expect(screen.getByRole("button", { name: /^remove$/i }).hasAttribute("disabled")).toBe(true);
+    });
+  });
+
   /// #793: the app diagnosed prunable worktrees, named `git worktree
   /// prune` in its own confirmation copy, and never ran it anywhere.
   describe("stale registrations", () => {
@@ -2062,6 +2143,11 @@ describe("WorktreesPage", () => {
     /// A prunable worktree is not disk to reclaim -- the directory is
     /// already gone -- so reporting it as "safe to remove" would claim
     /// recoverable space that does not exist.
+    ///
+    /// Still a separate count after #814, and still its own number: what
+    /// that issue changed is that the two now read as PEERS rather than as
+    /// a figure and a caveat on it. Hence "to clear", and the colour
+    /// assertion in the test below.
     it("counts stale registrations separately from safe ones", () => {
       state.classified = [
         wt({ path: "/code/a", safety: { kind: "safe" } }),
@@ -2073,7 +2159,58 @@ describe("WorktreesPage", () => {
       // The exact string, anchored: the Prune BUTTON also says "2 stale
       // registrations", and this assertion is about the count being its
       // own fact on the line rather than only a label on an action.
-      expect(screen.getByText("2 stale registrations")).toBeTruthy();
+      expect(screen.getByText("2 stale registrations to clear")).toBeTruthy();
+    });
+
+    /// The two counts read as PEERS (#814).
+    ///
+    /// The issue was filed twice, and this is why: a green "N safe to
+    /// remove" beside a grey "N stale registrations" invites reading the
+    /// second as a warning, or as something the green count had declined
+    /// to vouch for. Both are clearable and only the verb differs, so the
+    /// shade must not be what carries the difference.
+    ///
+    /// Asserted on the COLOUR, because that is what the user reads before
+    /// any of the words. Grey is the specific regression: it is the tone
+    /// this page uses for "nothing to act on", which is the opposite of
+    /// the truth about a row one button clears.
+    ///
+    /// NOT a claim that Remove works on these rows. `isSafe` still
+    /// excludes `prunable`, the per-row button stays disabled, and the
+    /// separate button names the separate verb -- all of which #814 says
+    /// explicitly should not change.
+    it("shows the stale count in the same tone as the safe count", () => {
+      state.classified = [
+        wt({ path: "/code/a", safety: { kind: "safe" } }),
+        prunableWt("/code/b"),
+      ];
+      render(<WorktreesPage />);
+      const stale = screen.getByText("1 stale registration to clear");
+      expect(stale.className).toContain("3fb950");
+      expect(screen.getByText(/1 safe to remove/i).className).toContain("3fb950");
+      // The regression, named: grey is this page's "nothing to act on".
+      expect(stale.className).not.toContain("8b949e");
+    });
+
+    /// The row must not be the only place the reassurance lives, and the
+    /// tooltip must not be a second copy of the row (#814).
+    ///
+    /// Before this, the row read "directory is gone — prunable (...)" and
+    /// the tooltip opened by repeating that whole sentence before adding
+    /// the remedy. The reassurance is now on the row itself, so the
+    /// tooltip carries only what the row cannot say: which affordance to
+    /// use, and why it is not on this row.
+    it("says the safe part on the row, not only in a tooltip", () => {
+      state.classified = [prunableWt("/code/b")];
+      render(<WorktreesPage />);
+      // On the ROW, leading.
+      expect(screen.getByText(/^nothing to lose/)).toBeTruthy();
+      const remove = screen.getByRole("button", { name: /^remove$/i });
+      const tip = remove.getAttribute("title") ?? "";
+      // The remedy is named...
+      expect(tip).toContain("Prune stale registrations");
+      // ...without restating the row's own verdict back at the user.
+      expect(tip).not.toContain("nothing to lose");
     });
 
     /// One affordance over the repository, because `git worktree prune`

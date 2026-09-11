@@ -238,6 +238,23 @@ export type Safety =
   /// `safe` so the row can say which evidence it used, because this one
   /// cannot be re-checked against a remote that no longer exists.
   | { kind: "merged_upstream_deleted" }
+  /// A branchless checkout whose HEAD is already contained in the default
+  /// branch (#819). Removable.
+  ///
+  /// `detail` is what the sha resolves to in ref-relative terms --
+  /// `v1.13.0~30` -- or the bare word "detached" when no ref reaches it.
+  /// That string is what makes the row actionable: "detached at
+  /// v1.13.0~30" identifies the checkout, where "detached" only says what
+  /// it lacks.
+  ///
+  /// Its own kind rather than `safe`, because `safe` means "merged,
+  /// pushed" and there is no tracking config here to have established the
+  /// second half from; and not `merged_upstream_deleted`, which
+  /// specifically means the tracking config outlived the remote branch --
+  /// evidence that never existed for a detached HEAD. These rows were
+  /// `unknown` before #819, with no action at all: four on the reporting
+  /// machine, every one provably an ancestor of the default branch.
+  | { kind: "detached_merged"; detail: string }
   /// The branch was created and never committed to -- a scratch
   /// worktree. Distinct from `never_pushed`, which claims commits exist
   /// only here: for a branch with none, that claim is false, and the

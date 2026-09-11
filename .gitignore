@@ -1,16 +1,56 @@
-node_modules/
-dist/
-target/
-src-tauri/target/
-src-tauri/gen/
+# Trailing slashes are deliberately ABSENT from the build-output and
+# dependency entries below, and that is the whole of #813.
+#
+# `node_modules/` -- with the slash -- matches a DIRECTORY only. A
+# SYMLINK named `node_modules` is a different kind of filesystem object,
+# so it was not matched, and `git add -A` committed one without a
+# warning: a mode 120000 blob pointing at an absolute path inside one
+# developer's home directory.
+#
+# The consequence was worse than it sounds. Yarn could not mkdir over a
+# file standing in that path, so nine of ten CI jobs died with
+# `ENOTDIR: not a directory, mkdir '.../node_modules'` -- and the
+# PACKAGE named in the error varied between runs, whichever unpack raced
+# to the broken path first, which read as a flaky registry fetch rather
+# than as a committed file. It also installed fine on the authoring
+# machine, where a real directory exists for the link to resolve to, so
+# only clean runners ever saw it. Three CI runs and one wrong diagnosis
+# (#811 shipped an install retry for a transient that was not the cause)
+# to find.
+#
+# Dropping the slash ignores the name whatever its TYPE -- directory,
+# file, or symlink -- and still ignores the directory, so nothing is
+# lost. Applied to every entry where that same argument holds: each one
+# names a dependency tree or generated output, so nothing of that name
+# is ever meant to be tracked as any type, and each is a plausible
+# symlink target for exactly the reason above (running a tool in a fresh
+# worktree that lacks the real thing -- `target` and `dist` as much as
+# `node_modules`).
+#
+# Entries that KEEP their slash do so because the slash is carrying
+# something: `.yarn/*` and `src-mobile/gen/schemas/` name paths INSIDE a
+# tracked tree, where the trailing component is the point, and the icon
+# directories sit beside sibling icon FILES that are ignored by name
+# already. Re-spelling those buys nothing and would blur what the
+# neighbouring `!`-negations mean.
+#
+# The ignore rule is the narrow fix -- it discourages, it cannot
+# enforce. `scripts/check-symlinks.py` is the guard that catches the
+# class, and is what would have failed this in review rather than in
+# nine CI jobs.
+node_modules
+dist
+target
+src-tauri/target
+src-tauri/gen
 # The mobile crate's `gen/apple` (and `gen/android`, once generated) ARE
 # committed: they are the Xcode and Android Studio projects, which carry
 # hand edits and which `tauri ios build` needs. Each has its own
 # .gitignore for build products. Only the per-machine schema dump is
 # ignored, as it is for the desktop.
-src-mobile/target/
+src-mobile/target
 src-mobile/gen/schemas/
-coverage/
+coverage
 .DS_Store
 
 .yarn/*
@@ -18,8 +58,13 @@ coverage/
 !.yarn/releases
 
 # tsc -b build-mode artifacts
+#
+# `node_modules/.tmp/` used to be listed here as well. It is redundant
+# now that `node_modules` is ignored by name: git never descends into an
+# ignored directory, so a path beneath it cannot be reached to be
+# matched. Left in, it would read as though something about `.tmp`
+# needed saying separately, which it does not (#813).
 *.tsbuildinfo
-node_modules/.tmp/
 
 # `yarn tauri icon` (run via `make icons`) generates Windows/iOS/Android
 # Icon variants this desktop app never uses. The Makefile prunes them, but
@@ -49,5 +94,5 @@ src-mobile/gen/android/keystore.properties
 # Python bytecode. `scripts/check-tauri-versions.test.py` imports the
 # guard by path, so running the tests locally creates this next to the
 # scripts; #556 committed one by accident.
-__pycache__/
+__pycache__
 *.pyc

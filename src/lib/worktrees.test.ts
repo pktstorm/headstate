@@ -45,6 +45,12 @@ describe("isSafe", () => {
     // whole point of the fix, since treating it as never-pushed left
     // every merged worktree unremovable.
     expect(isSafe({ kind: "merged_upstream_deleted" })).toBe(true);
+    // #819: a branchless checkout contained in the default branch. The
+    // evidence is the same `merged_into` bar the two above clear --
+    // ancestry or an exact patch-id match -- and what this row LACKS is a
+    // branch, which is the thing removal would otherwise lose. Four such
+    // rows on the reporting machine were `unknown` with no action at all.
+    expect(isSafe({ kind: "detached_merged", detail: "detached at v1.13.0~30" })).toBe(true);
     for (const s of [
       { kind: "main_checkout" },
       { kind: "dirty", detail: 3 },
@@ -69,6 +75,14 @@ describe("isSafe", () => {
       { kind: "locked", detail: lock({ underlying: { kind: "safe" } }) },
       { kind: "prunable", detail: "gitdir file points to non-existent location" },
       { kind: "unknown", detail: "x" },
+      // The other half of #819, and the one that keeps it honest. A
+      // detached checkout whose HEAD is NOT on the default branch arrives
+      // as `unknown` and must stay un-removable: without this, the change
+      // would be indistinguishable from "call every detached row safe",
+      // which is the opposite of what the issue asks. Spelled with the
+      // real detail string the Rust side produces, so the pairing is
+      // visible here rather than only in scan.rs.
+      { kind: "unknown", detail: "detached HEAD at v1.13.0~30 — not found on main" },
     ] as Safety[]) {
       expect(isSafe(s)).toBe(false);
     }
@@ -170,14 +184,43 @@ describe("safetyReason", () => {
 
   // #753: this used to read "could not determine: directory is
   // missing" -- true, but it names neither the cause nor the cure for
-  // something one safe command fixes.
-  it("explains a stale registration rather than hedging", () => {
+  // something one safe command fixes. #814 then reordered it: naming the
+  // cure is not enough while the sentence still OPENS with a loss.
+  it("leads a stale registration with the reassurance, not the problem", () => {
     const stale = safetyReason({
       kind: "prunable",
       detail: "gitdir file points to non-existent location",
     });
-    expect(stale).toContain("prunable");
+    // THE ORDER is the issue. Asserted as a prefix rather than a
+    // `contains`, because "directory is gone — nothing to lose" would
+    // pass a containment check while being the exact sentence #814
+    // objects to: the answer has to arrive before the problem.
+    expect(stale.startsWith("nothing to lose")).toBe(true);
+    // The remedy survives, named as a VERB the user can act on rather
+    // than as the adjective "prunable" -- git vocabulary was half of what
+    // made the row read as a warning.
+    expect(stale).toContain("prune to clear");
+    // And git's own reason is still carried: #814 asked for a reordering,
+    // not for evidence to be dropped.
+    expect(stale).toContain("non-existent location");
     expect(stale).not.toContain("could not determine");
+  });
+
+  // #819: four worktrees read "could not determine: detached HEAD" while
+  // `merge-base --is-ancestor` answered true for every one of them. The
+  // row must lead with the answer, identify the sha, and say the thing
+  // that makes removal easy to accept -- that there is no branch to lose.
+  it("says a merged detached checkout is merged, and what it is", () => {
+    const d = safetyReason({ kind: "detached_merged", detail: "detached at v1.13.0~30" });
+    expect(d.startsWith("merged")).toBe(true);
+    // The sha is IDENTIFIED. "detached at v1.13.0~30" is what turns a
+    // row the user cannot act on into one they can.
+    expect(d).toContain("v1.13.0~30");
+    expect(d).toContain("no branch to delete");
+    // It is not a hedge any more.
+    expect(d).not.toContain("could not determine");
+    // And it must never read like the state #776 stopped it claiming.
+    expect(d).not.toContain("only here");
   });
 });
 
@@ -296,6 +339,13 @@ describe("safetyTone", () => {
     expect(safetyTone({ kind: "never_pushed" })).not.toContain("3fb950");
     // Green, like `safe`: same verdict, different evidence (#732).
     expect(safetyTone({ kind: "merged_upstream_deleted" })).toContain("3fb950");
+    // Green for the same reason again (#819). Green on this page means
+    // one-click removable, `isSafe` includes this kind, and the two must
+    // not disagree -- a green row with a disabled button, or a grey row
+    // with an enabled one, is the colour lying about the action.
+    expect(safetyTone({ kind: "detached_merged", detail: "detached at v1.13.0~30" })).toContain(
+      "3fb950",
+    );
   });
 
   // The main checkout is not a problem, so it must not look like one.

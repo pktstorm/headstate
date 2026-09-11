@@ -22,11 +22,33 @@ export function isOrphaned(s: Safety): boolean {
 }
 
 export function isSafe(s: Safety): boolean {
-  // Both kinds mean the work is on the default branch and the tree is
-  // clean, so both are removable (#732). They stay separate kinds so the
-  // row can say which evidence was used -- `merged_upstream_deleted`
-  // cannot be re-checked against a remote that no longer exists.
-  return s.kind === "safe" || s.kind === "merged_upstream_deleted";
+  // Mirrors `Safety::is_safe` in `src-tauri/src/worktrees/model.rs`, and
+  // the two MUST agree: this one greys the button and that one is the
+  // gate the command itself checks.
+  //
+  // Every kind here means the work is on the default branch and the tree
+  // is clean, so all are removable (#732). They stay separate kinds so
+  // the row can say which evidence was used -- `merged_upstream_deleted`
+  // cannot be re-checked against a remote that no longer exists, and
+  // `detached_merged` has no branch to re-check at all.
+  //
+  // `detached_merged` joined in #819 and is the one real widening, so the
+  // argument: the evidence is the same `merged_into` bar `safe` clears --
+  // ancestry or an exact patch-id match -- and what the row LACKS is a
+  // branch, which is the thing removing a worktree would otherwise lose.
+  // Its absence makes removal safer rather than riskier. Those rows were
+  // `unknown` with no action offered, which is the dead end #819 reports.
+  //
+  // `prunable` stays out, deliberately and per #814: there is no
+  // directory to remove, so remove is the wrong verb, and this allowlist
+  // guards directory deletion. That row is cleared by the header's Prune
+  // action instead -- #814 is a fix to how it READS, not to what it
+  // permits.
+  return (
+    s.kind === "safe" ||
+    s.kind === "merged_upstream_deleted" ||
+    s.kind === "detached_merged"
+  );
 }
 
 /// How long ago a lock was taken, as prose, or null if unknown.
@@ -214,6 +236,22 @@ export function safetyReason(s: Safety): string {
       // prove it, and is the fact a user comparing this row against
       // GitHub would otherwise find missing.
       return "merged; upstream deleted — safe to delete";
+    case "detached_merged":
+      // MERGED FIRST, then the detachment (#819).
+      //
+      // These rows used to read "could not determine: detached HEAD",
+      // which led with a failure and named a missing branch. Both halves
+      // were the wrong way round: the question is "can I clear this", the
+      // answer is yes, and the detachment is the caveat.
+      //
+      // `detail` carries the `at <ref>` when one resolved, so the row
+      // reads "merged — detached at v1.13.0~30, no branch to delete".
+      // That identifies the checkout, which "detached HEAD" never did.
+      //
+      // Ends on "no branch to delete" because that is the reassurance the
+      // user came for: the usual worry about removing a worktree is
+      // losing the branch, and here there is none.
+      return `merged — ${s.detail}, no branch to delete`;
     case "empty":
       // Says what is TRUE of the branch, not what the app will let you
       // do about it: the Remove button stays disabled, deliberately,
@@ -236,11 +274,28 @@ export function safetyReason(s: Safety): string {
       // reason still follows, unrewritten -- demoted, not dropped.
       return lockReason(s.detail);
     case "prunable":
-      // Says the remedy. Unlike the other refusals there IS one, it is
-      // safe, and it is one command -- where the old wording for this
-      // state, "could not determine: directory is missing", named
-      // neither the cause nor the cure.
-      return `directory is gone — prunable (${s.detail})`;
+      // THE SAFE PART FIRST, then the mechanism (#814).
+      //
+      // #753 gave this row "directory is gone — prunable (<reason>)",
+      // which beat "could not determine: directory is missing" by naming
+      // a remedy where the old wording named neither cause nor cure, and
+      // #793 shipped that remedy as a button. What both left is the
+      // READING: the row still opened with a loss and a piece of git
+      // vocabulary, while the reassurance that nothing can be lost lived
+      // only in a tooltip. The issue was filed twice, which is the signal
+      // -- the page answered "can I clear this?" with a vocabulary lesson
+      // instead of a yes.
+      //
+      // So the order is inverted. "Nothing to lose" is the answer, the
+      // missing directory is why, and git's own reason stays in
+      // parentheses because it is what git actually said.
+      //
+      // The VERB is still prune, not remove, and `isSafe` still excludes
+      // this kind. That distinction is right -- there is no directory to
+      // remove, and `git worktree prune` is repo-wide -- and #814 is
+      // explicit that it is not asking for the allowlist to widen. It
+      // asks that being correct stop reading as a warning.
+      return `nothing to lose — its directory is already gone, prune to clear (${s.detail})`;
     case "pending":
       return "checking…";
     case "orphaned":
@@ -394,6 +449,26 @@ export function canClaudify(s: Safety): boolean {
     // the dead end this list exists to avoid.
     s.kind === "empty"
   );
+  // `detached_merged` is deliberately NOT here, and that is not an
+  // omission (#819).
+  //
+  // The rule is "not removable and not the main checkout", and since
+  // #819 these rows ARE removable -- `isSafe` includes them, so the row
+  // gets the primary Remove button and the kebab's confirmed path. The
+  // issue asks for "at least one real action", and removal is the one the
+  // evidence supports; adding Claudify beside it would ask an agent to
+  // assess content that is already on the default branch.
+  //
+  // An UNMERGED detached row is a different case and is still not here:
+  // it reports `unknown`, which this function excludes, so it keeps the
+  // dead end the issue describes for the rows where the merge question
+  // could not be answered. Enabling it would need `assess()` to work
+  // without a branch name -- it builds `{base}..{branch}` and
+  // `log -1 -- {branch}`, both of which take an empty right-hand side for
+  // a detached checkout -- which is a change in `assess.rs` rather than
+  // here. Left as a follow-up rather than half-wired: a Claudify button
+  // that copies a prompt naming no branch is the closed loop moved, not
+  // broken.
 }
 
 /// The final component of a path, whichever separator it uses.
@@ -495,11 +570,14 @@ export function upstreamTone(u: Upstream): string {
 /// want; grey for the main checkout, which is not a problem at all.
 export function safetyTone(s: Safety): string {
   switch (s.kind) {
-    // Green for both merged states: the button is enabled for each, and
-    // a different colour would imply a different degree of safety
-    // rather than a different route to the same verdict (#732).
+    // Green for every merged state: the button is enabled for each, and
+    // a different colour would imply a different degree of safety rather
+    // than a different route to the same verdict (#732, and
+    // `detached_merged` on the same argument in #819 -- green on this
+    // page means one-click removable, and all three are in `isSafe`).
     case "safe":
     case "merged_upstream_deleted":
+    case "detached_merged":
       return "text-[#3fb950]";
     case "main_checkout":
       return "text-[#8b949e]";

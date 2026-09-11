@@ -83,10 +83,17 @@ export function WorktreeKebab({
 
   // The gate, read here exactly as the primary button reads it (#770).
   //
-  // `isSafe` covers `safe` AND `merged_upstream_deleted`: both mean the
-  // work is on the default branch and the tree is clean, so both take
-  // the plain confirmed path. Everything else goes through `onForce`,
-  // which opens the confirmation naming the specific loss.
+  // `isSafe` covers `safe`, `merged_upstream_deleted` and, since #819,
+  // `detached_merged`: all three mean the work is on the default branch
+  // and the tree is clean, so all three take the plain confirmed path.
+  // Everything else goes through `onForce`, which opens the confirmation
+  // naming the specific loss.
+  //
+  // The detached row needs no wiring of its own here, which is the
+  // argument for routing #819 through `isSafe` rather than through a new
+  // predicate: a row that is provably contained in the default branch
+  // wants the same route for the same reason, and one gate means the
+  // menu and the primary button cannot disagree about it (#770).
   //
   // The menu never HIDES removal — that is the entire point of the
   // issue. What varies is which route it takes and what it says first.

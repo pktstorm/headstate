@@ -444,15 +444,28 @@ pub fn worktree_safety(
         // main-branch SHA that exists everywhere. MEASURED on a real
         // 37-worktree checkout: 12 were detached and all 12 claimed it.
         //
-        // `Unknown` is the honest answer. A detached HEAD has no branch
-        // whose push state, tracking config, or merge status could be
-        // asked about -- the app genuinely cannot say, and saying so is
-        // not the same as claiming the work is unique to this machine.
-        // `git worktree add --detach` is an ordinary way to make a
-        // scratch checkout, so this is a normal state, not a broken one.
+        // What a detached HEAD cannot be asked is NARROWER than "every
+        // question", and #819 is the half this used to give away.
+        //
+        // Push state and tracking config genuinely need a branch, for the
+        // reason just given, so that part of #776 stands exactly as it
+        // is: `detached_safety` has no path to `NeverPushed`, and no
+        // detached row can claim its commits exist only here.
+        //
+        // MERGE STATUS does not need a branch. Every primitive in this
+        // file already asks about `HEAD` or about an explicit sha --
+        // `merge-base --is-ancestor HEAD`, `patch_id(.., "HEAD")`,
+        // `git cherry <default> HEAD` -- and none reads `wt.branch`. So
+        // the only thing that made a detached row unclassifiable was
+        // this return sitting ABOVE the merge check, not any missing
+        // evidence. Four worktrees on the reporting machine read
+        // "could not determine" while `merge-base --is-ancestor`
+        // answered true for all four, instantly.
         //
         // MEASURED over the reporting machine's 43 worktrees, same code
-        // and same moment, with only the ordering differing:
+        // and same moment, with only the ordering differing. This is
+        // #776's own table and it is unchanged -- the column that matters
+        // is still the first row:
         //
         // | verdict                | before | after |
         // |------------------------|--------|-------|
@@ -460,9 +473,24 @@ pub fn worktree_safety(
         // | Unknown(detached HEAD) | 0      | 10    |
         //
         // The 2 that remain are real branches with no tracking config,
-        // which is what the refusal is actually for.
+        // which is what the refusal is actually for. #819 does not move
+        // this row in either direction, by construction rather than by
+        // measurement: `detached_safety` has no path to `NeverPushed`.
+        //
+        // What #819 changes is the SECOND row, splitting it. Those 10
+        // were all the detached rows on that machine, merged and unmerged
+        // alike, because the verdict did not distinguish them. Counted
+        // separately on the repository in the issue, 4 of its detached
+        // rows are provably contained in the default branch -- `git
+        // merge-base --is-ancestor` answers true for each, and `name-rev`
+        // resolves them to `tags/v1.13.0~26..~30`. Those become
+        // `DetachedMerged`; the rest keep `Unknown`, which for a checkout
+        // whose HEAD is genuinely not on the default branch is still the
+        // honest answer. The live tally in `live_scan_classifies_real_worktrees`
+        // counts the two separately, which is how the split is checked
+        // rather than asserted.
         if wt.branch.is_empty() {
-            return Safety::Unknown("detached HEAD".into());
+            return detached_safety(dir, default_branch);
         }
         if !was_ever_pushed(dir) {
             return Safety::NeverPushed;
@@ -479,8 +507,18 @@ pub fn worktree_safety(
     // `ahead` is a real number -- but answering `Unpushed(n)` for a
     // checkout with no branch describes a branch that does not exist.
     // The check simply belongs above every verdict that presumes one.
+    //
+    // Routed through the same `detached_safety` as the path above (#819),
+    // so the two cannot drift on what a branchless checkout is allowed to
+    // say. In practice this arm is unreachable for a detached row --
+    // `classify` derives `has_upstream` from `upstream_state`, which
+    // returns `Detached` before it probes `@{u}` at all, so a detached
+    // worktree always takes the `!has_upstream` path. It is kept because
+    // `worktree_safety` takes `has_upstream` as a parameter and a caller
+    // passing true must not get a verdict that presumes a branch; the
+    // test below drives exactly that.
     if wt.branch.is_empty() {
-        return Safety::Unknown("detached HEAD".into());
+        return detached_safety(dir, default_branch);
     }
 
     // Ahead-count comes from the caller's `rev-list --left-right`, which
@@ -782,6 +820,130 @@ fn holder_is_running(holder: LockHolder) -> bool {
         return true;
     }
     (actual - claimed).abs() <= TOLERANCE_SECS
+}
+
+/// The verdict for a branchless checkout: merged, or honestly unknown.
+///
+/// The whole of #819, and the reason it is ONE function reached from both
+/// of `worktree_safety`'s detached guards: the rule about what a
+/// branchless checkout may claim must exist in exactly one place, or the
+/// two sites drift and one of them re-acquires the #776 bug.
+///
+/// **What changed, and what deliberately did not.** #776 replaced a
+/// detached row's `NeverPushed` -- "commits exist only here", the app's
+/// strongest refusal, asserted falsely over 12 of 43 real rows -- with
+/// `Unknown`. That was right, and the reasoning given for it was wider
+/// than the facts: push state and tracking config genuinely need a
+/// branch, because `was_ever_pushed` reads `branch.<name>.remote` and
+/// there is no such key. Merge status needs no branch at all.
+/// `merged_into` asks `merge-base --is-ancestor HEAD <default>` and then
+/// patch-ids against `HEAD`; not one primitive in its tree reads
+/// `wt.branch`. So a detached row was being refused an answer the
+/// existing machinery could give -- four worktrees reading "could not
+/// determine" while `--is-ancestor` returned true for every one of them,
+/// in milliseconds (#819).
+///
+/// This function therefore asks exactly the merge question and nothing
+/// else. There is no path from here to `NeverPushed`, `Unpushed`,
+/// `MergedUpstreamDeleted` or `Empty`, and that is the #776 property
+/// stated as code rather than as a comment:
+///
+/// - `NeverPushed` / `Unpushed` are claims about a branch's relationship
+///   to a remote. Unreachable by construction; nothing below consults an
+///   upstream or a config key.
+/// - `MergedUpstreamDeleted` is the #732 label meaning "the tracking
+///   config survives but the remote branch is gone". For a detached HEAD
+///   there was never a tracking config to survive, so the label would be
+///   describing evidence that does not exist.
+/// - `Empty` reads a branch's reflog (`branch_is_empty` returns false on
+///   an empty name, deliberately), so it cannot fire here either.
+///
+/// **Why `DetachedMerged` rather than reusing `Safe`.** `Safe`'s own
+/// prose is "merged, pushed" and its row invites "merged when?" -- both
+/// of which would be the app asserting, for a checkout with no branch,
+/// things it did not establish. A separate variant lets the row say the
+/// two facts it actually has, in the order that answers the user's
+/// question: it is merged, and there is no branch. It also keeps #776
+/// auditable: grepping for which variants a branchless checkout can
+/// produce is a finite list of one.
+///
+/// It IS in `is_safe`, which is the point of the issue -- a clean
+/// checkout whose HEAD is contained in the default branch has nothing to
+/// lose, and arguably less than a merged branch does, since there is no
+/// branch ref to forget. The gate is not widened in the sense that
+/// matters: the evidence required is `merged_into`'s, unchanged, which
+/// answers `Safe` only on ancestry or an exact patch-id match.
+///
+/// An unmerged detached checkout stays `Unknown`, NOT `Unmerged`.
+/// `Unmerged`'s prose is "branch not merged", and for these rows there is
+/// no branch to say that about -- and `merged_into` failing is not proof
+/// the content is absent, only that neither ancestry nor a patch-id
+/// match could show it. So the row keeps the hedge it has always had,
+/// now with the sha's description attached so it is a useful hedge.
+fn detached_safety(dir: &Path, default_branch: &str) -> Safety {
+    // `name-rev` for BOTH arms, merged or not, because "detached at
+    // v1.13.0~30" is the fix for half of #819 on its own: a bare
+    // "detached HEAD" tells the user nothing they could act on, while a
+    // tag-relative name tells them what this checkout actually is. ~26ms
+    // measured, and only for rows that are detached -- 10 of 43 on the
+    // reporting machine, not every row.
+    let at = head_name_rev(dir);
+    let described = |prefix: &str| match &at {
+        Some(name) => format!("{prefix} at {name}"),
+        None => prefix.to_string(),
+    };
+
+    match merged_into(dir, default_branch) {
+        Safety::Safe => Safety::DetachedMerged(described("detached")),
+        // A git failure is carried as its own words rather than flattened
+        // into "detached HEAD". `merged_into` returns `Unknown(e)` only
+        // when a git call failed, and that is a different situation from
+        // "asked and could not show it" -- the first may succeed later.
+        Safety::Unknown(why) => Safety::Unknown(format!("{}: {why}", described("detached HEAD"))),
+        // Unmerged, or anything else `merged_into` can produce: the
+        // question was asked and the content could not be shown to be on
+        // the default branch. Said as a hedge rather than as `Unmerged`,
+        // because there is no branch for "branch not merged" to be about.
+        _ => Safety::Unknown(format!(
+            "{} — not found on {default_branch}",
+            described("detached HEAD")
+        )),
+    }
+}
+
+/// What a checkout's HEAD resolves to in ref-relative terms, e.g.
+/// `tags/v1.13.0~30`.
+///
+/// "detached at v1.13.0~30" beats "detached" by enough to be worth a git
+/// call (#819): the first says what this checkout IS, the second says
+/// only what it lacks. On the reporting machine all four of the rows that
+/// prompted the issue resolved to `tags/v1.13.0~NN`, which is exactly the
+/// "leftovers of finished work" they turned out to be.
+///
+/// `name-rev` rather than `describe`: `describe` needs a reachable tag
+/// and errors without one, while `name-rev` falls back to any ref that
+/// reaches the commit -- a branch or a remote-tracking ref -- which is
+/// the common case in a worktree tree with few tags. Measured at ~26ms.
+///
+/// `undefined` is git's word for "no ref reaches this commit", printed on
+/// stdout with a success exit rather than as an error. It is filtered
+/// here: rendering "detached at undefined" would be worse than saying
+/// nothing, which is what `None` gets the caller.
+///
+/// The `tags/` and `remotes/` prefixes are stripped. They say which ref
+/// namespace answered, which is machinery rather than information at a
+/// glance, and the row has one line.
+fn head_name_rev(dir: &Path) -> Option<String> {
+    let out = git(dir, &["name-rev", "--name-only", "HEAD"]).ok()?;
+    let name = out.trim();
+    if name.is_empty() || name == "undefined" {
+        return None;
+    }
+    let name = name
+        .strip_prefix("tags/")
+        .or_else(|| name.strip_prefix("remotes/"))
+        .unwrap_or(name);
+    Some(name.to_string())
 }
 
 /// Whether this branch's work is already on `default_branch`.
@@ -3748,11 +3910,35 @@ prunable gitdir file points to non-existent location
             "expected Prunable, got {s:?}"
         );
         assert!(!s.is_safe(), "safe-by-default: {}", s.reason());
-        // The remedy, which is the fact the old wording never carried.
-        assert!(s.reason().contains("prunable"), "{}", s.reason());
+        // The REMEDY, which is the fact the old wording never carried.
+        //
+        // Asserted as the verb "prune" rather than as the adjective
+        // "prunable" (#814). The row used to open with "directory is gone
+        // — prunable", leading with a loss and a piece of git vocabulary;
+        // it now opens with the answer and names something to do. Pinning
+        // the jargon was pinning the thing the issue asked to remove, so
+        // the assertion moved to what it was always standing in for.
+        assert!(s.reason().contains("prune"), "{}", s.reason());
+        // LEADS with the reassurance, which is the whole of #814. Asserted
+        // as a PREFIX, because "directory is gone — nothing to lose" would
+        // satisfy a containment check while being the exact sentence the
+        // issue objects to: the answer has to arrive before the problem.
+        assert!(
+            s.reason().starts_with("nothing to lose"),
+            "the safe part comes first: {}",
+            s.reason()
+        );
         assert!(
             !s.reason().contains("could not determine"),
             "it is determined, and git said why: {}",
+            s.reason()
+        );
+        // Git's own reason survives the reordering. It is what git
+        // actually said, and #814 asked for an order change rather than
+        // for evidence to be dropped.
+        assert!(
+            s.reason().contains("non-existent location"),
+            "git's reason is still carried: {}",
             s.reason()
         );
     }
@@ -6558,8 +6744,9 @@ prunable gitdir file points to non-existent location
         );
     }
 
-    /// The second half of #776: a detached worktree is `Unknown`, not
-    /// `NeverPushed`.
+    /// The second half of #776, and the #819 answer on top of it: a
+    /// detached worktree merged into the default branch says so, and
+    /// under no circumstances claims `NeverPushed`.
     ///
     /// `git worktree add --detach` is an ordinary way to make a scratch
     /// checkout, and 12 of 37 worktrees on the reporting machine were in
@@ -6572,8 +6759,16 @@ prunable gitdir file points to non-existent location
     /// answered false and the `NeverPushed` return fired before the
     /// detached check below it could ever run. The check existed for
     /// exactly one case and was unreachable for exactly that case.
+    ///
+    /// #776 fixed that by returning `Unknown`, and this fixture's
+    /// verdict has now moved again -- `Unknown` to `DetachedMerged` --
+    /// because the checkout is detached AT `main` and so is provably
+    /// contained in it. The thing being pinned is unchanged and is the
+    /// reason the assertions below are written negatively as well as
+    /// positively: whatever a detached row is allowed to say, it is never
+    /// allowed to say its commits exist only here.
     #[test]
-    fn a_detached_worktree_is_unknown_not_never_pushed() {
+    fn a_detached_worktree_is_merged_never_never_pushed() {
         let (_t, repo, _wt) = repo_with_worktree("feature");
         let detached = repo.parent().unwrap().join("scratch");
         let out = Command::new("git")
@@ -6623,25 +6818,92 @@ prunable gitdir file points to non-existent location
              of the bug"
         );
 
-        let s = worktree_safety(target, "main", false, Some(0));
-        assert_eq!(
-            s,
-            Safety::Unknown("detached HEAD".into()),
-            "a detached HEAD must say it cannot be classified rather than \
-             claim commits exist only here, got {s:?}"
+        // The premise of #819's half: git can answer the merge question
+        // for this sha without any branch, and answers it instantly.
+        assert!(
+            git(&detached, &["merge-base", "--is-ancestor", "HEAD", "main"]).is_ok(),
+            "the fixture must be detached AT something merged, or the \
+             #819 half tests nothing"
         );
-        assert!(!s.is_safe(), "and it must still not be removable");
+
+        let s = worktree_safety(target, "main", false, Some(0));
+        assert!(
+            matches!(s, Safety::DetachedMerged(_)),
+            "a detached HEAD contained in the default branch must say so \
+             rather than give up, got {s:?}"
+        );
+        // THE #776 PROPERTY, asserted directly rather than inferred from
+        // the variant above. This is the regression that fix exists to
+        // prevent, and it must hold for every verdict a detached row can
+        // produce, not only for the one this fixture happens to hit.
+        assert_ne!(
+            s,
+            Safety::NeverPushed,
+            "a branchless checkout must never claim its commits exist \
+             only here -- that is #776"
+        );
+        assert!(
+            !s.reason().contains("only here"),
+            "nor say so in prose: {}",
+            s.reason()
+        );
+        // And it is no longer a dead end: the row reaches the
+        // safe-to-remove set, which is the action #819 asks for.
+        assert!(
+            s.is_safe(),
+            "a clean checkout contained in the default branch has nothing \
+             to lose: {}",
+            s.reason()
+        );
+        // The prose leads with the answer and identifies the checkout.
+        // Pinned whole, because the ORDER is the point of the issue and
+        // a `contains` would pass on a sentence that led with the
+        // failure again. It also pins that the row names what the sha IS
+        // rather than only what it lacks (#819).
+        //
+        // `feature`, not `main`, and that is `name-rev` behaving
+        // correctly rather than a fixture quirk worth working around:
+        // `repo_with_worktree` branches `feature` from the same commit,
+        // so both refs name this sha and git picks one. WHICH ref answers
+        // does not matter to the user -- any of them identifies the
+        // commit, which is the whole improvement over the bare word
+        // "detached". On the rows that prompted the issue it was a tag,
+        // `v1.13.0~30`.
+        assert_eq!(
+            s.reason(),
+            "merged — detached at feature, no branch to delete",
+            "the merged fact comes first and the sha is identified"
+        );
+        assert!(
+            !s.reason().contains("could not determine"),
+            "it was determined: {}",
+            s.reason()
+        );
     }
 
-    /// A detached worktree stays `Unknown` on the OTHER path too -- the
-    /// one where an upstream resolves and an ahead-count exists.
+    /// A detached worktree never reports `Unpushed` on the OTHER path --
+    /// the one where an upstream resolves and an ahead-count exists.
     ///
     /// `worktree_safety` reaches its detached check by two routes and
     /// #776 corrected the ordering on both. This pins the second, which
     /// no test covered: a detached HEAD has no branch to be "ahead" of,
     /// so an ahead-count must not produce `Unpushed` for one.
+    ///
+    /// An ahead-count of 3 is passed DELIBERATELY, and it is the whole
+    /// fixture. `classify` cannot produce this combination in practice --
+    /// `upstream_state` returns `Detached` before probing `@{u}`, so a
+    /// detached row always takes the `!has_upstream` path -- but
+    /// `worktree_safety` takes `has_upstream` as a parameter and must not
+    /// depend on its callers being careful. The number must be ignored,
+    /// not believed.
+    ///
+    /// The verdict moved from `Unknown` to `DetachedMerged` in #819 (this
+    /// fixture's HEAD is `main`, so it is trivially contained in it). The
+    /// assertion below is written as "not `Unpushed`" rather than as an
+    /// equality because that is the property #776 bought and it should
+    /// survive the next re-labelling too.
     #[test]
-    fn a_detached_worktree_is_unknown_even_with_an_ahead_count() {
+    fn a_detached_worktree_is_never_unpushed_even_with_an_ahead_count() {
         let (_t, repo, _wt) = repo_with_worktree("feature");
         let w = Worktree {
             path: repo.to_string_lossy().into_owned(),
@@ -6649,11 +6911,129 @@ prunable gitdir file points to non-existent location
             ..Default::default()
         };
         let s = worktree_safety(&w, "main", true, Some(3));
-        assert_eq!(
+        assert_ne!(
             s,
-            Safety::Unknown("detached HEAD".into()),
-            "a detached HEAD cannot be ahead of a branch it does not \
-             have, got {s:?}"
+            Safety::Unpushed(3),
+            "a detached HEAD cannot be ahead of a branch it does not have"
+        );
+        assert!(
+            !matches!(s, Safety::Unpushed(_) | Safety::NeverPushed),
+            "nor any other verdict that presumes a branch and a remote, \
+             got {s:?}"
+        );
+        // What it says instead: the sha is on the default branch, which
+        // is answerable without a branch and is what #819 asked for.
+        assert!(
+            matches!(s, Safety::DetachedMerged(_)),
+            "expected the merge question to be answered, got {s:?}"
+        );
+    }
+
+    /// The other half of #819, and the one that keeps it honest: a
+    /// detached checkout whose HEAD is NOT on the default branch stays
+    /// `Unknown` and stays un-removable.
+    ///
+    /// Without this the change would be indistinguishable from "call
+    /// every detached row safe", which is the opposite of what the issue
+    /// asks for -- it asks that "unknown" be said only about what is
+    /// genuinely unknown. A commit that exists nowhere but this directory
+    /// is exactly that case, and it must not be swept into the
+    /// safe-to-remove set on the strength of having no branch.
+    ///
+    /// `Unknown` rather than `Unmerged` on purpose. `Unmerged`'s prose is
+    /// "branch not merged" and there is no branch here to say it about;
+    /// and `merged_into` failing is not proof the content is absent, only
+    /// that neither ancestry nor a patch-id match could establish it.
+    #[test]
+    fn an_unmerged_detached_worktree_stays_unknown_and_unremovable() {
+        let (_t, repo, _wt) = repo_with_worktree("feature");
+        let detached = repo.parent().unwrap().join("scratch");
+        let envs = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+        let run = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .envs(envs)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        run(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                detached.to_str().unwrap(),
+                "main",
+            ],
+        );
+        // A commit that exists ONLY in this detached checkout. Real
+        // content, not an empty commit: `merged_into` falls through to
+        // patch-id comparison when ancestry fails, and an empty diff
+        // would be compared as nothing rather than as something absent.
+        std::fs::write(detached.join("scratch-only.txt"), "only here\n").unwrap();
+        run(&detached, &["add", "-A"]);
+        run(&detached, &["commit", "-q", "-m", "detached work"]);
+
+        // The premise: git agrees this is not contained in main.
+        assert!(
+            git(&detached, &["merge-base", "--is-ancestor", "HEAD", "main"]).is_err(),
+            "the fixture must be genuinely unmerged, or it tests nothing"
+        );
+
+        let listed = parse_porcelain(&git(&repo, &["worktree", "list", "--porcelain"]).unwrap());
+        let target = listed
+            .iter()
+            // Trailing component, not the whole path: on macOS a temp dir
+            // resolves through `/private`, so git prints the same
+            // directory under a different spelling.
+            .find(|w| w.path.ends_with("/scratch"))
+            .expect("the detached worktree must be listed");
+        assert!(
+            target.branch.is_empty(),
+            "the fixture must be detached, or it tests nothing"
+        );
+
+        let s = worktree_safety(target, "main", false, Some(0));
+        assert!(
+            matches!(s, Safety::Unknown(_)),
+            "an unmerged detached checkout is genuinely unknown, got {s:?}"
+        );
+        assert!(
+            !s.is_safe(),
+            "and must NOT be removable -- this commit exists nowhere \
+             else: {}",
+            s.reason()
+        );
+        // The #776 property holds here too, on the arm where it is most
+        // tempting to break: these commits really do exist only here, and
+        // the app still must not say so, because it has no branch config
+        // to have established it from.
+        assert_ne!(s, Safety::NeverPushed);
+        // The hedge is now a USEFUL hedge: it says what the sha is and
+        // which branch it was looked for on.
+        assert!(
+            s.reason().contains("detached"),
+            "it still names the condition: {}",
+            s.reason()
+        );
+        assert!(
+            s.reason().contains("main"),
+            "and what it was compared against: {}",
+            s.reason()
         );
     }
 }
@@ -6695,6 +7075,13 @@ mod live {
                 Safety::Unpushed(_) => "unpushed",
                 Safety::NeverPushed => "never_pushed",
                 Safety::MergedUpstreamDeleted => "merged_upstream_deleted",
+                // The tally that produced the #819 column of the
+                // measured table in `worktree_safety`. Counted
+                // separately from `safe` on purpose: the whole question
+                // was how many rows move out of `unknown` without any
+                // moving into `never_pushed`, and a merged total would
+                // hide both halves.
+                Safety::DetachedMerged(_) => "detached_merged",
                 Safety::Empty => "empty",
                 Safety::Unmerged => "unmerged",
                 Safety::Locked(_) => "locked",
