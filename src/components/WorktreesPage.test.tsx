@@ -31,8 +31,12 @@ const state = vi.hoisted(() => ({
 
 const toastSuccess = vi.hoisted(() => vi.fn());
 const toastError = vi.hoisted(() => vi.fn());
+// `info` is its own channel, not a success with different words: a prune
+// that cleared nothing is neither a failure nor an accomplishment, and
+// the page must be able to say so (#793).
+const toastInfo = vi.hoisted(() => vi.fn());
 vi.mock("sonner", () => ({
-  toast: { success: toastSuccess, error: toastError },
+  toast: { success: toastSuccess, error: toastError, info: toastInfo },
 }));
 
 const dockerImages = vi.hoisted(() => vi.fn(() => [] as unknown[]));
@@ -84,6 +88,8 @@ vi.mock("../api/hooks", () => ({
   useRemoveWorktrees: () => removeManyFn,
   useRemoveWorktreeForced: () => forceFn,
   useUnlockWorktree: () => unlockFn,
+  useUnlockWorktrees: () => unlockManyFn,
+  usePruneWorktrees: () => pruneFn,
   useAssessed: () => ({ data: state.assessed }),
   useMarkAssessed: () => markAssessedFn,
   useClearAssessed: () => clearAssessedFn,
@@ -114,6 +120,19 @@ const removeManyFn = vi.hoisted(() =>
     Promise.resolve(paths.map((p) => ({ path: p, error: null }))),
   ),
 );
+// Shaped exactly like `removeManyFn`, because the real bulk unlock is
+// shaped like the real bulk removal: an outcome per target, since a row
+// somebody else unlocked between the scan and the click is an ordinary
+// race and not a reason to abandon the batch (#792).
+const unlockManyFn = vi.hoisted(() =>
+  vi.fn<(repo: string, paths: string[]) => Promise<Outcome[]>>((_r, paths) =>
+    Promise.resolve(paths.map((p) => ({ path: p, error: null }))),
+  ),
+);
+// Resolves with a COUNT, like the real command: `git worktree prune` is
+// silent on success, so the number is the only thing that separates
+// "cleared 12" from "there was nothing to do" (#793).
+const pruneFn = vi.hoisted(() => vi.fn<(repo: string) => Promise<number>>(() => Promise.resolve(0)));
 
 const markAssessedFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 const clearAssessedFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
@@ -276,6 +295,7 @@ describe("WorktreesPage", () => {
     removeFn.mockClear();
     toastSuccess.mockClear();
     toastError.mockClear();
+    toastInfo.mockClear();
   });
 
   it("says what it is doing while scanning", () => {
@@ -1943,6 +1963,211 @@ describe("WorktreesPage", () => {
       expect(screen.getByRole("button", { name: /^delete$/i })).toBeTruthy();
       openKebab();
       expect(screen.queryByRole("menuitem", { name: /remove worktree/i })).toBeNull();
+    });
+
+    /// A prunable row no longer offers the WRONG verb, and is not left a
+    /// dead end either (#793).
+    ///
+    /// Both halves in one test, because either alone is an incomplete
+    /// fix. The menu used to offer "Remove worktree" on a row whose
+    /// directory is gone, routed at `remove_worktree_forced` -- which
+    /// runs `git worktree remove` against nothing. Deleting that item
+    /// without naming the action that does work would only make the dead
+    /// end quieter.
+    it("points a prunable row at the prune action instead of offering removal", () => {
+      state.classified = [
+        wt({ safety: { kind: "prunable", detail: "gitdir file points to non-existent location" } }),
+      ];
+      render(<WorktreesPage />);
+      openKebab();
+      expect(screen.queryByRole("menuitem", { name: /remove worktree/i })).toBeNull();
+      expect(screen.getByRole("menu").textContent).toMatch(/prune stale registrations/i);
+    });
+  });
+
+  /// #793: the app diagnosed prunable worktrees, named `git worktree
+  /// prune` in its own confirmation copy, and never ran it anywhere.
+  describe("stale registrations", () => {
+    const prunableWt = (path: string) =>
+      wt({
+        path,
+        branch: "",
+        safety: { kind: "prunable", detail: "gitdir file points to non-existent location" },
+      });
+
+    beforeEach(() => {
+      pruneFn.mockClear();
+      pruneFn.mockResolvedValue(2);
+    });
+
+    /// Counted in their OWN words, never folded into the green count.
+    /// A prunable worktree is not disk to reclaim -- the directory is
+    /// already gone -- so reporting it as "safe to remove" would claim
+    /// recoverable space that does not exist.
+    it("counts stale registrations separately from safe ones", () => {
+      state.classified = [
+        wt({ path: "/code/a", safety: { kind: "safe" } }),
+        prunableWt("/code/b"),
+        prunableWt("/code/c"),
+      ];
+      render(<WorktreesPage />);
+      expect(screen.getByText(/1 safe to remove/i)).toBeTruthy();
+      // The exact string, anchored: the Prune BUTTON also says "2 stale
+      // registrations", and this assertion is about the count being its
+      // own fact on the line rather than only a label on an action.
+      expect(screen.getByText("2 stale registrations")).toBeTruthy();
+    });
+
+    /// One affordance over the repository, because `git worktree prune`
+    /// takes no path. A per-row button would clear all of them and
+    /// appear to clear one.
+    it("runs git worktree prune for the whole repository", async () => {
+      state.classified = [prunableWt("/code/b"), prunableWt("/code/c")];
+      render(<WorktreesPage />);
+      fireEvent.click(screen.getByRole("button", { name: /prune 2 stale registrations/i }));
+      await waitFor(() => expect(pruneFn).toHaveBeenCalledWith("/code/proj"));
+      // No confirmation dialog: nothing recoverable is deleted, and a
+      // dialog over an action with no loss teaches users to click
+      // through the ones that matter.
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+
+    /// The COUNT is the result. `git worktree prune` is silent on
+    /// success, so a bare "Pruned" could not tell a cleared repository
+    /// from one somebody had already pruned in a terminal.
+    it("reports how many registrations went", async () => {
+      state.classified = [prunableWt("/code/b"), prunableWt("/code/c")];
+      render(<WorktreesPage />);
+      fireEvent.click(screen.getByRole("button", { name: /prune 2 stale/i }));
+      await waitFor(() =>
+        expect(toastSuccess).toHaveBeenCalledWith(
+          expect.stringMatching(/pruned 2 stale registrations/i),
+          expect.anything(),
+        ),
+      );
+    });
+
+    /// Zero is a legitimate answer and not a success. The scan is a
+    /// snapshot, so a second click or a terminal prune in between leaves
+    /// nothing to do -- and "Pruned 0" dressed as a success would read
+    /// as a result that did not happen.
+    it("says plainly when there was nothing to prune", async () => {
+      pruneFn.mockResolvedValue(0);
+      state.classified = [prunableWt("/code/b")];
+      render(<WorktreesPage />);
+      fireEvent.click(screen.getByRole("button", { name: /prune 1 stale/i }));
+      await waitFor(() => expect(toastInfo).toHaveBeenCalled());
+      expect(toastSuccess).not.toHaveBeenCalled();
+    });
+
+    /// Silent when there is nothing stale. Most repositories have none,
+    /// and a permanent "0 stale registrations" with a disabled button
+    /// beside it is furniture.
+    it("offers nothing when no registration is stale", () => {
+      state.classified = [wt({ safety: { kind: "safe" } })];
+      render(<WorktreesPage />);
+      expect(screen.queryByText(/stale registration/i)).toBeNull();
+      expect(screen.queryByRole("button", { name: /prune/i })).toBeNull();
+    });
+  });
+
+  /// #792: `holder_running` was computed on every scan and read only by
+  /// the unlock dialog, so the user learned the holder was dead after
+  /// deciding to unlock.
+  describe("locks with no live holder", () => {
+    const deadLockWt = (path: string) =>
+      wt({
+        path,
+        safety: {
+          kind: "locked",
+          detail: lockOf({ holder_running: false, age_days: 2 }),
+        },
+      });
+
+    beforeEach(() => {
+      unlockManyFn.mockClear();
+      unlockManyFn.mockImplementation((_r, paths) =>
+        Promise.resolve(paths.map((p) => ({ path: p, error: null }))),
+      );
+    });
+
+    /// On the ROW, which is where the decision is made -- not only in a
+    /// dialog the user opens after deciding. And AFTER git's own reason,
+    /// never instead of it: the reason is the locker's own words.
+    it("says on the row that the holder process is gone", () => {
+      state.classified = [deadLockWt("/code/a")];
+      render(<WorktreesPage />);
+      const line = screen.getByText(/holder process is gone/i).textContent ?? "";
+      expect(line).toContain("some tool (pid 123)");
+      expect(line.indexOf("some tool")).toBeLessThan(line.indexOf("holder process"));
+    });
+
+    /// Silent about a holder that is running, or one the reason named
+    /// nobody to check. A live pid was true for all 20 locks on the
+    /// reporting machine and every one was abandoned, so announcing it
+    /// would spend weak evidence as proof; `null` means the question was
+    /// never asked, which must not read as a negative answer.
+    it("says nothing about a holder it could not check or that is running", () => {
+      state.classified = [
+        wt({ path: "/code/a", safety: { kind: "locked", detail: lockOf({ holder_running: true }) } }),
+        wt({ path: "/code/b", safety: { kind: "locked", detail: lockOf({ holder_running: null }) } }),
+      ];
+      render(<WorktreesPage />);
+      expect(screen.queryByText(/holder process is gone/i)).toBeNull();
+    });
+
+    /// A bulk affordance, because the condition is bulk: five after one
+    /// reboot on the reporting machine, 20+ historically. Five dialogs
+    /// each saying "the process it names is no longer running" add
+    /// clicks, not judgement.
+    it("unlocks every provably-dead lock in one gesture", async () => {
+      state.classified = [deadLockWt("/code/a"), deadLockWt("/code/b")];
+      render(<WorktreesPage />);
+      fireEvent.click(screen.getByRole("button", { name: /unlock 2 abandoned locks/i }));
+      // Still behind a dialog, unlike prune: this clears a claim on a
+      // directory that is still there, and the scope is worth reviewing
+      // once.
+      expect(screen.getByRole("dialog").textContent).toContain("/code/a");
+      fireEvent.click(screen.getByRole("button", { name: /^unlock 2 locks$/i }));
+      await waitFor(() =>
+        expect(unlockManyFn).toHaveBeenCalledWith("/code/proj", ["/code/a", "/code/b"]),
+      );
+    });
+
+    /// The narrowing that keeps #753's refusal intact. A lock whose
+    /// holder is alive, or whose reason named nobody to check, is not in
+    /// the batch: a bulk action over claims that MIGHT be live is
+    /// exactly what that issue declined to offer.
+    it("leaves locks whose holder might be live out of the batch", async () => {
+      state.classified = [
+        deadLockWt("/code/a"),
+        wt({ path: "/code/b", safety: { kind: "locked", detail: lockOf({ holder_running: true }) } }),
+        wt({ path: "/code/c", safety: { kind: "locked", detail: lockOf({ holder_running: null }) } }),
+      ];
+      render(<WorktreesPage />);
+      fireEvent.click(screen.getByRole("button", { name: /unlock 1 abandoned lock$/i }));
+      fireEvent.click(screen.getByRole("button", { name: /^unlock 1 lock$/i }));
+      await waitFor(() =>
+        expect(unlockManyFn).toHaveBeenCalledWith("/code/proj", ["/code/a"]),
+      );
+    });
+
+    /// Removal does not become easier. `is_safe()` still excludes
+    /// `locked`, so the row's own button stays disabled -- the lock
+    /// becomes EASY TO CLEAR, not silently removable.
+    it("does not make a dead-holder lock removable", () => {
+      state.classified = [deadLockWt("/code/a")];
+      render(<WorktreesPage />);
+      expect(screen.getByRole("button", { name: /^remove$/i })).toHaveProperty("disabled", true);
+    });
+
+    /// Offered only when there is something to offer.
+    it("offers nothing when every lock has a live or unknown holder", () => {
+      state.classified = [
+        wt({ safety: { kind: "locked", detail: lockOf({ holder_running: true }) } }),
+      ];
+      render(<WorktreesPage />);
+      expect(screen.queryByRole("button", { name: /abandoned lock/i })).toBeNull();
     });
   });
 

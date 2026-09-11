@@ -20,6 +20,8 @@ import {
   useRemovalProgress,
   useAssessment,
   useUnlockWorktree,
+  useUnlockWorktrees,
+  usePruneWorktrees,
 } from "../api/hooks";
 import {
   formatSize,
@@ -41,6 +43,7 @@ import {
   refAge,
   lockAge,
   lockHolderNote,
+  isDeadLock,
   sortWorktrees,
   WORKTREE_SORT_LABELS,
   type WorktreeSort,
@@ -333,7 +336,17 @@ function Row({
               ? "Delete this directory — its repository is gone, so nothing about the contents can be checked first"
               : safe
                 ? "Remove this worktree"
-                : safetyReason(wt.safety)
+                : // A prunable row says where its action IS, which is
+                  // the dead end #793 reported: the button is correctly
+                  // disabled -- there is no directory to remove -- and
+                  // the tooltip restating "directory is gone — prunable"
+                  // told the user a diagnosis they had already read on
+                  // the row, with no remedy. Now it names the header
+                  // affordance, and says why the action is not here: the
+                  // verb is repository-wide.
+                  wt.safety.kind === "prunable"
+                  ? `${safetyReason(wt.safety)} — there is nothing to remove. Use “Prune stale registrations” above the list; git prunes a whole repository at once.`
+                  : safetyReason(wt.safety)
           }
           className={`shrink-0 rounded border px-2 py-0.5 text-xs ${
             (safe || orphaned) && !removing
@@ -785,6 +798,26 @@ export function WorktreesPage() {
   /// would put them one boolean away from showing the wrong one.
   const [unlocking, setUnlocking] = useState<Worktree | null>(null);
   const unlock = useUnlockWorktree();
+  /// The bulk unlock's dialog and in-flight flag (#792).
+  ///
+  /// Two pieces of state rather than one nullable list, because the
+  /// batch outlives its dialog: the dialog closes on confirm so the user
+  /// gets their app back -- the same decision the bulk removal made for
+  /// the same reason -- and the button then needs to know work is still
+  /// running. The rows themselves come from `deadLocks` below, recomputed
+  /// each render, so a freezing snapshot cannot go stale against them.
+  const [bulkUnlockOpen, setBulkUnlockOpen] = useState(false);
+  const [bulkUnlockBusy, setBulkUnlockBusy] = useState(false);
+  const unlockMany = useUnlockWorktrees();
+  /// Pruning's in-flight flag, and no dialog (#793).
+  ///
+  /// Deliberately the only cleanup on this page with no confirmation.
+  /// Every registration it clears describes a directory git has already
+  /// reported gone, so there is nothing to lose and nothing to review --
+  /// and a dialog over an action with no recoverable loss is how users
+  /// learn to click through the dialogs that do matter.
+  const [pruning, setPruning] = useState(false);
+  const prune = usePruneWorktrees();
   const [pullingPath, setPullingPath] = useState<string | null>(null);
   const removeOrphanFn = useRemoveOrphan();
   // Every repository's sizes, only on the all-repositories view. One
@@ -821,6 +854,50 @@ export function WorktreesPage() {
       },
     );
   };
+  /// Clear this repository's stale worktree registrations (#793).
+  ///
+  /// No confirmation: see `pruning`. What it does need is an HONEST
+  /// result, and the count is it -- `git worktree prune` is silent on
+  /// success, so a bare "Pruned" would be indistinguishable from a
+  /// no-op on a repository somebody had already pruned in a terminal.
+  /// The Rust side counts by listing before and after, so the number is
+  /// what actually went rather than what we hoped would.
+  ///
+  /// A zero is reported as a neutral message, not a success and not an
+  /// error. Nothing was wrong and nothing happened, and dressing that up
+  /// either way would misdescribe it.
+  const runPrune = () => {
+    setPruning(true);
+    prune(selected?.path ?? "").then(
+      (cleared) => {
+        setPruning(false);
+        if (cleared === 0) {
+          toast.info("Nothing to prune", {
+            description:
+              "Git found no stale registrations — they may already have been cleared.",
+          });
+        } else {
+          toast.success(
+            `Pruned ${cleared} stale registration${cleared === 1 ? "" : "s"}`,
+            {
+              // Says what did NOT happen as plainly as what did. The
+              // word "prune" beside a list of worktrees invites reading
+              // this as a deletion, and on a page whose other buttons
+              // delete directories that confusion is worth one line.
+              description: "No files were deleted — only git's records of directories already gone.",
+            },
+          );
+        }
+      },
+      (e: unknown) => {
+        setPruning(false);
+        toast.error("Could not prune stale registrations", {
+          description: typeof e === "string" ? e : undefined,
+        });
+      },
+    );
+  };
+
   const pull = usePullCheckout();
 
   /// Fast-forward the main checkout, reporting git's own words either
@@ -1059,6 +1136,28 @@ export function WorktreesPage() {
   const safeKnown = !classifying && !classifyFailed;
   const shownSafe = shown.filter((w) => isSafe(w.safety));
   const safeCount = shownSafe.length;
+  /// Stale registrations, counted and labelled SEPARATELY from "safe to
+  /// remove" (#793).
+  ///
+  /// Their own count on purpose, and the issue is explicit that this is
+  /// the right shape: a prunable worktree is not unsafe, it is a
+  /// different verb. `is_safe()` stays a two-variant allowlist, the
+  /// Remove button stays disabled on these rows because there is no
+  /// directory to remove, and the thing that was missing was never a
+  /// wider gate -- it was an action and a number of its own. Folding
+  /// them into the green count would claim 12 directories are
+  /// recoverable disk when they are 12 dangling pointers.
+  const shownPrunable = shown.filter((w) => w.safety.kind === "prunable");
+  const prunableCount = shownPrunable.length;
+  /// Locks whose named holder is provably gone (#792).
+  ///
+  /// `isDeadLock` narrows to `holder_running === false` -- see its own
+  /// doc for why `null` must not count. These rows are the ones a bulk
+  /// unlock may touch; every other locked row keeps the single-row
+  /// confirmation, because a bulk action over claims that might be live
+  /// is exactly what #753 refused to offer and was right to.
+  const shownDeadLocks = shown.filter(isDeadLock);
+  const deadLockCount = shownDeadLocks.length;
   // Same honesty rule as the all-repositories rollup: an unmeasured
   // size is null, and counting it as zero would report a confident
   // wrong total. Sizes arrive in their own pass after safety, so this
@@ -1112,6 +1211,89 @@ export function WorktreesPage() {
             <HelpButton topic="worktree-safety" />
           </span>
         )}
+        {/* A SECOND count, in its own words and its own colour (#793).
+
+            "12 stale registrations" is not a subset of "safe to remove"
+            and must not read as one: there is no directory behind these,
+            so they are not disk to reclaim and the Remove button is
+            rightly disabled on them. Grey, matching the rows' own tone,
+            because nothing here is at risk and nothing is being asked of
+            the user's judgement.
+
+            Silent at zero. Most repositories have none, and a permanent
+            "0 stale registrations" would be furniture. */}
+        {safeKnown && prunableCount > 0 ? (
+          <span className="text-xs text-[#8b949e]">
+            {prunableCount} stale registration{prunableCount === 1 ? "" : "s"}
+          </span>
+        ) : null}
+        {/* The action #793 found missing entirely. `git worktree prune`
+            appeared in three prose comments in this repository and in no
+            argument list anywhere, so the app diagnosed the condition,
+            named the remedy, disabled the button that would be wrong,
+            and sent the user to a terminal.
+
+            ONE affordance over the repository rather than a button per
+            row, because that is the shape of git's verb: `prune` takes
+            no path and clears every stale registration. A per-row button
+            would have cleared all 12 and said it cleared one.
+
+            No confirmation behind it, unlike every other cleanup on this
+            page -- see `pruning`'s own note. Styled as an ordinary
+            action, not a destructive one: red here would put a dangling
+            pointer in the same visual class as deleting a directory
+            full of unpushed commits. */}
+        {safeKnown && prunableCount > 0 ? (
+          <button
+            type="button"
+            disabled={pruning}
+            onClick={() => runPrune()}
+            title="Run `git worktree prune` — clears registrations whose directory is already gone. Nothing on disk is deleted."
+            className="rounded border border-[#30363d] px-2 py-0.5 text-xs text-[#e6edf3] hover:bg-[#161b22] disabled:opacity-50"
+          >
+            {pruning
+              ? "Pruning…"
+              : `Prune ${prunableCount} stale registration${prunableCount === 1 ? "" : "s"}`}
+          </button>
+        ) : null}
+        {/* Dead-holder locks, counted separately again and for the same
+            reason (#792): this is not disk to reclaim, it is an obstacle
+            that has stopped being one. Grey, matching these rows' new
+            tone -- a lock nothing holds is bookkeeping, and amber would
+            keep asking for the judgement that is no longer required. */}
+        {safeKnown && deadLockCount > 0 ? (
+          <span className="text-xs text-[#8b949e]">
+            {deadLockCount} lock{deadLockCount === 1 ? "" : "s"} with no live holder
+          </span>
+        ) : null}
+        {/* The low-friction route for the provably-dead case (#792).
+
+            A BULK affordance because the condition is bulk: five on the
+            reporting machine after one reboot, 20+ historically, and
+            clicking through five separate confirmations that each say
+            "the process it names is no longer running" adds no judgement
+            — it only adds clicks to a decision already made.
+
+            Still behind a dialog, unlike Prune, and the line between
+            them is real: pruning clears a pointer to a directory that is
+            gone, while this clears a claim on a directory that is still
+            there. The dialog lists the paths, so the bulk action is
+            reviewed once rather than not at all.
+
+            Amber, like the single-row unlock item: reversible by `git
+            worktree lock`, so not red, but not a plain action either. */}
+        {safeKnown && deadLockCount > 0 ? (
+          <button
+            type="button"
+            disabled={bulkUnlockBusy}
+            onClick={() => setBulkUnlockOpen(true)}
+            className="rounded border border-[#d29922]/40 px-2 py-0.5 text-xs text-[#d29922] hover:bg-[#d29922]/10 disabled:opacity-50"
+          >
+            {bulkUnlockBusy
+              ? "Unlocking…"
+              : `Unlock ${deadLockCount} abandoned lock${deadLockCount === 1 ? "" : "s"}`}
+          </button>
+        ) : null}
         {/* A COUNT, not a bare "measuring sizes…".
 
             The old label said only that work was happening, which is
@@ -1462,6 +1644,121 @@ export function WorktreesPage() {
                 className="rounded border border-[#d29922]/40 px-3 py-1.5 text-sm font-medium text-[#d29922] hover:bg-[#d29922]/10"
               >
                 Unlock it
+              </button>
+            </div>
+          </DialogContent>
+        </Dialog>
+      ) : null}
+
+      {/* The bulk unlock confirmation (#792).
+
+          Narrower than it looks: only rows where `holder_running` is
+          explicitly false get here, so every line in the list below has
+          a named process that has been checked and is not running. A
+          lock whose holder is alive, or whose reason named nobody to
+          check, is excluded and keeps the single-row dialog -- a bulk
+          action over claims that MIGHT be live is exactly what #753
+          refused to offer, and nothing here reopens that.
+
+          So the dialog's job is narrower than the single-row one's. That
+          one exists to make the user read evidence and weigh it; this
+          one states the evidence is already decisive and shows the
+          scope, because the remaining question is "which directories"
+          rather than "should I". Hence the path list and no per-row
+          holder prose.
+
+          Deliberately NOT styled as destructive, for the reason the
+          single-row dialog gives: nothing is deleted and `git worktree
+          lock` puts it back. */}
+      {bulkUnlockOpen ? (
+        <Dialog open onOpenChange={(o) => !o && setBulkUnlockOpen(false)}>
+          <DialogContent className="max-w-2xl">
+            <DialogTitle>
+              Unlock {deadLockCount} abandoned lock{deadLockCount === 1 ? "" : "s"}?
+            </DialogTitle>
+            <ActingOnDesktop />
+            <p className="mt-2 text-sm text-[#8b949e]">
+              Each of these locks names a process, and each of those processes is
+              no longer running — so nothing is working in these directories.
+              Unlocking deletes nothing and can be undone by locking them again.
+            </p>
+            {/* What the unlock does NOT do, said before the button
+                rather than only in the toast afterwards. On a page where
+                the adjacent bulk button deletes directories, a user
+                clicking this one deserves to know the rows will still be
+                there. */}
+            <p className="mt-2 text-sm text-[#8b949e]">
+              The worktrees stay where they are. Their safety verdicts are
+              re-checked afterwards, and each is removable only if it earns that
+              on its own.
+            </p>
+            {/* Every path. These are claims on real directories, and a
+                count alone would make the scope unreviewable. */}
+            <ul className="mt-3 max-h-64 overflow-y-auto font-mono text-xs text-[#8b949e]">
+              {shownDeadLocks.map((w) => (
+                <li key={w.path} className="py-0.5">
+                  {w.path}
+                </li>
+              ))}
+            </ul>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setBulkUnlockOpen(false)}
+                className="rounded border border-[#30363d] px-3 py-1.5 text-sm hover:bg-[#21262d]"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const targets = shownDeadLocks.map((w) => w.path);
+                  // Closed NOW, like the bulk removal and for the same
+                  // reason: the work does not need the dialog, progress
+                  // is on the toolbar button, and twenty sequential
+                  // unlocks should not hold the app.
+                  setBulkUnlockBusy(true);
+                  setBulkUnlockOpen(false);
+                  unlockMany(selected?.path ?? "", targets).then(
+                    (outcomes) => {
+                      setBulkUnlockBusy(false);
+                      const failed = outcomes.filter((o) => o.error !== null);
+                      const ok = outcomes.length - failed.length;
+                      // Never a bare "done". A row somebody else
+                      // unlocked between the scan and the click is an
+                      // ordinary race, and hiding the refusals would
+                      // misreport which locks are still in place.
+                      if (failed.length === 0) {
+                        toast.success(`Unlocked ${ok} worktree${ok === 1 ? "" : "s"}`, {
+                          description:
+                            "The worktrees are still there — their safety verdicts will refresh.",
+                        });
+                      } else {
+                        toast.error(
+                          `${failed.length} of ${outcomes.length} could not be unlocked`,
+                          {
+                            description: failed
+                              .map((f) => `${pathBasename(f.path)}: ${f.error}`)
+                              .join("\n"),
+                          },
+                        );
+                      }
+                    },
+                    (e: unknown) => {
+                      setBulkUnlockBusy(false);
+                      if (isCancelled(e)) return;
+                      toast.error("The bulk unlock could not run", {
+                        description: typeof e === "string" ? e : undefined,
+                      });
+                    },
+                  );
+                }}
+                disabled={bulkUnlockBusy}
+                className="rounded border border-[#d29922]/40 px-3 py-1.5 text-sm font-medium text-[#d29922] hover:bg-[#d29922]/10 disabled:opacity-50"
+              >
+                {bulkUnlockBusy
+                  ? "Unlocking…"
+                  : `Unlock ${deadLockCount} lock${deadLockCount === 1 ? "" : "s"}`}
               </button>
             </div>
           </DialogContent>

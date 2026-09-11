@@ -4,8 +4,10 @@ import {
   canClaudify,
   forceWarning,
   formatSize,
+  isDeadLock,
   isSafe,
   lockAge,
+  lockHolderIsGone,
   lockHolderNote,
   lockReason,
   pathBasename,
@@ -245,6 +247,41 @@ describe("lockReason", () => {
     );
     expect(line).toBe("locked — no reason given");
   });
+
+  // #792: the row is where the decision is made, and it never read
+  // `holder_running` -- the single consumer was the unlock dialog, so the
+  // user learned the holder was dead only after deciding to unlock.
+  //
+  // APPENDED, never folded in. Git's reason is the locker's own words and
+  // rewriting them would be the app inventing a claim on another
+  // process's behalf, so the exact full string is asserted rather than a
+  // substring: that is what pins the order.
+  it("says when the named holder is gone, after git's own reason", () => {
+    const line = lockReason(lock({ age_days: 2, holder_running: false }));
+    expect(line).toBe("locked 2 days ago by some tool (pid 123) — holder process is gone");
+  });
+
+  // Before the merge verdict, because the two answer different questions
+  // and they are read in that order: "is anything holding this" decides
+  // whether to unlock at all, "what is underneath" decides whether it was
+  // worth it.
+  it("puts the dead holder before what is underneath", () => {
+    const line = lockReason(
+      lock({ age_days: 2, holder_running: false, underlying: { kind: "safe" } }),
+    );
+    expect(line).toBe(
+      "locked 2 days ago by some tool (pid 123) — holder process is gone — merged, would be safe once unlocked",
+    );
+  });
+
+  // Silent in both the other cases. A running pid was true for all 20
+  // locks on the reporting machine and every one was abandoned, so
+  // announcing it would spend weak evidence as proof; `null` means
+  // nothing was named to check.
+  it("says nothing about a holder that is running or was never checked", () => {
+    expect(lockReason(lock({ holder_running: true }))).not.toContain("holder process");
+    expect(lockReason(lock({ holder_running: null }))).not.toContain("holder process");
+  });
 });
 
 describe("safetyTone", () => {
@@ -280,6 +317,69 @@ describe("safetyTone", () => {
     expect(prunable).toContain("8b949e");
     expect(prunable).not.toContain("3fb950");
   });
+
+  // #792: amber asks for a judgement, and a lock whose named process is
+  // provably gone has none left to make -- so it takes the grey that
+  // `prunable` already uses for the other pure-bookkeeping state. Still
+  // not green: green means one-click removable, and this takes an unlock
+  // first.
+  it("tones a lock with no live holder as stale rather than amber", () => {
+    const dead = safetyTone({ kind: "locked", detail: lock({ holder_running: false }) });
+    expect(dead).toContain("8b949e");
+    expect(dead).not.toContain("d29922");
+    expect(dead).not.toContain("3fb950");
+    // And only for the decisive case. A running holder keeps the amber
+    // that asks the user to think, and an unchecked one must not be
+    // treated as a negative answer.
+    expect(safetyTone({ kind: "locked", detail: lock({ holder_running: true }) })).toContain(
+      "d29922",
+    );
+    expect(safetyTone({ kind: "locked", detail: lock({ holder_running: null }) })).toContain(
+      "d29922",
+    );
+  });
+});
+
+describe("lockHolderIsGone", () => {
+  // The distinction the whole of #792 rests on, and the reason this is a
+  // named predicate rather than `=== false` written out in three places.
+  // `null` is "nobody was named to check", not "nothing holds it" --
+  // most locks not written by our own tooling land there, and treating
+  // an unasked question as a negative answer is how a live claim gets
+  // cleared.
+  it("is true only when a named process was checked and found gone", () => {
+    expect(lockHolderIsGone(lock({ holder_running: false }))).toBe(true);
+    expect(lockHolderIsGone(lock({ holder_running: true }))).toBe(false);
+    expect(lockHolderIsGone(lock({ holder_running: null }))).toBe(false);
+  });
+});
+
+describe("isDeadLock", () => {
+  const wt = (safety: Safety): Worktree => ({
+    path: "/code/a",
+    branch: "feature",
+    head: "abc",
+    size_bytes: null,
+    safety,
+    is_main: false,
+    merged_at: null,
+    upstream: null,
+    last_commit: null,
+  });
+
+  // The bulk unlock's selector (#792). Narrower than "locked" on
+  // purpose: a batch over claims that might be live is exactly what #753
+  // refused to offer, and nothing here reopens that.
+  it("selects locked rows whose holder is provably gone, and nothing else", () => {
+    expect(isDeadLock(wt({ kind: "locked", detail: lock({ holder_running: false }) }))).toBe(true);
+    expect(isDeadLock(wt({ kind: "locked", detail: lock({ holder_running: true }) }))).toBe(false);
+    expect(isDeadLock(wt({ kind: "locked", detail: lock({ holder_running: null }) }))).toBe(false);
+    // Not a lock at all. `prunable` is the near miss worth naming: it is
+    // also pure stale bookkeeping and also grey, and it has its own verb
+    // (#793) rather than being swept into this batch.
+    expect(isDeadLock(wt({ kind: "prunable", detail: "gone" }))).toBe(false);
+    expect(isDeadLock(wt({ kind: "safe" }))).toBe(false);
+  });
 });
 
 describe("forceWarning", () => {
@@ -300,11 +400,32 @@ describe("forceWarning", () => {
     expect(forceWarning({ kind: "unmerged" })).toContain("does not consider this safe");
   });
 
-  // #753: forcing does not work here, and the dialog must say so.
-  // The forced path relaxes Headstate's gate but still calls git
-  // without `--force`, and git refuses a locked tree on its own
-  // account -- so the general wording would walk the user through a
-  // destructive-sounding confirmation and then hand them an error.
+  // #798: the count is the sentence the user needed, and the app had
+  // it all along. The generic line described Headstate's opinion where
+  // the question is what disappears -- and this is now the one
+  // previously-impossible removal that actually goes through, so the
+  // stakes have to be stated before it does.
+  it("names how many uncommitted files a dirty worktree would lose", () => {
+    const warning = forceWarning({ kind: "dirty", detail: 2 });
+    expect(warning).toContain("2 uncommitted files");
+    expect(warning).toContain("deleted permanently");
+    expect(warning).toContain("cannot be undone");
+    expect(warning).not.toContain("does not consider this safe");
+  });
+
+  // One file is one file. A plural here would be the kind of small
+  // wrongness that makes a user doubt the number itself, at the moment
+  // the number is the whole reason to read the dialog.
+  it("says it in the singular for one file", () => {
+    expect(forceWarning({ kind: "dirty", detail: 1 })).toContain("1 uncommitted file will");
+  });
+
+  // #753/#798: forcing does not work here, and the dialog must say so.
+  // Since #798 that is a decision rather than a gap -- git wants
+  // `--force --force` for a lock and Headstate passes it once, because
+  // a lock is another process's claim. So git still refuses, and the
+  // general wording would walk the user through a destructive-sounding
+  // confirmation and then hand them an error.
   it("tells the truth about a locked worktree", () => {
     const warning = forceWarning({ kind: "locked", detail: lock() });
     expect(warning).toContain("locked");
@@ -313,10 +434,13 @@ describe("forceWarning", () => {
   });
 
   // Nothing can be lost when the directory is already gone, so the
-  // destructive framing would be simply false.
+  // destructive framing would be simply false. Since #793 it also
+  // names the action that exists rather than a command to retype
+  // elsewhere -- the app can run `git worktree prune` itself now.
   it("does not threaten loss for a directory that is already gone", () => {
     const warning = forceWarning({ kind: "prunable", detail: "gone" });
-    expect(warning).toContain("loses nothing");
+    expect(warning).toContain("Nothing can be lost");
+    expect(warning).toContain("Prune stale registrations");
     expect(warning).not.toContain("cannot be undone");
   });
 });

@@ -251,6 +251,26 @@ impl Lock {
             n => Some(format!("{n} days ago")),
         }
     }
+
+    /// Whether the process this lock names is PROVABLY gone.
+    ///
+    /// Its own predicate, mirrored as `lockHolderIsGone` in
+    /// `src/lib/worktrees.ts`, because three places now turn on this one
+    /// fact -- the row's prose, the row's colour, and which rows a bulk
+    /// unlock may touch -- and a `== Some(false)` written out three
+    /// times is three chances to drift into `!= Some(true)` (#792).
+    ///
+    /// That distinction is the whole point. `Some(false)` is the one
+    /// decisive signal available here: the reason named a process and it
+    /// is not running. `None` means the reason named no process to
+    /// check, and it must NOT read as "nothing holds it" -- most locks
+    /// not written by our own tooling land there, and treating an
+    /// unasked question as a negative answer is how a live claim gets
+    /// cleared. `Some(true)` is weak evidence in the other direction and
+    /// is not spent as proof either; see `holder_running`.
+    pub fn holder_is_gone(&self) -> bool {
+        self.holder_running == Some(false)
+    }
 }
 
 /// Defaults to `Pending`, never `Safe`.
@@ -344,6 +364,34 @@ impl Safety {
                     // Says the lock carries no note rather than
                     // trailing off, which would read as a display bug.
                     None => s.push_str(" — no reason given"),
+                }
+                // APPENDED after git's reason, never folded into it
+                // (#792).
+                //
+                // `holder_running` was computed on every scan from the
+                // beginning and read by nothing but the unlock dialog,
+                // so the user learned the holder was dead only AFTER
+                // deciding to unlock and opening the confirmation --
+                // which is the wrong end of the decision. The row is
+                // where the decision is made.
+                //
+                // After the reason rather than replacing it, because
+                // the reason is the locker's own words and rewriting
+                // them would be the app inventing a claim on another
+                // process's behalf (`Lock::reason` is explicit about
+                // this). The row therefore reads "locked 2 days ago by
+                // claude agent … — holder process is gone": git's
+                // sentence, then ours.
+                //
+                // Said ONLY for `Some(false)`. `Some(true)` is weak
+                // evidence -- on the reporting machine it was true for
+                // all 20 locks and every one was abandoned -- and
+                // printing "holder still running" on every row would
+                // spend that weak evidence as though it were proof.
+                // `None` means the reason named no pid to check, and
+                // silence is the honest rendering of that.
+                if lock.holder_is_gone() {
+                    s.push_str(" — holder process is gone");
                 }
                 // What the row could not say before: whether clearing
                 // the lock would reveal something disposable. Without
