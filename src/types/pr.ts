@@ -423,6 +423,19 @@ export interface PrDetail {
     /// re-run, so the button is offered only where this exists.
     run_id: number | null;
   }[];
+  /// GitHub's own count of check contexts, which `checks` can be SHORT of.
+  ///
+  /// The Rust side pages the rollup up to a budget (#790 cut it from 20
+  /// serial requests to 3, because that chain was the slow click), so a
+  /// pull request with hundreds of contexts now arrives capped. Paired
+  /// with `checks` the way `comment_count` is paired with `comments`, and
+  /// read the same way: render what arrived, say what is missing.
+  ///
+  /// Compare with `checks.length` using a saturating subtraction -- the
+  /// two numbers come from different pages of a rollup that can grow
+  /// mid-fetch, so a total BELOW the length is possible and is not a
+  /// negative shortfall.
+  checks_total: number;
 }
 
 /// How an image's provenance was established. A recorded fact and a

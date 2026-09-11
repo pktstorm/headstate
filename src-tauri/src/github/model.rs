@@ -408,6 +408,23 @@ pub struct PrDetail {
     #[serde(default)]
     pub review_threads: Vec<ReviewThread>,
     pub checks: Vec<CheckRun>,
+    /// GitHub's own count of check contexts on the head commit, so a
+    /// CAPPED list can say what it is missing (#790).
+    ///
+    /// Paired with `checks` the way `comment_count` is paired with
+    /// `comments`, and for the same reason: the panel renders what
+    /// arrived and annotates the gap rather than presenting a subset as
+    /// complete. `append_remaining_checks` explains why this matters
+    /// more here than for comments -- a short check list reads as a
+    /// green pull request.
+    ///
+    /// A count SMALLER than `checks.len()` is possible (the two numbers
+    /// come from different pages of a rollup that can grow mid-fetch),
+    /// so every reader must treat the difference as saturating rather
+    /// than trusting it to be non-negative -- the same care
+    /// `poll::truncation_payload` takes with `issueCount`.
+    #[serde(default)]
+    pub checks_total: u64,
 }
 
 #[cfg(test)]
