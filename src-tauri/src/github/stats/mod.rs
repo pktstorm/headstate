@@ -15,6 +15,12 @@
 //!
 //! # The shape of a load
 //!
+//! 0. [`tree`] enumerates what scopes EXIST -- the organisations,
+//!    repositories and people a question can be asked about (#825). It
+//!    fetches no statistics at all: two requests, one rate-limit point
+//!    each, measured. Discovery is cheap and measurement is separate
+//!    (`hooks.ts:712-717`), so entering the view costs 2 points and
+//!    clicking is what spends.
 //! 1. [`scope`] turns a subject and a scope into a search qualifier. Every
 //!    stats query before this was hardcoded `author:@me`, which is the one
 //!    thing blocking the second audience #823 names.
@@ -42,8 +48,13 @@ pub mod fetch;
 pub mod query;
 pub mod scope;
 pub mod slice;
+/// The scope hierarchy #825's sidebar renders: which organisations,
+/// repositories and people exist to ask about. Cheap by construction --
+/// two requests, one point each, no statistics.
+pub mod tree;
 
 pub use budget::{Budget, Spend};
 pub use fetch::{load_count, load_detail, Outcome};
 pub use query::Slice;
 pub use scope::{Measure, Scope, StatsQuery, Subject};
+pub use tree::{load_tree, MemberRow, OrgTree, RepoRow, Tree};

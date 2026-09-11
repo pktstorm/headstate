@@ -22,6 +22,35 @@ export interface Filters {
   awaitingReviewOnly?: boolean;
   readyToQueueOnly?: boolean;
   sort?: "newest" | "oldest" | "recently-updated" | "least-recently-updated";
+  /// WHERE a PR Stats question is scoped, mirroring
+  /// `github::stats::scope::Scope` (#827) rather than inventing a parallel
+  /// representation (#825 requirement 7).
+  ///
+  /// `"repo"` carries `owner/name` in `statsScopeValue`, `"org"` and
+  /// `"user"` carry a login, and `"all"` carries nothing. The kind and the
+  /// value are two fields rather than one `"org:acme"`-style string because
+  /// the Rust command takes them as two parameters (`scopeKind`,
+  /// `scopeValue`) -- a packed string would be assembled here and split
+  /// there, which is two places for the grammar to disagree.
+  ///
+  /// `undefined` means no scope has been chosen, which is NOT the same as
+  /// `"all"`: the sidebar has to be able to tell "nothing clicked yet" from
+  /// "the widest scope was deliberately clicked", because only the second
+  /// should highlight a row.
+  statsScopeKind?: "repo" | "org" | "user" | "all";
+  statsScopeValue?: string;
+  /// WHOSE PRs a PR Stats question is about -- a login, mirroring
+  /// `Subject::Login`.
+  ///
+  /// `undefined` is `Subject::Viewer`, which is the default the stats page
+  /// has always answered ("how am I doing?"). A login here is the second
+  /// audience #823 names, reached by clicking a Members row.
+  ///
+  /// Deliberately INDEPENDENT of the scope fields: "this person, in this
+  /// org" is the natural question a member row under an org heading asks,
+  /// and collapsing the two axes into one selection would make it
+  /// unaskable.
+  statsSubject?: string;
 }
 
 /// How many filters are narrowing the list.
@@ -35,9 +64,21 @@ export interface Filters {
 /// button and speaks for itself, and `sort` because ordering the list is
 /// not hiding any of it -- counting either would make the badge argue
 /// with what the user can already see.
+///
+/// The three `stats*` keys are excluded for the reason `repo` is excluded
+/// from the triage chips below: they are sidebar NAVIGATION, not filters
+/// narrowing a list. They live in `pr-stats`'s filter set because that is
+/// where the per-view store keeps a view's selection, and this bar never
+/// renders on that view -- but a count that would be wrong if it ever did
+/// is a trap, and excluding them costs a line.
 export function activeFilterCount(filters: Filters): number {
+  const navigation = new Set<keyof Filters>([
+    "statsScopeKind",
+    "statsScopeValue",
+    "statsSubject",
+  ]);
   return (Object.entries(filters) as [keyof Filters, unknown][]).filter(([key, value]) => {
-    if (key === "query" || key === "sort") return false;
+    if (key === "query" || key === "sort" || navigation.has(key)) return false;
     if (Array.isArray(value)) return value.length > 0;
     return value !== undefined && value !== false;
   }).length;

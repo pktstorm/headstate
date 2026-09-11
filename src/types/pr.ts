@@ -1341,3 +1341,103 @@ export interface FootprintProcess {
   /// number that means nothing to a reader.
   memory: number;
 }
+
+/// What a stats load cost in GitHub rate-limit points.
+///
+/// Mirrors `github::stats::budget::Spend`. camelCase here, unlike most of
+/// this file, because that type carries `#[serde(rename_all = "camelCase")]`
+/// -- the whole stats layer from #827 does, and matching the Rust attribute
+/// is what keeps these names honest rather than aspirational.
+///
+/// `points` is a FLOOR rather than a total when `unmetered` is non-zero: a
+/// response that carried no `rateLimit` is counted as unmetered instead of
+/// guessed at 1, because a guess recorded as a measurement is the defect
+/// `budget.rs` exists to prevent.
+///
+/// Not exported: it is reached through `StatsTree.spend`, and `knip` fails
+/// the lint on a type nothing imports by name. #826 will export it the
+/// moment a component takes a spend as a prop.
+interface Spend {
+  points: number;
+  requests: number;
+  unmetered: number;
+  /// The lowest remaining budget GitHub reported. `null` means nothing
+  /// reported one, which is NOT the same as zero.
+  remaining: number | null;
+  resetAt: string | null;
+}
+
+/// One repository a stats question can be scoped to (#825).
+export interface RepoRow {
+  /// `owner/name` -- exactly what the `repo` scope value needs, so a clicked
+  /// row needs no reassembly.
+  nameWithOwner: string;
+  /// When anything was last pushed, or `null` for a repository never pushed
+  /// to.
+  ///
+  /// The rows are ordered by this, descending, server-side. It is shown
+  /// because that ordering is otherwise invisible: a user cannot tell
+  /// whether the twelfth row is a week stale or three years dead.
+  ///
+  /// CAVEAT, carried from the Rust side so it is not lost in translation:
+  /// this is ANY push, not pull-request activity. A repository whose only
+  /// recent commit was a dependency bot outranks one with a week-old human
+  /// PR. Ordering by recent PR count instead would need one search per
+  /// repository before the user clicked anything, which is the opposite of
+  /// cheap discovery -- see `github::stats::tree`.
+  pushedAt: string | null;
+  isArchived: boolean;
+}
+
+/// One person a stats question can be scoped to.
+export interface MemberRow {
+  /// The login. The identity statistics are actually keyed on
+  /// (`author:<login>`), which is why it is shown even when `name` is
+  /// present -- a board of display names alone is unverifiable against
+  /// GitHub's own UI.
+  login: string;
+  name: string | null;
+  avatarUrl: string | null;
+}
+
+/// One organisation in the scope hierarchy.
+export interface OrgTree {
+  login: string;
+  name: string | null;
+  /// Repositories, most-recently-pushed first. May be shorter than
+  /// `reposTotal` -- see that field.
+  repos: RepoRow[];
+  /// What GitHub says the true count is. Greater than `repos.length` means
+  /// the list is a SAMPLE, and the UI must say so rather than present a
+  /// truncated list as complete (#802 and #790 both shipped that bug).
+  reposTotal: number;
+  members: MemberRow[];
+  membersTotal: number;
+  /// Whether the organisation's contents could be read AT ALL.
+  ///
+  /// `false` means the token listed the org and was then refused its detail
+  /// -- typically a SAML-SSO authorisation not granted, or a token without
+  /// `read:org`. Both lists are empty in that case, and rendering that as
+  /// "no members" is the #769 failure: silence read as success. The UI must
+  /// branch on this flag, never on `members.length === 0`.
+  readable: boolean;
+}
+
+/// The whole scope hierarchy the PR Stats sidebar renders (#825).
+///
+/// Enumerated from GitHub, never from a local checkout: where you happen to
+/// have cloned something has no bearing on whose statistics you may want to
+/// read. Costs 2 rate-limit points and carries NO statistics -- discovery is
+/// cheap, measurement happens on click (`hooks.ts:712-717`).
+export interface StatsTree {
+  /// The authenticated login. The Personal section's scope value.
+  viewer: string;
+  orgs: OrgTree[];
+  orgsTotal: number;
+  /// The viewer's OWN repositories -- owner-affiliated, so this does not
+  /// repeat the organisation sections.
+  personal: RepoRow[];
+  personalTotal: number;
+  refusedFields: number;
+  spend: Spend;
+}

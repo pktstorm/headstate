@@ -47,6 +47,11 @@ vi.mock("./api/hooks", () => ({
     prefs: { enabled: true, ci_failed: true, conflicted: true },
     set: () => Promise.resolve(),
   }),
+  // `StatsSidebar`'s discovery query (#825). Resolved EMPTY rather than
+  // pending: these tests are about what the PR Stats page body renders, and
+  // a pending sidebar would leave a "Finding your organizations" line in
+  // the document that a `queryByText` elsewhere could trip over.
+  useStatsTree: () => ({ data: undefined, isPending: false, error: null }),
   useReviewing: () => ({ data: mockReviewing(), isLoading: false }),
   // The badge's own cheap query, separate from the list.
   useReviewingCount: () => ({ data: mockReviewing().length }),

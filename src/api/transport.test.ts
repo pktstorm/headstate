@@ -198,6 +198,9 @@ const ROWS: Row[] = [
   // Both take no arguments: the health sample is of THIS machine and
   // the history is bounded on the Rust side, so there is nothing for a
   // caller to scope or to ask for more of.
+  // Argument-free: the scope hierarchy is everything the TOKEN can see, so
+  // there is nothing for a caller to narrow. #825.
+  row(api.statsTree, [], "stats_tree"),
   row(api.systemHealth, [], "system_health"),
   row(api.systemHealthHistory, [], "system_health_history"),
   row(api.systemFootprint, [], "system_footprint"),

@@ -41,6 +41,7 @@ import { SystemHealthPage } from "./components/SystemHealthPage";
 import { WorktreesPage } from "./components/WorktreesPage";
 import { QueryError, errorMessage } from "./components/QueryError";
 import { RepoSidebar } from "./components/RepoSidebar";
+import { StatsSidebar } from "./components/StatsSidebar";
 import { StatusBar } from "./components/StatusBar";
 import { SystemHealthSidebar } from "./components/SystemHealthSidebar";
 import { StatsPage } from "./components/StatsPage";
@@ -310,15 +311,25 @@ export default function App() {
       // Worktrees does, so a second sidebar would be the same rows
       // under a different name.
       <WorktreeSidebar viewCounts={{ "to-review": reviewingCount }} />
+    ) : view === "pr-stats" ? (
+      // PR Stats has its OWN sidebar now (#825), and is no longer a
+      // fall-through. It inherited `RepoSidebar` in #794 as a deliberate
+      // placeholder whose rows were "continuity and a future scope hook,
+      // not a live filter" -- `ViewSwitcher`'s doc comment said so, and
+      // said it was worth revisiting "if PR Stats is ever scoped per
+      // repo, at which point these rows stop being decoration". This is
+      // that point.
+      //
+      // The column it replaces listed repositories where the viewer has
+      // an OPEN PR (`repoCounts(prs)`), which cannot hold an
+      // organisation or a person -- so #823's second audience ("how is
+      // my team doing?") had nowhere to be asked from. This one is
+      // sourced from GitHub and consults nothing on disk.
+      <StatsSidebar viewCounts={{ "to-review": reviewingCount }} />
     ) : (
-      // My PRs and PR Stats. The fall-through is the DECISION for the
-      // second one rather than an accident of ordering: #794 settled
-      // that PR Stats keeps the repo sidebar it inherited as a panel,
-      // rather than the blank column the issue offered as a fallback.
-      // `ViewSwitcher`'s doc comment carries the reasoning, including
-      // the part that matters here -- `StatsPage` does not read
-      // `filters.repo`, so the rows are continuity and a future scope
-      // hook, not a live filter.
+      // My PRs, and any future view that falls through. The repo rows
+      // are a live filter here -- this is the view they were always
+      // about.
       <RepoSidebar prs={source} viewCounts={{ "to-review": reviewingCount }} />
     );
 

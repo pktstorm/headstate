@@ -43,6 +43,7 @@ import type {
   PrDetail,
   PullRequest,
   Stats,
+  StatsTree,
   Worktree,
   WorktreeRepo,
 } from "../types/pr";
@@ -214,6 +215,14 @@ export const replyToThread = (
 /// `Stats.merged_week`/`merged_month` are real; the other five fields
 /// always come back zero today. Does not persist to SQLite.
 export const getStats = () => call<Stats>("get_stats");
+
+/// The scope hierarchy the PR Stats sidebar renders (#825): organisations
+/// with their repositories and members, plus the viewer's own repositories.
+///
+/// Sourced from GitHub, never from a local checkout. Carries NO statistics --
+/// two requests, 2 rate-limit points total, measured -- because discovery is
+/// cheap and measurement waits for a click (`hooks.ts:712-717`).
+export const statsTree = () => call<StatsTree>("stats_tree");
 
 /// Repos and their worktrees, WITHOUT safety classification.
 ///

@@ -8,19 +8,21 @@ import { repoCounts } from "@/lib/repos";
 /// filter set). Selecting a repo writes through the shared filter store --
 /// this component holds no filter state of its own.
 ///
-/// This is the sidebar for My PRs AND for PR Stats (#794). Stats used to
-/// own a pinned row at the bottom of this column, outside the scroll area
-/// so it stayed reachable however many repos the list grew to. That row
-/// is gone: the destination moved into `ViewSwitcher`, which is where the
-/// rest of the app's navigation already lived, and a single column of
-/// repositories with nothing pinned under it is the simpler layout the
-/// old one was working around.
+/// This is the sidebar for My PRs, and the fall-through for any future
+/// view that has no column of its own. Stats used to own a pinned row at
+/// the bottom of it, outside the scroll area so it stayed reachable
+/// however many repos the list grew to. That row is gone: the destination
+/// moved into `ViewSwitcher`, which is where the rest of the app's
+/// navigation already lived.
 ///
-/// The rows stay live on both views, and highlight on either. On PR Stats
-/// a selection writes to that view's own filter set and nothing reads it
-/// yet -- `StatsPage` is a whole-account summary -- so the highlight is
-/// the honest thing to render: it says what was clicked. `ViewSwitcher`
-/// carries why the column is here at all rather than blank.
+/// It also SERVED PR Stats between #794 and #825, with the repo rows live
+/// but read by nothing. That is over: #825 gave PR Stats its own
+/// `StatsSidebar`, a GitHub-sourced hierarchy of organisations,
+/// repositories and members, because a list of repositories where the
+/// viewer has an open PR cannot hold an organisation or a person and so
+/// could not express "how is my team doing?". The `repoActive` guard below
+/// is what is left of the arrangement, and it is still worth keeping --
+/// see its comment.
 export function RepoSidebar({
   prs,
   viewCounts,
@@ -38,17 +40,18 @@ export function RepoSidebar({
       active ? "bg-[#1f6feb] text-white" : "text-[#e6edf3] hover:bg-[#161b22]"
     }`;
 
-  // Both views this sidebar serves, not just My PRs (#794). The repo rows
-  // are the navigation for each, so a selection has to look selected on PR
-  // Stats too -- and there is no longer a pinned Stats row competing for
-  // the highlight, which is what the old `panel === "list"` half of this
-  // was avoiding.
+  // My PRs is the only view whose `filters.repo` this column both writes
+  // and has read back. PR Stats was the other until #825 gave it
+  // `StatsSidebar`, and it is dropped from this list rather than left in:
+  // a highlight here would be for a filter key that view no longer uses
+  // (its scope lives in `statsScopeKind` / `statsScopeValue` now).
   //
-  // Still guarded on `view` at all, because this component is the
-  // FALLBACK sidebar in `App.tsx`: any future view that falls through to
-  // it would otherwise show a repo row highlighted for a page that never
-  // reads `filters.repo`.
-  const repoActive = view === "my-prs" || view === "pr-stats";
+  // Guarded on `view` at all because this component is the FALLBACK
+  // sidebar in `App.tsx`: any future view that falls through to it would
+  // otherwise show a repo row highlighted for a page that never reads
+  // `filters.repo` -- which is exactly the state PR Stats was in for a
+  // release.
+  const repoActive = view === "my-prs";
 
   return (
     <nav className="flex w-64 shrink-0 flex-col border-r border-[#30363d] p-3">

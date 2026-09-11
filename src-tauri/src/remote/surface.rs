@@ -80,6 +80,18 @@ pub const SURFACE: &[(&str, Class)] = &[
     // reason. The desktop's wall-clock ceiling and read-concurrency cap
     // are inside the command, so a phone's `remote_call` inherits both.
     ("stats_count", Class::Read),
+    // The scope hierarchy the stats sidebar renders (#825). A Read: two
+    // GraphQL lookups returning org, repository and member NAMES, and no
+    // statistics at all.
+    //
+    // Exposed for the same reason `stats_count` is, even though PR Stats is
+    // in `MOBILE_HIDDEN_VIEWS` today: the row classes a command by what it
+    // DOES, not by which screens currently call it, and a Local
+    // classification here would have to be revisited the moment the
+    // companion grows the view. Nothing about enumerating scopes is
+    // desktop-specific -- unlike `reveal_in_finder`, a phone could act on
+    // this answer perfectly well.
+    ("stats_tree", Class::Read),
     ("get_reviewing", Class::Read),
     ("count_reviewing", Class::Read),
     ("get_pr_detail", Class::Read),
@@ -439,6 +451,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             a.get("days")?,
         )
         .await),
+        "stats_tree" => res(commands::stats_tree(app.state()).await),
         "get_reviewing" => res(commands::get_reviewing(app.clone(), app.state()).await),
         "count_reviewing" => res(commands::count_reviewing(app.state()).await),
         "get_pr_detail" => {

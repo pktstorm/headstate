@@ -2340,6 +2340,83 @@ pub async fn stats_count(
     out
 }
 
+/// The scope hierarchy the PR Stats sidebar renders (#825).
+///
+/// Organisations with their repositories and members, plus the viewer's own
+/// repositories. No statistics: this is the DISCOVERY half of
+/// `hooks.ts:712-717`'s rule, and it runs on entering the view, so it has
+/// to be cheap enough that arriving at a page costs nothing anyone would
+/// notice. MEASURED at **2 rate-limit points and ~1.6s total** for this
+/// account's whole hierarchy (2 orgs, 8 members, 59 org repositories, 6
+/// personal ones) -- see `github::stats::tree` for the figures per request.
+///
+/// # Why this replaces the local-repo list rather than adding to it
+///
+/// The sidebar listed `repoCounts(prs)` -- repositories where the viewer
+/// has an OPEN PR (`src/lib/repos.ts`). That list cannot hold an
+/// organisation or a person, so the second audience #823 names ("how is my
+/// team doing?") had nowhere to be asked from, and a repository with no
+/// current PR was missing even though its history is what a lead wants.
+///
+/// # No `Budget::permits` check, unlike `stats_count`
+///
+/// `stats_count` refuses to start when the remaining budget is near the
+/// `RESERVE` floor, because a scope load can cost dozens of points and the
+/// thing being protected is the poll loop's standing obligation. This costs
+/// **2**, measured, and refusing it would mean a sidebar that cannot draw
+/// its own rows -- leaving the user no way to see WHICH scope they might
+/// load, on the one screen whose job is to say what exists. Two points is
+/// inside the noise of a single poll, and the expensive thing the user
+/// might click from here is still gated by `stats_count`'s own check.
+///
+/// # Not cached, deliberately
+///
+/// `stats_count` caches through `store::stats` because a closed window's
+/// answer cannot change and recomputing it per navigation is waste. This
+/// does not, and the asymmetry is the point: membership changes, people
+/// join, repositories are created, and a sidebar built from a stale roster
+/// offers scopes that may no longer exist. At 2 points against a
+/// 5,000-point hourly budget the freshness is worth more than the saving --
+/// and TanStack Query's `staleTime` on the frontend already stops it
+/// re-running within a session, which is the layer where "do not re-ask
+/// while the user is still here" belongs.
+#[tauri::command]
+pub async fn stats_tree(client: State<'_, GhClient>) -> Result<crate::github::stats::Tree, String> {
+    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+
+    crate::diag!("[diag] cmd stats_tree start");
+    let started = std::time::Instant::now();
+    // The wall-clock ceiling is INSIDE `load_tree`, the way `load_count`
+    // and `load_detail` carry theirs: the layer that knows how many
+    // requests it issues is the layer that should bound them, and a
+    // ceiling applied out here would be a second place for a future
+    // third request to escape.
+    let out = crate::github::stats::load_tree(&client)
+        .await
+        .map_err(|e| e.to_string());
+    crate::diag!(
+        "[diag] cmd stats_tree end {}ms {}",
+        started.elapsed().as_millis(),
+        match &out {
+            // Counts and logins, never a repository NAME: this repo's
+            // privacy rule applies to the diagnostic log too, and the
+            // shape of the tree is what a reader of the log needs.
+            Ok(t) => format!(
+                "ok orgs={}/{} personal={}/{} unreadable={} complete={} points={}",
+                t.orgs.len(),
+                t.orgs_total,
+                t.personal.len(),
+                t.personal_total,
+                t.unreadable_orgs().count(),
+                t.is_complete(),
+                t.spend.points
+            ),
+            Err(e) => format!("err: {e}"),
+        }
+    );
+    out
+}
+
 /// Whether we have a usable GitHub client. `state` is computed once at
 /// startup from `auth::read_token` / `auth::build_client` and stored as
 /// managed state; this command just hands it to the frontend.

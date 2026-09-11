@@ -42,6 +42,8 @@ pub const SURFACE: &[(&str, Class)] = &[
     // The hardened stats layer (#824). A Read; the desktop's timeout and
     // read-concurrency cap live inside the command, so this inherits both.
     ("stats_count", Class::Read),
+    // The stats scope hierarchy (#825). A Read; names only, no statistics.
+    ("stats_tree", Class::Read),
     ("get_reviewing", Class::Read),
     ("count_reviewing", Class::Read),
     ("get_pr_detail", Class::Read),
