@@ -284,6 +284,50 @@ impl StatsQuery {
         format!("is:pr {state}{author}{scope}{date}{from}..{to}")
     }
 
+    /// The same question, asked about who REVIEWED rather than who wrote
+    /// (#826's reviewer leaderboard).
+    ///
+    /// `reviewed-by:<login>` in place of the author qualifier, which is the
+    /// one qualifier swap that changes what a row MEANS rather than which
+    /// rows there are. The state, scope and date halves come from
+    /// [`Measure::qualifiers`] and [`Scope::qualifier`] exactly as
+    /// [`StatsQuery::search_query`] builds them, so a reviewer count and an
+    /// author count over the same window cannot disagree about what the
+    /// window or the scope is -- the failure this module's docs exist to
+    /// prevent.
+    ///
+    /// # Why the author qualifier is DROPPED rather than kept
+    ///
+    /// `author:X reviewed-by:Y` is a perfectly legal search, and it means "X's
+    /// pull requests that Y reviewed" -- a third question, and not the one a
+    /// reviewer leaderboard asks. A leaderboard of reviews given must count
+    /// every pull request in the scope that this person reviewed, whoever
+    /// wrote it; the measured proof that those differ is in
+    /// `query::reviewer_query`'s docs, where the two pull requests crediting
+    /// `pktstorm` as reviewer were both AUTHORED by someone else. Carrying a
+    /// stale `author:@me` through would have returned the viewer's own pull
+    /// requests that the named person reviewed, which on a board titled "top
+    /// reviewers" would be wrong in a way no figure on screen could reveal.
+    ///
+    /// So the author is dropped unconditionally and this takes `&self`
+    /// rather than requiring the caller to build a subject-less query first:
+    /// a caller that forgot would get the three-qualifier search, and this is
+    /// the one place that mistake can be made impossible.
+    pub fn reviewed_by(&self, reviewer: &str, from: &str, to: &str) -> String {
+        let (state, date) = self.measure.qualifiers();
+        let scope = self.scope.qualifier();
+        let scope = if scope.is_empty() {
+            String::new()
+        } else {
+            format!("{scope} ")
+        };
+        // Qualifier ORDER matches `search_query`'s -- type, state, who,
+        // repo, date -- for the same two human reasons it gives: a log of
+        // thirty reviewer aliases is readable when only the name varies, and
+        // a test can assert on the whole string.
+        format!("is:pr {state}reviewed-by:{reviewer} {scope}{date}{from}..{to}")
+    }
+
     /// A stable identity for persistence, with `@me` resolved.
     ///
     /// Includes the measure: a merged count and an opened count over the
@@ -327,6 +371,60 @@ mod tests {
         assert!(
             !q.search_query("2026-07-01", "2026-07-31").contains("@me"),
             "a named subject must not carry the viewer qualifier too"
+        );
+    }
+
+    /// `reviewed_by` replaces the author, never joins it.
+    ///
+    /// The mistake this guards is specific and silent: `author:@me
+    /// reviewed-by:octocat` is a LEGAL search meaning "my pull requests that
+    /// octocat reviewed". A board titled "top reviewers" built on it would
+    /// rank colleagues by how much of the VIEWER'S work they reviewed, and
+    /// nothing on the page could reveal it -- the numbers would be plausible
+    /// and just about the wrong population.
+    ///
+    /// Asserted on the full string for the same reason the test above is: a
+    /// `contains("reviewed-by:octocat")` check passes while the author
+    /// qualifier is still there.
+    #[test]
+    fn reviewed_by_replaces_the_author_rather_than_joining_it() {
+        let q = StatsQuery::new(
+            Some(Subject::Viewer),
+            Scope::Org("FNX-Labs".into()),
+            Measure::Merged,
+        );
+        assert_eq!(
+            q.reviewed_by("octocat", "2026-08-12", "2026-09-10"),
+            "is:pr is:merged reviewed-by:octocat org:FNX-Labs merged:2026-08-12..2026-09-10"
+        );
+        assert!(
+            !q.reviewed_by("octocat", "2026-08-12", "2026-09-10")
+                .contains("author:"),
+            "an author qualifier alongside reviewed-by asks a third question"
+        );
+    }
+
+    /// The reviewer and author searches agree on everything EXCEPT who.
+    ///
+    /// Both come from the same `Measure::qualifiers` and `Scope::qualifier`,
+    /// which is this module's whole rule -- two searches that spelled the
+    /// window or the scope differently would produce boards a reader cannot
+    /// compare. Asserted by diffing the two strings rather than by re-reading
+    /// the builders, so a future change to either qualifier has to keep them
+    /// in step.
+    #[test]
+    fn the_reviewer_search_differs_from_the_author_search_only_in_who() {
+        let q = StatsQuery::new(
+            Some(Subject::Login("octocat".into())),
+            Scope::Org("FNX-Labs".into()),
+            Measure::Merged,
+        );
+        let authored = q.search_query("2026-08-12", "2026-09-10");
+        let reviewed = q.reviewed_by("octocat", "2026-08-12", "2026-09-10");
+        assert_eq!(
+            authored.replace("author:octocat", "reviewed-by:octocat"),
+            reviewed,
+            "the two searches must differ only in the who qualifier"
         );
     }
 

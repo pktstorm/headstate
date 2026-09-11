@@ -30,6 +30,7 @@ import {
   statsBoard,
   statsSeries,
   statsCount,
+  statsReviewers,
   // The four unscoped account-wide commands (#826). Their wrappers never
   // left `tauri.ts` -- #829 deleted only the hooks -- so restoring the page
   // is these four imports and the hooks below, not a rebuilt feature.
@@ -1988,6 +1989,94 @@ export function useScopedCounts(
       for (const r of results) void r.refetch();
     },
   };
+}
+
+/// The reviews-GIVEN board: who reviewed the most, per scope (#826).
+///
+/// # Why this is a separate query from the board, and not a field on it
+///
+/// `useStatsBoard` reads `reviews { totalCount }` off pull requests the
+/// ROW'S AUTHOR wrote, which counts review their work RECEIVED. Reviews
+/// GIVEN cannot be derived from that document at all, at any cost: a PR node
+/// says how many reviews it attracted, never who wrote them -- so the two
+/// boards are answers to different questions over different searches, and
+/// #829 was right to refuse to print one under the other's title.
+///
+/// MEASURED, and the two genuinely name different people on this account's
+/// own data (live API, 2026-09-11): a `reviewed-by:<viewer>` search over an
+/// org window returned two pull requests, both AUTHORED BY SOMEONE ELSE and
+/// each carrying `reviews { totalCount } == 1`. So those same two pull
+/// requests credit the AUTHOR on the received board and the REVIEWER on the
+/// given one. A single chart could not have been both.
+///
+/// # Cost: one point, and the expense is LATENCY
+///
+/// One `reviewed-by:<login>` search per member, aliased into one document.
+/// MEASURED live 2026-09-11 against `org:FNX-Labs`, 3 runs per cell:
+///
+/// | Reviewer aliases | Cost | Wall clock |
+/// |---|---|---|
+/// | 4 (this account's real org size) | **1** | 0.84-1.04s |
+/// | 10 | **1** | 1.26-1.50s |
+/// | 36 | **1** | 3.62-4.15s |
+///
+/// So alias count is free on rate limit and linear in latency, exactly as
+/// #823 measured for the history document -- and this is the CHEAP document
+/// shape, count-only with no `nodes`, which is why 36 aliases answer in 3.6s
+/// where 10 node-bearing aliases at a 50-node page failed outright at the
+/// ~11s deadline (`board.rs`'s table). That is also why the page size is
+/// never raised: `fetch::SLICE_PAGE_FULL` is 50 and `degrade` sheds pages
+/// before aliases because NODES drive the deadline, and this document
+/// materialises none.
+///
+/// `totalCount` is read UNPAGED and must stay that way. #826's measurement
+/// is that the `first:` ARGUMENT is what GitHub prices, not the connection
+/// -- so adding `first:` to a connection read only for a count would buy
+/// nothing and cost a point per search. There is a partial disagreement on
+/// record in #823 about whether the paged form is actively more expensive;
+/// both measurements agree the unpaged form is free, so this takes the cheap
+/// path that neither disputes.
+///
+/// # Where the logins come from, and why they are not in the key
+///
+/// The caller passes the roster it already holds for this scope, read off
+/// `useStatsTree`'s `org.members` -- so no request is spent re-deriving a
+/// list that is on screen in the sidebar beside the board.
+///
+/// The key carries the scope and the window and deliberately NOT the member
+/// list. That is this file's standing rule, which `useStatsBoard` states as
+/// "a count in a key makes every sibling key change when one item is
+/// removed, refetching everything": a roster that gained a person would
+/// invalidate every window's cached board. The logins are an INPUT to the
+/// request rather than part of its identity -- the question is "who reviewed
+/// most in this scope and window", and that question is the same question
+/// when the roster changes. The consequence, stated because it is a real
+/// trade rather than a free win: a newly-added member does not appear until
+/// the five-minute `staleTime` lapses. Five minutes of a missing row beats
+/// re-spending every board in the cache on a roster edit, and a roster that
+/// changed mid-session is the rarer event by far.
+///
+/// # `enabled`
+///
+/// Threaded from the caller like every other expensive hook here, so nothing
+/// loads until a scope is clicked. Also gated on there BEING logins: a scope
+/// with no roster (a repository, Personal, Everything) has nobody to ask
+/// about, and the Rust command rejects an empty list rather than returning an
+/// empty board that would read as "nobody reviewed anything".
+export function useStatsReviewers(
+  scope: StatsScope | undefined,
+  days: number,
+  logins: string[],
+  enabled: boolean,
+) {
+  const loadable = scopeIsLoadable(scope);
+  return useQuery({
+    queryKey: ["stats-reviewers", loadable ? scopeKey(scope) : "none", days],
+    queryFn: () => statsReviewers(scope!.kind, scope!.value, days, logins),
+    enabled: enabled && loadable && logins.length > 0,
+    staleTime: 5 * 60 * 1000,
+    retry: false,
+  });
 }
 
 /// The period comparisons behind the unscoped page's delta cards.

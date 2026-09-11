@@ -83,6 +83,12 @@ vi.mock("./api/hooks", () => ({
   }),
   useStatsSeries: () => ({ data: undefined, isError: false, refetch: () => {} }),
   useStatsBoard: () => ({ data: undefined, isError: false, refetch: () => {} }),
+  useStatsReviewers: () => ({
+    data: undefined,
+    isError: false,
+    isPending: true,
+    refetch: () => {},
+  }),
   // The account-wide page's four (#826's reopening). Reached here because
   // `StatsPage` routes to it when nothing is selected, which is this suite's
   // state -- so these are the hooks the PR Stats route actually mounts.

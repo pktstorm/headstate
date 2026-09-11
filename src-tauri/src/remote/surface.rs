@@ -106,6 +106,18 @@ pub const SURFACE: &[(&str, Class)] = &[
     // The scoped daily activity series (#826). A Read, and the cheap half
     // of a scope page: count-only searches, no nodes.
     ("stats_series", Class::Read),
+    // The reviews-GIVEN leaderboard (#826, restored by its reopening). A
+    // Read, and the CHEAPEST query on the stats page: one count-only
+    // `reviewed-by:<login>` search per member, all aliased into one request
+    // at 1 point -- measured 0.84-1.04s for this account's real 4-member
+    // org. No nodes, so the ~11s deadline that governs `stats_board`'s
+    // document does not bind it.
+    //
+    // Classed by what it does rather than by which screens call it, the same
+    // rule `stats_tree` above is classed by: a phone could act on a ranking
+    // of reviewers perfectly well, and its budget refusal and wall-clock
+    // ceiling live inside the command.
+    ("stats_reviewers", Class::Read),
     ("get_reviewing", Class::Read),
     ("count_reviewing", Class::Read),
     ("get_pr_detail", Class::Read),
@@ -483,6 +495,18 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
             a.get("subject")?,
             a.get("scopeKind")?,
             a.get("scopeValue")?,
+            a.get("days")?,
+        )
+        .await),
+        "stats_reviewers" => res(commands::stats_reviewers(
+            app.state(),
+            a.get("scopeKind")?,
+            a.get("scopeValue")?,
+            // A `Vec<String>`, which `Args::get` decodes like any other
+            // shape: the key is the camelCase name the webview sends, and a
+            // missing one is an error naming it rather than a silent empty
+            // list that would produce an empty leaderboard.
+            a.get("logins")?,
             a.get("days")?,
         )
         .await),

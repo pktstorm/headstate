@@ -872,6 +872,201 @@ async fn series_inner(
     })
 }
 
+/// One person's reviews GIVEN in a window.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReviewerRow {
+    pub login: String,
+    /// Pull requests in scope, merged in the window, that this person
+    /// reviewed. A real `0` -- never a stand-in for an unmeasured count,
+    /// which is [`Reviewers::unmeasured`]'s job.
+    pub reviews: u64,
+}
+
+/// The reviews-given board, with the honesty fields a partial one needs.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Reviewers {
+    /// One row per login that was successfully counted, ranked highest
+    /// first with ties broken on login.
+    ///
+    /// Includes rows whose count is `0`. A zero here is a MEASURED zero --
+    /// "this person reviewed nothing in this window" -- and the UI is what
+    /// decides not to rank it (`Leaderboard.tsx`'s "a zero has no rank"
+    /// rule). Dropping them in Rust instead would make "everybody reviewed
+    /// nothing" indistinguishable from "nobody could be measured", which is
+    /// precisely the confusion the next field exists to prevent.
+    pub rows: Vec<ReviewerRow>,
+    /// Logins whose count did NOT come back, named rather than counted.
+    ///
+    /// The #802/#790 rule applied to a leaderboard: a failed alias rendered
+    /// as `0` would place a colleague at the BOTTOM of a ranking on the
+    /// strength of a query that never answered. Named, because a reader
+    /// deciding whether to trust the order needs to know who is missing from
+    /// it -- "2 people could not be measured" does not say whether the
+    /// leader might be one of them.
+    pub unmeasured: Vec<String>,
+    /// Fields GitHub refused across the reviewer responses.
+    ///
+    /// Its own channel rather than folded into `unmeasured`, matching
+    /// `Board`'s three-channel split: a refusal suggests a SAML
+    /// authorization to fix, and a missing alias suggests a retry.
+    pub refused_fields: usize,
+    pub spend: super::budget::Spend,
+}
+
+impl Reviewers {
+    /// Whether every login in scope was measured.
+    ///
+    /// The caller renders a ranking as a ranking only when this holds. A
+    /// top-five over a roster with one unmeasured member can have the wrong
+    /// person in first place, which is `board.rs`'s reason for making
+    /// completeness a required prop rather than an optional note.
+    pub fn is_complete(&self) -> bool {
+        self.unmeasured.is_empty() && self.refused_fields == 0
+    }
+}
+
+/// Count reviews GIVEN by each of `logins`, over one window (#826).
+///
+/// # Why there is no slicing here
+///
+/// This document RETRIEVES nothing -- it reads `issueCount` and no `nodes`
+/// -- and `issueCount` is exact at any size. The 1,000-result cap that
+/// forces `slice.rs` to subdivide limits what can be PAGED OUT of a search,
+/// not what can be counted (`slice::SUBDIVIDE_AT`'s doc records exactly
+/// that distinction, and #829 found the bug that comes from confusing the
+/// two in the other direction). So one alias spans the whole window and
+/// there is no plan, no probe round and no per-slice arithmetic to get
+/// wrong.
+///
+/// # Chunked at `ALIAS_CHUNK`, not at `BOARD_ALIAS_CHUNK`
+///
+/// The measured asymmetry. `board::BOARD_ALIAS_CHUNK` is 5 because 10
+/// node-bearing aliases at a 50-node page failed 0 of 3 against the ~11s
+/// server deadline. This document carries no nodes at all: MEASURED live
+/// 2026-09-11 on `org:FNX-Labs`, 36 reviewer aliases answered in 3.62-4.15s
+/// at cost 1, and 10 in 1.26-1.50s. Nodes drive the deadline, which is why
+/// `degrade` sheds PAGES first and `SLICE_PAGE_FULL` stays 50 -- a document
+/// with no page is governed by alias latency alone, and `ALIAS_CHUNK`'s 10
+/// is already sized against that.
+///
+/// # A failed chunk does not fail the board
+///
+/// Its logins are named in `unmeasured` and the rest still render, matching
+/// `load_series` rather than `load_count`. The reasoning there applies with
+/// more force: a count is one number and a short one is simply wrong, while
+/// a ranking missing two named people is still useful to a reader who can
+/// see WHICH two. What must never happen is the missing ones appearing as
+/// zeroes, which would rank them last on the strength of nothing.
+pub async fn load_reviewers(
+    client: &GitHubClient,
+    q: &StatsQuery,
+    logins: &[String],
+    window: &Slice,
+    budget: &Budget,
+) -> Result<Reviewers, ClientError> {
+    match tokio::time::timeout(
+        LOAD_TIMEOUT,
+        reviewers_inner(client, q, logins, window, budget),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => Err(ClientError::Timeout(LOAD_TIMEOUT.as_secs())),
+    }
+}
+
+async fn reviewers_inner(
+    client: &GitHubClient,
+    q: &StatsQuery,
+    logins: &[String],
+    window: &Slice,
+    budget: &Budget,
+) -> Result<Reviewers, ClientError> {
+    // Indexed rather than pushed, so chunks completing out of order cannot
+    // reassign a count to the wrong person -- `query.rs:667-678`'s
+    // absolute-index rule, and the consequence of getting it wrong here is
+    // worse than a reordered chart: it would attribute one colleague's
+    // review count to another by name.
+    let mut counts = vec![None::<u64>; logins.len()];
+    let mut refused = 0usize;
+    let per_wave = ALIAS_CHUNK * READ_CONCURRENCY;
+
+    for (w, wave) in logins.chunks(per_wave).enumerate() {
+        let base = w * per_wave;
+        let mut set = tokio::task::JoinSet::new();
+        for (n, chunk) in wave.chunks(ALIAS_CHUNK).enumerate() {
+            let first_index = base + n * ALIAS_CHUNK;
+            let doc = super::query::reviewer_query(q, chunk, window, first_index);
+            let client = client.clone();
+            let budget = budget.clone();
+            let len = chunk.len();
+            set.spawn(async move {
+                let v = client.stats_graphql(&json!({ "query": doc })).await?;
+                budget.record(&v);
+                let refused = crate::github::client::refused_fields_of(&v);
+                let mut out = Vec::with_capacity(len);
+                for i in 0..len {
+                    let alias = super::query::reviewer_alias(first_index + i);
+                    // `None` rather than 0 for a missing alias. The caller
+                    // turns it into a named unmeasured login; defaulting to
+                    // zero would rank that person last on a query that
+                    // never answered.
+                    out.push(v[&alias]["issueCount"].as_u64());
+                }
+                Ok::<(usize, Vec<Option<u64>>, usize), ClientError>((first_index, out, refused))
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            // A chunk that failed outright leaves its logins as `None` and
+            // they become named unmeasured rows. A panic IS propagated: a
+            // dropped task is a bug rather than a server refusal, which is
+            // `series_inner`'s distinction above.
+            match joined.map_err(|e| ClientError::Join(e.to_string()))? {
+                Ok((first_index, out, r)) => {
+                    refused += r;
+                    for (i, c) in out.into_iter().enumerate() {
+                        counts[first_index + i] = c;
+                    }
+                }
+                Err(e) => log::warn!(
+                    "a reviewer-count chunk failed ({e}); its logins are reported as \
+                     unmeasured rather than as zero"
+                ),
+            }
+        }
+    }
+
+    let mut rows = Vec::new();
+    let mut unmeasured = Vec::new();
+    for (i, login) in logins.iter().enumerate() {
+        match counts[i] {
+            Some(reviews) => rows.push(ReviewerRow {
+                login: login.clone(),
+                reviews,
+            }),
+            None => unmeasured.push(login.clone()),
+        }
+    }
+    // Ranked here AND again in the UI, for `board.rs`'s reason: chunks
+    // complete out of order by design, so without a deterministic order two
+    // equal rows swap between loads, which reads as a bug in the data rather
+    // than in the sort. Ties break on LOGIN, the same tie-break the author
+    // board uses, so the two boards order a tie identically.
+    rows.sort_by(|a, b| {
+        b.reviews
+            .cmp(&a.reviews)
+            .then_with(|| a.login.cmp(&b.login))
+    });
+
+    Ok(Reviewers {
+        rows,
+        unmeasured,
+        refused_fields: refused,
+        spend: budget.snapshot(),
+    })
+}
+
 /// Which scopes route through the connection rather than search.
 ///
 /// Exposed so a caller can report WHICH guarantee it has before issuing
@@ -1167,6 +1362,68 @@ mod tests {
         assert!(
             !refused.is_complete(),
             "refused fields mean data is missing even when nothing was capped"
+        );
+    }
+
+    /// A reviewer board states its own completeness, and a MEASURED zero is
+    /// not a gap.
+    ///
+    /// The distinction this pins is the one the feature is built on, and on a
+    /// ranking it binds harder than on a count: an unmeasured login rendered
+    /// as `0` would place a colleague LAST on the strength of a query that
+    /// never answered, and a top-five missing one person can have the wrong
+    /// name in first place.
+    ///
+    /// It is also the state this board is usually in on real data. MEASURED
+    /// 2026-09-11: `org:FNX-Labs` over a 30-day window holds 569 merged pull
+    /// requests and ZERO reviewed by any of its four members -- the account
+    /// merges without human review. So the true answer here looks exactly
+    /// like a broken query, which is precisely why the two must not render
+    /// the same.
+    #[test]
+    fn a_reviewer_board_distinguishes_a_measured_zero_from_an_unmeasured_login() {
+        let all_zero = Reviewers {
+            rows: vec![
+                ReviewerRow {
+                    login: "octocat".into(),
+                    reviews: 0,
+                },
+                ReviewerRow {
+                    login: "pktstorm".into(),
+                    reviews: 0,
+                },
+            ],
+            unmeasured: vec![],
+            refused_fields: 0,
+            spend: Budget::new().snapshot(),
+        };
+        // Everybody measured, everybody zero. That is a COMPLETE board
+        // reporting an empty answer, which is the measured truth on this
+        // account -- and the rows are kept rather than dropped so the UI can
+        // say "no reviews given" rather than "nothing could be counted".
+        assert!(all_zero.is_complete());
+        assert_eq!(all_zero.rows.len(), 2);
+
+        let short = Reviewers {
+            unmeasured: vec!["hubot".into()],
+            ..all_zero.clone()
+        };
+        assert!(
+            !short.is_complete(),
+            "a login that could not be counted makes the ranking partial, \
+             because the leader might be the one that is missing"
+        );
+
+        // A refusal is its own channel, independent of a missing alias: it
+        // suggests a SAML authorization to fix where a missing alias suggests
+        // a retry, which is the same three-channel split `Board` carries.
+        let refused = Reviewers {
+            refused_fields: 2,
+            ..all_zero
+        };
+        assert!(
+            !refused.is_complete(),
+            "refused fields mean data is missing even when every login answered"
         );
     }
 

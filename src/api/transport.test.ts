@@ -228,6 +228,16 @@ const ROWS: Row[] = [
     scopeValue: "acme",
     days: 30,
   }),
+  // The reviews-GIVEN board. No `subject` and no `measure`: it asks about
+  // everyone in `logins`, and its measure is fixed (a review counts against a
+  // pull request that MERGED, so reviewing work still in flight does not move
+  // somebody up the board).
+  row(api.statsReviewers, ["org", "acme", 30, ["octocat", "hubot"]], "stats_reviewers", {
+    scopeKind: "org",
+    scopeValue: "acme",
+    days: 30,
+    logins: ["octocat", "hubot"],
+  }),
   row(api.systemHealth, [], "system_health"),
   row(api.systemHealthHistory, [], "system_health_history"),
   row(api.systemFootprint, [], "system_footprint"),

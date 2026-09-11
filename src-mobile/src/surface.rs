@@ -49,6 +49,9 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("stats_board", Class::Read),
     // The scoped daily activity series (#826). A Read; count-only.
     ("stats_series", Class::Read),
+    // The reviews-GIVEN leaderboard (#826). A Read; one count-only
+    // `reviewed-by:<login>` search per member, aliased into one request.
+    ("stats_reviewers", Class::Read),
     ("get_reviewing", Class::Read),
     ("count_reviewing", Class::Read),
     ("get_pr_detail", Class::Read),

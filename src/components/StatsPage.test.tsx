@@ -13,6 +13,9 @@ vi.mock("../api/hooks", async () => {
     useScopedCounts: vi.fn(),
     useStatsSeries: vi.fn(),
     useStatsBoard: vi.fn(),
+    // The reviews-GIVEN board and the roster it reads (#826's reopening).
+    useStatsReviewers: vi.fn(),
+    useStatsTree: vi.fn(),
     // The four account-wide hooks #829 removed and #826's reopening restored.
     // Mocked here because `StatsPage` now routes to the unscoped page when
     // nothing is selected, so every test in this file mounts a component that
@@ -37,7 +40,9 @@ import {
   usePeriods,
   useScopedCounts,
   useStatsBoard,
+  useStatsReviewers,
   useStatsSeries,
+  useStatsTree,
 } from "../api/hooks";
 import { useActiveFilters } from "../store/filters";
 import { StatsPage, describeScope, partialityCaveat } from "./StatsPage";
@@ -160,6 +165,8 @@ beforeEach(() => {
   vi.mocked(useScopedCounts).mockReturnValue(noCounts as never);
   vi.mocked(useStatsSeries).mockReturnValue(pendingQ);
   vi.mocked(useStatsBoard).mockReturnValue(pendingQ);
+  vi.mocked(useStatsReviewers).mockReturnValue(pendingQ);
+  vi.mocked(useStatsTree).mockReturnValue(pendingQ);
   // The unscoped page's four, pending by default. Only the tests that
   // actually mount it override these.
   vi.mocked(usePeriods).mockReturnValue(pendingQ);

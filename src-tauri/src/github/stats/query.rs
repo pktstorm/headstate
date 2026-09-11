@@ -221,6 +221,124 @@ pub fn slice_detail_query(
     doc
 }
 
+/// Alias for the reviewer at `index`. `v0`, `v1`, ...
+///
+/// `v` for reviewer, because `r` is taken by nothing here yet but `s` is
+/// already the slice prefix and a one-letter collision between two alias
+/// families that merge into ONE map is the `slice_alias` failure mode
+/// exactly: chunk two's `r0` silently overwriting chunk one's. Indices are
+/// ABSOLUTE across a whole load for the same reason, `query.rs:667-678`'s
+/// rule.
+pub fn reviewer_alias(index: usize) -> String {
+    format!("v{index}")
+}
+
+/// Reviews GIVEN: one `reviewed-by:<login>` count per person (#826).
+///
+/// # Why this cannot be a field on the detail document
+///
+/// `slice_detail_query` above reads `reviews { totalCount }` off each PR
+/// node, which counts reviews that pull request RECEIVED -- and since the
+/// node is attributed to its AUTHOR, the board built from it ranks people by
+/// how much review their own work attracted. A node says how many reviews it
+/// has; it never says who wrote them. So reviews given are not a cheaper
+/// projection of the same document, they are a different search, and #829
+/// was right to ship the correctly-titled "most-reviewed" board rather than
+/// print it under "top reviewers".
+///
+/// MEASURED, and the two boards genuinely name DIFFERENT people on this
+/// account's own data (live API, `gh api graphql`, 2026-09-11): a
+/// `reviewed-by:<viewer> org:<org> merged:2026-01-01..2026-09-10` search
+/// returned two pull requests, both **authored by somebody else** and each
+/// carrying `reviews { totalCount } == 1`. So those same two pull requests
+/// credit the AUTHOR on the received board and the REVIEWER on the given one.
+/// No single chart could have been both, which is what made the mislabelling
+/// a correctness bug rather than a wording one.
+///
+/// # Cost: one point. The expense is LATENCY
+///
+/// One search per login, all aliased into one document. MEASURED live
+/// 2026-09-11 against `org:FNX-Labs`, 3 runs per cell:
+///
+/// | Reviewer aliases | Cost | Wall clock |
+/// |---|---|---|
+/// | 4 (this account's real org size) | **1** | 0.84-1.04s |
+/// | 10 | **1** | 1.26-1.50s |
+/// | 36 | **1** | 3.62-4.15s |
+///
+/// Free on rate limit at every size and linear in latency -- which
+/// reproduces #823's history-document figures (10 aliases 2.36s, 36 7.67s)
+/// on the same count-only shape. This document is comfortably FASTER than
+/// those because each alias here is a single search rather than two.
+///
+/// It is chunked at [`ALIAS_CHUNK`] rather than at
+/// `board::BOARD_ALIAS_CHUNK`, and the asymmetry is the measured one: this
+/// document materialises NO nodes, so the ~11s deadline that governs the
+/// detail document does not bind it the same way. `board.rs`'s table is the
+/// evidence -- 10 node-bearing aliases at a 50-node page failed 0 of 3 at
+/// 10.6s, where 36 count-only aliases here answer in 3.6-4.2s. Nodes drive
+/// the deadline, so the page size is what `fetch::degrade` sheds first and
+/// `fetch::SLICE_PAGE_FULL` stays at 50; a document with no page cannot be
+/// made safer by shrinking one.
+///
+/// # `issueCount` is read UNPAGED, and must stay that way
+///
+/// No `first:` argument anywhere in this document. #826's measurement is
+/// that GitHub prices the `first:` ARGUMENT rather than the connection --
+/// `reviews { totalCount }` costs 1 at 15 searches while
+/// `reviews(first: 1) { totalCount }` costs 2 from 6 searches up (the table
+/// is in `board.rs`'s module docs). #823 carries a partial disagreement
+/// about whether the paged form is ACTIVELY more expensive; both
+/// measurements agree the unpaged form is free, so this takes the cheap path
+/// neither disputes. Adding `first:` here would buy nothing -- a count needs
+/// no page -- and could cost a point per search.
+///
+/// # One window, not one slice per day
+///
+/// The 1,000-result cap that forces `slice.rs` to subdivide applies to
+/// RETRIEVING results, not to counting them: `issueCount` is exact at any
+/// size (`slice.rs`'s `SUBDIVIDE_AT` doc records that the cap is what makes
+/// a count exact below 800 and a NODE LIST short above it). This document
+/// retrieves nothing, so one alias covers the whole window and the
+/// subdivision machinery is not needed -- and must not be used, because
+/// summing per-day counts would DOUBLE-COUNT a reviewer who reviewed two
+/// pull requests merged on the same day into the same number either way but
+/// would silently overcount across slices if a PR's merge date ever
+/// straddled two ranges. One range, one number, no arithmetic.
+///
+/// A reviewer with no reviews in the window comes back as `0` from GitHub
+/// rather than as a missing alias, and the caller must keep that distinct
+/// from an alias that FAILED -- `Reviewers::unmeasured` is where that
+/// distinction lives.
+pub fn reviewer_query(
+    q: &StatsQuery,
+    logins: &[String],
+    window: &Slice,
+    first_index: usize,
+) -> String {
+    let mut doc = String::from("query {\n  rateLimit { cost remaining resetAt }\n");
+    for (i, login) in logins.iter().enumerate() {
+        let alias = reviewer_alias(first_index + i);
+        // Built by replacing the AUTHOR qualifier with a reviewer one, so
+        // the state, scope and date qualifiers come from the one builder in
+        // `scope.rs` rather than being reassembled here -- which that
+        // module's docs forbid, because a subject spelled differently
+        // between two aliases produces a total that counts nothing.
+        //
+        // `StatsQuery::reviewed_by` is what performs the swap, and it
+        // asserts the author qualifier is absent rather than emitting both:
+        // `author:X reviewed-by:Y` is a legal search that means "X's PRs
+        // that Y reviewed", which is a third question and not this one.
+        let search = q.reviewed_by(login, &window.from, &window.to);
+        doc.push_str(&format!(
+            "  {alias}: search(query: {}, type: ISSUE) {{ issueCount }}\n",
+            graphql_string(&search)
+        ));
+    }
+    doc.push_str("}\n");
+    doc
+}
+
 /// A single repository's pull requests, through the CONNECTION.
 ///
 /// The uncapped path, and the reason `Scope::needs_search` exists.
@@ -525,6 +643,102 @@ mod tests {
         );
     }
 
+    /// The reviewer document counts reviews GIVEN, and must not carry an
+    /// author qualifier.
+    ///
+    /// This is the test for the thing that made #829 refuse to ship the
+    /// requested title: `reviews { totalCount }` counts reviews RECEIVED, so
+    /// the only honest "top reviewers" board needs `reviewed-by:`. And the
+    /// author must be GONE rather than alongside it -- `author:X
+    /// reviewed-by:Y` is a legal search meaning "X's pull requests that Y
+    /// reviewed", a third question whose wrongness no figure on screen could
+    /// reveal.
+    ///
+    /// Asserted on the WHOLE string rather than on substrings, for
+    /// `a_named_subject_replaces_the_viewer_entirely`'s reason: a
+    /// `contains("reviewed-by:octocat")` check would pass happily while a
+    /// stray `author:@me` narrowed the board to the viewer's own pull
+    /// requests.
+    #[test]
+    fn the_reviewer_document_counts_reviews_given_by_anyone() {
+        // A query carrying a SUBJECT, deliberately: that is the realistic
+        // mistake, since `StatsQuery` is usually built with one.
+        let authored = StatsQuery::new(
+            Some(Subject::Viewer),
+            Scope::Org("FNX-Labs".into()),
+            Measure::Merged,
+        );
+        let doc = reviewer_query(
+            &authored,
+            &["octocat".to_string(), "hubot".to_string()],
+            &Slice::new("2026-08-12", "2026-09-10"),
+            0,
+        );
+        assert!(
+            doc.contains(
+                "\"is:pr is:merged reviewed-by:octocat org:FNX-Labs merged:2026-08-12..2026-09-10\""
+            ),
+            "the reviewer search must drop the author entirely: {doc}"
+        );
+        assert!(
+            !doc.contains("author:"),
+            "an author qualifier alongside reviewed-by asks a third question: {doc}"
+        );
+        // One alias per login, with ABSOLUTE indices so chunks merging into
+        // one map cannot attribute one colleague's count to another.
+        assert!(doc.contains("v0: search("));
+        assert!(doc.contains("v1: search("));
+        assert_eq!(doc.matches("search(").count(), 2);
+    }
+
+    /// The reviewer document is COUNT-ONLY and unpaged, which is what makes
+    /// it cost 1 point.
+    ///
+    /// MEASURED live 2026-09-11 on `org:FNX-Labs`: cost 1 at 4, 10 and 36
+    /// aliases (0.84-1.04s, 1.26-1.50s, 3.62-4.15s). A `first:` argument is
+    /// what GitHub prices, so adding one to a connection read only for a
+    /// count would buy nothing and could cost a point per search -- and a
+    /// `nodes` selection would put this document under the ~11s node deadline
+    /// that `board.rs`'s table shows kills 10 aliases at a 50-node page.
+    #[test]
+    fn the_reviewer_document_is_count_only_and_unpaged() {
+        let doc = reviewer_query(
+            &q(),
+            &["octocat".to_string()],
+            &Slice::new("2026-08-12", "2026-09-10"),
+            0,
+        );
+        assert!(doc.contains("{ issueCount }"));
+        assert!(
+            !doc.contains("nodes"),
+            "nodes would put this document under the node deadline"
+        );
+        assert!(
+            !doc.contains("first:"),
+            "a `first:` argument is the priced shape and buys a count nothing"
+        );
+        // And the cost is READ rather than assumed, on every request.
+        assert!(doc.contains("rateLimit { cost remaining resetAt }"));
+    }
+
+    /// A reviewer login cannot break out of the string literal either.
+    ///
+    /// The same guard `a_subject_cannot_break_out_of_the_string_literal`
+    /// gives, on the second path that now takes a login from the sidebar --
+    /// which is whatever GitHub returned.
+    #[test]
+    fn a_reviewer_login_cannot_break_out_of_the_string_literal() {
+        let doc = reviewer_query(
+            &q(),
+            &["a\" evil: \"b".to_string()],
+            &Slice::new("2026-08-12", "2026-09-10"),
+            0,
+        );
+        assert!(doc.contains("\\\""), "the quote must be escaped");
+        assert_eq!(doc.matches("search(").count(), 1);
+        assert_eq!(doc.matches('{').count(), doc.matches('}').count());
+    }
+
     /// Both documents must be valid GraphQL: balanced braces, one
     /// top-level closing brace, and it closes the document.
     #[test]
@@ -532,6 +746,12 @@ mod tests {
         for doc in [
             probe_query(&q(), &slices(3), 0),
             slice_detail_query(&q(), &slices(3), 0, 100),
+            reviewer_query(
+                &q(),
+                &["a".to_string(), "b".to_string(), "c".to_string()],
+                &Slice::new("2026-08-12", "2026-09-10"),
+                0,
+            ),
         ] {
             assert_eq!(
                 doc.matches('{').count(),

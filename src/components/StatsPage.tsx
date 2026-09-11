@@ -8,7 +8,9 @@ import {
   usePeriods,
   useScopedCounts,
   useStatsBoard,
+  useStatsReviewers,
   useStatsSeries,
+  useStatsTree,
 } from "../api/hooks";
 import { useActiveFilters } from "../store/filters";
 import type { ShortSlice } from "../types/pr";
@@ -128,6 +130,25 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
   // opened count still appears in the headline figures, where it is the
   // intake half of the pair.
   const boardQ = useStatsBoard(scope, "merged", days, loadable);
+
+  // The roster for the reviews-GIVEN board, read off the tree the sidebar
+  // already loaded rather than fetched again. `useStatsTree` is keyed
+  // `["stats-tree"]` with a five-minute staleTime, so this is the SAME cached
+  // answer the sidebar is rendering -- no request, and no chance of the board
+  // disagreeing with the Members rows beside it.
+  //
+  // Only an ORG scope has a roster. A repository, Personal and Everything
+  // have no membership to enumerate, so the reviewer board is absent there
+  // rather than empty -- which is the honest shape: "nobody reviewed" and
+  // "nothing enumerated the reviewers" must not render as the same chart.
+  const tree = useStatsTree(true).data;
+  const reviewerLogins =
+    scope.kind === "org"
+      ? (tree?.orgs.find((o) => o.login === scope.value)?.members ?? []).map(
+          (m) => m.login,
+        )
+      : [];
+  const reviewersQ = useStatsReviewers(scope, days, reviewerLogins, loadable);
 
   const board = boardQ.data;
   const series = seriesQ.data;
@@ -386,7 +407,33 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
                   component's own short reminder on the rankings is where a
                   reader's eye actually is when they read a name off a
                   board. */}
-              <Leaderboards rows={board.rows} complete={board.complete} />
+              <Leaderboards
+                rows={board.rows}
+                complete={board.complete}
+                // The reviews-GIVEN board travels as its OWN query rather than
+                // as a field on the rows, because it is a different search
+                // over a different population -- the rows are authors in the
+                // window, and a reviewer need not have authored anything. So
+                // it lands independently and the rankings drawn from the board
+                // do not wait on it, which is this page's progressive rule
+                // applied to one more part.
+                //
+                // `undefined` while pending, which the component renders as a
+                // loading board rather than an empty one. A reviewer board
+                // that printed "no reviews in this window" for the second it
+                // was in flight would be a claim, and it is the claim this
+                // account's real data makes TRUE -- so a reader could not tell
+                // the transient from the answer.
+                reviewers={reviewersQ.data}
+                reviewersPending={reviewersQ.isPending && reviewerLogins.length > 0}
+                reviewersError={reviewersQ.isError}
+                // Absent, not empty, when nothing enumerated a roster. Only an
+                // org scope has members; on a repository or Personal scope
+                // there is nobody to ask about, and an empty chart there would
+                // say "nobody reviewed" on the strength of never having
+                // looked.
+                reviewersAvailable={reviewerLogins.length > 0}
+              />
             </>
           )}
         </>
