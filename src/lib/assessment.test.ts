@@ -13,6 +13,8 @@ const a = (over: Partial<Assessment> = {}): Assessment => ({
   has_upstream: true,
   subjects: [],
   subjects_elided: 0,
+  base: "origin/main",
+  fetched_at: "2026-09-11T08:00:00Z",
   ...over,
 });
 

@@ -7,8 +7,64 @@
 //! Everything here is local. No network, no GitHub API -- the comparison
 //! is against the `origin/main` ref already on disk, so this works on a
 //! plane and costs no rate limit.
+//!
+//! # Why this module still does not fetch (#815)
+//!
+//! That local-only design is the direct cause of the bug #815 reports.
+//! The numbers below are computed against whatever `origin/main` on disk
+//! happens to say, so an agent handed them would assess a branch as
+//! unmerged work worth finishing when every commit in it had already
+//! landed upstream -- then do the work, and find out at PR time. #702
+//! measured the staleness that makes this happen: one repository on this
+//! machine had refs 12 days old while its rows read like the present
+//! tense.
+//!
+//! The fix is in the PROMPT, not here. `prompt()` now names the base ref
+//! explicitly, tells the agent to refresh `origin` before believing
+//! anything, and tells it to stop and report rather than work if the
+//! branch is already upstream. Three reasons that is the better half to
+//! change:
+//!
+//! 1. The agent's own refresh is the only one that is actually fresh.
+//!    Claudify copies a command to the clipboard; the user pastes it into
+//!    a shell seconds, minutes, or a day later. A refresh at copy time is
+//!    stale again by the time the agent reads its own prompt, so the
+//!    agent has to do one regardless -- and then the click's bought
+//!    nothing but latency.
+//! 2. `git()` is documented as local-only and bounded at 30s, a bound
+//!    chosen for a stalled FILESYSTEM. A network refresh over a slow link
+//!    can legitimately exceed 30s, and every field here turns a git
+//!    failure into an ABSENT fact -- so a slow network would silently
+//!    produce an assessment that states nothing, which is precisely the
+//!    failure mode the `Option` fields exist to prevent.
+//! 3. A network call inside one row's click would move every OTHER row's
+//!    merge verdict on the page, with no visible cause. `size_worktrees`
+//!    set the precedent that an expensive operation lives behind its own
+//!    explicit affordance rather than riding along on an unrelated one.
+//!
+//! Rejected, with reasons:
+//!
+//! - **On the render path** (the scan, or `assess_worktree`). An implicit
+//!   network call per page load across 37 remotes is what `Repo`'s
+//!   `fetched_at` doc already declines: "a view that opens in a second
+//!   must not become one that opens in thirty".
+//! - **Once per repo inside the Claudify click.** Defensible -- it is a
+//!   deliberate gesture already spending six git calls -- and it is what
+//!   #815 leans towards as a second best. Declined on (1): the agent
+//!   refreshes regardless, so this is a duplicate network round trip
+//!   whose only visible effect is making the click feel broken on a slow
+//!   link. `claudify_command` is also a SYNCHRONOUS Tauri command, unlike
+//!   `assess_worktree`'s `spawn_blocking`, so an unbounded network call
+//!   there blocks the IPC thread rather than a pool thread.
+//! - **Refuse to produce a prompt when the refs are stale.** Withholding
+//!   the feature is worse than carrying the caveat: the agent can refresh
+//!   the refs itself, which is exactly what it is now told to do.
+//!
+//! What this module does instead is SAY how stale it is. `fetched_at`
+//! rides along in the struct and `prompt()` prints it, so the numbers are
+//! labelled as-of-a-refresh rather than presented as live.
 
-use super::scan::{default_branch, git};
+use super::scan::{default_branch, fetched_at, git};
 use serde::Serialize;
 use std::path::Path;
 
@@ -43,6 +99,36 @@ pub struct Assessment {
     /// Uncommitted paths. Not covered by the diff against the default
     /// branch, so an agent would otherwise assess an incomplete picture.
     pub uncommitted: u64,
+    /// The ref every count above was measured against, by name --
+    /// `origin/main` on a repository with a remote, a bare `main` on a
+    /// purely local one (#815).
+    ///
+    /// Carried rather than re-derived, and NAMED rather than described.
+    /// The prompt used to say "the default branch", which is ambiguous
+    /// in exactly the way that caused the bug: an agent reading it is
+    /// free to resolve it as the local `main`, the merge-base the
+    /// worktree was cut from, or the remote ref -- three different
+    /// answers, one of which is the one the numbers actually came from.
+    /// Telling the agent the literal ref makes its own `rev-list`
+    /// reproduce these counts instead of inventing different ones.
+    ///
+    /// `String`, not `Option`: `default_branch` always answers, falling
+    /// back to the local branch name, so there is no "we could not tell"
+    /// state to represent here.
+    pub base: String,
+    /// When this repository's remote refs were last refreshed, RFC 3339,
+    /// or `None` for never/unreadable.
+    ///
+    /// The same `FETCH_HEAD` mtime the Worktrees page shows (#702), but
+    /// plumbed through to the PROMPT, which is where it was missing
+    /// (#815). The page's caveat never reached the agent's context, so
+    /// the agent had no way to know its inputs were as-of-a-refresh
+    /// rather than live.
+    ///
+    /// `None` means "we do not know", never "just now" -- never
+    /// refreshed is the stalest state there is, and the prompt says so
+    /// in those words.
+    pub fetched_at: Option<String>,
 }
 
 /// Gather what can be known about a worktree's work, locally.
@@ -70,6 +156,12 @@ pub fn assess(repo_path: &str, worktree_path: &str, branch: &str) -> Assessment 
     let mut a = Assessment {
         path: worktree_path.to_string(),
         branch: branch.to_string(),
+        // Both read from the MAIN checkout, not the worktree: `base` is a
+        // property of the repository, and `FETCH_HEAD` lives in the
+        // repository's `.git` directory rather than in a worktree's
+        // `.git` file.
+        base: base.clone(),
+        fetched_at: fetched_at(repo),
         commits_ahead: count(&["rev-list", "--count", &range2]),
         // `--` before the ref: a branch named `--output=/path` would
         // otherwise make git write to an arbitrary file. The boundary in
@@ -120,18 +212,84 @@ impl Assessment {
     /// A fact that could not be gathered is OMITTED rather than guessed.
     /// "0 commits ahead" when the check failed would send an agent looking
     /// for work that is there.
+    ///
+    /// # Refresh first, and say how stale these numbers are (#815)
+    ///
+    /// Two things this prompt used to get wrong, which together produced
+    /// the same wasted-work loop over and over: an agent assessed a
+    /// branch as unfinished work, finished it, opened a PR, and found
+    /// every commit already upstream.
+    ///
+    /// **It said "the default branch", twice, unqualified.** Three
+    /// different refs answer to that phrase -- the local `main`, the
+    /// merge-base the worktree was cut from, and `origin/main` -- and
+    /// only the last is what the numbers above were measured against. So
+    /// the prompt now interpolates `base` literally. An agent that runs
+    /// `rev-list --count origin/main..branch` reproduces the count it was
+    /// handed; one that guesses `main` does not, and has no way to know
+    /// it diverged.
+    ///
+    /// **It never said to refresh.** Nothing on this path fetches (see
+    /// the module header for why that stays true), so the counts are as
+    /// old as the last refresh -- 12 days, measured (#702). The agent is
+    /// now told to refresh `origin` and to re-derive the comparison
+    /// itself, which is the whole fix: even when the app's inputs are
+    /// stale, the agent's are not, because it refreshed them.
+    ///
+    /// The already-upstream check is ordered BEFORE the four questions
+    /// and phrased as a stop, not a caveat. Order is the entire point.
+    /// "Check whether this is already merged" placed among the questions
+    /// gets answered in a report written after the work is done, which is
+    /// the exact failure being fixed; a STOP placed first is the only
+    /// form of it that saves anything.
+    ///
+    /// The refresh is worded as `git fetch origin` with no refspec and no
+    /// `--prune`. A refspec would need the default branch's short name,
+    /// which `base` carries only as `origin/<name>`, and pruning is a
+    /// write to the user's refs that an assessment was not asked to make.
+    ///
+    /// Staleness is stated as the timestamp rather than as prose ("2
+    /// hours ago"): the prompt may be pasted a day after it was copied,
+    /// and a relative phrase computed at copy time would then be a lie
+    /// with no way for the reader to notice. An absolute instant stays
+    /// true however long the clipboard holds it.
+    ///
+    /// The staleness line is printed only when there ARE numbers to
+    /// label. Every git call can fail, and a lone "These numbers are as
+    /// of a fetch at ..." above an empty list is a confident sentence
+    /// about nothing -- the same failure the `Option` fields exist to
+    /// avoid, one level up. The FIRST block still tells the agent to
+    /// refresh in that case, which is what matters.
     pub fn prompt(&self) -> String {
         let mut out = format!(
             "Assess the git worktree at {}, branch {}.\n\n",
             self.path, self.branch
         );
 
+        // Ordered first and labelled as a precondition, because an agent
+        // that reads the facts below before this line has already started
+        // to believe them.
+        out.push_str(&format!(
+            "FIRST, before assessing anything:\n\
+             \x20 - Run `git fetch origin` in that worktree. The numbers below were \
+             measured against the on-disk `{base}` ref, and nothing in this app \
+             fetches, so they can be days old.\n\
+             \x20 - Re-derive the comparison yourself against `{base}` \
+             (`git rev-list --count {base}..{branch}`). Use `{base}` by that name, \
+             not a local `main` and not the merge-base this worktree was cut from; \
+             they are different refs and can give different answers.\n\
+             \x20 - If the work on {branch} is ALREADY on `{base}` -- merged, \
+             rebased, cherry-picked, or landed under other commit hashes -- STOP. \
+             Report that it is already upstream and do no further work. Do not \
+             finish, tidy, rebase or prepare the branch first. That wasted-work \
+             path is the reason this instruction exists.\n\n",
+            base = self.base,
+            branch = self.branch,
+        ));
+
         let mut facts = Vec::new();
         if let Some(n) = self.commits_ahead {
-            facts.push(format!(
-                "  {n} commit{} ahead of the default branch",
-                plural(n)
-            ));
+            facts.push(format!("  {n} commit{} ahead of {}", plural(n), self.base));
         }
         if let Some(f) = self.files_changed {
             let ins = self.insertions.unwrap_or(0);
@@ -142,8 +300,8 @@ impl Assessment {
             facts.push(format!("  last commit {when}"));
         }
         if self.uncommitted > 0 {
-            // Not covered by the diff against the default branch, so an
-            // agent would otherwise assess an incomplete picture.
+            // Not covered by the diff against the base ref, so an agent
+            // would otherwise assess an incomplete picture.
             facts.push(format!(
                 "  {} uncommitted file{} in the working tree",
                 self.uncommitted,
@@ -155,7 +313,25 @@ impl Assessment {
             // it is read rather than buried among the counts.
             facts.push("  NOT PUSHED -- these commits exist only on this machine".to_string());
         }
+        // The staleness header goes WITH the facts, inside this guard,
+        // rather than above it. When every git call failed there are no
+        // numbers, and "These numbers are as of a fetch at ..." followed
+        // by nothing is a sentence about an empty set -- the same
+        // confident-statement-of-nothing the `Option` fields exist to
+        // avoid. Labelled here, or not printed at all.
+        //
+        // Stated even though the FIRST block tells the agent to refresh:
+        // the agent reads these numbers whether or not it runs the
+        // commands, and an unlabelled number reads as current.
         if !facts.is_empty() {
+            out.push_str(&match &self.fetched_at {
+                Some(at) => format!("These numbers are as of a fetch at {at}:\n\n"),
+                // The stalest state there is, not the freshest -- the same
+                // rule `refAge` follows on the page (#702).
+                None => {
+                    "These numbers come from refs that have NEVER been fetched:\n\n".to_string()
+                }
+            });
             out.push_str(&facts.join("\n"));
             out.push_str("\n\n");
         }
@@ -171,15 +347,25 @@ impl Assessment {
             out.push('\n');
         }
 
-        out.push_str(
-            "Please:\n\
+        // `base` again rather than "the default branch": question 2 is
+        // the one whose answer changes with the ref, so leaving it vague
+        // here would reintroduce the ambiguity the FIRST block removes.
+        //
+        // "safe to discard" stays available as a recommendation even
+        // though the already-upstream case now stops above: a branch can
+        // be discardable for reasons that have nothing to do with having
+        // landed -- abandoned, superseded, an experiment.
+        out.push_str(&format!(
+            "Then please:\n\
              \x20 1. What does this change, and why does it appear to exist?\n\
-             \x20 2. What would it affect if merged into the default branch?\n\
+             \x20 2. What would it affect if merged into {base}?\n\
              \x20 3. Is it complete, or was it abandoned midway?\n\
-             \x20 4. Recommend one: open a PR / needs work first / safe to discard.\n\n\
+             \x20 4. Recommend one: open a PR / needs work first / safe to discard \
+             / already upstream.\n\n\
              Do not push anything or open a pull request. Report your assessment \
              and let me decide.",
-        );
+            base = self.base,
+        ));
         out
     }
 
@@ -285,6 +471,8 @@ mod tests {
             subjects: vec!["add retry to the client".into()],
             subjects_elided: 0,
             uncommitted: 0,
+            base: "origin/main".into(),
+            fetched_at: Some("2026-09-11T08:00:00Z".into()),
         }
     }
 
@@ -347,6 +535,152 @@ mod tests {
         // The questions still get asked -- an agent with fewer facts is
         // still more use than no prompt.
         assert!(p.contains("Recommend one"));
+    }
+
+    /// Print the prompt for a human to read as prose. Run manually:
+    /// `cargo test --lib show_the_prompt -- --ignored --nocapture`
+    ///
+    /// `#[ignore]`d and assertion-free on purpose. It is a review tool,
+    /// not a check: the tests around it pin the load-bearing phrases, but
+    /// whether the whole thing READS as instructions an agent will follow
+    /// is a judgment no assertion makes. A snapshot of the full text
+    /// would fail on every wording change without telling anyone whether
+    /// the new wording is better, so there is none.
+    #[test]
+    #[ignore]
+    fn show_the_prompt() {
+        println!("--- FRESH ---\n{}", base().prompt());
+        println!(
+            "--- NEVER FETCHED ---\n{}",
+            Assessment {
+                fetched_at: None,
+                has_upstream: false,
+                ..base()
+            }
+            .prompt()
+        );
+    }
+
+    /// #815's core fix: the agent is told to refresh `origin` before
+    /// believing any number in the prompt.
+    ///
+    /// Nothing on this path fetches -- deliberately, see the module
+    /// header -- so the agent's own refresh is the only thing that makes
+    /// the comparison current. Without this instruction an agent
+    /// assessed against refs that were days old, did the work, and found
+    /// it already upstream at PR time.
+    #[test]
+    fn the_prompt_tells_the_agent_to_refresh_the_remote_first() {
+        let p = base().prompt();
+        assert!(p.contains("git fetch origin"), "{p}");
+        // Ordered BEFORE the questions. A refresh mentioned after them is
+        // read after the agent has already believed the counts.
+        let fetch = p.find("git fetch origin").expect("a fetch instruction");
+        let questions = p.find("Then please:").expect("the question block");
+        assert!(fetch < questions, "the refresh must come first:\n{p}");
+    }
+
+    /// The base ref is named, not described.
+    ///
+    /// "the default branch" answers to three different refs -- the local
+    /// `main`, the merge-base the worktree was cut from, and
+    /// `origin/main` -- and only the last is what the counts were
+    /// measured against. An agent that resolves the phrase differently
+    /// gets different numbers and cannot tell that it has.
+    #[test]
+    fn the_prompt_names_the_base_ref_rather_than_describing_it() {
+        let p = base().prompt();
+        assert!(p.contains("origin/main"), "{p}");
+        assert!(
+            !p.contains("the default branch"),
+            "the vague phrase is what #815 was about:\n{p}"
+        );
+        // The count line and question 2 both carry the real ref.
+        assert!(p.contains("4 commits ahead of origin/main"), "{p}");
+        assert!(p.contains("merged into origin/main"), "{p}");
+    }
+
+    /// A purely local repository has no remote-tracking ref, so
+    /// `default_branch` falls back to the bare branch name. The prompt
+    /// must quote THAT, not an `origin/` ref that does not exist.
+    #[test]
+    fn a_local_only_repository_gets_its_own_base_ref_quoted() {
+        let p = Assessment {
+            base: "main".into(),
+            ..base()
+        }
+        .prompt();
+        assert!(p.contains("4 commits ahead of main"), "{p}");
+        assert!(!p.contains("origin/main"), "{p}");
+    }
+
+    /// STOP, not "mention it in the report".
+    ///
+    /// A caveat answered in a report written after the work is done is
+    /// the exact failure #815 describes. The instruction only saves
+    /// anything if it halts the agent before it starts.
+    #[test]
+    fn the_prompt_stops_the_agent_when_the_work_is_already_upstream() {
+        let p = base().prompt();
+        assert!(p.contains("ALREADY on"), "{p}");
+        assert!(p.contains("STOP"), "{p}");
+        assert!(p.contains("do no further work"), "{p}");
+        // The ways a branch lands without its own commits surviving --
+        // a squash-merged branch is not "merged" by `rev-list`.
+        assert!(p.contains("cherry-picked"), "{p}");
+    }
+
+    /// The prompt says how stale its own numbers are.
+    ///
+    /// The page has carried this caveat since #702 and the agent never
+    /// saw it, so the agent had no way to know its inputs were
+    /// as-of-a-fetch rather than live (#815).
+    #[test]
+    fn the_prompt_dates_the_numbers_it_quotes() {
+        let p = base().prompt();
+        assert!(p.contains("as of a fetch at 2026-09-11T08:00:00Z"), "{p}");
+    }
+
+    /// No numbers means no sentence ABOUT the numbers.
+    ///
+    /// Every git call in `assess` can fail, and when they all do there is
+    /// nothing under the heading. "These numbers are as of a fetch at
+    /// 2026-09-11T08:00:00Z:" followed by a blank is a confident
+    /// statement about an empty set -- the same class of defect as the
+    /// "0 commits ahead" the `Option` fields exist to prevent. The
+    /// refresh instruction is unaffected, which is the part that matters.
+    #[test]
+    fn the_staleness_line_is_dropped_when_there_are_no_facts_to_label() {
+        let p = Assessment {
+            commits_ahead: None,
+            files_changed: None,
+            insertions: None,
+            deletions: None,
+            last_activity: None,
+            uncommitted: 0,
+            has_upstream: true,
+            ..base()
+        }
+        .prompt();
+        assert!(!p.contains("as of a fetch"), "{p}");
+        assert!(!p.contains("NEVER been fetched"), "{p}");
+        // Still told to refresh and still told to stop if it landed.
+        assert!(p.contains("git fetch origin"), "{p}");
+        assert!(p.contains("STOP"), "{p}");
+    }
+
+    /// Never fetched is the STALEST state, not the freshest -- the same
+    /// rule `refAge` follows on the page. Saying nothing here would
+    /// silence the caveat in the case that most needs it.
+    #[test]
+    fn never_fetched_is_stated_as_the_worst_case() {
+        let p = Assessment {
+            fetched_at: None,
+            ..base()
+        }
+        .prompt();
+        assert!(p.contains("NEVER been fetched"), "{p}");
+        assert!(!p.contains("as of a fetch at"), "{p}");
     }
 
     /// The agent is told not to write. A button labelled "assess" that
@@ -487,5 +821,22 @@ mod tests {
         assert_eq!(a.files_changed, Some(1));
         assert_eq!(a.insertions, Some(2));
         assert_eq!(a.subjects, vec!["add the feature".to_string()]);
+
+        // The ref the counts came from, carried by name so the prompt can
+        // quote it (#815). Same value the comparison above used -- if
+        // these two ever diverge, the prompt tells an agent to reproduce
+        // a number against a ref that did not produce it.
+        assert_eq!(a.base, "origin/main");
+        assert!(
+            a.prompt().contains("1 commit ahead of origin/main"),
+            "{}",
+            a.prompt()
+        );
+
+        // This fixture pushes and never fetches, so `FETCH_HEAD` does not
+        // exist -- which the prompt must state as the worst case rather
+        // than pass over in silence.
+        assert_eq!(a.fetched_at, None);
+        assert!(a.prompt().contains("NEVER been fetched"), "{}", a.prompt());
     }
 }

@@ -550,6 +550,21 @@ export interface Assessment {
   has_upstream: boolean;
   subjects: string[];
   subjects_elided: number;
+  /// The ref the counts above were measured against, by name:
+  /// `origin/main` with a remote, a bare `main` on a purely local repo.
+  ///
+  /// Carried so the Claudify prompt can NAME it. It used to say "the
+  /// default branch", which an agent is free to resolve as the local
+  /// `main`, the merge-base, or the remote ref -- three answers, one of
+  /// which produced these numbers (#815).
+  base: string;
+  /// When this repository's remote refs were last fetched, RFC 3339, or
+  /// `null` for never/unreadable.
+  ///
+  /// Nothing on the assessment path fetches, so every count here is only
+  /// as current as this instant. `refAge` says so on the page; the
+  /// prompt now says so to the agent (#815).
+  fetched_at: string | null;
 }
 
 /// What kind of build output a directory holds.
