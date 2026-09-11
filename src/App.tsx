@@ -54,7 +54,7 @@ import { applyFilters, hasActiveFilters, sortPrs } from "./lib/derive";
 import { shortcutFor } from "./lib/shortcuts";
 import { useIsMobile } from "./lib/useIsMobile";
 import { relativeSeconds } from "./lib/time";
-import { useActiveFilters, useFilters } from "./store/filters";
+import { MOBILE_HIDDEN_VIEWS, useActiveFilters, useFilters } from "./store/filters";
 
 /// The assembled app shell. `AuthGate` already wraps this component once in
 /// `main.tsx` -- it is not repeated here, so there is exactly one
@@ -70,19 +70,28 @@ export default function App() {
     dataUpdatedAt,
   } = usePullRequests();
   const filters = useActiveFilters();
-  const { view, panel: storedPanel, selectedPr, selectPr, applyPreset } = useFilters();
+  const { view: storedView, panel, selectedPr, selectPr, applyPreset } = useFilters();
   const isMobile = useIsMobile();
-  // Stats is desktop-only in the companion's first release. The panel
-  // persists across launches, so a desktop closed on Stats would
-  // otherwise open a phone on a page the phone does not offer -- with
-  // no sidebar entry to leave it by, since that entry is hidden too.
+  // A view the companion does not ship falls back to the default one.
   //
-  // On the BUILD, not the viewport: "the companion does not offer
-  // Stats" is a statement about which app this is, and the viewport
-  // version took Stats away from a desktop user who dragged their
-  // window under 768px -- on a page they can still reach from the
-  // sidebar there, since `RepoSidebar` hides that entry by viewport too.
-  const panel = IS_MOBILE_BUILD && storedPanel === "stats" ? "list" : storedPanel;
+  // This replaces the `panel === "stats"` downgrade that stood here
+  // until #794. Stats was a `panel` value then; it is the `pr-stats`
+  // VIEW now, and `view` persists across launches exactly as `panel`
+  // did -- so a desktop closed on PR Stats would otherwise open a phone
+  // on a page the phone does not offer, with no switcher entry to leave
+  // it by since that entry is hidden too.
+  //
+  // Derived rather than written back to the store, deliberately. The
+  // phone and the desktop can share a persisted store (UI prefs sync,
+  // and a user may restore a backup), so CORRECTING the stored value
+  // would silently move the desktop off PR Stats as well. What the
+  // phone cannot show, the phone declines to show; what the desktop
+  // stored stays stored.
+  //
+  // On the BUILD, not the viewport, per `lib/target.ts`: a desktop user
+  // who drags their window under 768px keeps the page.
+  const view =
+    IS_MOBILE_BUILD && MOBILE_HIDDEN_VIEWS.has(storedView) ? "my-prs" : storedView;
   // The sidebar is a sheet on the phone, opened from a button in the
   // header. Any navigation closes it: the point of picking a repo is
   // to look at it, and a sheet still covering the list would hide the
@@ -302,6 +311,14 @@ export default function App() {
       // under a different name.
       <WorktreeSidebar viewCounts={{ "to-review": reviewingCount }} />
     ) : (
+      // My PRs and PR Stats. The fall-through is the DECISION for the
+      // second one rather than an accident of ordering: #794 settled
+      // that PR Stats keeps the repo sidebar it inherited as a panel,
+      // rather than the blank column the issue offered as a fallback.
+      // `ViewSwitcher`'s doc comment carries the reasoning, including
+      // the part that matters here -- `StatsPage` does not read
+      // `filters.repo`, so the rows are continuity and a future scope
+      // hook, not a live filter.
       <RepoSidebar prs={source} viewCounts={{ "to-review": reviewingCount }} />
     );
 
@@ -363,10 +380,12 @@ export default function App() {
               <Menu className="h-4 w-4" aria-hidden="true" />
             </button>
           ) : null}
-          {/* View selection lives in the sidebar ("Stats", pinned to its
-              bottom) rather than as a per-page tab pair here: the sidebar is
-              already where you choose what you are looking at, and a tab row
-              repeated above every page competed with it. */}
+          {/* View selection lives in the sidebar's switcher rather than
+              as a per-page tab row here: the sidebar is already where you
+              choose what you are looking at, and a tab row repeated above
+              every page competed with it. Since #794 that is true of PR
+              Stats too -- it was the last destination reached any other
+              way. */}
           <h1 className="text-sm font-semibold">
             {view === "to-review"
               ? "Pull requests to review"
@@ -384,8 +403,13 @@ export default function App() {
                   ? "Worktrees"
                 : view === "branches"
                   ? "Branches"
-                : panel === "stats"
-                  ? "Stats"
+                  // "PR Stats", matching the switcher entry exactly
+                  // (#794). The header naming the page something other
+                  // than the menu item that opened it is how a user
+                  // doubts they are where they meant to be -- and this
+                  // said "Stats" while that now says "PR Stats".
+                : view === "pr-stats"
+                  ? "PR Stats"
                   : "Pull requests"}
           </h1>
           <div className="ml-auto">
@@ -407,10 +431,21 @@ export default function App() {
             page, and none of Worktrees, Branches or System health has
             any notion of a selected PR to go back to. System health
             least of all -- it is about the machine, and nothing on it
-            can be reached from a pull request. */}
+            can be reached from a pull request.
+
+            PR Stats joins them (#794), and for a reason the others do
+            not share: it IS about pull requests, just not about one of
+            them. A whole-account summary with a single PR's detail
+            rendered over it is not a page anybody asked for. `setView`
+            clears `selectedPr`, so the switcher path could not reach
+            this anyway -- but "could not reach it today" is the wrong
+            thing for the route to rely on, since the detail branch is
+            FIRST in this chain and therefore wins over every view
+            branch below it. */}
         {selectedPr &&
         view !== "worktrees" &&
         view !== "branches" &&
+        view !== "pr-stats" &&
         view !== "system-health" ? (
           <div className="p-4">
             <PrDetailView
@@ -447,12 +482,21 @@ export default function App() {
           <div className="p-4">
             <SystemHealthPage />
           </div>
-        ) : panel === "stats" ? (
+        ) : view === "pr-stats" ? (
           <div className="p-4">
-            {/* No priorities strip here: Stats is a read-only summary of the
-                whole account, and the strip is a triage surface that belongs
-                beside the list it acts on. Its cards already surface what
-                needs attention, and each one clicks through to the list. */}
+            {/* No priorities strip here: PR Stats is a read-only summary
+                of the whole account, and the strip is a triage surface
+                that belongs beside the list it acts on. Its cards already
+                surface what needs attention, and each one clicks through
+                to the list.
+
+                Keyed on `view` since #794, not on `panel`. It sits after
+                the other view branches for the same reason it sat after
+                `system-health` before: this chain is ordered, and a
+                branch that tested a DIFFERENT axis had to come last or
+                it would have swallowed every view whose panel happened
+                to be "stats". That hazard is gone now that one axis
+                decides. */}
             <StatsPage />
           </div>
         ) : (

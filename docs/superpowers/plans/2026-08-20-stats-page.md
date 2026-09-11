@@ -1,5 +1,17 @@
 # Stats Page Implementation Plan
 
+> **Superseded in part — HOW THE PAGE IS REACHED.** This plan was executed;
+> the page it describes is `src/components/StatsPage.tsx` and its contents
+> are still accurate. Its ROUTING is not. The plan says `App.tsx` renders it
+> when `view === "dashboard"`; that enum was split into `view` + `panel`
+> shortly after, making it `panel === "stats"` within My PRs, and #794
+> promoted it again to a view of its own, `view === "pr-stats"`, labelled
+> **"PR Stats"** in the switcher. The pinned sidebar row this plan's era
+> added is gone. Left in place rather than rewritten: a plan is a record of
+> what was decided on 2026-08-20, and editing it to match today's code
+> destroys that without improving anything. `src/store/filters.ts` is the
+> live answer on views.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace the seven-card Stats view with a history-oriented dashboard: daily opened-vs-merged area chart, period delta cards, cycle-time / code-volume / review-burden insights, and a repo distribution table.

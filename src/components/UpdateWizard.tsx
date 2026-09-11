@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import { toast } from "sonner";
 import type { Ecosystem, Outdated } from "@/types/pr";
 import { applyUpdatesInBackground } from "@/api/tauri";
-import { branchNameError, derivedBranchName } from "@/lib/branchName";
+import { branchNameError, derivedBranchName, soleEcosystem } from "@/lib/branchName";
 import {
   Dialog,
   DialogContent,
@@ -92,18 +92,42 @@ export function UpdateWizard({
     return { applicable, blocked };
   }, [packages]);
 
+  // The instant the generated name is stamped with (#797), fixed when the
+  // dialog opens rather than read on each render.
+  //
+  // The name now ends in a UTC timestamp, which is what makes two runs in
+  // one repository unique -- but a stamp re-read per render would tick
+  // visibly in a field the user may be about to edit, and every keystroke
+  // elsewhere would move it. Worse, the name shown would not be the name
+  // sent: `run` reads this same value, so freezing it is what makes the
+  // prediction BINDING.
+  //
+  // Re-taken on each open, not once per mount, so a dialog left closed
+  // for an hour does not stamp its next run with an hour-old time.
+  const [openedAt, setOpenedAt] = useState(() => new Date());
+  const [wasOpen, setWasOpen] = useState(open);
+  if (open !== wasOpen) {
+    setWasOpen(open);
+    if (open) setOpenedAt(new Date());
+  }
+
+  const selectedRows = useMemo(
+    () => applicable.filter((p) => selected.has(key(p))),
+    [applicable, selected],
+  );
   const derivedName = useMemo(
     () =>
       derivedBranchName(
-        applicable.filter((p) => selected.has(key(p))).map((p) => p.name),
+        selectedRows.map((p) => p.name),
+        soleEcosystem(selectedRows.map((p) => p.ecosystem)),
+        openedAt,
       ),
-    [applicable, selected],
+    [selectedRows, openedAt],
   );
   const branchError = branchNameError(branchEdit ?? derivedName);
 
   const run = () => {
-    const requests = applicable
-      .filter((p) => selected.has(key(p)))
+    const requests = selectedRows
       .map((p) => ({
         name: p.name,
         version: p.latest,
@@ -130,7 +154,17 @@ export function UpdateWizard({
       description: "A worktree is being prepared and a pull request assembled.",
     });
 
-    applyUpdatesInBackground(repo, requests, branchEdit ?? undefined).catch((e: unknown) => {
+    // The DERIVED name is sent, not `undefined` (#797).
+    //
+    // Passing `undefined` let the backend derive its own, which was
+    // harmless while the name was a pure function of the package list --
+    // both sides computed the same string. It is not harmless now that
+    // the name carries a timestamp: two clock reads a second apart give
+    // two different names, so the field would show one branch and the run
+    // would create another. Sending what was shown makes the prediction
+    // binding rather than advisory, and `valid_branch_name` validates it
+    // on arrival exactly as it validates a real override.
+    applyUpdatesInBackground(repo, requests, branchEdit ?? derivedName).catch((e: unknown) => {
       toast.error("Could not start the update run", {
         description: typeof e === "string" ? e : undefined,
       });

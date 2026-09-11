@@ -78,6 +78,33 @@ impl Ecosystem {
         }
     }
 
+    /// This ecosystem's name as it appears in a branch name (#797).
+    ///
+    /// Exactly the `serde(rename_all = "snake_case")` spelling of the
+    /// variant, which is what `Ecosystem` already is on the wire and
+    /// therefore what the TypeScript `Ecosystem` union holds. That is the
+    /// point: `branch_name` and `derivedBranchName` must agree on the
+    /// string, and the one thing both sides are already guaranteed to
+    /// spell identically is the serialised form.
+    ///
+    /// NOT `program()`. That is the executable -- `pod` for CocoaPods --
+    /// and a branch called `headstate/pod-deps-…` names the tool rather
+    /// than the ecosystem. Every value here is ASCII lowercase letters,
+    /// so nothing it produces needs sanitising for a ref.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Ecosystem::Npm => "npm",
+            Ecosystem::Yarn => "yarn",
+            Ecosystem::Poetry => "poetry",
+            Ecosystem::Uv => "uv",
+            Ecosystem::Dotnet => "dotnet",
+            Ecosystem::Cocoapods => "cocoapods",
+            Ecosystem::Terraform => "terraform",
+            Ecosystem::Swift => "swift",
+            Ecosystem::Cargo => "cargo",
+        }
+    }
+
     /// The manifest whose presence means this ecosystem is in use.
     pub fn manifest(self) -> &'static str {
         match self {
@@ -151,4 +178,63 @@ pub struct ProjectReport {
     /// Relative to the repository root. Empty at the root itself.
     pub label: String,
     pub reports: Vec<EcosystemReport>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every ecosystem. A literal list is the only way to enumerate a
+    /// Rust enum without a derive; what stops a stale one from passing
+    /// quietly is that a new variant has to be spelled in
+    /// `src/lib/branchName.ts` too, and `branchName.test.ts` asserts the
+    /// two agree on the slug.
+    const EVERY: &[Ecosystem] = &[
+        Ecosystem::Npm,
+        Ecosystem::Yarn,
+        Ecosystem::Poetry,
+        Ecosystem::Uv,
+        Ecosystem::Dotnet,
+        Ecosystem::Cocoapods,
+        Ecosystem::Terraform,
+        Ecosystem::Swift,
+        Ecosystem::Cargo,
+    ];
+
+    /// `slug` must BE the serialised name, not merely resemble it.
+    ///
+    /// The slug goes into a branch name that `derivedBranchName` has to
+    /// predict without a round trip (#797), and the only string the two
+    /// sides are guaranteed to spell identically is the one that crosses
+    /// the wire -- the TypeScript `Ecosystem` union IS this serde form.
+    /// Derived from `serde_json` here rather than typed out, so a variant
+    /// renamed on one side cannot pass by having a hand-written copy
+    /// renamed to match.
+    #[test]
+    fn slug_matches_the_serialised_name() {
+        for eco in EVERY {
+            let json = serde_json::to_string(eco).expect("an ecosystem serialises");
+            assert_eq!(
+                format!("\"{}\"", eco.slug()),
+                json,
+                "{eco:?}: slug and serde form disagree"
+            );
+        }
+    }
+
+    /// A slug reaches `git worktree add -b`, so it must need no
+    /// sanitising. Every value is ASCII lowercase today; this is what
+    /// stops a future variant spelled with an underscore or a dot from
+    /// quietly changing what a ref looks like.
+    #[test]
+    fn every_slug_is_safe_in_a_ref() {
+        for eco in EVERY {
+            let s = eco.slug();
+            assert!(!s.is_empty(), "{eco:?} has an empty slug");
+            assert!(
+                s.chars().all(|c| c.is_ascii_lowercase()),
+                "{eco:?} slug {s:?} is not plain lowercase ASCII"
+            );
+        }
+    }
 }
