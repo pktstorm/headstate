@@ -93,15 +93,27 @@ export function WorktreeKebab({
   const safe = isSafe(worktree.safety);
   // Locked is offered, and says up front that forcing will not help.
   //
-  // `remove_worktree_forced` relaxes Headstate's gate but still calls
-  // git WITHOUT `--force`, and git refuses a locked tree on its own
-  // account. Without this line the user confirms a destructive-sounding
-  // dialog and gets an error. `forceWarning` already owns that
-  // sentence for #753's confirmation, so it is reused rather than
+  // The REASON changed in #798 while the behaviour did not. It used to
+  // be that `remove_worktree_forced` never passed git's `--force` at
+  // all, so forcing a locked tree failed the same way forcing a dirty
+  // one did -- an implementation gap, now closed.
+  //
+  // What remains is a decision. Git wants `--force --force` for a lock
+  // and Headstate passes it once, on purpose: the lock is the only
+  // mechanism another process has for saying "I am using this
+  // directory", and 13 of 34 worktrees on the reporting machine were
+  // locked by agents actively working in them. Double-forcing would
+  // tear a directory out from under whatever holds it, so the route is
+  // an explicit unlock -- the item directly above, behind a
+  // confirmation that names the holder and the age (#775).
+  //
+  // So git still refuses, and without this line the user confirms a
+  // destructive-sounding dialog and gets an error. `forceWarning` owns
+  // that sentence for #753's confirmation, so it is reused rather than
   // reworded: two copies of a warning about an unrecoverable action are
   // two chances to drift.
   const locked = worktree.safety.kind === "locked";
-  // Two rows are left out, and only two.
+  // Three rows are left out.
   //
   // An ORPHAN has no repository for git to run in, so it is removed by
   // an entirely different call -- the Rust side deletes the directory
@@ -112,11 +124,22 @@ export function WorktreeKebab({
   // one row on the page where offering this would be a serious bug
   // rather than a widened gate.
   //
-  // PRUNABLE deliberately stays IN. Its directory is already gone, but
-  // the stale registration remains and removing it is real work that
-  // loses nothing -- `forceWarning` has copy saying exactly that, so
-  // the confirmation is already honest about it.
-  const removable = worktree.safety.kind !== "orphaned" && !worktree.is_main;
+  // PRUNABLE is newly out (#793), and the reason is that the route was
+  // simply wrong rather than merely redundant. It used to stay in on the
+  // grounds that clearing the stale registration is real work that loses
+  // nothing -- true -- but the route it took was
+  // `remove_worktree_forced`, which runs `git worktree remove` on a
+  // directory that is not there. Wrong verb, and since #798 it now runs
+  // that wrong verb with `--force`, which is no better.
+  //
+  // `git worktree prune` is the right verb and #793 made it reachable:
+  // one repository-wide affordance in the header, because prune is
+  // repo-wide. So this row is not a dead end -- `instead` below sends
+  // the user to the action that exists, which is what the old
+  // disabled-button state never did.
+  const prunable = worktree.safety.kind === "prunable";
+  const removable =
+    worktree.safety.kind !== "orphaned" && !prunable && !worktree.is_main;
 
   return (
     <div ref={ref} className="relative shrink-0" onClick={(e) => e.stopPropagation()}>
@@ -262,6 +285,32 @@ export function WorktreeKebab({
                 )}
               </span>
             </button>
+          ) : null}
+
+          {/* Where a prunable row's action actually lives (#793).
+
+              Not a button, and that is the point. `git worktree prune`
+              is repo-wide -- it takes no path -- so a menu item here
+              would clear every stale registration in the repository
+              while appearing to act on this one row. Naming the header
+              affordance instead keeps the scope honest.
+
+              Present at all because the alternative is the dead end the
+              issue reported: a greyed Remove button, exclusion from
+              every count and from bulk selection, and a kebab that
+              offered "Remove anyway…" routed at the wrong verb. Removing
+              that wrong route without saying where the right one is
+              would have left the row quieter and no more actionable.
+
+              `role="none"` and not a menuitem: it is explanatory text
+              inside a menu, and a keyboard user tabbing onto something
+              that does nothing is worse than reading it in passing. */}
+          {prunable ? (
+            <p role="none" className="px-2 py-1.5 text-xs text-[#8b949e]">
+              This worktree's directory is already gone. Use “Prune stale
+              registrations” above the list — `git worktree prune` is repository-wide,
+              so it clears this one along with the rest.
+            </p>
           ) : null}
         </div>
       ) : null}
