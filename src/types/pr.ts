@@ -411,6 +411,26 @@ export interface PrDetail {
   /// into one list would imply a Resolve button on comments that have no
   /// such concept.
   review_threads: ReviewThread[];
+  /// GitHub's own count of review threads, which `review_threads` can be
+  /// SHORT of (#802).
+  ///
+  /// The query asks for the connection maximum of 100 and does not
+  /// paginate (see `map_review_threads` for why a cursor loop was
+  /// rejected), so above 100 threads the list arrives truncated. Read it
+  /// the way `checks_total` is read: render what arrived, say what is
+  /// missing. Before this existed the window was 20 and the shortfall was
+  /// invisible, which let an unresolved blocking comment sit outside a
+  /// view that looked complete.
+  ///
+  /// `unresolved_threads` is a FLOOR whenever this exceeds
+  /// `review_threads.length` -- it is counted from the threads that
+  /// arrived, and the total includes resolved and outdated ones so it
+  /// cannot be used to correct it.
+  ///
+  /// Compare with `review_threads.length` using a saturating subtraction;
+  /// a total below the length is possible and is not a negative
+  /// shortfall.
+  review_threads_total: number;
   /// `state` is `success`, `failure`, `pending`, `skipped`, or a raw
   /// GitHub value when unmodelled -- never coerced to success. Inlined
   /// rather than exported types, since nothing imports the names.

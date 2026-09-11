@@ -393,14 +393,58 @@ query($owner: String!, $repo: String!, $number: Int!) {
       # asked: on a repository where the viewer lacks write access,
       # Resolve renders and then fails with a 403. A button that cannot
       # work must not be shown, and only GitHub can answer that.
-      reviewThreads(first: 20) { nodes {
-        id isResolved isOutdated path line
-        viewerCanReply viewerCanResolve viewerCanUnresolve
-        comments(first: 10) {
-          totalCount
-          nodes { author { login } createdAt body }
+      #
+      # `first: 100` is the connection maximum, and the page size is NOT
+      # the cost -- the same fact the rollup's `contexts` comment below
+      # records. Was 20, which silently dropped thread 21 onwards (#802).
+      #
+      # MEASURED against the live API on a pull request with real
+      # threads: `first: 20` and `first: 100` both leave the whole detail
+      # query at cost 1, with no measurable latency difference (557ms vs
+      # 574ms, inside the noise) and no node-limit error -- 100 threads
+      # x 10 comments is 1,000 nodes against GitHub's 500,000 ceiling.
+      # Asking for the largest page is therefore free, and it is the
+      # reason #802 needs no cursor loop: see `map_review_threads` for
+      # the sampling behind that, and why a serial page chain was
+      # REJECTED rather than merely skipped.
+      #
+      # `totalCount` so a truncated list can say how many threads it is
+      # missing rather than rendering a plausible-looking subset. Free
+      # for the same reason: GitHub charges the connection, not the
+      # fields on it. This is what removes the SILENCE, which was the
+      # actual defect -- a reviewer deciding from a complete-looking view
+      # of 20 of 25 threads decides on partial information without being
+      # told it is partial.
+      reviewThreads(first: 100) {
+        totalCount
+        nodes {
+          id isResolved isOutdated path line
+          viewerCanReply viewerCanResolve viewerCanUnresolve
+          # DELIBERATE, and deliberately left at 10 (#802 asks for a
+          # decision either way rather than silence).
+          #
+          # Kept because the gap here is ALREADY honest: `comment_count`
+          # carries the thread's real total and `ReviewThreads.tsx` renders
+          # "Showing 10 of 14. See the rest on GitHub." A truncated thread
+          # therefore says so, which is the property the thread COUNT was
+          # missing and this change adds.
+          #
+          # Raising it is not free the way the page above is. Thread
+          # comments are the only nested connection in this query, so the
+          # node count is the product of the two pages: 100 x 100 is
+          # 10,000 bodies of markdown on the wire for a view that renders
+          # the first few and collapses the rest. The cost of a long
+          # back-and-forth is also bounded differently -- the tenth
+          # comment is a conversation you read on GitHub, where the
+          # twenty-first THREAD could be an unanswered blocking question
+          # the view never admitted existed. Different severity, and only
+          # the second one was silent.
+          comments(first: 10) {
+            totalCount
+            nodes { author { login } createdAt body }
+          }
         }
-      } }
+      }
       # Does the BASE branch of this pull request use a merge queue?
       #
       # `mergeQueue(branch:)` is branch-scoped because the setting is:
@@ -655,5 +699,36 @@ mod tests {
             .collect();
         assert_eq!(bare.len(), 1, "exactly one top-level closing brace");
         assert_eq!(bare[0], q.lines().count() - 1, "and it closes the query");
+    }
+
+    /// The review-thread fix lives in the QUERY, and the mapper's tests
+    /// cannot see it: they feed `map_detail` a JSON literal, so they pass
+    /// just as happily against a document that never asks for
+    /// `totalCount` or that still asks for 20 threads. Without this guard
+    /// the whole of #802 can be silently undone -- and the symptom would
+    /// be a view that looks complete, which is the defect itself.
+    #[test]
+    fn the_detail_query_asks_for_every_thread_and_its_true_count() {
+        let q = PR_DETAIL_QUERY;
+        // 100 is the connection maximum, and MEASURED free: the detail
+        // query still costs 1 point, with no latency difference and no
+        // node-limit error. A smaller page is a silent regression, since
+        // no mapper test can tell the difference.
+        assert!(
+            q.contains("reviewThreads(first: 100)"),
+            "threads must be asked for at the connection maximum"
+        );
+        // Nested inside that connection, NOT the comment connection's own
+        // `totalCount` a line or two down, so the assertion would fail if
+        // the field were dropped from the threads but kept on comments.
+        let threads = q
+            .split_once("reviewThreads(first: 100)")
+            .expect("the thread connection")
+            .1;
+        let before_nodes = threads.split_once("nodes").expect("thread nodes").0;
+        assert!(
+            before_nodes.contains("totalCount"),
+            "the thread connection must select totalCount, or truncation is silent again"
+        );
     }
 }

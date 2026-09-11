@@ -34,8 +34,11 @@ function location(t: ReviewThread): string {
 /// object: inline threads anchored to a file and line, and the only ones
 /// that can be resolved. Merging them into the comment list would imply a
 /// Resolve button on comments that have no such concept.
-export function ReviewThreads({ threads, repo, number }: {
+export function ReviewThreads({ threads, total, repo, number }: {
   threads: ReviewThread[];
+  /// GitHub's own count, which `threads` can be short of. See
+  /// `PrDetail.review_threads_total`.
+  total: number;
   repo: string;
   number: number;
 }) {
@@ -47,36 +50,87 @@ export function ReviewThreads({ threads, repo, number }: {
   const actionable = threads.filter(isActionable);
   const settled = threads.filter((t) => !isActionable(t));
 
+  // `>` rather than a subtraction against a possibly-larger length: the
+  // two numbers can come from slightly different moments (a thread
+  // resolved between GitHub computing the total and serialising the
+  // nodes), so the total can legitimately be the smaller one and that is
+  // not a shortfall. The same care `checks_total` takes.
+  const truncated = total > threads.length;
+
   return (
     <section className="overflow-hidden rounded-md border border-[#30363d]">
       <h2 className="flex items-center gap-2 border-b border-[#30363d] bg-[#0d1117] px-3 py-2 text-sm font-semibold text-[#e6edf3]">
         <MessageSquare className="h-4 w-4 shrink-0 text-[#8b949e]" aria-hidden="true" />
         Conversations
-        <span className="font-normal text-[#8b949e]">{threads.length}</span>
+        {/* The fetched count and the true one, because claiming "100" on a
+            pull request with 150 threads is the lie #802 is about. Only
+            when they differ -- "7 of 7" is noise. */}
+        <span className="font-normal text-[#8b949e]">
+          {truncated ? `${threads.length} of ${total}` : threads.length}
+        </span>
       </h2>
       <div className="flex flex-col gap-2 p-3">
         {actionable.map((t) => (
           <ThreadCard key={t.id} thread={t} repo={repo} number={number} />
         ))}
         {settled.map((t) => (
-          <ThreadCard key={t.id} thread={t} repo={repo} number={number} />
+          // FORCED OPEN when the list is truncated, settled or not. A
+          // settled thread normally collapses because it is history -- but
+          // once threads are missing, "resolved" is only known about the
+          // ones that arrived, and a wall of collapsed cards above a
+          // truncation notice is exactly the reassuring-looking view the
+          // issue is about. Same reasoning as the Checks panel opening
+          // when capped (#790): a collapsed summary is least trustworthy
+          // precisely when the data behind it is incomplete.
+          <ThreadCard
+            key={t.id}
+            thread={t}
+            repo={repo}
+            number={number}
+            forceOpen={truncated}
+          />
         ))}
+        {/* HONEST TRUNCATION, the same shape as the Checks panel's
+            "Showing 300 of 412 checks" and the PR list's "showing 100 of
+            137". This is the whole point of #802: the window was 20 with
+            no count, so a pull request with 25 threads rendered 20 and
+            looked finished, and an unresolved blocking comment could sit
+            in the gap. The window is now 100 (the connection maximum, and
+            free) and, when even that is not enough, it says so.
+
+            Amber rather than grey -- the colour the capped check notice
+            uses -- because an unseen conversation can block a merge,
+            which is a different weight of fact from the "see the rest on
+            GitHub" that tails a long comment list. */}
+        {truncated ? (
+          <p className="text-xs text-[#d29922]">
+            Showing {threads.length} of {total} conversations. An unresolved one could be among
+            the rest — see them on GitHub.
+          </p>
+        ) : null}
       </div>
     </section>
   );
 }
 
-function ThreadCard({ thread, repo, number }: {
+function ThreadCard({ thread, repo, number, forceOpen = false }: {
   thread: ReviewThread;
   repo: string;
   number: number;
+  /// Start open even when the thread is settled, because the LIST it sits
+  /// in is incomplete. See the call site.
+  forceOpen?: boolean;
 }) {
   const actionable = isActionable(thread);
   // Unresolved threads start OPEN: they are the ones needing an answer,
   // and hiding them behind a click is what the whole section exists to
   // stop. Settled ones collapse but stay listed, so a resolved discussion
   // remains findable.
-  const [open, setOpen] = useState(actionable);
+  //
+  // Only the INITIAL state, so a later toggle still wins: `forceOpen`
+  // opens a card that the user can then close, rather than pinning it
+  // open and taking the control away.
+  const [open, setOpen] = useState(actionable || forceOpen);
   const [reply, setReply] = useState("");
   const [busy, setBusy] = useState(false);
 

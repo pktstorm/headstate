@@ -71,6 +71,10 @@ const detail = (over: Partial<PrDetail> = {}): PrDetail => ({
   comment_count: 0,
   comments: [],
   review_threads: [],
+  // Matches `review_threads` above: an empty list with nothing missing.
+  // A non-zero default here would make every test that does not mention
+  // threads render a truncation notice.
+  review_threads_total: 0,
   latest_reviews: [],
   merge_queue_enabled: false,
   in_merge_queue: false,
@@ -729,6 +733,39 @@ describe("PrDetailView", () => {
       state.data = detail({ checks: [check("build"), check("test")], checks_total: 1 });
       render(<PrDetailView repo="o/r" number={42} onBack={() => {}} />);
       expect(screen.queryByText(/showing 2 of/i)).toBeNull();
+    });
+  });
+
+  /// The same honesty one section down (#802). The thread window was 20
+  /// with no count at all, so a pull request with 25 conversations
+  /// rendered 20 and looked finished -- an unresolved blocking comment
+  /// could sit in the gap. `ReviewThreads.test.tsx` covers the notice
+  /// itself; these two assert the WIRING, since a `review_threads_total`
+  /// that never reaches the section is a field that changes nothing.
+  describe("truncated conversation list", () => {
+    const t = (id: string) => ({
+      id,
+      is_resolved: false,
+      is_outdated: false,
+      path: "src/a.ts",
+      line: 1,
+      viewer_can_reply: false,
+      viewer_can_resolve: false,
+      viewer_can_unresolve: false,
+      comments: [{ author: "carol", created_at: "2026-08-20T10:00:00Z", body: "hm" }],
+      comment_count: 1,
+    });
+
+    it("says how many conversations it is missing", () => {
+      state.data = detail({ review_threads: [t("RT_1")], review_threads_total: 25 });
+      render(<PrDetailView repo="o/r" number={42} onBack={() => {}} />);
+      expect(screen.getByText(/showing 1 of 25 conversations/i)).toBeTruthy();
+    });
+
+    it("says nothing when every conversation arrived", () => {
+      state.data = detail({ review_threads: [t("RT_1")], review_threads_total: 1 });
+      render(<PrDetailView repo="o/r" number={42} onBack={() => {}} />);
+      expect(screen.queryByText(/showing 1 of 1 conversations/i)).toBeNull();
     });
   });
 });
