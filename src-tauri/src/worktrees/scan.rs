@@ -725,9 +725,10 @@ fn start_time_in(tail: &str) -> Option<i64> {
 /// the row as it was; too narrow reports a live holder as dead, which
 /// invites clearing a claim on a directory something is working in.
 ///
-/// When the reason names no start time at all, this falls back to the
-/// existence check -- exactly the old behaviour, for locks that do not
-/// follow our convention.
+/// When the reason names no start time at all -- or when `sysinfo`
+/// cannot read the process's -- this falls back to the existence check,
+/// exactly the old behaviour. Both are "no evidence of a mismatch", and
+/// neither is evidence of one.
 ///
 /// **Weak evidence when true, carried honestly.** On the reporting
 /// machine the pid-only check answered true for all 20 locks and every
@@ -759,7 +760,23 @@ fn holder_is_running(holder: LockHolder) -> bool {
     // `as i64` on a u64 of epoch seconds: a start time large enough to
     // overflow is some 290 billion years away, and the subtraction
     // below would saturate long before anything here could wrap.
-    (proc.start_time() as i64 - claimed).abs() <= TOLERANCE_SECS
+    let actual = proc.start_time() as i64;
+    // A zero start time means `sysinfo` could not read one, not that the
+    // process began at the epoch -- its own `ProcessInner` initialises
+    // the field to 0 before the platform fills it in. Comparing it would
+    // be ~55 years off any real claim, so the tolerance would reject it
+    // and the holder would read as GONE.
+    //
+    // That is the one direction this function must never fail in. A
+    // false "gone" invites clearing a claim on a directory something is
+    // working in, where a false "live" merely leaves the row as it was.
+    // So an unreadable start time falls back to the existence check,
+    // exactly as a reason with no start time does: the process is there,
+    // and we have no evidence it is a different one.
+    if actual == 0 {
+        return true;
+    }
+    (actual - claimed).abs() <= TOLERANCE_SECS
 }
 
 /// Whether this branch's work is already on `default_branch`.
@@ -3447,6 +3464,35 @@ prunable gitdir file points to non-existent location
                 started_at: Some(1_000_000_000),
             }),
             "a live pid that started at some other time is a DIFFERENT process"
+        );
+
+        // The REAL start time matches, within tolerance. Without this the
+        // test above would pass against a `holder_is_running` that
+        // returned false for every pinned start time -- which would
+        // report every one of our own locks as abandoned, the exact
+        // failure direction the function must never take.
+        let mut sys = sysinfo::System::new();
+        let me = sysinfo::Pid::from_u32(mine);
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[me]), true);
+        let started = sys.process(me).expect("this process exists").start_time();
+        assert!(
+            holder_is_running(LockHolder {
+                pid: mine,
+                started_at: Some(started as i64),
+            }),
+            "the holder's own start time must match"
+        );
+        // The unreadable-start-time guard is on the PROCESS's side, not
+        // the lock's, and cannot be reached from here: `sysinfo` returns
+        // this process's real start time, so no fixture can make it 0.
+        // Asserted as a precondition of the guard instead, so a platform
+        // where `start_time()` does come back 0 fails here -- loudly, at
+        // the place the guard exists for -- rather than silently reporting
+        // every live holder on that platform as gone.
+        assert!(
+            started > 0,
+            "sysinfo read a start time for this process; the `actual == 0` \
+             fallback in holder_is_running is for platforms where it does not"
         );
     }
 
