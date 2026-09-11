@@ -23,6 +23,7 @@ pub mod devices;
 pub mod health;
 mod schema;
 pub mod settings;
+pub mod stats;
 
 pub use cache::{load_snapshot, load_snapshot_marked, save_snapshot, CachedList, CachedSnapshot};
 pub use schema::{open_db, StoreError};

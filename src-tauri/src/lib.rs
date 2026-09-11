@@ -246,6 +246,7 @@ pub fn run() {
             commands::set_view_needs_github,
             commands::get_cycle_trend,
             commands::get_merged_detail,
+            commands::stats_count,
             commands::get_auth_state,
             remote::pairing::issue_pairing_token,
             remote::pairing::respond_to_pairing,

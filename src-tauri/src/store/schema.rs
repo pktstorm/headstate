@@ -204,6 +204,71 @@ const MIGRATIONS: &[&str] = &[
     // this migration keep NULL, which is exactly right -- those
     // samples genuinely did not measure it.
     "ALTER TABLE health_samples ADD COLUMN battery_capacity_percent REAL;",
+    // 10: cached stats answers for PR Stats (#824, epic #823).
+    //
+    // # Why this is a NEW table and not the old one
+    //
+    // Migration 2 above dropped `merge_history`, the table the original
+    // stats design planned, as "never written to... rather than left as a
+    // permanently-empty table implying a feature that does not exist".
+    // `store/mod.rs` records the deeper reason it was the wrong shape: it
+    // accumulated merges by diffing the open set, and a PR leaving that
+    // set is not necessarily a merge, so it would have recorded abandoned
+    // PRs as merges and contradicted the `is:merged` search that must
+    // stay authoritative.
+    //
+    // This table does not accumulate anything. It memoises an ANSWER
+    // GitHub already gave, keyed by the question, and GitHub's `is:merged`
+    // search stays the only source of truth. That is the difference, and
+    // it is why reusing the old table would have been wrong even if it
+    // still existed.
+    //
+    // # Why caching is correct here and not merely fast
+    //
+    // A leaderboard over a CLOSED time window cannot change: the PRs
+    // merged in August 2026 are fixed once August is over. So the cache
+    // is not a staleness trade, it is the recognition that recomputing a
+    // constant is waste -- and the waste is large, because recomputing
+    // means the probe rounds and slice fetches of `github::stats::fetch`,
+    // which cost requests against a 5,000/hour budget.
+    //
+    // `window_end` is what makes that safe, and it is why the row carries
+    // the window rather than only a key: a caller can tell an answer about
+    // a closed window (reusable forever) from one about a window that
+    // includes today (reusable only briefly). The decision lives in
+    // `store::stats`, not here, but the column it needs is here.
+    //
+    // # Columns
+    //
+    // `key` is `measure|subject|scope` from `StatsQuery::cache_key`, with
+    // `@me` already RESOLVED to a login. That resolution is load-bearing:
+    // two accounts on one machine share this file, and a row keyed on the
+    // literal `@me` would serve one user's numbers to the other.
+    //
+    // `complete` is 0 when the answer was capped, refused, or assembled
+    // from a plan that could not be fully retrieved -- #824 item 8
+    // carried into storage, so a partial answer cannot be read back as a
+    // confident one. A cached total whose partiality was forgotten is
+    // worse than no cache: it launders a sample into a fact.
+    //
+    // `payload` is the serialised `Outcome` JSON, for the same reason
+    // migration 8 puts per-core detail in a `detail` blob: it is only
+    // ever read back whole, the shape will grow as #826 defines what a
+    // leaderboard needs, and normalising it would buy a join and nothing
+    // else.
+    //
+    // Timestamps are RFC 3339 text, matching every other timestamp here.
+    "CREATE TABLE IF NOT EXISTS stats_cache (
+        key          TEXT NOT NULL,
+        window_start TEXT NOT NULL,
+        window_end   TEXT NOT NULL,
+        total        INTEGER NOT NULL,
+        complete     INTEGER NOT NULL,
+        payload      TEXT NOT NULL,
+        fetched_at   TEXT NOT NULL,
+        PRIMARY KEY (key, window_start, window_end)
+     );
+     CREATE INDEX IF NOT EXISTS stats_cache_fetched ON stats_cache (fetched_at DESC);",
 ];
 
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {

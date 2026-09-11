@@ -1054,6 +1054,47 @@ impl GitHubClient {
         }))
         .await
     }
+
+    /// One stats-layer GraphQL request, with this module's partial-success
+    /// handling.
+    ///
+    /// The stats layer (`github::stats`) needs the same treatment every
+    /// query here gets -- `data` kept alongside `errors`, a 502 reported
+    /// as `NotJson` rather than as a serde failure, `RESOURCE_LIMITS_
+    /// EXCEEDED` surfaced rather than escalated -- and must not grow its
+    /// own copy of it. `client.rs:1094-1175` is 80 lines of hard-won
+    /// behaviour and a second implementation would drift from it silently.
+    ///
+    /// Public, unlike `graphql_partial_ok`, because the stats layer is a
+    /// sibling module rather than a method on this type: its documents are
+    /// built from a subject and a scope, so they cannot be `const`s here.
+    /// The NAME is what keeps that honest -- a stats request is
+    /// identifiable in a call graph, and this cannot become a general
+    /// "run any GraphQL" escape hatch without being renamed first.
+    pub async fn stats_graphql(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.graphql_partial_ok(body).await
+    }
+}
+
+/// How many fields GitHub refused on this response.
+///
+/// The same reading `refused_fields` does, exported for the stats layer:
+/// its `Outcome` carries the count so a partial total says so, and that
+/// is one of the things #824 item 8 requires.
+pub fn refused_fields_of(v: &serde_json::Value) -> usize {
+    refused_fields(v)
+}
+
+/// Whether GitHub gave up rather than objected -- see `server_gave_up`.
+///
+/// Exported for the stats layer's degradation ladder, which inherits
+/// `fetch_merged_detail`'s rule (`client.rs:1024-1050`) rather than
+/// reimplementing the question "is asking for less likely to help".
+pub fn server_gave_up_on(e: &ClientError) -> bool {
+    server_gave_up(e)
 }
 
 /// See `GitHubClient::graphql_partial_ok`. A free function so the

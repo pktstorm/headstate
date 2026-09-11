@@ -2175,6 +2175,171 @@ pub async fn get_merged_detail(client: State<'_, GhClient>) -> Result<MergedDeta
         .map_err(|e| e.to_string())
 }
 
+/// A COMPLETE count of pull requests for one subject and scope (#824).
+///
+/// The first command on the hardened stats layer, and deliberately the
+/// only one: it is the narrowest thing that exercises all eight
+/// protections end to end -- parameterised subject and scope,
+/// connection-first routing, probe-driven slicing, bounded read
+/// concurrency, a wall-clock ceiling, metered spend, an honest
+/// partiality report, and the persistence cache.
+///
+/// No UI calls this yet. #825 builds the sidebar that chooses a scope and
+/// #826 the views that render leaderboards; shipping the command now is
+/// what makes the layer reachable and testable rather than dead code
+/// waiting on two other PRs.
+///
+/// # Arguments
+///
+/// `subject` is a login, or `None` for the viewer -- NOT for "everyone".
+/// A leaderboard's "everyone" is a different question and is
+/// `StatsQuery`'s `None` subject; exposing that through this command would
+/// make one parameter mean two things, so #826 gets its own command for it
+/// rather than an overloaded flag here.
+///
+/// `scope_kind` is one of `repo`, `org`, `user`, `all`, with `scope_value`
+/// carrying `owner/name` or the org/user login. Strings rather than a
+/// tagged enum because this is the Tauri boundary: the phone's
+/// `remote_call` passes JSON, and `surface::Args` reads scalars.
+///
+/// # Why the window is clamped
+///
+/// `clamp_days` exists for exactly this reason on `get_history`
+/// (`commands.rs:37-46`): a Tauri command is a public surface, and an
+/// unbounded value builds an arbitrarily large plan. Here the blast
+/// radius is worse than a long query -- a 100-year window is probed,
+/// subdivided, and probed again. The same clamp applies, and the slicer's
+/// own `MAX_DEPTH` is the second line of defence.
+#[tauri::command]
+pub async fn stats_count(
+    app: AppHandle,
+    client: State<'_, GhClient>,
+    subject: Option<String>,
+    scope_kind: String,
+    scope_value: Option<String>,
+    measure: String,
+    days: i64,
+) -> Result<crate::github::stats::Outcome, String> {
+    use crate::github::stats::{Budget, Measure, Scope, Slice, StatsQuery, Subject};
+
+    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    let days = clamp_days(days);
+
+    let subject = match subject {
+        // An empty string is a caller mistake, not a request for the
+        // viewer: treating it as `@me` would silently answer a different
+        // question than the one asked.
+        Some(s) if s.trim().is_empty() => return Err("subject must not be empty".into()),
+        Some(s) => Subject::Login(s),
+        None => Subject::Viewer,
+    };
+    let scope = match (scope_kind.as_str(), scope_value) {
+        ("repo", Some(v)) => Scope::Repo(v),
+        ("org", Some(v)) => Scope::Org(v),
+        ("user", Some(v)) => Scope::Personal(v),
+        ("all", _) => Scope::All,
+        (k, None) => return Err(format!("scope {k} needs a value")),
+        (k, _) => return Err(format!("unknown scope: {k}")),
+    };
+    let measure = match measure.as_str() {
+        "merged" => Measure::Merged,
+        "opened" => Measure::Opened,
+        other => return Err(format!("unknown measure: {other}")),
+    };
+
+    let now = chrono::Utc::now();
+    // The window ends YESTERDAY, matching `query::period_ranges`
+    // (`query.rs:247-252`): today is still accumulating, so including it
+    // compares a partial day against complete ones. It is also what makes
+    // the answer CACHEABLE -- see `store::stats::is_closed`.
+    let end = now - chrono::Duration::days(1);
+    let start = end - chrono::Duration::days(days - 1);
+    let fmt = |d: chrono::DateTime<chrono::Utc>| d.format("%Y-%m-%d").to_string();
+    let window = Slice::new(fmt(start), fmt(end));
+
+    let q = StatsQuery::new(Some(subject), scope, measure);
+
+    // The cache key needs `@me` RESOLVED, because two accounts on one
+    // machine share this database and a row keyed on the literal would be
+    // served to whichever asked second. `fetch_viewer` is one cheap
+    // request and its result never changes for a session.
+    let viewer = client.fetch_viewer().await.map_err(|e| e.to_string())?;
+    let key = q.cache_key(&viewer);
+
+    let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
+    if let Ok(Some(hit)) = crate::store::stats::get(&conn, &key, &window.from, &window.to, now) {
+        if let Ok(cached) = serde_json::from_str::<crate::github::stats::Outcome>(&hit.payload) {
+            crate::diag!("[diag] cmd stats_count cache hit total={}", hit.total);
+            return Ok(cached);
+        }
+        // A payload that will not parse is a shape change across an
+        // upgrade. Dropped and re-fetched rather than erroring: the
+        // cache is an optimisation and must never be able to break the
+        // feature it accelerates.
+        log::warn!("discarding an unreadable stats cache row");
+    }
+
+    let budget = Budget::new();
+    // REFUSE before spending, so a load cannot be the thing that starves
+    // the poll loop. The projection is the probe rounds plus one request
+    // per chunk of slices, all at the measured 1 point each -- small, but
+    // the point of the check is the one case where `remaining` is already
+    // near the floor because something else spent it.
+    let projected = u64::try_from(days).unwrap_or(u64::MAX) / 5 + 8;
+    if !budget.permits(projected) {
+        return Err(format!(
+            "GitHub budget too low for this scope (needs about {projected} points, \
+             keeping {} in reserve for background refresh)",
+            crate::github::stats::budget::RESERVE
+        ));
+    }
+
+    crate::diag!("[diag] cmd stats_count start days={days}");
+    let started = std::time::Instant::now();
+    let out = crate::github::stats::load_count(&client, &q, window.clone(), &budget)
+        .await
+        .map_err(|e| e.to_string());
+    crate::diag!(
+        "[diag] cmd stats_count end {}ms {}",
+        started.elapsed().as_millis(),
+        match &out {
+            Ok(o) => format!(
+                "ok total={} complete={} slices={} rounds={} points={}",
+                o.total,
+                o.is_complete(),
+                o.slices,
+                o.rounds,
+                o.spend.points
+            ),
+            Err(e) => format!("err: {e}"),
+        }
+    );
+
+    if let Ok(o) = &out {
+        // Cached on success only. A failed load has nothing worth
+        // remembering, and a partial one is stored WITH its partiality
+        // (`complete`) so it cannot be read back as a confident number.
+        if let Ok(payload) = serde_json::to_string(o) {
+            if let Err(e) = crate::store::stats::put(
+                &conn,
+                &key,
+                &window.from,
+                &window.to,
+                o.total,
+                o.is_complete(),
+                &payload,
+                now,
+            ) {
+                // Non-fatal: the answer is already correct, and failing
+                // the command because the cache could not be written
+                // would turn an optimisation into a liability.
+                log::warn!("could not cache the stats answer: {e}");
+            }
+        }
+    }
+    out
+}
+
 /// Whether we have a usable GitHub client. `state` is computed once at
 /// startup from `auth::read_token` / `auth::build_client` and stored as
 /// managed state; this command just hands it to the frontend.

@@ -152,8 +152,17 @@ query($q: String!, $first: Int!, $after: String) {
 
 /// The dashboard counters, as one aliased query costing 1 point.
 /// `$week` and `$month` are ISO dates.
+///
+/// `rateLimit` added for #824. It was the only stats query that asked
+/// GitHub for counts without asking what they cost, which mattered once
+/// anything started READING cost: `github::stats::budget` accumulates
+/// spend per scope load, and a request that reports no cost is counted as
+/// `unmetered` rather than guessed at 1 -- so omitting the field here
+/// would have made every total that included this query a floor instead
+/// of a figure, for no reason beyond the field being absent.
 pub const STATS_QUERY: &str = r#"
 query($week: String!, $month: String!) {
+  rateLimit { cost remaining resetAt }
   merged_week: search(query: $week, type: ISSUE) { issueCount }
   merged_month: search(query: $month, type: ISSUE) { issueCount }
 }"#;
@@ -230,7 +239,11 @@ pub fn history_query(now: DateTime<Utc>, days: i64) -> String {
 /// and 60 fails outright. It is a server-side timeout, not a documented
 /// limit, so the fix is to stay well below it rather than retry into it.
 pub fn history_query_range(now: DateTime<Utc>, start: i64, len: i64) -> String {
-    let mut q = String::from("query {\n");
+    // `rateLimit` on every chunk (#824). Each chunk is its own request, so
+    // the cost has to be readable per chunk or a 6-chunk history fetch
+    // reports a sixth of what it spent. Free: the field is not a
+    // connection and the document still costs 1 point.
+    let mut q = String::from("query {\n  rateLimit { cost remaining resetAt }\n");
     for i in start..start + len {
         let d = day(now - Duration::days(i));
         q.push_str(&format!(
@@ -279,7 +292,7 @@ pub fn history_query_with_periods(now: DateTime<Utc>, days: i64) -> String {
 /// rather than waiting on the whole daily series.
 pub fn periods_query(now: DateTime<Utc>) -> String {
     let r = period_ranges(now);
-    let mut q = String::from("query {\n");
+    let mut q = String::from("query {\n  rateLimit { cost remaining resetAt }\n");
     let mut add = |alias: &str, filter: &str, range: &(String, String)| {
         q.push_str(&format!(
             "  {alias}: search(query: \"is:pr author:@me {filter}{}..{}\", type: ISSUE) {{ issueCount }}\n",
@@ -332,6 +345,7 @@ pub fn cycle_trend_query(now: DateTime<Utc>) -> String {
     let r = period_ranges(now);
     format!(
         r#"query {{
+  rateLimit {{ cost remaining resetAt }}
   current: search(query: "is:pr author:@me is:merged merged:{}..{}", type: ISSUE, first: 100) {{
     issueCount
     nodes {{ ... on PullRequest {{ createdAt mergedAt }} }}

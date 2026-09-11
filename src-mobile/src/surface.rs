@@ -39,6 +39,9 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("get_periods", Class::Read),
     ("get_cycle_trend", Class::Read),
     ("get_merged_detail", Class::Read),
+    // The hardened stats layer (#824). A Read; the desktop's timeout and
+    // read-concurrency cap live inside the command, so this inherits both.
+    ("stats_count", Class::Read),
     ("get_reviewing", Class::Read),
     ("count_reviewing", Class::Read),
     ("get_pr_detail", Class::Read),
