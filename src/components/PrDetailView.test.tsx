@@ -6,6 +6,10 @@ import { stubViewport } from "@/test-utils";
 const state = vi.hoisted(() => ({
   data: undefined as PrDetail | undefined,
   isLoading: false,
+  // True while `usePrDetail` is serving the clicked row's own facts in
+  // place of the fetch (#790). Defaulted false so every existing test
+  // exercises the LOADED view exactly as before.
+  isPlaceholderData: false,
   isError: false,
 }));
 
@@ -71,6 +75,7 @@ const detail = (over: Partial<PrDetail> = {}): PrDetail => ({
   merge_queue_enabled: false,
   in_merge_queue: false,
   checks: [],
+  checks_total: 0,
   ...over,
 });
 
@@ -150,7 +155,12 @@ describe("PrDetailView layout", () => {
 
 describe("PrDetailView", () => {
   beforeEach(() => {
-    Object.assign(state, { data: undefined, isLoading: false, isError: false });
+    Object.assign(state, {
+      data: undefined,
+      isLoading: false,
+      isPlaceholderData: false,
+      isError: false,
+    });
     // The mutation mocks are module-level, so without this a later test
     // sees calls made by an earlier one -- which is exactly how the
     // "not called" assertion below failed while passing in isolation.
@@ -617,6 +627,108 @@ describe("PrDetailView", () => {
       await waitFor(() => expect(deleteBranch).toHaveBeenCalled());
       expect(deleteBranch.mock.calls[0][0]).toBe("REF_1");
       expect(deleteBranch.mock.calls[0][4]).toBe(true);
+    });
+  });
+
+  /// #790: the view blocked on the whole fetch. It now renders from the
+  /// clicked row immediately, which means it renders a `PrDetail` with
+  /// several fields deliberately EMPTY -- and the risk moves from "slow"
+  /// to "confidently wrong about what it does not have yet".
+  describe("seeded from the clicked row", () => {
+    it("shows the row's facts rather than a spinner", () => {
+      state.isPlaceholderData = true;
+      state.data = detail({ body: "", additions: 0, deletions: 0, changed_files: 0 });
+      render(<PrDetailView repo="o/r" number={42} onBack={() => {}} />);
+
+      expect(screen.queryByText(/loading pull request/i)).toBeNull();
+      expect(screen.getByText(/add retry to the fetch client/i)).toBeTruthy();
+      expect(screen.getByText(/wants to merge/)).toBeTruthy();
+    });
+
+    /// The diff size is the one header fact the list row cannot carry:
+    /// `PRS_QUERY` does not select additions, deletions or changedFiles.
+    /// "+0 −0 across 0 files" on a real pull request is a number the
+    /// user cannot tell from an empty diff.
+    it("omits the diff size instead of printing zeroes", () => {
+      state.isPlaceholderData = true;
+      state.data = detail({ additions: 0, deletions: 0, changed_files: 0 });
+      render(<PrDetailView repo="o/r" number={42} onBack={() => {}} />);
+      expect(screen.queryByText(/across 0 files/)).toBeNull();
+    });
+
+    /// And once the real answer lands, a genuinely empty diff prints
+    /// normally -- the suppression must be about the placeholder, not
+    /// about the value being zero.
+    it("prints a real zero diff once loaded", () => {
+      state.isPlaceholderData = false;
+      state.data = detail({ additions: 0, deletions: 0, changed_files: 0 });
+      render(<PrDetailView repo="o/r" number={42} onBack={() => {}} />);
+      expect(screen.getByText(/across 0 files/)).toBeTruthy();
+    });
+
+    /// "No description." would be actively WRONG while seeded: the body
+    /// is exactly what the row cannot carry, and a user who opened the
+    /// pull request to read it would be told there isn't one.
+    it("says the description is still loading rather than absent", () => {
+      state.isPlaceholderData = true;
+      state.data = detail({ body: "" });
+      render(<PrDetailView repo="o/r" number={42} onBack={() => {}} />);
+      expect(screen.getByText(/loading the description and checks/i)).toBeTruthy();
+      expect(screen.queryByText(/^no description\.$/i)).toBeNull();
+    });
+
+    it("still says 'no description' for a PR that really has none", () => {
+      state.isPlaceholderData = false;
+      state.data = detail({ body: "" });
+      render(<PrDetailView repo="o/r" number={42} onBack={() => {}} />);
+      expect(screen.getByText(/^no description\.$/i)).toBeTruthy();
+    });
+
+    /// The spinner branch is now only for a pull request with no cached
+    /// row to seed from: a cold launch straight into a detail view.
+    it("keeps the spinner when there was nothing to seed from", () => {
+      state.isLoading = true;
+      state.data = undefined;
+      render(<PrDetailView repo="o/r" number={42} onBack={() => {}} />);
+      expect(screen.getByText(/loading pull request/i)).toBeTruthy();
+    });
+  });
+
+  /// The check list is CAPPED at 300 contexts (#790 cut the page budget
+  /// from 20 serial requests to 3). The whole reason that pagination
+  /// exists is that a short check list does not look short -- it renders
+  /// a wall of green on a pull request whose rollup says FAILURE -- so
+  /// the cap is only safe if the panel says what it is missing.
+  describe("capped check list", () => {
+    const check = (name: string) => ({ name, state: "success", url: "", run_id: null });
+
+    it("says how many checks it is missing", () => {
+      state.data = detail({ checks: [check("build")], checks_total: 412 });
+      render(<PrDetailView repo="o/r" number={42} onBack={() => {}} />);
+      expect(screen.getByText(/showing 1 of 412 checks/i)).toBeTruthy();
+    });
+
+    /// An all-green capped list is where the collapsed "everything
+    /// passed" summary is least trustworthy, so it opens.
+    it("opens the section even when everything fetched is green", () => {
+      state.data = detail({ checks: [check("build")], checks_total: 412 });
+      render(<PrDetailView repo="o/r" number={42} onBack={() => {}} />);
+      expect(screen.getByText("build")).toBeTruthy();
+    });
+
+    it("says nothing when the list is complete", () => {
+      state.data = detail({ checks: [check("build")], checks_total: 1 });
+      render(<PrDetailView repo="o/r" number={42} onBack={() => {}} />);
+      expect(screen.queryByText(/showing 1 of/i)).toBeNull();
+    });
+
+    /// A total BELOW the length is possible: the two numbers come from
+    /// different pages of a rollup that can grow mid-fetch. It is not a
+    /// negative shortfall and must not be announced as one.
+    it("says nothing when the total is smaller than what arrived", () => {
+      state.data = detail({ checks: [check("build"), check("test")], checks_total: 1 });
+      render(<PrDetailView repo="o/r" number={42} onBack={() => {}} />);
+      expect(screen.queryByText(/showing 2 of/i)).toBeNull();
     });
   });
 });

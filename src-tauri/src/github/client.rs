@@ -697,7 +697,14 @@ impl GitHubClient {
     }
 
     /// Everything the detail view needs, in one request at cost 1, plus
-    /// one small follow-up per extra page of checks.
+    /// up to three small follow-ups for extra pages of checks.
+    ///
+    /// The follow-ups are cursor-dependent and therefore strictly
+    /// serial, which makes this the one fetch in the app whose latency
+    /// is a multiple of a single POST rather than a single POST. That is
+    /// what #790 was: see `append_remaining_checks` for the page budget,
+    /// and `commands::get_pr_detail` for the wall-clock ceiling that now
+    /// bounds the whole chain.
     ///
     /// `repo` is `owner/name`; it is split here rather than by the caller
     /// so a malformed value fails in one place with a clear message.
@@ -723,12 +730,50 @@ impl GitHubClient {
     /// full, plausible list of passing checks on a pull request the
     /// rollup itself reports as FAILURE. Observed on a pull request with
     /// 63 checks whose only two failures both sat past the first page.
+    /// That is why this loop exists at all, and none of what follows
+    /// weakens it: a 63-check pull request is still fetched complete.
     ///
-    /// Stops on the first page that says there is no next one. The page
-    /// budget is a guard against a cursor that never advances, not an
-    /// expected limit: 100 per page means it allows 2000 checks, far
-    /// past anything real, so hitting it means the API is misbehaving
-    /// and looping forever would be worse than showing what we have.
+    /// Stops on the first page that says there is no next one.
+    ///
+    /// MAX_PAGES was 20, which made this the slowest thing in the app
+    /// (#790). Each iteration is its own POST and the cursor makes them
+    /// strictly serial, so the budget is a latency budget: at the p90
+    /// per-POST latency measured for `poll::FETCH_TIMEOUT` (8,814ms)
+    /// twenty pages is three minutes of spinner, and the command had no
+    /// overall timeout to stop it. Worse, the user is waiting on the
+    /// CHEAPEST section of the view -- the body, the review threads and
+    /// the merge state all arrived on page 1.
+    ///
+    /// Cut to 3 (300 contexts). Two reasons that number and not another:
+    ///
+    /// - It is still past anything observed. The largest real rollup in
+    ///   the reports behind this is 63 contexts, which fits in one page;
+    ///   the second page exists for the pathological repository, the
+    ///   third for headroom.
+    /// - It bounds the serial chain at 4 POSTs, which fits inside the
+    ///   30s command ceiling added in `get_pr_detail` at p90 latency
+    ///   rather than blowing through it. A budget the timeout kills is
+    ///   not a budget, it is a guaranteed error message.
+    ///
+    /// REJECTED: backgrounding the extra pages (render page 1, fill the
+    /// rest in progressively). It is the better end state and the issue
+    /// asks for it, but it needs a second command, an event channel and
+    /// a partial-checks state in the view, and it cannot be done without
+    /// reintroducing exactly the silent-truncation bug this function was
+    /// written to fix -- a progressively-filling list is indistinguishable
+    /// from a truncated one until it finishes. Capping plus an honest
+    /// count is most of the win for a fraction of the surface, and the
+    /// `checks_total` field it adds is what the progressive version would
+    /// need anyway. Filed as follow-up rather than rushed here.
+    ///
+    /// REJECTED: a page budget of 1. The 63-check pull request above is
+    /// the reported bug; a cap that truncates it trades a slow correct
+    /// view for a fast wrong one.
+    ///
+    /// Hitting the cap is now a REAL possibility rather than a sign the
+    /// API is misbehaving, so it no longer returns silently: the total
+    /// from `totalCount` reaches `PrDetail::checks_total` and the panel
+    /// says "showing 300 of 412".
     async fn append_remaining_checks(
         &self,
         v: &mut serde_json::Value,
@@ -736,9 +781,42 @@ impl GitHubClient {
         name: &str,
         number: u64,
     ) -> Result<(), ClientError> {
-        const MAX_PAGES: usize = 20;
+        const MAX_PAGES: usize = 3;
 
-        for _ in 0..MAX_PAGES {
+        // DIAGNOSTIC LOGGING (Settings > diagnostic log). The page count
+        // is what makes a slow click attributable: `[diag] graphql POST`
+        // lines alone leave "one slow POST" and "four serial POSTs"
+        // looking identical unless the reader counts log lines by hand,
+        // and those two have completely different fixes (#790). Logged
+        // on EVERY path including zero pages, so a fast click proves the
+        // loop was not involved rather than leaving it unaccounted for.
+        let started = std::time::Instant::now();
+        let mut pages = 0usize;
+        let out = self
+            .checks_pages(v, owner, name, number, MAX_PAGES, &mut pages)
+            .await;
+        crate::diag!(
+            "[diag] checks pagination {} page(s) in {}ms{}",
+            pages,
+            started.elapsed().as_millis(),
+            if pages == MAX_PAGES { " (CAPPED)" } else { "" }
+        );
+        out
+    }
+
+    /// `append_remaining_checks` without the timing, so the logging
+    /// above brackets every exit rather than being repeated at each of
+    /// the four `return`s below.
+    async fn checks_pages(
+        &self,
+        v: &mut serde_json::Value,
+        owner: &str,
+        name: &str,
+        number: u64,
+        max_pages: usize,
+        pages: &mut usize,
+    ) -> Result<(), ClientError> {
+        for _ in 0..max_pages {
             let contexts = &v["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]
                 ["statusCheckRollup"]["contexts"];
             if !contexts["pageInfo"]["hasNextPage"]
@@ -762,10 +840,12 @@ impl GitHubClient {
                     }
                 }))
                 .await?;
+            *pages += 1;
             let fetched = &page["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]
                 ["statusCheckRollup"]["contexts"];
             let more = fetched["nodes"].as_array().cloned().unwrap_or_default();
             let page_info = fetched["pageInfo"].clone();
+            let total = fetched["totalCount"].clone();
 
             let target = &mut v["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]
                 ["statusCheckRollup"]["contexts"];
@@ -776,6 +856,16 @@ impl GitHubClient {
                 None => return Ok(()),
             }
             target["pageInfo"] = page_info;
+            // The LATER page's total wins, for the reason the query's own
+            // comment gives: a rollup can grow while we walk it, and the
+            // stale number would understate what is missing. Only when
+            // the page actually carried one -- overwriting a good total
+            // with `null` from a partial response would make the panel
+            // fall back to "nothing missing" on the one shape where
+            // something is.
+            if !total.is_null() {
+                target["totalCount"] = total;
+            }
         }
         Ok(())
     }
@@ -2301,6 +2391,108 @@ mod tests {
         assert_eq!(
             d.checks[1].state, "failure",
             "a failure on a later page must survive the merge"
+        );
+    }
+
+    /// The page budget is what bounds the one serial request chain in the
+    /// app (#790). A rollup that never says `hasNextPage: false` is the
+    /// shape that used to cost 20 POSTs and over 30 seconds of spinner;
+    /// the assertion is on the REQUEST COUNT, because the latency this
+    /// guards is a multiple of it and nothing else in the test can see
+    /// the difference.
+    #[tokio::test]
+    async fn pr_detail_stops_paging_checks_at_the_budget() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("isMergeQueueEnabled"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"repository": {"pullRequest": {
+                    "number": 42, "title": "t",
+                    "commits": {"nodes": [{"commit": {"statusCheckRollup": {
+                        "contexts": {
+                            "totalCount": 412,
+                            "pageInfo": {"hasNextPage": true, "endCursor": "CUR0"},
+                            "nodes": [{"name": "a", "conclusion": "SUCCESS"}]
+                        }
+                    }}}]}
+                }}}
+            })))
+            .mount(&server)
+            .await;
+
+        // Always another page, and always a fresh cursor so the loop's
+        // own "cursor did not advance" guard is not what stops it.
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("ChecksPage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"repository": {"pullRequest": {
+                    "commits": {"nodes": [{"commit": {"statusCheckRollup": {
+                        "contexts": {
+                            "totalCount": 412,
+                            "pageInfo": {"hasNextPage": true, "endCursor": "CURn"},
+                            "nodes": [{"name": "b", "conclusion": "SUCCESS"}]
+                        }
+                    }}}]}
+                }}}
+            })))
+            .mount(&server)
+            .await;
+
+        let d = client_for(&server)
+            .await
+            .fetch_pr_detail("acme/alpha", 42)
+            .await
+            .unwrap();
+
+        let posts = server.received_requests().await.unwrap().len();
+        assert_eq!(
+            posts, 4,
+            "one detail query plus at most three check pages; {posts} POSTs is the #790 chain"
+        );
+        assert_eq!(d.checks.len(), 4, "every page fetched must still be merged");
+        assert_eq!(
+            d.checks_total, 412,
+            "a capped list must carry GitHub's own count so the panel can say what is missing"
+        );
+    }
+
+    /// Absent `totalCount` reads as "nothing missing", not as zero.
+    ///
+    /// A cached payload written before #790 added the field, or a partial
+    /// response that dropped it, would otherwise make the panel claim
+    /// "showing 1 of 0" -- a subtraction against a count smaller than the
+    /// list, which is the failure mode `poll::truncation_payload` takes
+    /// the same care over.
+    #[tokio::test]
+    async fn pr_detail_without_a_check_total_reports_no_shortfall() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"repository": {"pullRequest": {
+                    "number": 42, "title": "t",
+                    "commits": {"nodes": [{"commit": {"statusCheckRollup": {
+                        "contexts": {
+                            "pageInfo": {"hasNextPage": false, "endCursor": null},
+                            "nodes": [{"name": "a", "conclusion": "SUCCESS"}]
+                        }
+                    }}}]}
+                }}}
+            })))
+            .mount(&server)
+            .await;
+
+        let d = client_for(&server)
+            .await
+            .fetch_pr_detail("acme/alpha", 42)
+            .await
+            .unwrap();
+        assert_eq!(d.checks.len(), 1);
+        assert_eq!(
+            d.checks_total, 1,
+            "no total must mean complete, never a zero the UI subtracts from"
         );
     }
 

@@ -38,6 +38,7 @@ const pr = (over: Partial<PrDetail> = {}): PrDetail => ({
   merge_queue_enabled: false,
   in_merge_queue: false,
   checks: [],
+  checks_total: 0,
   ...over,
 });
 
