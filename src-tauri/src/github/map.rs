@@ -174,6 +174,15 @@ pub fn map_detail(v: &Value, repo: &str) -> PrDetail {
         comment_count: pr["comments"]["totalCount"].as_u64().unwrap_or(0),
         comments,
         review_threads: map_review_threads(pr),
+        // Read BEFORE `checks` is moved, and defaulted to the number of
+        // checks we actually have rather than to 0: absent `totalCount`
+        // (an old cached payload, a partial response that dropped the
+        // field) must read as "nothing missing", and a 0 against a
+        // non-empty list would instead be a nonsense "showing 37 of 0".
+        checks_total: pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]
+            ["totalCount"]
+            .as_u64()
+            .unwrap_or(checks.len() as u64),
         checks,
     }
 }

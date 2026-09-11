@@ -1063,17 +1063,165 @@ export function useDeleteHeadBranch() {
     });
 }
 
+/// The list row for one pull request, from whichever cached list holds it.
+///
+/// Both `["prs"]` (My PRs) and `["reviewing"]` (To review) hold
+/// `PullRequest[]`, and the detail view is reachable from either -- so
+/// checking only one would leave half the rows with no seed. `["prs"]`
+/// first because it is the larger list and the one that is warm on
+/// launch.
+///
+/// Deliberately reads the CACHE rather than taking the row as a prop.
+/// Threading a `PullRequest` down from `App` would seed only the click
+/// path: a refetch, a remount, or a PR reached any other way would have
+/// nothing, and the component would need two code paths for the same
+/// data. The cache is already the single source for these rows.
+function cachedRow(
+  qc: QueryClient,
+  repo: string | undefined,
+  number: number | undefined,
+): PullRequest | undefined {
+  if (!repo || !number) return undefined;
+  for (const key of [["prs"], ["reviewing"]]) {
+    const row = qc
+      .getQueryData<PullRequest[]>(key)
+      ?.find((p) => p.repo === repo && p.number === number);
+    if (row) return row;
+  }
+  return undefined;
+}
+
+/// A `PrDetail` from a list row, for the fields the two types share.
+///
+/// Everything here is a fact the row already carried and the user was
+/// looking at when they clicked -- title, number, author, the branch
+/// pair, the diff size, the merge and review state. The rest is left at
+/// its EMPTY value rather than invented: no body, no comments, no review
+/// threads, no checks. `PrDetailView` hides an empty section, so the
+/// placeholder renders as the real view minus the parts that have not
+/// arrived, not as a page of zeroes claiming to be complete.
+///
+/// `additions`/`deletions`/`changed_files` are the exception to "the row
+/// already had it": the list query does not select them (see
+/// `PRS_QUERY`), so the diff size is genuinely missing until the detail
+/// lands. Zero is the honest value and the view suppresses the line at
+/// zero rather than printing "+0 −0 across 0 files".
+///
+/// `checks_total: 0` matters: the Checks section is hidden while `checks`
+/// is empty, and a non-zero total with an empty list would make it claim
+/// "showing 0 of 12" on data nobody fetched.
+function seedFromRow(row: PullRequest): PrDetail {
+  return {
+    id: row.id,
+    number: row.number,
+    title: row.title,
+    url: row.url,
+    // The list only carries OPEN pull requests, and `PrDetailView` reads
+    // this to decide whether to offer "Delete branch" -- an action that
+    // must never appear on a guess. Lowercase to match the mapper, which
+    // lowercases GitHub's `state`.
+    state: "open",
+    is_draft: row.is_draft,
+    body: "",
+    author: row.author,
+    repo: row.repo,
+    head_ref: row.head_ref,
+    head_oid: row.head_oid,
+    head_ref_id: row.head_ref_id,
+    base_ref: row.base_ref,
+    merge_status: row.merge_status,
+    review: row.review,
+    latest_reviews: row.latest_reviews,
+    // NOT on the list row. False offers a plain Merge, which is the same
+    // safe direction the Rust mapper defaults to: GitHub refuses it if
+    // the branch really does require the queue.
+    merge_queue_enabled: false,
+    in_merge_queue: row.in_merge_queue,
+    additions: 0,
+    deletions: 0,
+    changed_files: 0,
+    unresolved_threads: row.unresolved_threads,
+    comment_count: row.comment_count,
+    comments: [],
+    review_threads: [],
+    checks: [],
+    checks_total: 0,
+  };
+}
+
 /// One pull request's detail, fetched when the view opens.
 ///
 /// Not part of the poll loop: it is per-PR and only wanted while on
-/// screen. Kept briefly so reopening the same PR is instant, but short
-/// enough that CI state is not stale on return.
+/// screen.
+///
+/// SEEDED from the clicked row (#790). The fetch behind this is the
+/// slowest in the app -- up to four serial GitHub round-trips, because
+/// the check rollup pages on a cursor -- and the view used to render a
+/// bare "Loading pull request…" for all of it, despite the row the user
+/// just clicked already holding the title, number, author, branch pair
+/// and review state. The felt wait is now the time for the BODY and the
+/// CHECKS to arrive, not the time for the page to exist.
+///
+/// `placeholderData`, not `initialData`. The distinction is the whole
+/// point: `initialData` would be written into the cache as if it had
+/// been fetched, so `staleTime` would suppress the real fetch for 30
+/// seconds and the body would never load. `placeholderData` is render-
+/// only -- it never enters the cache, it leaves `isPlaceholderData` true
+/// so the view can mark what is provisional, and the fetch runs
+/// regardless.
+///
+/// A PR reached with no cached row (a cold launch straight into a detail
+/// view, a repository filtered out of both lists) gets `undefined` back
+/// and the original spinner. That path is unchanged and is why the
+/// spinner branch stays.
 export function usePrDetail(repo: string | undefined, number: number | undefined) {
+  const qc = useQueryClient();
   return useQuery({
     queryKey: ["pr-detail", repo, number],
-    queryFn: () => getPrDetail(repo as string, number as number),
+    // DIAGNOSTIC LOGGING (Settings > diagnostic log). `timeCall` rather
+    // than `timed`, because the query function closes over per-render
+    // arguments and so cannot be hoisted to module scope -- see
+    // `diag.ts`. This is the line that tells a slow COMMAND from a slow
+    // RENDER: the Rust side's `[diag] cmd get_pr_detail` pair brackets
+    // the fetch, and the gap between the two is React's (#790).
+    queryFn: () =>
+      timeCall(`pr-detail`, () => getPrDetail(repo as string, number as number)),
     enabled: Boolean(repo && number),
     staleTime: 30_000,
+    // Evaluated on every render, which is what makes it work: the row
+    // can land in the cache AFTER this view mounts (open the app on a
+    // detail view, the poll arrives a second later) and a value captured
+    // once would miss it.
+    placeholderData: () => {
+      const row = cachedRow(qc, repo, number);
+      return row ? seedFromRow(row) : undefined;
+    },
+    // EXPLICIT, because the inherited default is 3 and this fetch sits
+    // behind octocrab's own `max_retries: 3` with a 60-second minimum
+    // wait on a rate-limit response (`auth.rs`). Stacked, that is up to
+    // 16 attempts for one click, each one of them able to wait out the
+    // 30-second command ceiling before the next begins -- minutes of
+    // spinner from a single click, which is what #790 reported.
+    //
+    // 1, not 0: a detail fetch really does fail transiently (a laptop
+    // waking, a 502 from GitHub), and one quiet retry saves the user a
+    // click. Two would be the first step back towards the multiplier.
+    retry: 1,
+    // A whole session, against the default five minutes (#790). `gcTime`
+    // is how long an UNUSED entry survives, not how long it is trusted
+    // -- `staleTime: 30_000` above is still what decides that -- so this
+    // does not serve stale CI state: a revisit past 30 seconds refetches
+    // either way. What it changes is whether that refetch happens BEHIND
+    // the previous answer or behind a blank spinner. At the default, a
+    // triage session that works through a list and comes back to a pull
+    // request six minutes later paid the full cold load again.
+    //
+    // Unbounded deliberately. The entry is one pull request's detail, a
+    // few KB; a heavy day is tens of them, and the cost of holding them
+    // is far below the cost of re-fetching them through the slowest
+    // query in the app. They are dropped on relaunch like everything
+    // else in this cache.
+    gcTime: Infinity,
     // `unknown` mergeability is TRANSIENT: GitHub sets it while it
     // recomputes, which approving a pull request is precisely what
     // triggers. One invalidation after the mutation is not enough --

@@ -599,17 +599,73 @@ pub async fn delete_head_branch(
     }
 }
 
+/// One pull request's detail, for the view opened by clicking a row.
+///
+/// Bounded by `poll::FETCH_TIMEOUT`, the same ceiling the poll loop and
+/// `refresh_now` use. Added for #790, where clicking a PR showed
+/// "Loading pull request…" for over 30 seconds with nothing to act on.
+///
+/// This is the path that most needed a ceiling and was the only fetch
+/// without one. Every other GitHub fetch is either bounded here or runs
+/// in the background where a long one costs nobody's attention; this one
+/// is a user gesture with a blocked view behind it, and its worst case
+/// was the product of four uncapped multipliers -- up to 4 serial check
+/// pages, times octocrab's `max_retries: 3` at a 60-second minimum wait
+/// on a 429 (`auth.rs`), times TanStack's retries on top. Minutes,
+/// legitimately, with no error and no end.
+///
+/// The reasoning at `refresh_now` applies unchanged and is the reason a
+/// transport timeout is not enough on its own: read and write timeouts
+/// bound one socket operation, restart on every retry, and never fire at
+/// all against a server that trickles bytes. Only a wall-clock ceiling
+/// around the whole command bounds what the user is actually waiting on.
+///
+/// 30s is generous for this fetch and deliberately so: the budget exists
+/// to convert an unbounded hang into an actionable error, not to tighten
+/// a latency target. A real fetch that needs 25 seconds should still
+/// succeed.
+///
+/// NOT also applied on the mobile companion's forwarding path
+/// (`src-mobile`): this bound is inside the command, so a phone's
+/// `remote_call` inherits it for the GitHub work itself. The hop from
+/// phone to desktop has no timeout of its own and an unreachable desktop
+/// is a separate failure with a separate fix -- see the PR for #790.
 #[tauri::command]
 pub async fn get_pr_detail(
     client: State<'_, GhClient>,
     repo: String,
     number: u64,
 ) -> Result<PrDetail, String> {
+    // DIAGNOSTIC LOGGING (Settings > diagnostic log). Brackets the whole
+    // command for the reason `get_reviewing` gives: without it the log
+    // holds the individual POSTs and no total, so a 30-second click
+    // could not be attributed to the command at all -- and the gap
+    // between the summed POSTs and this elapsed time is exactly where
+    // octocrab's rate-limit wait hides, which nothing else records.
+    // The repository and number are NOT logged: the diagnostic log is
+    // something a user pastes into an issue, and a private repository's
+    // name is not ours to put in it.
+    crate::diag!("[diag] cmd get_pr_detail start");
+    let started = std::time::Instant::now();
     let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
-    client
-        .fetch_pr_detail(&repo, number)
-        .await
-        .map_err(|e| e.to_string())
+    let out = match tokio::time::timeout(
+        crate::poll::FETCH_TIMEOUT,
+        client.fetch_pr_detail(&repo, number),
+    )
+    .await
+    {
+        Ok(res) => res.map_err(|e| e.to_string()),
+        Err(_) => Err(ClientError::Timeout(crate::poll::FETCH_TIMEOUT.as_secs()).to_string()),
+    };
+    crate::diag!(
+        "[diag] cmd get_pr_detail end {}ms {}",
+        started.elapsed().as_millis(),
+        match &out {
+            Ok(d) => format!("ok checks={}/{}", d.checks.len(), d.checks_total),
+            Err(e) => format!("err: {e}"),
+        }
+    );
+    out
 }
 
 /// Repos and their worktrees, unclassified.
