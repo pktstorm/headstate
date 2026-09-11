@@ -63,6 +63,7 @@ import {
   dockerRemoveVolume,
   dockerState,
   deleteHeadBranch,
+  pruneWorktrees,
   removeWorktreeForced,
   unlockWorktree,
   setAutoMerge,
@@ -1613,6 +1614,89 @@ export function useUnlockWorktree() {
     unlockWorktree(repoPath, worktreePath).then(() => {
       void qc.invalidateQueries({ queryKey: ["worktree-safety"] });
       void qc.invalidateQueries({ queryKey: ["worktrees"] });
+    });
+}
+
+/// Clear the locks on several worktrees, reporting each one's outcome
+/// (#792).
+///
+/// N sequential unlocks, not one bulk call, and deliberately no new Rust
+/// command for it. `unlock_worktree` re-checks the target against the
+/// repository's own listing on every call, and that per-target check is
+/// the thing worth keeping: a batch endpoint would either repeat it N
+/// times anyway or drop it, and dropping it on the bulk path is how a
+/// bulk path becomes the dangerous one.
+///
+/// `allSettled`, never `all`. One row somebody else already unlocked
+/// between the scan and the click is an ordinary race -- the scan is a
+/// snapshot -- and `all` would abandon the remaining unlocks over it.
+/// Partial success is the normal case, so the caller is handed every
+/// outcome and says so.
+///
+/// Sequential rather than parallel. Each call shells out to `git
+/// worktree list`, and 20 of those at once on a 150-worktree repository
+/// is a thundering herd for no gain: the work is git's disk, not ours.
+///
+/// Invalidates ONCE at the end rather than per unlock, for the reason
+/// `useUnlockWorktree` documents -- the row must be re-classified
+/// because the verdict underneath was hidden by the lock -- but twenty
+/// invalidations would mean twenty `classify_repo` passes over every
+/// worktree in the repository.
+export function useUnlockWorktrees() {
+  const qc = useQueryClient();
+  return async (repoPath: string, worktreePaths: string[]) => {
+    const outcomes: { path: string; error: string | null }[] = [];
+    for (const path of worktreePaths) {
+      try {
+        await unlockWorktree(repoPath, path);
+        outcomes.push({ path, error: null });
+      } catch (e) {
+        // The same unwrapping `errorMessage` does in `QueryError.tsx`,
+        // inlined rather than imported: this is the api layer and that is
+        // a component module, so importing it here would invert the
+        // layering for four lines. A bare `String(e)` would render
+        // "Error: that worktree is not locked" -- git's own words with
+        // a class name bolted on -- where the rest of the app shows the
+        // message alone.
+        //
+        // Falls back to a fixed sentence rather than to `String(e)` for
+        // anything else: a thrown object stringifies to "[object
+        // Object]", and a row in a failure list reading that tells the
+        // user strictly less than "it failed" does.
+        const msg =
+          typeof e === "string"
+            ? e
+            : e instanceof Error
+              ? e.message
+              : "the unlock failed for an unknown reason";
+        outcomes.push({ path, error: msg });
+      }
+    }
+    void qc.invalidateQueries({ queryKey: ["worktree-safety"] });
+    void qc.invalidateQueries({ queryKey: ["worktrees"] });
+    return outcomes;
+  };
+}
+
+/// Clear a repository's stale worktree registrations (#793).
+///
+/// INVALIDATES rather than patching the cache, and here that is not even
+/// a choice between two honest options. `git worktree prune` is
+/// repo-wide and git decides what it clears, so the only way to know
+/// which rows went is to ask again -- filtering the cache by what we
+/// hoped it would do would leave a row on screen that no longer exists,
+/// or remove one that does.
+///
+/// Both keys, like the unlock above: `worktrees` holds the listing the
+/// pruned registrations appear in, and `worktree-safety` holds the
+/// verdicts computed over it.
+export function usePruneWorktrees() {
+  const qc = useQueryClient();
+  return (repoPath: string) =>
+    pruneWorktrees(repoPath).then((cleared) => {
+      void qc.invalidateQueries({ queryKey: ["worktree-safety"] });
+      void qc.invalidateQueries({ queryKey: ["worktrees"] });
+      return cleared;
     });
 }
 

@@ -261,6 +261,48 @@ pub fn worktree_safety(
         return Safety::Prunable(why.clone());
     }
     if !dir.is_dir() {
+        // A worktree that is LOCKED and gone reports the lock, not a
+        // bare "directory is missing" (#792).
+        //
+        // #792 expected this combination to report `Prunable` and lose
+        // the lock. MEASURED against real git, it does neither: git
+        // WITHHOLDS the `prunable` line while a lock file exists -- it
+        // will not prune a locked registration, so it does not advertise
+        // one as prunable -- and the listing carries `locked` with no
+        // `prunable` beside it. So the prunable arm above does not fire,
+        // and this fallback did, producing "could not determine:
+        // directory is missing": precisely the wording #753 set out to
+        // eliminate, for a state where git had in fact said something
+        // useful.
+        //
+        // Both facts now reach the row. The verdict is `Locked`, because
+        // the lock is what is ACTIONABLE -- it is the reason git refuses
+        // to prune this registration, and clearing it is what lets the
+        // header's Prune action finish the job (#793). The missing
+        // directory travels inside it as `underlying`, which is exactly
+        // what that field is for, so the row reads "locked … " and the
+        // unlock confirmation says the directory is gone underneath.
+        //
+        // Not a reorder of the main lock arm below. That arm's position
+        // relative to `Dirty` is load-bearing and documented there, and
+        // everything between here and it shells `git` into a directory
+        // that does not exist. This is the narrow case where the lock is
+        // the only thing left to say.
+        //
+        // `lock_age_days` and `holder_in` both degrade to `None` here
+        // without special-casing: the age is read from `<dir>/.git`,
+        // which is gone, and the reason is whatever git recorded. An
+        // unknown age is rendered as "locked" with no date rather than
+        // as a fresh lock -- the safe direction, documented on
+        // `Lock::age_days`.
+        if let Some(why) = &wt.locked {
+            return Safety::Locked(Lock {
+                reason: (!why.is_empty()).then(|| why.clone()),
+                age_days: lock_age_days(dir),
+                holder_running: holder_in(why).map(holder_is_running),
+                underlying: Box::new(Safety::Unknown("directory is missing".into())),
+            });
+        }
         return Safety::Unknown("directory is missing".into());
     }
 
@@ -324,7 +366,11 @@ pub fn worktree_safety(
             // a display bug.
             reason: (!why.is_empty()).then(|| why.clone()),
             age_days: lock_age_days(dir),
-            holder_running: pid_in(why).map(process_is_running),
+            // `holder_in`, not a bare pid: a recycled pid must not read
+            // as a live holder, and our own lock reasons record the
+            // start time that tells them apart (#792). See
+            // `holder_is_running`.
+            holder_running: holder_in(why).map(holder_is_running),
             underlying: Box::new(underlying),
         });
     }
@@ -562,23 +608,88 @@ fn lock_age_days(dir: &Path) -> Option<u64> {
     Some(age.as_secs() / 86_400)
 }
 
-/// The pid a lock reason names, if it names one.
+/// Who a lock reason says is holding it: a pid, and the start time it
+/// claims for that pid.
 ///
 /// Git imposes no format on `--reason`, so this is a convention rather
-/// than a contract: it looks for `pid <digits>`, which is what the
-/// locks on the reporting machine use and the spelling #753 already
-/// documents. Anything else yields `None`, which the UI reads as
-/// "nothing to check" rather than as "nobody holds it".
+/// than a contract: it looks for `pid <digits>`, optionally followed by
+/// `start <ctime>`, which is what the locks on the reporting machine
+/// carry -- `claude agent agent-a53ff… (pid 90962 start Sat Sep  5
+/// 01:52:48 2026)`. Anything else yields `None` for the whole thing,
+/// which the UI reads as "nothing to check" rather than as "nobody
+/// holds it".
 ///
-/// Parsed at all only so the app can say what it CHECKED. The pid is
-/// not treated as identifying evidence: see `Lock::holder_running`.
-fn pid_in(reason: &str) -> Option<u32> {
-    let tail = reason.split("pid ").nth(1)?;
-    let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
-    digits.parse().ok()
+/// The start time is optional and its absence is NOT an error. Plenty
+/// of lockers write a bare pid, and refusing to check those at all
+/// would throw away the one genuinely decisive signal (`Some(false)`)
+/// for every lock that does not follow our own convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LockHolder {
+    pid: u32,
+    /// Epoch seconds, parsed from the reason's `start <ctime>`, or
+    /// `None` when the reason names no start time.
+    ///
+    /// Epoch seconds rather than the string, so the comparison is
+    /// against `sysinfo`'s own unit and no formatting round-trip can
+    /// make two equal times look different.
+    started_at: Option<i64>,
 }
 
-/// Whether a pid is a currently-running process.
+/// Who the lock reason names, if it names anybody.
+///
+/// Parsed so the app can say what it CHECKED. The pid alone is not
+/// treated as identifying evidence: see `Lock::holder_running`.
+fn holder_in(reason: &str) -> Option<LockHolder> {
+    let tail = reason.split("pid ").nth(1)?;
+    let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+    let pid = digits.parse().ok()?;
+    Some(LockHolder {
+        pid,
+        started_at: start_time_in(tail),
+    })
+}
+
+/// The epoch seconds a `start <ctime>` fragment names, if it names one.
+///
+/// The format is `ctime(3)`'s -- `Sat Sep  5 01:52:48 2026`, with the
+/// day-of-month space-padded to two columns -- because that is what the
+/// agent tooling writing these locks emits, and matching the producer
+/// is the only thing a parser here can do.
+///
+/// **No timezone in the string, so it is read as LOCAL time.** That is
+/// what `ctime` produces, and the alternative -- guessing UTC -- would
+/// be wrong by the machine's offset: up to 12 hours, which is more than
+/// enough to turn a matching start time into a mismatching one and
+/// report a live holder as dead. The exactly-correct reading is not
+/// available (the producer did not record an offset), so the reading
+/// that matches the producer's own clock is the one taken, and the
+/// tolerance in `holder_is_running` absorbs the rest.
+///
+/// The weekday is parsed and discarded rather than skipped by position:
+/// `%a` consumes it and chrono then validates the rest, where slicing a
+/// fixed number of characters off the front would silently misread any
+/// locale or format that differs.
+///
+/// `None` on anything unparseable, which degrades to the pid-only
+/// check. A start time we cannot read is not a mismatch -- claiming one
+/// would report every unconventional lock as dead, and that is the
+/// direction that makes clearing a LIVE claim feel safe.
+fn start_time_in(tail: &str) -> Option<i64> {
+    let after = tail.split("start ").nth(1)?;
+    // Up to the closing paren of `(pid N start <ctime>)`, or the end.
+    let stamp = after.split(')').next()?.trim();
+    let naive = chrono::NaiveDateTime::parse_from_str(stamp, "%a %b %e %H:%M:%S %Y").ok()?;
+    // `Local` rather than `Utc`: see the doc above. An ambiguous or
+    // non-existent local time -- the hour a DST transition skips or
+    // repeats -- resolves to whichever candidate chrono offers first
+    // rather than to `None`, because a lock taken in that hour is an
+    // ordinary lock and refusing to read it would lose the signal.
+    chrono::TimeZone::from_local_datetime(&chrono::Local, &naive)
+        .earliest()
+        .map(|dt| dt.timestamp())
+}
+
+/// Whether the process a lock names is still the process that took it.
 ///
 /// Through `sysinfo`, which is already a dependency for System Health
 /// and is portable -- rather than a raw `kill(pid, 0)`, which would
@@ -587,22 +698,85 @@ fn pid_in(reason: &str) -> Option<u32> {
 /// where 45% of rows are locked.
 ///
 /// Refreshes only the ONE pid, not the process table. The whole
-/// question is "does this exist", and enumerating several hundred
-/// processes to answer it -- once per locked row -- would be the
-/// expensive way to learn one bit.
+/// question is about one process, and enumerating several hundred to
+/// answer it -- once per locked row -- would be the expensive way.
 ///
-/// **Weak evidence, carried honestly.** On the reporting machine this
-/// answers true for all 20 locks and every one of them is abandoned,
-/// because the pid belongs to the surviving parent session rather than
-/// to the worker that took the lock. So a `true` here is worth very
-/// little and the UI must not spend it as proof; a `false` is worth a
-/// great deal, being the one unambiguous signal that the named holder
-/// is gone.
-fn process_is_running(pid: u32) -> bool {
-    let pid = sysinfo::Pid::from_u32(pid);
+/// **Checks (pid, start_time), not the pid alone, and that is the
+/// improvement over what #792 asked for.** A bare pid check is not
+/// merely imprecise, it is wrong in the dangerous direction: pids are
+/// recycled, so a lock naming a long-dead pid whose number some
+/// unrelated process has since been given reads as a LIVE holder, and
+/// the row then hides the one fact the user needed. The reporting
+/// machine rebooted between taking these locks and reading them, which
+/// is precisely when every pid in the space gets handed out again.
+///
+/// Our lock reasons already record the holder's start time beside its
+/// pid, so the identity is available and the comparison costs nothing
+/// extra -- `sysinfo` returns `start_time()` from the same refresh that
+/// proves the process exists. A pid that exists but started AFTER the
+/// lock was taken cannot be the locker, so it is reported gone.
+///
+/// The tolerance is deliberately generous. `ctime` has one-second
+/// resolution, the string carries no timezone (see `start_time_in`),
+/// and `sysinfo`'s start time is the kernel's own -- so an exact
+/// comparison would fail on rounding alone. A window is used instead,
+/// and it is the SAFE direction that it is wide: too wide reports a
+/// recycled pid as live, which is today's behaviour and merely leaves
+/// the row as it was; too narrow reports a live holder as dead, which
+/// invites clearing a claim on a directory something is working in.
+///
+/// When the reason names no start time at all -- or when `sysinfo`
+/// cannot read the process's -- this falls back to the existence check,
+/// exactly the old behaviour. Both are "no evidence of a mismatch", and
+/// neither is evidence of one.
+///
+/// **Weak evidence when true, carried honestly.** On the reporting
+/// machine the pid-only check answered true for all 20 locks and every
+/// one was abandoned, because the pid belonged to the surviving parent
+/// session rather than to the worker that took the lock. So a `true`
+/// here is worth very little even now and the UI must not spend it as
+/// proof; a `false` is worth a great deal, being the one unambiguous
+/// signal that the named holder is gone.
+fn holder_is_running(holder: LockHolder) -> bool {
+    /// How far apart the lock's claimed start time and the kernel's may
+    /// be before the process is judged a different one. Five minutes:
+    /// comfortably more than a clock skew or a rounding difference, and
+    /// far less than the hours or days that separate a recycled pid from
+    /// the lock that named its predecessor.
+    const TOLERANCE_SECS: i64 = 300;
+
+    let pid = sysinfo::Pid::from_u32(holder.pid);
     let mut sys = sysinfo::System::new();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-    sys.process(pid).is_some()
+    let Some(proc) = sys.process(pid) else {
+        return false;
+    };
+    let Some(claimed) = holder.started_at else {
+        // No start time to compare, so existence is all there is --
+        // the pre-#792 behaviour, kept for lockers that write a bare
+        // pid.
+        return true;
+    };
+    // `as i64` on a u64 of epoch seconds: a start time large enough to
+    // overflow is some 290 billion years away, and the subtraction
+    // below would saturate long before anything here could wrap.
+    let actual = proc.start_time() as i64;
+    // A zero start time means `sysinfo` could not read one, not that the
+    // process began at the epoch -- its own `ProcessInner` initialises
+    // the field to 0 before the platform fills it in. Comparing it would
+    // be ~55 years off any real claim, so the tolerance would reject it
+    // and the holder would read as GONE.
+    //
+    // That is the one direction this function must never fail in. A
+    // false "gone" invites clearing a claim on a directory something is
+    // working in, where a false "live" merely leaves the row as it was.
+    // So an unreadable start time falls back to the existence check,
+    // exactly as a reason with no start time does: the process is there,
+    // and we have no evidence it is a different one.
+    if actual == 0 {
+        return true;
+    }
+    (actual - claimed).abs() <= TOLERANCE_SECS
 }
 
 /// Whether this branch's work is already on `default_branch`.
@@ -3183,14 +3357,189 @@ prunable gitdir file points to non-existent location
             Some(false),
             "no process carries that pid"
         );
+        assert!(lock.holder_is_gone(), "and the predicate agrees");
+
+        // And the ROW says so (#792). `holder_running` was computed from
+        // the first and read only by the unlock dialog, so the user
+        // learned the holder was dead after deciding to unlock. The
+        // reason string must carry it, AFTER git's own words rather than
+        // instead of them.
+        let line = s.reason();
+        assert!(
+            line.contains("holder process is gone"),
+            "the row must say the holder is gone: {line}"
+        );
+        assert!(
+            line.contains("some tool (pid 2147483646)"),
+            "git's reason stays verbatim and comes first: {line}"
+        );
+        assert!(
+            line.find("some tool").unwrap() < line.find("holder process").unwrap(),
+            "ours is appended, not prepended: {line}"
+        );
 
         // And the process running THIS test is, which is the control:
-        // without it a `process_is_running` that always returned false
+        // without it a `holder_is_running` that always returned false
         // would satisfy the assertion above.
         assert!(
-            process_is_running(std::process::id()),
+            holder_is_running(LockHolder {
+                pid: std::process::id(),
+                started_at: None,
+            }),
             "the test's own process is running"
         );
+    }
+
+    /// The row says nothing about a holder it could not check, or one
+    /// that is running (#792).
+    ///
+    /// The other half of the dead-holder line, and the half that keeps
+    /// it meaningful. `None` means the reason named no pid -- most locks
+    /// not written by our own tooling -- and a row reading "holder
+    /// process is gone" there would assert something nobody established.
+    /// `Some(true)` is weak evidence in the other direction: it was true
+    /// for all 20 locks on the reporting machine and every one was
+    /// abandoned, so announcing it would spend weak evidence as proof.
+    ///
+    /// The test's own pid is the live case, which is the only pid a test
+    /// can be sure about.
+    #[test]
+    fn the_row_is_silent_about_an_unchecked_or_living_holder() {
+        let unchecked = Safety::Locked(Lock {
+            reason: Some("a human, by hand".into()),
+            age_days: Some(3),
+            holder_running: None,
+            underlying: Box::new(Safety::Unmerged),
+        });
+        assert!(!unchecked.reason().contains("holder process is gone"));
+
+        let alive = Safety::Locked(Lock {
+            reason: Some(format!("this very test (pid {})", std::process::id())),
+            age_days: Some(0),
+            holder_running: Some(true),
+            underlying: Box::new(Safety::Unmerged),
+        });
+        let line = alive.reason();
+        assert!(!line.contains("holder process is gone"), "{line}");
+        // And says nothing the other way either: "still running" would
+        // be the same weak evidence worn as a badge.
+        assert!(!line.contains("still running"), "{line}");
+    }
+
+    /// A RECYCLED pid is not mistaken for a live holder (#792).
+    ///
+    /// The improvement over a bare pid check, and the reason the reason
+    /// string's start time is parsed at all. A pid is not an identity:
+    /// the reporting machine rebooted between taking these locks and
+    /// reading them, which is exactly when every pid in the space is
+    /// handed out again -- so a lock naming a long-dead worker reads as
+    /// LIVE the moment something unrelated inherits its number, and the
+    /// row hides the one fact the user needed.
+    ///
+    /// Uses the TEST'S OWN pid with a start time that is deliberately
+    /// wrong, which is the recycled case exactly: the pid resolves to a
+    /// real running process, and that process is not the one the lock
+    /// named. A synthetic absent pid could not express this -- it would
+    /// pass against the old pid-only check too.
+    ///
+    /// The far-past timestamp is 2001, not "a few minutes ago": the
+    /// tolerance in `holder_is_running` is five minutes, and a fixture
+    /// near that edge would be testing the constant rather than the
+    /// rule.
+    #[test]
+    fn a_recycled_pid_is_not_a_live_holder() {
+        let mine = std::process::id();
+
+        assert!(
+            holder_is_running(LockHolder {
+                pid: mine,
+                started_at: None,
+            }),
+            "with no start time to compare, existence is all there is"
+        );
+        assert!(
+            !holder_is_running(LockHolder {
+                pid: mine,
+                // 2001-09-09T01:46:40Z. This process did not start then.
+                started_at: Some(1_000_000_000),
+            }),
+            "a live pid that started at some other time is a DIFFERENT process"
+        );
+
+        // The REAL start time matches, within tolerance. Without this the
+        // test above would pass against a `holder_is_running` that
+        // returned false for every pinned start time -- which would
+        // report every one of our own locks as abandoned, the exact
+        // failure direction the function must never take.
+        let mut sys = sysinfo::System::new();
+        let me = sysinfo::Pid::from_u32(mine);
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[me]), true);
+        let started = sys.process(me).expect("this process exists").start_time();
+        assert!(
+            holder_is_running(LockHolder {
+                pid: mine,
+                started_at: Some(started as i64),
+            }),
+            "the holder's own start time must match"
+        );
+        // The unreadable-start-time guard is on the PROCESS's side, not
+        // the lock's, and cannot be reached from here: `sysinfo` returns
+        // this process's real start time, so no fixture can make it 0.
+        // Asserted as a precondition of the guard instead, so a platform
+        // where `start_time()` does come back 0 fails here -- loudly, at
+        // the place the guard exists for -- rather than silently reporting
+        // every live holder on that platform as gone.
+        assert!(
+            started > 0,
+            "sysinfo read a start time for this process; the `actual == 0` \
+             fallback in holder_is_running is for platforms where it does not"
+        );
+    }
+
+    /// The holder parser reads our own lock format, and degrades rather
+    /// than lies on anything else (#792).
+    ///
+    /// `start_time_in` reads a `ctime(3)` string as LOCAL time, because
+    /// that is what `ctime` writes and the producer recorded no offset
+    /// -- so the assertion here is a round trip through the local zone
+    /// rather than a fixed epoch number, which would only pass in one
+    /// timezone and fail the CI runner's.
+    #[test]
+    fn the_lock_holder_parser_reads_a_pid_and_an_optional_start_time() {
+        // The real format, verbatim from a lock file on the reporting
+        // machine.
+        let h = holder_in(
+            "claude agent agent-a53ff3bb2114a7ca9 (pid 90962 start Sat Sep  5 01:52:48 2026)",
+        )
+        .expect("our own lock format must parse");
+        assert_eq!(h.pid, 90962);
+        let expected = chrono::TimeZone::from_local_datetime(
+            &chrono::Local,
+            &chrono::NaiveDateTime::parse_from_str("2026-09-05 01:52:48", "%Y-%m-%d %H:%M:%S")
+                .unwrap(),
+        )
+        .earliest()
+        .unwrap()
+        .timestamp();
+        assert_eq!(h.started_at, Some(expected));
+
+        // A bare pid is the common case for anybody else's lock, and it
+        // must still yield a pid to check -- dropping it would lose the
+        // decisive `Some(false)` for every lock not written by us.
+        let bare = holder_in("some tool (pid 123)").expect("a bare pid must parse");
+        assert_eq!(bare.pid, 123);
+        assert_eq!(bare.started_at, None);
+
+        // An unreadable start time degrades to the pid-only check
+        // rather than being treated as a mismatch: claiming a mismatch
+        // would report a live holder as dead, which is the direction
+        // that makes clearing a real claim feel safe.
+        let odd =
+            holder_in("some tool (pid 123 start yesterday-ish)").expect("the pid is still there");
+        assert_eq!(odd.started_at, None);
+
+        // No pid at all is "nothing to check", not "nobody holds it".
+        assert_eq!(holder_in("a human, by hand"), None);
     }
 
     /// `unlock_worktree` clears the lock and nothing else (#775).
@@ -3401,6 +3750,186 @@ prunable gitdir file points to non-existent location
             "it is determined, and git said why: {}",
             s.reason()
         );
+    }
+
+    /// `prune_worktrees` clears stale registrations and reports how many
+    /// (#793).
+    ///
+    /// Real git throughout, because the bug being fixed was that the app
+    /// named this command in three comments and ran it nowhere -- a
+    /// mocked git would have "passed" against no implementation at all.
+    ///
+    /// Two stale registrations, not one. The count is the reason this
+    /// returns a number rather than `()`, and a fixture with one
+    /// registration cannot tell "counted them" from "returned 1 on
+    /// success".
+    ///
+    /// Asserts the SURVIVOR as firmly as the casualties. `git worktree
+    /// prune` takes no path and walks everything, so the risk worth
+    /// testing is not that it clears too little but that a live worktree
+    /// goes with the dead ones.
+    #[test]
+    fn pruning_clears_stale_registrations_and_counts_them() {
+        let (_t, repo, gone_a) = repo_with_worktree("gone-a");
+        let repo_s = repo.to_str().unwrap();
+        let gone_b = repo.parent().unwrap().join("gone-b");
+        let alive = repo.parent().unwrap().join("still-here");
+        git_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "gone-b",
+                gone_b.to_str().unwrap(),
+            ],
+        );
+        git_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "still-here",
+                alive.to_str().unwrap(),
+            ],
+        );
+        std::fs::remove_dir_all(&gone_a).unwrap();
+        std::fs::remove_dir_all(&gone_b).unwrap();
+
+        // The fixture must actually be stale, or the count below proves
+        // nothing about pruning.
+        let before = parse_porcelain(&git(&repo, &["worktree", "list", "--porcelain"]).unwrap());
+        assert_eq!(
+            before.iter().filter(|w| w.prunable.is_some()).count(),
+            2,
+            "two registrations must start out prunable"
+        );
+
+        assert_eq!(
+            prune_worktrees(repo_s).unwrap(),
+            2,
+            "both stale registrations cleared, and counted"
+        );
+
+        let after = parse_porcelain(&git(&repo, &["worktree", "list", "--porcelain"]).unwrap());
+        assert!(
+            after.iter().all(|w| w.prunable.is_none()),
+            "no stale registration may remain: {after:?}"
+        );
+        assert!(
+            after.iter().any(|w| w.branch == "still-here"),
+            "the live worktree must survive a repo-wide prune"
+        );
+        assert!(alive.is_dir(), "and so must its directory");
+    }
+
+    /// A worktree that is BOTH locked and gone reports the LOCK, and
+    /// survives the prune (#792).
+    ///
+    /// #792 raised this case expecting it to report `Prunable` and lose
+    /// the lock, on the reading that `worktree_safety` returns at the
+    /// prunable arm before reaching the lock arm. MEASURED against real
+    /// git, the premise does not hold and the actual behaviour was worse:
+    ///
+    /// - Git WITHHOLDS the `prunable` line while a lock file exists. It
+    ///   will not prune a locked registration, so it does not advertise
+    ///   one as prunable. The listing carries `locked` and no `prunable`.
+    /// - So the prunable arm never fired, the `!is_dir` fallback did, and
+    ///   the row read "could not determine: directory is missing" -- the
+    ///   exact wording #753 set out to eliminate, over a state where git
+    ///   had said something useful.
+    ///
+    /// Now both facts reach the row: the verdict is `Locked` because the
+    /// lock is the ACTIONABLE fact -- it is why git refuses to prune this
+    /// registration -- and the missing directory rides inside it as
+    /// `underlying`, which is what that field is for.
+    ///
+    /// The second half is why `prune_worktrees` counts by listing twice
+    /// rather than trusting its own arithmetic: git declines this one, so
+    /// the honest count is 0, and a function that reported what it hoped
+    /// for would have claimed a removal that did not happen.
+    #[test]
+    fn a_locked_and_gone_worktree_reports_the_lock_and_survives_the_prune() {
+        let (_t, repo, wt) = repo_with_worktree("locked-and-gone");
+        git_ok(
+            &repo,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "some tool (pid 123)",
+                wt.to_str().unwrap(),
+            ],
+        );
+        std::fs::remove_dir_all(&wt).unwrap();
+
+        let branch = default_branch(&repo);
+        let listed = parse_porcelain(&git(&repo, &["worktree", "list", "--porcelain"]).unwrap());
+        let target = listed
+            .iter()
+            .find(|w| !w.is_main && w.branch == "locked-and-gone")
+            .expect("git still lists it");
+        // The premise correction, asserted so a future git that starts
+        // flagging these as prunable fails here loudly rather than
+        // quietly changing which arm runs.
+        assert!(target.locked.is_some(), "git reports the lock");
+        assert_eq!(
+            target.prunable, None,
+            "git does NOT advertise a locked registration as prunable"
+        );
+
+        let s = worktree_safety(target, &branch, true, Some(0));
+        let Safety::Locked(lock) = &s else {
+            panic!("expected Locked -- the lock is the actionable fact: {s:?}");
+        };
+        assert_eq!(lock.reason.as_deref(), Some("some tool (pid 123)"));
+        assert_eq!(
+            *lock.underlying,
+            Safety::Unknown("directory is missing".into()),
+            "and the missing directory travels inside it"
+        );
+        assert!(
+            !s.reason().starts_with("could not determine"),
+            "the row must not lead with a failed check: {}",
+            s.reason()
+        );
+        assert!(!s.is_safe(), "and it is not removable: {}", s.reason());
+
+        // Git keeps its own counsel about the lock, so the count must be
+        // what WENT rather than what we hoped -- the reason
+        // `prune_worktrees` lists before and after.
+        assert_eq!(
+            prune_worktrees(repo.to_str().unwrap()).unwrap(),
+            0,
+            "git declines to prune a registration that is still locked"
+        );
+        let after = parse_porcelain(&git(&repo, &["worktree", "list", "--porcelain"]).unwrap());
+        assert!(
+            after.iter().any(|w| w.branch == "locked-and-gone"),
+            "so the row is still there, and the remedy is an explicit unlock"
+        );
+    }
+
+    /// Pruning a tidy repository is 0, not an error (#793).
+    ///
+    /// The header affordance only appears when there is something to
+    /// prune, but the scan is a snapshot: a second click, or a prune
+    /// somebody ran in a terminal meanwhile, arrives here with nothing to
+    /// do. Reporting that as a failure would read as a broken command
+    /// rather than as an already-tidy repository.
+    #[test]
+    fn pruning_a_tidy_repository_clears_nothing_and_says_so() {
+        let (_t, repo, wt) = repo_with_worktree("present-and-correct");
+
+        assert_eq!(
+            prune_worktrees(repo.to_str().unwrap()).unwrap(),
+            0,
+            "nothing stale, nothing cleared -- and not an error"
+        );
+        assert!(wt.is_dir(), "a live worktree is not what prune is for");
     }
 
     /// The other half of the gate: a genuinely safe worktree MUST be
@@ -3857,9 +4386,99 @@ prunable gitdir file points to non-existent location
         assert!(!wt.is_dir(), "the directory should be gone");
     }
 
-    /// The override permits a known-unsafe SAFETY state. It does not make
-    /// git force anything, and it does not bypass the checks that protect
-    /// against acting on the wrong directory.
+    /// A DIRTY worktree is removable through the override and not
+    /// otherwise (#798).
+    ///
+    /// The test the old coverage could not have been running. Every
+    /// existing `remove_worktree_forced` case used an UNMERGED-but-clean
+    /// fixture, where Headstate's gate is the only thing in the way --
+    /// so the forced path passed while git was never asked to do
+    /// anything it would refuse. `Dirty` is the one state where git has
+    /// its own opinion, it is the commonest unsafe reason on a real
+    /// machine, and it was the one state the forced path could not
+    /// handle: *"contains modified or untracked files, use --force"*.
+    ///
+    /// Both halves asserted in one test on purpose. The pair is the
+    /// whole invariant -- force works, and the absence of force still
+    /// protects -- and splitting them would let a change that passes
+    /// `--force` unconditionally keep a green suite.
+    ///
+    /// Real git, a real untracked file, a real refusal. A mocked git
+    /// would have passed before this fix too, which is exactly how the
+    /// bug survived.
+    #[test]
+    fn the_override_removes_a_dirty_worktree_and_the_plain_path_does_not() {
+        let (_t, repo, wt) = repo_with_worktree("dirty-then-forced");
+        let repo_s = repo.to_str().unwrap();
+        let wt_s = wt.to_string_lossy().into_owned();
+        // Untracked rather than modified: it needs no prior commit, and
+        // git refuses `worktree remove` for either.
+        std::fs::write(wt.join("uncommitted.txt"), "work in progress\n").unwrap();
+
+        // The fixture must actually be dirty, or the rest proves nothing.
+        let listed = parse_porcelain(&git(&repo, &["worktree", "list", "--porcelain"]).unwrap());
+        let target = listed
+            .iter()
+            .find(|w| w.branch == "dirty-then-forced")
+            .expect("the worktree must be listed");
+        assert_eq!(
+            worktree_safety(target, "main", false, Some(0)),
+            Safety::Dirty(1),
+            "the fixture must start out dirty, or this tests nothing"
+        );
+
+        let err = remove_worktree(repo_s, &wt_s).unwrap_err();
+        assert!(
+            err.contains("not safe to remove"),
+            "the gated path must refuse a dirty worktree: {err}"
+        );
+        assert!(wt.is_dir(), "a refused removal must leave the tree alone");
+
+        remove_worktree_forced(repo_s, &wt_s)
+            .expect("the override must be able to remove a dirty worktree (#798)");
+        assert!(!wt.is_dir(), "the directory should be gone");
+    }
+
+    /// A LOCKED worktree is still refused by the override (#798).
+    ///
+    /// The deliberate limit on the fix above. Git needs `--force
+    /// --force` for a lock and this code gives it once, so the removal
+    /// fails at git rather than succeeding quietly -- and that is the
+    /// decision, not an oversight: a lock is another process's claim,
+    /// and `unlock_worktree` is the route that makes the user read the
+    /// claim before clearing it.
+    ///
+    /// Asserts the DIRECTORY survives, not merely that an error came
+    /// back. A half-completed double-force would return an error and
+    /// still have deleted files.
+    #[test]
+    fn the_override_does_not_double_force_past_a_lock() {
+        let (_t, repo, wt) = repo_with_worktree("held-by-another");
+        commit_in(&wt, "the work");
+        git_ok(
+            &repo,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "some tool (pid 123)",
+                wt.to_str().unwrap(),
+            ],
+        );
+
+        let err = remove_worktree_forced(repo.to_str().unwrap(), &wt.to_string_lossy())
+            .expect_err("a locked worktree must not be removable by a single --force");
+        assert!(
+            err.contains("git refused"),
+            "git must be the refuser: {err}"
+        );
+        assert!(wt.is_dir(), "the locked directory must survive");
+    }
+
+    /// The override permits a known-unsafe SAFETY state. It does not
+    /// bypass the checks that protect against acting on the wrong
+    /// directory -- `--force` is about the TREE's contents, never about
+    /// which tree.
     #[test]
     fn the_override_still_refuses_a_worktree_of_another_repo() {
         let (_t, repo, _wt) = squash_merged_fixture(false);
@@ -7003,10 +7622,27 @@ pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> Result<(), Strin
 /// reason to think hard, not a reason the user may never decide.
 ///
 /// It relaxes exactly one check -- the safety gate. Everything else
-/// holds: the target must still be a worktree of THIS repository, the
-/// main checkout is still refused, and git is still asked without
-/// `--force`, so a genuinely stuck worktree still fails rather than
-/// being torn out.
+/// holds: the target must still be a worktree of THIS repository, and
+/// the main checkout is still refused.
+///
+/// It DOES pass git's `--force` (#798), which it did not until that
+/// issue. The old behaviour was not a deliberate second line of
+/// defence, it was a contradiction: the function is named `forced`, it
+/// logs that it is forcing, and then git refused the commonest unsafe
+/// reason on its own account -- `Dirty` -- with *"contains modified or
+/// untracked files, use --force to delete it"*. So the one path whose
+/// entire purpose is "I have read the warning and I want it gone" could
+/// not do it, and the worktree was left in place after the user had
+/// confirmed a destructive dialog.
+///
+/// `--force` ONCE, never twice. Git wants `--force --force` for a
+/// LOCKED worktree, and that is deliberately not given: a lock is
+/// another process's claim on the directory, and on the reporting
+/// machine 13 of 34 worktrees were locked by agents actively working in
+/// them. Clearing such a claim is `unlock_worktree`'s job, behind a
+/// confirmation that names the holder and the age -- so a locked
+/// worktree still fails here, loudly, rather than being torn out from
+/// under whatever holds it.
 pub fn remove_worktree_forced(repo_path: &str, worktree_path: &str) -> Result<(), String> {
     remove_inner(repo_path, worktree_path, true)
 }
@@ -7059,13 +7695,36 @@ fn remove_inner(repo_path: &str, worktree_path: &str, allow_unsafe: bool) -> Res
         log::warn!("removing {worktree_path} past the safety gate, by explicit confirmation");
     }
 
-    // No `--force`. The gate above already established the tree is clean,
-    // so needing force here would mean the gate was wrong -- and forcing
-    // past it is precisely how unpushed work is lost.
+    // `--force` exactly when the gate was SKIPPED, and never when it
+    // ran (#798).
+    //
+    // On the GATED path there is still no `--force`, and the original
+    // reasoning for that is unchanged and load-bearing: the gate above
+    // already established the tree is clean, so needing force there
+    // would mean the gate was wrong -- and forcing past a gate that has
+    // just been proved wrong is precisely how unpushed work is lost.
+    //
+    // On the FORCED path that claim was simply false, and saying it
+    // anyway is what made `remove_worktree_forced` structurally
+    // incapable of removing a `Dirty` worktree -- the commonest unsafe
+    // reason there is. Nothing established the tree is clean on this
+    // branch; the log line three lines up says the opposite. The user
+    // read the specific loss in a confirmation naming it and asked for
+    // the directory to go, so git is told to make it go.
+    //
+    // ONCE, not twice. `--force --force` is what git wants for a locked
+    // worktree and is deliberately withheld -- see
+    // `remove_worktree_forced` for why a lock is a claim to respect
+    // rather than an obstacle to double-force past.
+    let mut args: Vec<&str> = vec!["worktree", "remove"];
+    if allow_unsafe {
+        args.push("--force");
+    }
     // git's OWN resolved path, with a separator: the caller's raw string
     // could be relative or flag-shaped, and the gate above already
     // matched this record.
-    git(repo, &["worktree", "remove", "--", &wt.path])
+    args.extend(["--", wt.path.as_str()]);
+    git(repo, &args)
         .map(|_| ())
         .map_err(|e| format!("git refused: {e}"))
 }
@@ -7137,4 +7796,79 @@ pub fn unlock_worktree(repo_path: &str, worktree_path: &str) -> Result<(), Strin
     git(repo, &["worktree", "unlock", "--", &wt.path])
         .map(|_| ())
         .map_err(|e| format!("git refused: {e}"))
+}
+
+/// Clear every stale worktree registration in a repository, and say how
+/// many went.
+///
+/// `git worktree prune`, which #793 found the app had been naming in
+/// prose and never running -- the string appears in three comments and
+/// nowhere in an argument list. 12 worktrees on the reporting machine
+/// were `Prunable`: the Remove button greyed out, excluded from "safe to
+/// remove", and the confirmation copy literally quoting the command the
+/// user then had to go and type in a terminal.
+///
+/// **Deletes nothing recoverable, and nothing on disk at all.** A
+/// prunable registration is an entry under `.git/worktrees/` whose
+/// directory has already gone -- git says so itself, with "gitdir file
+/// points to non-existent location". There is no tree to lose work
+/// from, no branch is touched, and no commit becomes unreachable: the
+/// branch the vanished worktree had checked out keeps its ref. So this
+/// is the one "cleanup" in the app whose worst case is that it does
+/// nothing.
+///
+/// REPO-WIDE by design, not per worktree. That is what git's verb is:
+/// `prune` takes no path and walks every registration. A per-row button
+/// would have been a lie about the scope -- clicking it on one row
+/// would clear all 12 -- so the UI offers it once, over the repository,
+/// with the count in the label.
+///
+/// Returns how many registrations were cleared, counted by LISTING
+/// before and after rather than by parsing git's output. `--verbose`
+/// prints a line per removal whose wording is not a documented
+/// interface, and `git worktree list --porcelain` is already parsed
+/// here for every other purpose. The count is what the toast needs:
+/// "pruned 12 stale registrations" is a result, where a bare success is
+/// indistinguishable from a no-op on a repository that had none.
+///
+/// A zero is a legitimate answer and not an error. Two clicks in a row,
+/// or a prune somebody else ran in a terminal meanwhile, leaves nothing
+/// to do -- and reporting that as a failure would read as a broken
+/// command rather than as an already-tidy repository.
+pub fn prune_worktrees(repo_path: &str) -> Result<u64, String> {
+    let repo = Path::new(repo_path);
+
+    let before = git(repo, &["worktree", "list", "--porcelain"])
+        .map_err(|e| format!("could not list worktrees: {e}"))?;
+    let stale_before = parse_porcelain(&before)
+        .iter()
+        .filter(|w| w.prunable.is_some())
+        .count();
+
+    // No `--expire`: git's default prunes what is ALREADY stale with no
+    // grace period, which is the behaviour the UI promised when it named
+    // the command. Passing an expiry would make the button silently do
+    // less than the sentence beside it says.
+    git(repo, &["worktree", "prune"])
+        .map(|_| ())
+        .map_err(|e| format!("git refused: {e}"))?;
+
+    // Counted from a FRESH listing rather than assumed to be
+    // `stale_before`. Git can decline an individual registration it
+    // considers still in use -- a locked one, for instance -- and
+    // reporting the number we hoped for instead of the number that went
+    // would overstate the result in exactly the direction that stops the
+    // user noticing the rows are still there.
+    let after = git(repo, &["worktree", "list", "--porcelain"])
+        .map_err(|e| format!("could not list worktrees: {e}"))?;
+    let stale_after = parse_porcelain(&after)
+        .iter()
+        .filter(|w| w.prunable.is_some())
+        .count();
+
+    // Saturating, not a subtraction that could wrap. A registration
+    // going prunable between the two listings is possible -- a directory
+    // can be deleted at any moment -- and the honest answer then is
+    // "none cleared", not a vast number.
+    Ok(stale_before.saturating_sub(stale_after) as u64)
 }

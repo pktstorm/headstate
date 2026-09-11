@@ -275,6 +275,17 @@ export const removeWorktreeForced = (repoPath: string, worktreePath: string) =>
 export const unlockWorktree = (repoPath: string, worktreePath: string) =>
   call<void>("unlock_worktree", { repoPath, worktreePath });
 
+/// Clear a repository's stale worktree registrations (#793). Resolves
+/// with how many went.
+///
+/// Takes no worktree path, because `git worktree prune` takes none: it
+/// is repo-wide, and a per-row signature would promise a scope git does
+/// not offer. Deletes nothing recoverable -- every registration it
+/// clears describes a directory git has already reported gone -- so
+/// unlike the removal calls it is reached without a confirmation.
+export const pruneWorktrees = (repoPath: string) =>
+  call<number>("prune_worktrees", { repoPath });
+
 /// The clipboard payload for Claudify, plus whether Claude Code was
 /// found. `claude_installed` is advisory: the command is returned either
 /// way, since a user may paste it on another machine.
