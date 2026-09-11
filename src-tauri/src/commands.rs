@@ -2417,6 +2417,338 @@ pub async fn stats_tree(client: State<'_, GhClient>) -> Result<crate::github::st
     out
 }
 
+/// A scope and window parsed from the Tauri boundary's scalars.
+///
+/// Shared by `stats_board` and `stats_series` so the two cannot disagree
+/// about what a window is. That matters more than it sounds: the two
+/// render on the SAME page, and a board covering 30 days beside a chart
+/// covering 31 would produce a page whose own numbers contradict each
+/// other with nothing on screen to explain it.
+struct ScopeRequest {
+    scope: crate::github::stats::Scope,
+    window: crate::github::stats::Slice,
+    /// Every day in the window, oldest first, `YYYY-MM-DD`.
+    days: Vec<String>,
+}
+
+/// Parse the scope scalars and derive the window.
+///
+/// `scope_kind` is one of `repo`, `org`, `user`, `all`, with `scope_value`
+/// carrying `owner/name` or the org/user login -- exactly the strings
+/// `StatsSidebar` writes through `setStatsScope`, so a clicked row needs no
+/// translation. Strings rather than a tagged enum because this is the Tauri
+/// boundary and the phone's `remote_call` passes JSON scalars
+/// (`surface::Args`).
+///
+/// `days` is clamped for `clamp_days`' reason (`commands.rs:37-46`): a
+/// Tauri command is a public surface and an unbounded value builds an
+/// arbitrarily large plan. Here the blast radius is worse than one long
+/// query, because the planner probes, subdivides and probes again.
+fn parse_scope_request(
+    scope_kind: &str,
+    scope_value: Option<String>,
+    days: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<ScopeRequest, String> {
+    use crate::github::stats::{Scope, Slice};
+
+    let scope = match (scope_kind, scope_value) {
+        ("repo", Some(v)) => Scope::Repo(v),
+        ("org", Some(v)) => Scope::Org(v),
+        ("user", Some(v)) => Scope::Personal(v),
+        ("all", _) => Scope::All,
+        (k, None) => return Err(format!("scope {k} needs a value")),
+        (k, _) => return Err(format!("unknown scope: {k}")),
+    };
+    let days = clamp_days(days);
+    // The window ends YESTERDAY, matching `query::period_ranges`
+    // (`query.rs:247-252`) and `stats_count`: today is still accumulating,
+    // so including it compares a partial day against complete ones. It is
+    // also what makes an answer CACHEABLE -- see `store::stats::is_closed`.
+    let end = now - chrono::Duration::days(1);
+    let start = end - chrono::Duration::days(days - 1);
+    let fmt = |d: chrono::DateTime<chrono::Utc>| d.format("%Y-%m-%d").to_string();
+    let all_days: Vec<String> = (0..days)
+        .map(|i| fmt(start + chrono::Duration::days(i)))
+        .collect();
+    Ok(ScopeRequest {
+        scope,
+        window: Slice::new(fmt(start), fmt(end)),
+        days: all_days,
+    })
+}
+
+/// Upper bound on what a board load will spend, in rate-limit points.
+///
+/// # Why this is not `stats_count`'s figure
+///
+/// `stats_count` projects `days / 5 + 8`, which is right for the COUNT path:
+/// that path subdivides only when a slice approaches the 1,000-result cap, so
+/// a 30-day window is usually one or two slices and the 8 covers the probes.
+///
+/// A board subdivides to the PAGE (see `fetch::plan_to`), so its plan is far
+/// finer and its request count is driven by the DAY COUNT rather than by how
+/// near the cap the window is. The worst case is one slice per day, which is
+/// the floor the date grammar imposes -- GitHub has no sub-day range -- and
+/// it is reached by any scope busy enough to exceed a 50-node page every day.
+///
+/// So the bound is computed from the two fan-outs rather than guessed:
+///
+/// - **Probes.** One request per `query::ALIAS_CHUNK` slices per round, and
+///   at most `MAX_PROBE_ROUNDS` rounds before every slice is a single day.
+/// - **Detail.** One request per `board::BOARD_ALIAS_CHUNK` slices.
+/// - **Plus one** for the `fetch_viewer` call the split needs.
+///
+/// I found the old arithmetic wrong by checking it against this: `days/5 + 8`
+/// gives 14 for a 30-day window whose worst case is ~15 requests, and 26 for
+/// a 90-day window whose worst case is ~45. Under-projecting is the dangerous
+/// direction, because the check exists precisely to stop a load starting that
+/// then runs the budget below `RESERVE` and starves the poll loop -- the one
+/// part of the app with a standing obligation.
+///
+/// For reference, the MEASURED figure on a real 30-day org window (569 merged
+/// pull requests, 22 slices) was **9 points**, against the 24 this bounds it
+/// at. Deliberately loose: a refusal here costs the user a page they asked
+/// for, so the bound should be wrong in the direction of letting a real load
+/// through, while still being an upper bound rather than a typical one.
+fn board_projection(days: i64) -> u64 {
+    let days = u64::try_from(days).unwrap_or(u64::MAX);
+    let alias_chunk = crate::github::stats::query::ALIAS_CHUNK as u64;
+    let detail_chunk = crate::github::stats::board::BOARD_ALIAS_CHUNK as u64;
+    // Worst case is one slice per day: the date grammar cannot cut finer.
+    let slices = days.max(1);
+    let probes = slices.div_ceil(alias_chunk) * MAX_PROBE_ROUNDS;
+    let detail = slices.div_ceil(detail_chunk);
+    // +1 for `fetch_viewer`.
+    probes + detail + 1
+}
+
+/// Probe rounds the board's projection assumes, as an upper bound.
+///
+/// `slice::MAX_DEPTH` is 24 and is the RECURSION guard, not a realistic
+/// round count -- projecting against it would refuse almost every load. The
+/// planner splits proportionally and is capped at `ALIAS_CHUNK` pieces per
+/// split, so reaching one-day slices from a 90-day window takes
+/// ceil(log10(90)) = 2 rounds in principle and measured 3 on a real 30-day
+/// window. 4 is that measured figure plus one.
+const MAX_PROBE_ROUNDS: u64 = 4;
+
+/// Per-author aggregates for one scope: #826's Mine and Others views and
+/// the three leaderboards, in ONE load.
+///
+/// # Why one command and not two
+///
+/// Mine and Others are the same measurement partitioned two ways, not two
+/// measurements. The board carries every author who appears in the window;
+/// "Mine" is the viewer's row and "Others" is the rest
+/// (`Board::row_for` / `Board::others`). Issuing a narrowed
+/// `author:@me` query as well would double the cost of the page to
+/// recompute a row the board already holds, and the two answers could then
+/// disagree -- a Mine figure that does not match the viewer's own entry on
+/// the leaderboard beside it is the kind of contradiction a reader cannot
+/// resolve and will not trust.
+///
+/// It is also why `subject` is not a parameter here. A board asks about
+/// EVERYONE; `scope.rs` has a test named for the mistake of constraining
+/// one to a single author, which renders a board with one name on it. The
+/// viewer's login is resolved server-side so the split can be made, and a
+/// member row's subject is applied by the UI to that same board rather than
+/// by re-querying.
+///
+/// # Cost, and why this one is gated
+///
+/// Unlike `stats_tree`, this is the expensive click. The probe rounds plus
+/// one detail request per `board::BOARD_ALIAS_CHUNK` slices, each measured
+/// at 1 point, so the projection below is the same shape `stats_count`
+/// uses. `Budget::permits` refuses before spending, because the thing being
+/// protected is the poll loop's standing obligation and a leaderboard is
+/// something the user asked for once.
+///
+/// # Not cached, unlike `stats_count`
+///
+/// `stats_count` memoises a closed window's total through `store::stats`,
+/// keyed on the question. A board is not a number: it is a row per person,
+/// and the cache's schema stores a total and a payload keyed on
+/// `StatsQuery::cache_key` -- which for a board has no subject at all, so
+/// every board in a scope would share one key. Caching it properly needs a
+/// migration of its own and a decision about whether a roster change
+/// invalidates a closed window's board; neither is in this PR's scope.
+/// TanStack Query's `staleTime` holds it for the session, which is the
+/// layer that stops a re-fetch per navigation.
+#[tauri::command]
+pub async fn stats_board(
+    client: State<'_, GhClient>,
+    scope_kind: String,
+    scope_value: Option<String>,
+    measure: String,
+    days: i64,
+) -> Result<StatsBoard, String> {
+    use crate::github::stats::{Budget, Measure};
+
+    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    let measure = match measure.as_str() {
+        "merged" => Measure::Merged,
+        "opened" => Measure::Opened,
+        other => return Err(format!("unknown measure: {other}")),
+    };
+    let now = chrono::Utc::now();
+    let req = parse_scope_request(&scope_kind, scope_value, days, now)?;
+
+    // Resolved so the UI can split the board into Mine and Others. One
+    // cheap request whose answer never changes for a session, and the same
+    // call `stats_count` makes for its cache key -- the viewer's login is
+    // genuinely needed here rather than avoidable, because `@me` is a
+    // qualifier GitHub resolves and not a login the UI can compare a row
+    // against.
+    let viewer = client.fetch_viewer().await.map_err(|e| e.to_string())?;
+
+    let budget = Budget::new();
+    let projected = board_projection(clamp_days(days));
+    if !budget.permits(projected) {
+        return Err(format!(
+            "GitHub budget too low for this scope (needs about {projected} points, \
+             keeping {} in reserve for background refresh)",
+            crate::github::stats::budget::RESERVE
+        ));
+    }
+
+    crate::diag!("[diag] cmd stats_board start kind={scope_kind} days={days}");
+    let started = std::time::Instant::now();
+    let out = crate::github::stats::load_board(&client, &req.scope, measure, req.window, &budget)
+        .await
+        .map(|board| StatsBoard { viewer, board })
+        .map_err(|e| e.to_string());
+    crate::diag!(
+        "[diag] cmd stats_board end {}ms {}",
+        started.elapsed().as_millis(),
+        match &out {
+            // Counts and flags, never a login: this is a public repo and
+            // the privacy rule applies to the diagnostic log too. The
+            // shape of the board is what a reader of the log needs, and
+            // naming colleagues in it would be the one place this feature
+            // could leak a roster.
+            Ok(b) => format!(
+                "ok authors={} total={} retrieved={} complete={} short={} refused={} \
+                 slices={} rounds={} points={}",
+                b.board.rows.len(),
+                b.board.total,
+                b.board.retrieved,
+                b.board.complete,
+                b.board.truncated_slices.len(),
+                b.board.refused_fields,
+                b.board.slices,
+                b.board.rounds,
+                b.board.spend.points
+            ),
+            Err(e) => format!("err: {e}"),
+        }
+    );
+    out
+}
+
+/// A board plus the viewer's login, which is what splits it into Mine and
+/// Others.
+///
+/// The login travels WITH the board rather than being fetched separately by
+/// the UI, because the two have to agree. A board fetched for one account
+/// and split by a login cached from another -- two accounts on one machine,
+/// which `Subject::cache_key`'s doc comment records as a real case -- would
+/// put the viewer's own work under "Others" and show "no activity" for
+/// Mine. Shipping them together makes that unrepresentable.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsBoard {
+    pub viewer: String,
+    #[serde(flatten)]
+    pub board: crate::github::stats::Board,
+}
+
+/// The scoped daily activity series: merged and opened counts per day.
+///
+/// The scoped counterpart to `get_history`, which is hardcoded
+/// `author:@me`. A SEPARATE command from `stats_board` deliberately, and
+/// that is the progressive-rendering requirement rather than a style
+/// choice: `StatsPage.tsx:12-22` records that three independent queries
+/// rendering as each lands beat one combined gate, because the costs differ
+/// enough that blocking on the slowest left the fast numbers finished and
+/// invisible (1.6s / 3.7s / 3.7s). This series is count-only and measured
+/// at 1.4-1.5s per 10-day chunk, where a board over a busy org is seconds
+/// of node fetching -- so folding them together would hide the chart behind
+/// the leaderboard for no reason.
+///
+/// `subject` is accepted here, unlike on `stats_board`, and the asymmetry
+/// is the point: a chart is about ONE line, so "this person's activity in
+/// this org" is a legitimate and cheap question, while a leaderboard is
+/// about everyone by definition. `None` means the whole scope.
+#[tauri::command]
+pub async fn stats_series(
+    client: State<'_, GhClient>,
+    subject: Option<String>,
+    scope_kind: String,
+    scope_value: Option<String>,
+    days: i64,
+) -> Result<crate::github::stats::Series, String> {
+    use crate::github::stats::{Budget, Measure, StatsQuery, Subject};
+
+    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    let subject = match subject {
+        // An empty string is a caller mistake, not a request for everyone:
+        // treating it as `None` would silently widen a chart about one
+        // person into one about a whole organisation, which looks like
+        // that person having a remarkable month.
+        Some(s) if s.trim().is_empty() => return Err("subject must not be empty".into()),
+        Some(s) => Some(Subject::Login(s)),
+        None => None,
+    };
+    let now = chrono::Utc::now();
+    let req = parse_scope_request(&scope_kind, scope_value, days, now)?;
+
+    let budget = Budget::new();
+    // One request per `ALIAS_CHUNK` days, at the measured 1 point each,
+    // plus slack. Far cheaper than a board, and gated anyway: the check
+    // exists for the case where something else has already spent the
+    // budget down to the reserve, which is independent of how cheap this
+    // particular call is.
+    let projected = u64::try_from(clamp_days(days)).unwrap_or(u64::MAX)
+        / crate::github::stats::query::ALIAS_CHUNK as u64
+        + 2;
+    if !budget.permits(projected) {
+        return Err(format!(
+            "GitHub budget too low for this chart (needs about {projected} points, \
+             keeping {} in reserve for background refresh)",
+            crate::github::stats::budget::RESERVE
+        ));
+    }
+
+    // `Measure::Merged` names the query's DEFAULT measure and is
+    // immediately overridden per alias by `series_query`, which asks for
+    // both. Passed rather than defaulted inside the document builder so
+    // there is no measure a caller can set here and have silently ignored.
+    let q = StatsQuery::new(subject, req.scope, Measure::Merged);
+
+    crate::diag!("[diag] cmd stats_series start kind={scope_kind} days={days}");
+    let started = std::time::Instant::now();
+    let out = crate::github::stats::load_series(&client, &q, &req.days, &budget)
+        .await
+        .map_err(|e| e.to_string());
+    crate::diag!(
+        "[diag] cmd stats_series end {}ms {}",
+        started.elapsed().as_millis(),
+        match &out {
+            Ok(s) => format!(
+                "ok points={} failed={} refused={} complete={} points_spent={}",
+                s.points.len(),
+                s.failed_days.len(),
+                s.refused_fields,
+                s.is_complete(),
+                s.spend.points
+            ),
+            Err(e) => format!("err: {e}"),
+        }
+    );
+    out
+}
+
 /// Whether we have a usable GitHub client. `state` is computed once at
 /// startup from `auth::read_token` / `auth::build_client` and stored as
 /// managed state; this command just hands it to the frontend.
@@ -2613,6 +2945,172 @@ mod tests {
     #[test]
     fn auth_error_names_the_command_that_fixes_it() {
         assert!(AUTH_ERR.contains("gh auth login"));
+    }
+
+    /// The board's budget projection is an UPPER bound at every offered
+    /// window, recomputed here from the fan-out rather than compared against
+    /// a hardcoded expectation.
+    ///
+    /// Under-projecting is the dangerous direction: the check exists to stop
+    /// a load STARTING that then runs the budget below `RESERVE` and starves
+    /// the poll loop, which is the only part of the app with a standing
+    /// obligation. The first arithmetic here was `days / 5 + 8`, copied from
+    /// `stats_count`, and it projected 14 for a 30-day window whose worst case
+    /// is 18 requests and 26 for a 90-day window whose worst case is 54 --
+    /// found by writing exactly this check.
+    #[test]
+    fn the_board_projection_bounds_its_own_worst_case() {
+        let alias_chunk = crate::github::stats::query::ALIAS_CHUNK as u64;
+        let detail_chunk = crate::github::stats::board::BOARD_ALIAS_CHUNK as u64;
+        // Every window the UI offers, plus the clamp's own bounds -- a Tauri
+        // command is a public surface, so the extremes are reachable.
+        for days in [1_i64, 7, 14, 30, 90] {
+            let slices = u64::try_from(days).unwrap().max(1);
+            // The worst case the date grammar allows: one slice per day,
+            // because GitHub has no sub-day range.
+            let worst =
+                slices.div_ceil(alias_chunk) * MAX_PROBE_ROUNDS + slices.div_ceil(detail_chunk);
+            let projected = board_projection(days);
+            assert!(
+                projected >= worst,
+                "{days} days: projected {projected} is below the worst case {worst}; \
+                 a load could start and then starve the poll loop"
+            );
+        }
+        // And it is not absurdly loose either: a projection so large that it
+        // refuses ordinary loads is a feature nobody can use. The MEASURED
+        // figure on a real 30-day org window was 9 points.
+        assert!(
+            board_projection(30) < 40,
+            "a 30-day window measured 9 points; a projection this high would \
+             refuse real loads"
+        );
+        // Clamped at both ends, so a hostile value cannot project to zero and
+        // bypass the check.
+        assert!(board_projection(0) > 0);
+        assert!(board_projection(-5) > 0);
+    }
+
+    /// The window and the day list describe exactly the same period.
+    ///
+    /// `stats_board` measures the WINDOW and `stats_series` measures the DAYS,
+    /// and the two render on one page. A board covering 30 days beside a chart
+    /// covering 31 would be a page whose own numbers contradict each other
+    /// with nothing on screen to explain it -- and the off-by-one that does it
+    /// is invisible in review, because both halves look right alone.
+    ///
+    /// Asserted as three properties rather than against a fixed date, so the
+    /// test does not rot and does not depend on when it runs.
+    #[test]
+    fn the_window_and_the_day_list_cover_the_same_period() {
+        let now = chrono::Utc::now();
+        for days in [1_i64, 7, 14, 30, 90] {
+            let r = parse_scope_request("org", Some("acme".into()), days, now).expect("parses");
+            assert_eq!(
+                r.days.len(),
+                usize::try_from(days).unwrap(),
+                "{days} days: one entry per day"
+            );
+            assert_eq!(
+                r.days.first().unwrap(),
+                &r.window.from,
+                "{days} days: starts together"
+            );
+            assert_eq!(
+                r.days.last().unwrap(),
+                &r.window.to,
+                "{days} days: ends together"
+            );
+            // Contiguous with no gap and no duplicate: a gap would drop a
+            // column from the chart and a duplicate would draw one twice.
+            for pair in r.days.windows(2) {
+                let a = chrono::NaiveDate::parse_from_str(&pair[0], "%Y-%m-%d").unwrap();
+                let b = chrono::NaiveDate::parse_from_str(&pair[1], "%Y-%m-%d").unwrap();
+                assert_eq!((b - a).num_days(), 1, "days must be consecutive: {pair:?}");
+            }
+        }
+    }
+
+    /// The window ends YESTERDAY, not today.
+    ///
+    /// `query::period_ranges` (`query.rs:247-252`) and `stats_count` both do
+    /// this, and the reason is the same: today is still accumulating, so
+    /// including it compares a partial day against complete ones. It is also
+    /// what makes a closed window's answer cacheable at all.
+    #[test]
+    fn the_window_excludes_today() {
+        let now = chrono::Utc::now();
+        let r = parse_scope_request("all", None, 7, now).expect("parses");
+        let today = now.format("%Y-%m-%d").to_string();
+        assert!(
+            r.window.to < today,
+            "window ends {} but today is {today}; a partial day would drag \
+             every figure down",
+            r.window.to
+        );
+        assert!(!r.days.contains(&today));
+    }
+
+    /// An unbounded `days` is clamped, like `get_history`'s.
+    ///
+    /// A Tauri command is a public surface. Here the blast radius is worse
+    /// than one long query: the planner probes, subdivides and probes again,
+    /// so a 100-year window would build an enormous plan before anything
+    /// refused it.
+    #[test]
+    fn the_window_is_clamped_like_every_other_public_surface() {
+        let now = chrono::Utc::now();
+        let huge = parse_scope_request("all", None, 100_000, now).expect("parses");
+        assert_eq!(
+            huge.days.len(),
+            usize::try_from(clamp_days(100_000)).unwrap()
+        );
+        // And a zero or negative value does not produce an empty or
+        // backwards window, which would make every search a no-op that
+        // returned a confident zero.
+        for bad in [0_i64, -1, i64::MIN] {
+            let r = parse_scope_request("all", None, bad, now).expect("parses");
+            assert!(!r.days.is_empty(), "{bad} produced an empty window");
+            assert!(
+                r.window.from <= r.window.to,
+                "{bad} produced a backwards window"
+            );
+        }
+    }
+
+    /// A scope kind that needs a value and has none is an ERROR, not a
+    /// silently widened question.
+    #[test]
+    fn a_scope_without_its_value_is_refused() {
+        let now = chrono::Utc::now();
+        for kind in ["repo", "org", "user"] {
+            assert!(
+                parse_scope_request(kind, None, 30, now).is_err(),
+                "{kind} with no value must be refused, not widened"
+            );
+        }
+        // `all` is the one kind whose value is genuinely absent.
+        assert!(parse_scope_request("all", None, 30, now).is_ok());
+        assert!(parse_scope_request("nonsense", Some("x".into()), 30, now).is_err());
+    }
+
+    /// The probe-round bound is a DECISION, not `MAX_DEPTH`.
+    ///
+    /// `slice::MAX_DEPTH` is 24 and is the recursion guard; projecting against
+    /// it would multiply the bound sixfold and refuse almost every load. The
+    /// measured figure on a real 30-day window was 3 rounds.
+    #[test]
+    fn the_probe_round_bound_is_not_the_recursion_guard() {
+        const {
+            assert!(
+                MAX_PROBE_ROUNDS >= 3,
+                "a real 30-day window measured 3 rounds"
+            );
+            assert!(
+                MAX_PROBE_ROUNDS < crate::github::stats::slice::MAX_DEPTH as u64,
+                "MAX_DEPTH is the recursion guard, not a realistic round count"
+            );
+        }
     }
 }
 

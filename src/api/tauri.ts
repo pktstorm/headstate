@@ -43,6 +43,9 @@ import type {
   PrDetail,
   PullRequest,
   Stats,
+  StatsBoard,
+  StatsOutcome,
+  StatsSeries,
   StatsTree,
   Worktree,
   WorktreeRepo,
@@ -223,6 +226,75 @@ export const getStats = () => call<Stats>("get_stats");
 /// two requests, 2 rate-limit points total, measured -- because discovery is
 /// cheap and measurement waits for a click (`hooks.ts:712-717`).
 export const statsTree = () => call<StatsTree>("stats_tree");
+
+/// A COMPLETE count of pull requests for one subject and scope (#824).
+///
+/// The first wrapper on the hardened stats layer. #827 shipped the command
+/// with no caller, deliberately -- "shipping the command now is what makes
+/// the layer reachable and testable rather than dead code waiting on two
+/// other PRs" -- and this is #826 becoming that caller.
+///
+/// `subject` is a login, or `undefined` for the VIEWER -- not for everyone.
+/// "Everyone" is a different question and is `statsBoard`'s; the Rust side
+/// rejects an empty string rather than reading it as either.
+///
+/// The answer carries its own completeness (`complete`, `slices`,
+/// `unretrievable`), because a count assembled from slices must not be
+/// readable as a plain number without it.
+export const statsCount = (
+  subject: string | undefined,
+  scopeKind: string,
+  scopeValue: string | undefined,
+  measure: "merged" | "opened",
+  days: number,
+) =>
+  call<StatsOutcome>("stats_count", {
+    subject,
+    scopeKind,
+    scopeValue,
+    measure,
+    days,
+  });
+
+/// The scope's per-author board: the numbers behind Mine and Others, and
+/// the three leaderboards (#826).
+///
+/// The EXPENSIVE call in this feature, and the one a click pays for: it
+/// probes the window, slices anything over the 1,000-result cap, and fetches
+/// per-PR nodes for every slice. Refused before it starts if the rate-limit
+/// budget is near its reserve, because the thing being protected is the poll
+/// loop's standing obligation.
+///
+/// No `subject` parameter, deliberately. A board asks about EVERYONE in the
+/// scope and ranks them; constraining it to one author renders a board with
+/// one name on it. `viewer` comes back in the answer so Mine and Others can
+/// be split from the one load rather than measured twice -- two loads could
+/// disagree, and a Mine figure that contradicts the viewer's own row on the
+/// leaderboard beside it is a contradiction a reader cannot resolve.
+export const statsBoard = (
+  scopeKind: string,
+  scopeValue: string | undefined,
+  measure: "merged" | "opened",
+  days: number,
+) => call<StatsBoard>("stats_board", { scopeKind, scopeValue, measure, days });
+
+/// The scoped daily opened/merged series (#826).
+///
+/// The cheap half of a scope page: count-only searches, no per-PR nodes, so
+/// it lands in about a second per ten days where a board over a busy
+/// organisation is seconds of node fetching. A SEPARATE command for exactly
+/// that reason -- `StatsPage` renders each query as it arrives rather than
+/// behind one gate, which is the pattern `StatsPage.tsx:12-22` records.
+///
+/// `subject` IS accepted here, unlike on the board, and the asymmetry is the
+/// point: a chart is about one line, so "this person, in this org" is a
+/// legitimate and cheap question. `undefined` means the whole scope.
+export const statsSeries = (
+  subject: string | undefined,
+  scopeKind: string,
+  scopeValue: string | undefined,
+  days: number,
+) => call<StatsSeries>("stats_series", { subject, scopeKind, scopeValue, days });
 
 /// Repos and their worktrees, WITHOUT safety classification.
 ///

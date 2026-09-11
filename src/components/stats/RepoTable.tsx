@@ -10,9 +10,23 @@ import type { RepoCount } from "@/types/pr";
 export function RepoTable({
   repos,
   sampleSize,
+  hint,
 }: {
   repos: RepoCount[];
+  /// How many merged pull requests the figures are drawn from, when they are
+  /// drawn from a fixed recent SAMPLE. Omit on a scope page, where the
+  /// population is the whole window rather than a sample -- see `hint`.
   sampleSize?: number;
+  /// What the shares are shares OF, in the caller's words, overriding the
+  /// sample wording.
+  ///
+  /// The unscoped page's figures come from the last N merged pull requests,
+  /// and that caveat is load-bearing there: the bars "are the most visually
+  /// assertive element on the page and had the weakest footing". A scope
+  /// page's come from the whole window, so repeating "share of recent merges"
+  /// there would understate a complete measurement -- and on a PARTIAL one
+  /// the caller knows why it is partial, which this component does not.
+  hint?: string;
 }) {
   const { setFilter, setPanel } = useFilters();
   const total = repos.reduce((sum, r) => sum + r.merged, 0);
@@ -25,7 +39,10 @@ export function RepoTable({
           merges, not of all time. The delta and insight cards already say
           so; this was the holdout. */}
       <div className="text-xs text-[#8b949e]">
-        {sampleSize ? `share of the last ${sampleSize} merged` : "share of recent merges"}
+        {hint ??
+          (sampleSize
+            ? `share of the last ${sampleSize} merged`
+            : "share of recent merges")}
       </div>
       {repos.length === 0 ? (
         <div className="py-8 text-center text-sm text-[#8b949e]">

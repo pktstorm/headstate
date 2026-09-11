@@ -159,10 +159,40 @@ pub fn probe_query(q: &StatsQuery, slices: &[Slice], first_index: usize) -> Stri
 /// `additions`, `deletions` and `changedFiles` are SCALARS and cost
 /// nothing extra. MEASURED 2026-09-11: 12 aliases x 100 nodes carrying
 /// all three plus `author { login }` cost **1 point** in 3.69-5.21s.
-/// `reviews { totalCount }` is deliberately NOT here: it is a connection
-/// and is priced per search (`poll.rs:1503-1580`), so adding it would
-/// multiply the cost of this document by its alias count. #826 can add it
-/// behind its own measurement if a reviewer leaderboard needs it.
+///
+/// `reviews { totalCount }` is here as of #826, and it is free -- which is
+/// NOT what #823 and #827 believed. Both recorded it as "a connection,
+/// priced per search". Re-measured live (`gh api graphql`, 2026-09-11,
+/// `org:FNX-Labs`, this document): `reviews { totalCount }` costs 1 point
+/// at 3, 6 and 15 searches, exactly tracking the scalars-only control,
+/// while `reviews(first: 1) { totalCount }` costs **2** from 6 searches
+/// up. `labels` behaves identically both ways.
+///
+/// So what GitHub prices is a connection that PAGES -- one carrying a
+/// `first:` argument -- not one read for `totalCount`. That reconciles
+/// with `poll.rs:1503-1580` rather than contradicting it: every connection
+/// on that test's cost list is paged. The rule for this document is
+/// therefore "no `first:` inside the node selection", and
+/// `the_detail_slice_carries_only_unpriced_fields` is what enforces it.
+/// `board.rs`'s module docs carry the full measurement table.
+///
+/// The field is a review count RECEIVED, since it hangs off a PR the
+/// subject authored. A board of reviews GIVEN would need
+/// `reviewed-by:<login>`, which is one search per person -- a different
+/// and much more expensive question, and the reason `AuthorRow`'s field is
+/// named `reviews_received`.
+///
+/// `number`, `title`, `url` and `repository { nameWithOwner }` carry the
+/// pull request's IDENTITY, which the outlier lists need: #826 keeps
+/// `Outliers`, and its whole point is that "every figure on this page was a
+/// scalar: it could report that something took four days or ran to ten
+/// thousand lines and then not say WHICH pull request that was". MEASURED
+/// 2026-09-11 on the same dense day-slices: adding all four leaves the
+/// document at **cost 1** and is, if anything, faster (5 aliases x 50:
+/// 3.81-4.77s with identity against 3.93-5.90s without, 3 runs each -- the
+/// difference is noise, and the point is that there is no penalty).
+/// `repository` is an OBJECT rather than a connection, which is why; it was
+/// measured rather than assumed because that is this layer's rule.
 pub fn slice_detail_query(
     q: &StatsQuery,
     slices: &[Slice],
@@ -183,7 +213,7 @@ pub fn slice_detail_query(
             // that no mapper test would catch.
             "  {alias}: search(query: {}, type: ISSUE, first: {first}) {{\n\
              \x20   issueCount\n\
-             \x20   nodes {{ ... on PullRequest {{ author {{ login }} createdAt mergedAt additions deletions changedFiles }} }} }}\n",
+             \x20   nodes {{ ... on PullRequest {{ number title url repository {{ nameWithOwner }} author {{ login }} createdAt mergedAt additions deletions changedFiles reviews {{ totalCount }} }} }} }}\n",
             graphql_string(&search)
         ));
     }
@@ -227,6 +257,65 @@ query($owner: String!, $name: String!, $first: Int!, $after: String) {
     }
   }
 }"#;
+
+/// Merged and opened counts for each day in `days`, for one scope.
+///
+/// The scoped counterpart to `query::history_query_range`, which is
+/// hardcoded `author:@me` and therefore cannot draw a chart for an
+/// organisation or a colleague -- the one thing #823's second audience
+/// needs. Two aliases per day, `m<i>` and `o<i>`, because a PR opened in
+/// July and merged in August belongs to July's opened count and August's
+/// merged count; `Measure`'s own doc comment records why those cannot share
+/// an alias.
+///
+/// COUNT-ONLY, which is what makes it affordable. No `nodes`, so no
+/// per-PR field is resolved at all and the deadline that governs the detail
+/// document does not apply the same way: MEASURED 2026-09-11, 10 count-only
+/// aliases over dense `org:FNX-Labs` day-slices answered in 1.4-1.5s where
+/// the same 10 aliases carrying 50 nodes each straddled ~11s and failed.
+/// So this document is chunked at the full [`ALIAS_CHUNK`], while
+/// `board::BOARD_ALIAS_CHUNK` is half it -- two numbers because they size
+/// two documents that measure seven times apart.
+///
+/// Alias indices are ABSOLUTE across the whole series for
+/// `query.rs:667-678`'s reason: chunks complete out of order and merge into
+/// one map, so a per-chunk index would have chunk two's `m0` overwrite
+/// chunk one's.
+pub fn series_query(q: &StatsQuery, days: &[String], first_index: usize) -> String {
+    let mut doc = String::from("query {\n  rateLimit { cost remaining resetAt }\n");
+    for (i, d) in days.iter().enumerate() {
+        let n = first_index + i;
+        // A fresh query per measure rather than one with the date swapped:
+        // `StatsQuery` owns the qualifier order and the subject, and
+        // rebuilding the string here is exactly the per-call-site
+        // assembly `scope.rs`'s module docs forbid.
+        let merged = q
+            .with_measure(super::scope::Measure::Merged)
+            .search_query(d, d);
+        let opened = q
+            .with_measure(super::scope::Measure::Opened)
+            .search_query(d, d);
+        doc.push_str(&format!(
+            "  m{n}: search(query: {}, type: ISSUE) {{ issueCount }}\n",
+            graphql_string(&merged)
+        ));
+        doc.push_str(&format!(
+            "  o{n}: search(query: {}, type: ISSUE) {{ issueCount }}\n",
+            graphql_string(&opened)
+        ));
+    }
+    doc.push_str("}\n");
+    doc
+}
+
+/// Aliases for the merged and opened counts of day `index`.
+///
+/// One function for both, so the two spellings cannot drift apart between
+/// the document that writes them and the mapper that reads them -- the
+/// failure `slice_alias` exists to prevent for the detail document.
+pub fn day_aliases(index: usize) -> (String, String) {
+    (format!("m{index}"), format!("o{index}"))
+}
 
 /// A Rust string as a GraphQL string literal.
 ///
@@ -353,21 +442,70 @@ mod tests {
         );
     }
 
-    /// `reviews { totalCount }` is a CONNECTION and priced per search
-    /// (`poll.rs:1503-1580`), so it would multiply this document's cost
-    /// by its alias count. The scalars are free. Guarded because the
-    /// difference is invisible in review: both read as "one more field".
+    /// Every field on this document must be free, and "free" turned out
+    /// to be about the ARGUMENT, not the field.
+    ///
+    /// # What this test used to assert, and what measuring changed
+    ///
+    /// It forbade `reviews` outright, on #823's premise that "a connection
+    /// is priced per search". That premise is too broad, which #826's
+    /// measurement established -- the guard did its job: it forced the
+    /// measurement before the field went in. Live API, `gh api graphql`,
+    /// 2026-09-11, `org:FNX-Labs`, the same document this function builds:
+    ///
+    /// | Nested field | 3 searches | 6 searches | 15 searches |
+    /// |---|---|---|---|
+    /// | scalars only | 1 | 1 | 1 |
+    /// | `reviews { totalCount }` | 1 | 1 | 1 |
+    /// | `reviews(first: 1) { totalCount }` | 1 | **2** | **2** |
+    /// | `labels { totalCount }` | 1 | 1 | - |
+    /// | `labels(first: 10) { nodes { name } }` | 1 | **2** | - |
+    ///
+    /// The SAME field is free without `first:` and priced with it, for both
+    /// `reviews` and `labels`. That reconciles with `poll.rs:1503-1580`
+    /// rather than contradicting it: every connection on that test's cost
+    /// list is a paged one, so its figures were right about the query it
+    /// measured.
+    ///
+    /// So the rule this guards is now: a connection may be read for
+    /// `totalCount`, and may NOT take a `first:` argument. `board.rs`'s
+    /// module docs carry the full table.
     #[test]
-    fn the_detail_slice_carries_only_free_scalars() {
+    fn the_detail_slice_carries_only_unpriced_fields() {
         let doc = slice_detail_query(&q(), &slices(1), 0, 100);
         for scalar in ["additions", "deletions", "changedFiles"] {
             assert!(doc.contains(scalar), "{scalar} is a free scalar and wanted");
         }
-        for connection in ["reviews", "comments", "labels", "reviewThreads", "commits"] {
+        // The reviewer leaderboard #826 asked for, in the spelling that
+        // measured free.
+        assert!(
+            doc.contains("reviews { totalCount }"),
+            "the reviewer board needs a review count per PR"
+        );
+        // A PAGED nested connection is the priced shape. Checked as
+        // `name(` so the argument is what trips it -- which is the thing
+        // that was actually measured, and is invisible in review because
+        // both spellings read as "one more field".
+        //
+        // The outer `search(` and the document's own `first:` are not
+        // nested connections and are excluded by checking only the node
+        // selection, which is where a per-PR field would be added.
+        let nodes = doc
+            .split_once("... on PullRequest {")
+            .expect("the node selection")
+            .1;
+        for connection in [
+            "reviews(",
+            "comments(",
+            "labels(",
+            "reviewThreads(",
+            "commits(",
+        ] {
             assert!(
-                !doc.contains(connection),
-                "{connection} is a connection, priced per search -- \
-                 measure the live cost before adding it"
+                !nodes.contains(connection),
+                "{connection} PAGES a nested connection, which measured 2 points \
+                 from 6 searches up -- read it for totalCount instead, or \
+                 measure the live cost first"
             );
         }
     }

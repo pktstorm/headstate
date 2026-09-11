@@ -240,6 +240,24 @@ impl StatsQuery {
         }
     }
 
+    /// The same question about the same scope, for a different measure.
+    ///
+    /// The scoped daily series (`query::series_query`) needs a merged
+    /// count and an opened count for every day, which are two measures
+    /// over one subject and scope. Without this, that document would
+    /// assemble its own qualifier strings per alias -- and the module
+    /// docs above forbid exactly that, because a subject spelled
+    /// differently between two aliases produces a total that is not a
+    /// count of anything. Clone-and-replace keeps the qualifier builder
+    /// the only place a query string is made.
+    pub fn with_measure(&self, measure: Measure) -> Self {
+        Self {
+            subject: self.subject.clone(),
+            scope: self.scope.clone(),
+            measure,
+        }
+    }
+
     /// The GitHub search query for one date range.
     ///
     /// `from` and `to` are inclusive `YYYY-MM-DD`, matching the format

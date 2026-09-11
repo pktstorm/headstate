@@ -1441,3 +1441,179 @@ export interface StatsTree {
   refusedFields: number;
   spend: Spend;
 }
+
+/// A complete count of pull requests for one subject and scope (#824).
+///
+/// Mirrors the Rust `github::stats::Outcome`. There is deliberately no way
+/// to read `total` without the facts about whether it is exact sitting
+/// beside it -- anything capped, sliced or assembled says so in the same
+/// object, which is the requirement #824 item 8 states.
+export interface StatsOutcome {
+  /// The exact count, summed across every slice. Exact even when
+  /// `retrievable` is false: the 1,000-result cap limits retrieval, not
+  /// counting.
+  total: number;
+  /// Whether every pull request in the window could be RETRIEVED, not
+  /// merely counted. False means per-PR detail is over a sample.
+  retrievable: boolean;
+  /// How many pull requests sit in slices whose nodes could not all be
+  /// fetched.
+  unretrievable: number;
+  /// How many slices the window was cut into. > 1 means the total is
+  /// assembled from more than one request.
+  slices: number;
+  /// Probe rounds the plan took.
+  rounds: number;
+  /// Whether the answer came from the uncapped `repository.pullRequests`
+  /// connection or from capped, sliced `search`. Reported so a reader can
+  /// tell WHICH completeness guarantee they have.
+  viaConnection: boolean;
+  spend: Spend;
+  /// Fields GitHub refused on the responses behind this total. Non-zero
+  /// means some data is missing, which is not the same as zero.
+  refusedFields: number;
+}
+
+/// One person's activity in one scope and window (#826).
+///
+/// Every figure is a count over the pull requests actually RETRIEVED, which
+/// is why completeness lives on `StatsBoard` rather than on a row: a row
+/// cannot say whether it is short, because a short row looks exactly like a
+/// smaller one. That is the whole failure mode of a ranking, and it is why
+/// a leaderboard is less forgiving of missing data than a count -- a total
+/// 5% short is a slightly wrong number, while a top-five 5% short can have
+/// the wrong person in first place.
+export interface AuthorRow {
+  /// The GitHub login, which is the identity the search qualifier uses
+  /// (`author:<login>`) and therefore the one a reader can check against
+  /// GitHub's own UI.
+  login: string;
+  prs: number;
+  /// Lines ADDED, summed. Raw `additions`, INCLUDING generated files --
+  /// the label is the mitigation, not a fix (#823). See
+  /// `LINES_CHANGED_LABEL`.
+  additions: number;
+  deletions: number;
+  /// `changedFiles`, summed. The honest companion to the line count:
+  /// 40,000 lines across 3 files is a generated diff and 40,000 across 300
+  /// is a refactor, and only the pair distinguishes them.
+  changedFiles: number;
+  /// Reviews RECEIVED on this author's pull requests.
+  ///
+  /// Received, not given. It comes off `reviews { totalCount }` on a PR the
+  /// author WROTE, so it measures how much review their work attracted. A
+  /// board of reviews GIVEN would need `reviewed-by:<login>` -- one search
+  /// per person, a different and far more expensive question. The label
+  /// must say "received" or the figure reads as the opposite of what it is.
+  reviewsReceived: number;
+  /// Hours from open to merge for each of this author's MERGED pull
+  /// requests, sorted ascending so `percentile()` can index it directly --
+  /// the same contract `MergedDetail.cycle_time_hours` has.
+  ///
+  /// SHORTER than `prs` whenever the window holds open pull requests: an
+  /// unmerged one has no cycle time, because measuring it against "now"
+  /// would report unfinished work as slow. So this length must not be
+  /// divided into `prs` or treated as the author's pull request count.
+  cycleTimeHours: number[];
+}
+
+/// One pull request on a board, enough to name and open it.
+///
+/// Mirrors `MergedPr` so the scoped outliers render through the SAME
+/// `Outliers` component rather than a second one.
+export interface BoardPr {
+  number: number;
+  title: string;
+  url: string;
+  /// `owner/name`.
+  repo: string;
+  author: string;
+  cycleTimeHours: number;
+  /// Additions plus deletions -- the same gameable measure, and it carries
+  /// the same label wherever it is shown.
+  size: number;
+}
+
+/// A slice of the window whose pull requests could not all be retrieved.
+///
+/// Carried with its sizes rather than as a count, because "3 slices were
+/// short" does not tell a reader whether the board is missing four pull
+/// requests or four hundred.
+export interface ShortSlice {
+  from: string;
+  to: string;
+  /// What GitHub said the slice holds.
+  issueCount: number;
+  /// How many pull requests actually came back.
+  retrieved: number;
+}
+
+/// Per-author aggregates for one scope, plus every way they could be wrong.
+///
+/// `viewer` travels WITH the board rather than being fetched separately,
+/// because the two have to agree: a board fetched for one account and split
+/// by a login cached from another -- two accounts on one machine, which the
+/// Rust `Subject::cache_key` doc records as a real case -- would put the
+/// viewer's own work under "Others" and show "no activity" for Mine.
+export interface StatsBoard {
+  /// The authenticated login. What splits the board into Mine and Others.
+  viewer: string;
+  /// One row per author who appears, in no ranking order -- the UI ranks by
+  /// whichever measure its chart is about.
+  rows: AuthorRow[];
+  /// Pull requests GitHub says the window holds. Exact even when the rows
+  /// are short: the 1,000-result cap limits retrieval, not counting.
+  total: number;
+  /// Pull requests actually aggregated into the rows.
+  retrieved: number;
+  /// Whether every pull request in the window made it into a row.
+  ///
+  /// The flag a ranking must branch on. False when anything was capped,
+  /// sliced short, or refused -- so a new partiality channel added later
+  /// cannot be forgotten at one call site.
+  complete: boolean;
+  truncatedSlices: ShortSlice[];
+  /// Fields GitHub refused across the detail responses. Non-zero means some
+  /// data is missing, which is NOT the same as being zero.
+  refusedFields: number;
+  /// How many slices the window was cut into. > 1 means assembled.
+  slices: number;
+  rounds: number;
+  spend: Spend;
+  /// The slowest MERGED pull requests in scope, slowest first. At most five.
+  ///
+  /// Merged only: "slowest to merge" is undefined for a pull request that
+  /// has not merged, and including open ones would make the list a ranking
+  /// of how long things have been open rather than how long they took.
+  slowest: BoardPr[];
+  /// The largest merged pull requests by lines changed. At most five.
+  largest: BoardPr[];
+  /// Merged pull requests per repository, most first. The scoped
+  /// counterpart to `MergedDetail.repo_counts`.
+  repoCounts: { repo: string; merged: number }[];
+}
+
+/// One day of scoped pull-request activity.
+///
+/// Field names match `HistoryPoint` so the scoped series renders through
+/// the SAME `ActivityChart` rather than a second charting idiom (#826).
+///
+/// Not exported, like `UpdateOutcome` above: nothing outside this file names
+/// it, since callers reach it through `StatsSeries.points`.
+interface ScopedPoint {
+  date: string;
+  opened: number;
+  merged: number;
+}
+
+/// The scoped daily series behind a scope page's activity chart.
+export interface StatsSeries {
+  points: ScopedPoint[];
+  /// Days whose counts did not come back, NAMED rather than counted and
+  /// never defaulted to zero. A missing day rendered as `0` would draw a
+  /// trough that reads as a quiet Tuesday -- the most legible possible lie,
+  /// because a chart invites the eye to read shape.
+  failedDays: string[];
+  refusedFields: number;
+  spend: Spend;
+}

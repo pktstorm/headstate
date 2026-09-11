@@ -44,6 +44,11 @@ pub const SURFACE: &[(&str, Class)] = &[
     ("stats_count", Class::Read),
     // The stats scope hierarchy (#825). A Read; names only, no statistics.
     ("stats_tree", Class::Read),
+    // The Mine/Others per-author board (#826). A Read; the desktop's
+    // ceiling, concurrency cap and budget refusal are inside the command.
+    ("stats_board", Class::Read),
+    // The scoped daily activity series (#826). A Read; count-only.
+    ("stats_series", Class::Read),
     ("get_reviewing", Class::Read),
     ("count_reviewing", Class::Read),
     ("get_pr_detail", Class::Read),

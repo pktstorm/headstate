@@ -220,7 +220,24 @@ pub fn subdivide(slice: &Slice, n: u32) -> Vec<Slice> {
 /// -- cutting into 60 pieces would cost the same point but push the
 /// document toward the ~11s deadline measured in `query.rs`.
 pub fn split_factor(count: u64) -> u32 {
-    let over = count.div_ceil(SUBDIVIDE_AT).max(2);
+    split_factor_for(count, SUBDIVIDE_AT)
+}
+
+/// [`split_factor`] against the caller's threshold.
+///
+/// The board subdivides to the PAGE size rather than to the search cap --
+/// `fetch::plan_to` carries the measurement for why -- and a split sized
+/// against 800 would be wrong by a factor of sixteen for a 50-node page: it
+/// would return 2 for a 569-PR slice that needs to become twelve.
+///
+/// `threshold` of 0 is treated as 1 rather than dividing by zero. A caller
+/// asking to subdivide until every slice holds fewer than zero pull requests
+/// has a bug, and the honest response is to cut as far as the date grammar
+/// allows and let `is_one_day` stop the recursion -- not to panic inside a
+/// planner, and not to silently return the count path's number for a
+/// question that was not asked.
+pub fn split_factor_for(count: u64, threshold: u64) -> u32 {
+    let over = count.div_ceil(threshold.max(1)).max(2);
     // +1 so a slice at 2.0x the threshold cuts into 3 rather than
     // exactly 2, which would leave both halves near the threshold and
     // cost another whole round.

@@ -1,0 +1,1544 @@
+//! Per-author aggregates for one scope and window: the numbers behind
+//! #826's Mine and Others views, and the three leaderboards.
+//!
+//! `fetch.rs` issues the requests and returns the raw alias map; this
+//! module is the part that turns that map into people. The split is
+//! deliberate and was left that way by #827 on purpose -- "`load_detail`
+//! returns the raw alias map rather than a leaderboard struct, because
+//! #826 defines that shape and this layer should not pre-empt it".
+//!
+//! # What a board is, and what it is NOT
+//!
+//! One row per author who appears in the window, carrying the four
+//! measures a scope page shows: pull requests, lines changed, files
+//! touched, reviews received. From those rows the UI takes two views --
+//! the viewer's own row ("Mine") and everybody else's ("Others") -- plus
+//! three rankings.
+//!
+//! It is not a census of the organisation. An author appears because they
+//! merged or opened something in the window; a member with no activity is
+//! **absent**, and that absence is the honest answer rather than a zero
+//! row. #826 states the rule: "a member with no activity in the window
+//! reads as 'no activity', not a zero that might be a failed query". The
+//! difference matters because a zero and a refusal look identical once
+//! they are both rendered as `0`, and two features in this repo have
+//! already shipped that confusion (#802, #790).
+//!
+//! # Completeness, and where it can fail
+//!
+//! A leaderboard is a RANKING, which makes it far less forgiving of
+//! missing data than a count is. A total that is 5% short is a slightly
+//! wrong number; a top-five that is 5% short can have the wrong person in
+//! first place. So [`Board`] carries three distinct partiality channels,
+//! none of which collapses into another:
+//!
+//! | Field | What it means | Why it is its own field |
+//! |---|---|---|
+//! | [`Board::complete`] | every PR in the window was retrieved | a ranking over a sample is not a ranking |
+//! | [`Board::truncated_slices`] | some slice returned fewer nodes than its own `issueCount` | names WHICH part is short, and by how much |
+//! | [`Board::refused_fields`] | GitHub refused fields on a response | a refusal is not an absence |
+//!
+//! The third is the one #827 left open. Its `Outcome::refused_fields` is
+//! `0` on the sliced path because "per-slice attribution of refusals needs
+//! the detail-fetch mapping that #826 owns" -- this module is that
+//! mapping, so the count is wired here rather than left at zero. See
+//! [`Board::from_alias_map`].
+//!
+//! What it is NOT is per-slice attribution, and the difference is worth
+//! stating rather than letting a reader assume the stronger property.
+//! `graphql_partial_ok` folds a response's `errors` array into a single
+//! `__refused` COUNT on `data` (`client.rs:1204-1213`), discarding the
+//! `path` that says which field was refused. So a board can say how many
+//! fields were refused across the load; it cannot say which author's
+//! additions are short. Attributing a refusal to a slice would need
+//! `graphql_partial_ok` to carry the paths through, which is a change to
+//! 80 lines of hard-won behaviour that every other query in the app
+//! depends on -- and the UI consequence is the same either way, since a
+//! board with any refusal is presented as incomplete rather than as a
+//! ranking with a footnote.
+//!
+//! # Measurements behind the document this reads
+//!
+//! Mine, live API, `gh api graphql`, 2026-09-11, `org:FNX-Labs`.
+//!
+//! ## `reviews { totalCount }` is FREE, and the epic's premise was wrong
+//!
+//! #823 and #826 both record that `reviews { totalCount }` is "a
+//! connection, priced per search", and #826 settled the review leaderboard
+//! as "proceed, reassess if it bites" on that basis. **It does not cost a
+//! point.** What is priced is a connection that PAGES -- one carrying a
+//! `first:` argument -- not one read for `totalCount` alone:
+//!
+//! | Nested field on each PR node | 3 searches | 6 searches | 15 searches |
+//! |---|---|---|---|
+//! | scalars only (the control) | 1 | 1 | 1 |
+//! | `reviews { totalCount }` | 1 | 1 | 1 |
+//! | `reviews(first: 1) { totalCount }` | 1 | **2** | **2** |
+//! | `reviews(first: 1) { nodes { state } }` | 1 | **2** | **2** |
+//! | `labels { totalCount }` | 1 | 1 | - |
+//! | `labels(first: 10) { nodes { name } }` | 1 | **2** | - |
+//! | `reviewThreads { totalCount }` | 1 | 1 | - |
+//!
+//! The same field is free without `first:` and priced with it, for both
+//! `reviews` and `labels` -- so the rule is the ARGUMENT, not the field.
+//! That reconciles rather than contradicts `poll.rs:1503-1580`: every
+//! connection in the cost list there is a paged one (`labels(first:`,
+//! `reviewThreads(first:`, `contexts(first:`), so its measurements were
+//! right about the queries it was measuring, and the generalisation to
+//! "connections are priced per search" is what was too broad.
+//!
+//! The practical consequence: `reviews { totalCount }` rides along on this
+//! document at no cost, so the reviewer leaderboard #826 asked for needs
+//! no retreat plan. A test pins the spelling, because the difference
+//! between the free form and the priced one is four characters.
+//!
+//! ## The document must be SMALLER than #827's chunk default
+//!
+//! `ALIAS_CHUNK` is 10 and `SLICE_PAGE_FULL` is 50, and that product does
+//! not survive real dense data. Against day-slices of `org:FNX-Labs` in
+//! 2026-08 (245 merged PRs across 10 days), three runs per cell:
+//!
+//! | Document | Succeeded | Wall clock |
+//! |---|---|---|
+//! | 10 aliases x 50 | **0 of 3** | 10.6 / 10.6 / 10.6s -- all 502 |
+//! | 10 aliases x 25 | 3 of 3 | 6.6-9.6s |
+//! | 5 aliases x 50 | 3 of 3 | 4.2-4.9s |
+//! | 5 aliases x 25 | 3 of 3 | 4.1-4.3s |
+//! | 3 aliases x 50 | 3 of 3 | 2.3-3.7s |
+//!
+//! Every failure landed at 10.6s, which is #827's measured ~11s server
+//! deadline exactly. Its own figure for this document was "3 aliases x 50:
+//! 3.42-3.68s, ok 2/2" -- correct, and measured at a THIRD of the chunk
+//! size it then shipped. Nothing between 3 and 10 was measured, and 10 is
+//! where it breaks.
+//!
+//! I confirmed the cause is node volume rather than this date range or the
+//! added `reviews` field: the identical 10 aliases count-only answered in
+//! 1.4-1.5s, 10 x 50 carrying only scalars still straddled the deadline
+//! (7.0-10.6s, 2 of 3), and 10 x 50 WITH `reviews` passed 3 of 3 at
+//! 7.7-8.5s on a re-run. At 7-10s against an 11s wall the outcome is a
+//! coin toss, which is why [`BOARD_ALIAS_CHUNK`] is 5 rather than 10.
+//!
+//! That is a narrowing of #827's constants for this document only, not a
+//! correction of its reasoning -- its ladder already sheds pages before
+//! aliases for exactly the reason these numbers show.
+
+use std::collections::HashMap;
+
+use super::budget::Budget;
+use super::query::Slice;
+use super::scope::{Scope, StatsQuery, Subject};
+use crate::github::client::{ClientError, GitHubClient};
+
+/// Searches per detail document, for the BOARD's document specifically.
+///
+/// `query::ALIAS_CHUNK` is 10, which measured 0 of 3 against real dense
+/// day-slices -- see the module docs for the table. 5 is the widest cell
+/// that succeeded 3 of 3 at the full 50-node page, at 4.2-4.9s against an
+/// ~11s deadline: roughly half the budget, which is the margin a document
+/// whose density the caller cannot predict actually needs.
+///
+/// Deliberately a SEPARATE constant rather than a change to
+/// `ALIAS_CHUNK`, and the asymmetry is the point. `ALIAS_CHUNK` also sizes
+/// the PROBE document, which is count-only and measured at 1.4-1.5s for
+/// the same 10 aliases -- seven times faster, because it materialises no
+/// nodes at all. Halving the probe chunk would double the planner's round
+/// count for no measured reason, and the planner's rounds are serial by
+/// construction.
+pub const BOARD_ALIAS_CHUNK: usize = 5;
+
+/// How many rows a leaderboard shows. #826 says top five.
+///
+/// Exported because the UI must not pick its own: a board cut to five in
+/// Rust and re-cut to three in TypeScript would render a "top three" whose
+/// fourth place was decided by a tie-break the UI never saw.
+pub const TOP_N: usize = 5;
+
+/// One person's activity in one scope and window.
+///
+/// Every field is a count over the PRs actually RETRIEVED, which is why
+/// [`Board::complete`] sits beside the rows rather than inside them: a row
+/// cannot say whether it is short, because a short row looks exactly like
+/// a smaller one. That is the whole failure mode of a ranking.
+///
+/// No `Eq`, because `cycle_time_hours` holds `f64`. `PartialEq` is kept for
+/// the tests, which compare whole rows deliberately -- a single-field
+/// assertion passes while a figure is accumulated into the wrong bucket.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthorRow {
+    /// The GitHub login. The identity the search qualifier uses
+    /// (`author:<login>`), so a row is checkable against GitHub's own UI.
+    pub login: String,
+    /// Pull requests by this author in the window, for the board's MEASURE.
+    ///
+    /// `Measure::Merged` counts merged ones and `Measure::Opened` counts
+    /// opened ones -- they are not interchangeable, and a PR opened in July
+    /// and merged in August belongs to July's opened count and August's merged
+    /// count. The board is loaded with one measure, so this is a count of that
+    /// one rather than of "pull requests" in general.
+    ///
+    /// Worth stating because it bounds what [`AuthorRow::cycle_time_hours`]
+    /// can be. On the merged measure every counted pull request HAS merged, so
+    /// the two differ only when a timestamp could not be parsed -- not because
+    /// some are still open. A first version of the UI labelled that gap "still
+    /// open, not counted", which described a mixed population this field never
+    /// holds.
+    pub prs: u64,
+    /// Lines ADDED, summed. Raw `additions`, including generated files --
+    /// see [`AuthorRow::lines_changed`] for why the label matters more
+    /// than the number.
+    pub additions: u64,
+    /// Lines REMOVED, summed.
+    pub deletions: u64,
+    /// `changedFiles`, summed. A free scalar, and the honest companion to
+    /// the line count: 40,000 lines across 3 files is a generated diff and
+    /// 40,000 across 300 is a refactor, and only the pair distinguishes
+    /// them.
+    pub changed_files: u64,
+    /// Reviews RECEIVED on this author's pull requests, summed.
+    ///
+    /// Received, not given, and the distinction is not a detail: this
+    /// comes off `reviews { totalCount }` on a PR the author WROTE, so it
+    /// measures how much review their work attracted. A leaderboard of
+    /// reviews GIVEN would need `reviewed-by:<login>` -- one search per
+    /// person, which is a different and much more expensive question. The
+    /// field name and the UI label both have to say "received" or the
+    /// board means the opposite of what a reader assumes.
+    pub reviews_received: u64,
+    /// Hours from open to merge, for each of this author's MERGED pull
+    /// requests, sorted ascending.
+    ///
+    /// Kept as the distribution rather than reduced to a mean, for the
+    /// reason `MergedDetail` already records: a median and a tail say
+    /// different things, and an average cycle time is dominated by the one
+    /// pull request somebody left open over a holiday. Sorted here so the
+    /// UI's `percentile()` can index it directly, which is the contract
+    /// `MergedDetail::cycle_time_hours` already has.
+    ///
+    /// SHORTER than `prs` whenever a pull request has no usable merge time,
+    /// which the mapper drops rather than guessing at:
+    ///
+    /// - `mergedAt` is null -- an open pull request. A cycle time computed
+    ///   against "now" would report it as slow rather than as unfinished, and
+    ///   it gets slower every second it stays open.
+    /// - the timestamps do not parse, or the merge precedes the creation. A
+    ///   negative duration sorts to the TOP of an ascending distribution and
+    ///   drags a median below zero, and clamping it to 0 would be a
+    ///   measurement claim about a value nobody can explain.
+    ///
+    /// On the **merged** measure only the second case is reachable, because
+    /// `is:merged` means every node has a `mergedAt`. That bounds what a UI
+    /// may say about the gap: it is a timestamp problem, not unfinished work.
+    /// A first version of `CycleTime` labelled it "still open, not counted",
+    /// which on a merged-only board called a merged pull request unfinished.
+    ///
+    /// Either way the length is NOT `prs`, and nothing may divide one by the
+    /// other.
+    pub cycle_time_hours: Vec<f64>,
+}
+
+impl AuthorRow {
+    fn new(login: String) -> Self {
+        Self {
+            login,
+            prs: 0,
+            additions: 0,
+            deletions: 0,
+            changed_files: 0,
+            reviews_received: 0,
+            cycle_time_hours: Vec::new(),
+        }
+    }
+
+    /// Additions plus deletions.
+    ///
+    /// The metric #823 settled on, and it is GAMEABLE -- one checked-in
+    /// generated file outranks a month of real work. The settled
+    /// mitigation is the label, not a fix: the UI must say "lines changed,
+    /// including generated files". That decision is recorded in #823 as
+    /// accepted with its consequence, so this method exists to make the
+    /// number available in exactly one place rather than have three call
+    /// sites each add two fields and each label it differently.
+    pub fn lines_changed(&self) -> u64 {
+        self.additions.saturating_add(self.deletions)
+    }
+}
+
+/// A slice whose nodes could not all be retrieved.
+///
+/// Carried as a STRUCT rather than a count, because "3 slices were short"
+/// does not tell a user whether the board is missing four PRs or four
+/// hundred. The window is named so the gap is locatable: a reader can ask
+/// GitHub the same question for that range and see what is missing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShortSlice {
+    pub from: String,
+    pub to: String,
+    /// What GitHub said the slice holds.
+    pub issue_count: u64,
+    /// How many nodes actually came back.
+    pub retrieved: u64,
+}
+
+impl ShortSlice {
+    /// PRs this slice is missing from the board.
+    pub fn missing(&self) -> u64 {
+        self.issue_count.saturating_sub(self.retrieved)
+    }
+}
+
+/// Per-author aggregates for one scope and window, with every way they
+/// could be wrong stated alongside them.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Board {
+    /// One row per author who appears, in NO guaranteed order -- the UI
+    /// ranks by whichever measure its chart is about, and a board that
+    /// arrived pre-sorted by one of them would invite a caller to render
+    /// "top by lines" from an order that is actually by PR count.
+    pub rows: Vec<AuthorRow>,
+    /// Pull requests GitHub says the window holds, from `issueCount`.
+    ///
+    /// Exact even when the rows are short -- the 1,000 cap limits
+    /// retrieval, not counting (`slice.rs:52`). So this is the number a
+    /// "based on N of M" label quotes, and comparing it against
+    /// [`Board::retrieved`] is how the UI knows to draw that label at all.
+    pub total: u64,
+    /// Pull requests actually aggregated into the rows.
+    pub retrieved: u64,
+    /// Whether every PR in the window made it into a row.
+    ///
+    /// The flag a ranking must branch on. Computed from all three
+    /// partiality channels rather than from `retrieved == total`, so a
+    /// refusal that happened not to shorten the node list still reads as
+    /// incomplete.
+    pub complete: bool,
+    /// Slices that came back short, with their sizes.
+    pub truncated_slices: Vec<ShortSlice>,
+    /// Fields GitHub refused across the detail responses.
+    ///
+    /// #827 left `Outcome::refused_fields` at 0 on the sliced path and
+    /// flagged it rather than silently zeroing it, because attribution
+    /// needs this mapping. It is counted here, per response, summed.
+    pub refused_fields: usize,
+    /// Slices the window was cut into. > 1 means assembled.
+    pub slices: usize,
+    /// Probe rounds the plan took.
+    pub rounds: u32,
+    /// What the whole load cost.
+    pub spend: super::budget::Spend,
+    /// The slowest merged pull requests in scope, slowest first.
+    ///
+    /// Kept on the board rather than derived per author, because the
+    /// interesting outlier is usually the scope's and not one person's --
+    /// and because the list is short and bounded by [`OUTLIERS`] either way.
+    pub slowest: Vec<BoardPr>,
+    /// The largest merged pull requests in scope by lines changed.
+    pub largest: Vec<BoardPr>,
+    /// Merged pull requests per repository, most first.
+    ///
+    /// The scoped counterpart to `MergedDetail::repo_counts`. Over a single
+    /// repository scope this is one row, which is correct rather than
+    /// useless: it confirms the scope.
+    pub repo_counts: Vec<RepoCount>,
+}
+
+/// How many outliers each list holds.
+///
+/// Five, matching both [`TOP_N`] and `MergedDetail`'s own outlier lists --
+/// so the page has one idea of "a few of the most extreme" rather than three
+/// numbers a reader has to notice differ.
+pub const OUTLIERS: usize = 5;
+
+/// One pull request, enough to name and open it.
+///
+/// Mirrors `MergedPr`, which `Outliers` already renders, so the scoped
+/// outliers go through the SAME component rather than a second one. #826 asks
+/// for reuse of the existing components and this is the type that makes it
+/// possible.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardPr {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    /// `owner/name`.
+    pub repo: String,
+    pub author: String,
+    pub cycle_time_hours: f64,
+    /// Additions plus deletions -- the same gameable measure, labelled the
+    /// same way wherever it appears.
+    pub size: u64,
+}
+
+/// Merged pull requests in one repository.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RepoCount {
+    pub repo: String,
+    pub merged: u64,
+}
+
+impl Board {
+    /// How many PRs are missing from the rows.
+    pub fn missing(&self) -> u64 {
+        self.total.saturating_sub(self.retrieved)
+    }
+
+    /// Whether the board was assembled from more than one request.
+    pub fn is_assembled(&self) -> bool {
+        self.slices > 1
+    }
+
+    /// The row for one login, or `None` when that person has no activity
+    /// in the window.
+    ///
+    /// `None` rather than a zero row, deliberately. "No activity" and
+    /// "zero" are the same number and different facts, and the caller has
+    /// to be able to tell them apart to honour #826's empty-means-empty
+    /// rule -- a zero row would let the UI render a confident `0` for a
+    /// person whose data simply is not here.
+    pub fn row_for(&self, login: &str) -> Option<&AuthorRow> {
+        self.rows.iter().find(|r| r.login == login)
+    }
+
+    /// Every row except one login's -- the "Others" view's population.
+    ///
+    /// Takes the login rather than a `Subject`, because the viewer's login
+    /// is resolved by the time a board is rendered and `Subject::Viewer`
+    /// would make this method unable to answer.
+    pub fn others(&self, login: &str) -> impl Iterator<Item = &AuthorRow> {
+        let login = login.to_string();
+        self.rows.iter().filter(move |r| r.login != login)
+    }
+
+    /// The top rows by one measure, highest first, at most [`TOP_N`].
+    ///
+    /// Ties break on LOGIN, ascending, rather than being left to the
+    /// sort's stability. Two people with the same line count would
+    /// otherwise swap places between loads depending on which slice
+    /// happened to land first -- a leaderboard that reorders on refresh
+    /// with no data change reads as broken, and the arrival order of
+    /// concurrent requests is genuinely nondeterministic here
+    /// (`fetch.rs`'s waves complete out of order by design).
+    pub fn top_by<F>(&self, measure: F) -> Vec<&AuthorRow>
+    where
+        F: Fn(&AuthorRow) -> u64,
+    {
+        let mut rows: Vec<&AuthorRow> = self.rows.iter().filter(|r| measure(r) > 0).collect();
+        rows.sort_by(|a, b| {
+            measure(b)
+                .cmp(&measure(a))
+                .then_with(|| a.login.cmp(&b.login))
+        });
+        rows.truncate(TOP_N);
+        rows
+    }
+
+    /// Build a board from `fetch::load_detail`'s alias map.
+    ///
+    /// # Why the slices go in alongside the map
+    ///
+    /// The map is keyed by ALIAS (`s0`, `s4`, ...), and an alias index is
+    /// meaningless without the slice it was assigned to. The truncation
+    /// report needs the date range, so the caller passes the same slice
+    /// list it passed to `load_detail`, in the same order -- the absolute
+    /// indexing rule `query.rs:667-678` records, applied one layer up.
+    ///
+    /// # A missing alias is not an empty slice
+    ///
+    /// Exactly the rule `fetch::probe_round` states for the probe: a slice
+    /// whose alias is absent from the map did not come back, and counting
+    /// it as zero PRs "would make a slice that failed look empty -- which
+    /// is the exact shape that turns a truncation into a confident wrong
+    /// number". Here the consequence is worse than a wrong total, because
+    /// a ranking built over a silently-dropped slice can put the wrong
+    /// person first. So an absent alias is recorded as a short slice of
+    /// unknown size rather than skipped.
+    pub fn from_alias_map(
+        map: &serde_json::Value,
+        slices: &[Slice],
+        rounds: u32,
+        spend: super::budget::Spend,
+    ) -> Self {
+        let mut by_login: HashMap<String, AuthorRow> = HashMap::new();
+        let mut by_repo: HashMap<String, u64> = HashMap::new();
+        // Every merged PR, so the outliers can be chosen after the whole
+        // board is known. Kept whole rather than maintaining two
+        // five-element heaps: a window is bounded by the slice plan and the
+        // cap, so this is thousands of small structs at worst, and a heap
+        // would be three times the code for a saving nobody would measure.
+        let mut prs: Vec<BoardPr> = Vec::new();
+        let mut total = 0u64;
+        let mut retrieved = 0u64;
+        let mut truncated = Vec::new();
+        let refused_fields = crate::github::client::refused_fields_of(map);
+
+        for (i, slice) in slices.iter().enumerate() {
+            let alias = super::query::slice_alias(i);
+            let entry = &map[&alias];
+            // `issueCount` absent means this alias did not answer. The
+            // slice is reported short with a zero retrieved count and an
+            // UNKNOWN true size -- the honest shape, since the only
+            // figure that could have said how big it was is the one that
+            // is missing.
+            let Some(issue_count) = entry["issueCount"].as_u64() else {
+                truncated.push(ShortSlice {
+                    from: slice.from.clone(),
+                    to: slice.to.clone(),
+                    issue_count: 0,
+                    retrieved: 0,
+                });
+                continue;
+            };
+            total = total.saturating_add(issue_count);
+
+            let nodes = entry["nodes"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+            let mut got = 0u64;
+            for n in nodes {
+                // A PR whose author is gone from GitHub resolves
+                // `author` to null. Attributed to a single named bucket
+                // rather than dropped: dropping it would make the rows
+                // sum to less than `retrieved` and put the board's own
+                // arithmetic out, and inventing a per-PR placeholder
+                // would scatter one absence across many rows.
+                let login = n["author"]["login"].as_str().unwrap_or(GHOST);
+                let row = by_login
+                    .entry(login.to_string())
+                    .or_insert_with(|| AuthorRow::new(login.to_string()));
+                row.prs = row.prs.saturating_add(1);
+                row.additions = row
+                    .additions
+                    .saturating_add(n["additions"].as_u64().unwrap_or(0));
+                row.deletions = row
+                    .deletions
+                    .saturating_add(n["deletions"].as_u64().unwrap_or(0));
+                row.changed_files = row
+                    .changed_files
+                    .saturating_add(n["changedFiles"].as_u64().unwrap_or(0));
+                row.reviews_received = row
+                    .reviews_received
+                    .saturating_add(n["reviews"]["totalCount"].as_u64().unwrap_or(0));
+
+                // Cycle time only for a MERGED pull request. An open one has
+                // a null `mergedAt`, and measuring it against "now" would
+                // report unfinished work as slow -- which is the one reading
+                // that turns an honest figure into an accusation. So an
+                // unmerged PR contributes to `prs` and to the line counts
+                // and to nothing else, and `cycle_time_hours` is therefore
+                // shorter than `prs`: the type's doc says so, because a
+                // caller dividing one by the other would be wrong.
+                let hours = cycle_hours(n);
+                if let Some(h) = hours {
+                    row.cycle_time_hours.push(h);
+                }
+
+                let repo = n["repository"]["nameWithOwner"].as_str().unwrap_or("");
+                if !repo.is_empty() && hours.is_some() {
+                    // Merged only, matching `MergedDetail::repo_counts`'s
+                    // own meaning. A repo count that mixed open and merged
+                    // would not be comparable with the merged total above it.
+                    *by_repo.entry(repo.to_string()).or_insert(0) += 1;
+                }
+                // Outlier candidates are merged pull requests: "slowest to
+                // merge" is undefined for one that has not merged, and
+                // "largest" beside it would then be drawn from a different
+                // population than the list next to it.
+                if let Some(h) = hours {
+                    prs.push(BoardPr {
+                        number: n["number"].as_u64().unwrap_or(0),
+                        title: n["title"].as_str().unwrap_or("").to_string(),
+                        url: n["url"].as_str().unwrap_or("").to_string(),
+                        repo: repo.to_string(),
+                        author: login.to_string(),
+                        cycle_time_hours: h,
+                        size: n["additions"].as_u64().unwrap_or(0)
+                            + n["deletions"].as_u64().unwrap_or(0),
+                    });
+                }
+                got += 1;
+            }
+            retrieved = retrieved.saturating_add(got);
+
+            // Short means GitHub's own count for this slice exceeds what
+            // it returned for it. Checked per slice rather than on the
+            // window total, because the window total can match by
+            // accident while two slices are short and long respectively
+            // -- and the board would then be confidently wrong.
+            if got < issue_count {
+                truncated.push(ShortSlice {
+                    from: slice.from.clone(),
+                    to: slice.to.clone(),
+                    issue_count,
+                    retrieved: got,
+                });
+            }
+        }
+
+        let mut rows: Vec<AuthorRow> = by_login.into_values().collect();
+        // Sorted by LOGIN, not by any measure. The board is ranked by the
+        // caller per chart, and a stable order here is what makes the
+        // serialized value comparable between loads and in tests.
+        rows.sort_by(|a, b| a.login.cmp(&b.login));
+        for r in &mut rows {
+            // Ascending, which is the contract `percentile()` on the UI side
+            // indexes against -- `MergedDetail::cycle_time_hours` documents
+            // the same requirement. `total_cmp` rather than `partial_cmp`:
+            // these are durations and cannot be NaN, but `partial_cmp`
+            // would need an `unwrap` whose failure mode is a panic in a
+            // mapper, and `total_cmp` has no failure mode at all.
+            r.cycle_time_hours.sort_by(f64::total_cmp);
+        }
+
+        // Outliers picked AFTER the whole window is mapped, so they are the
+        // scope's extremes rather than the last slice's. Ties break on the
+        // repo and number so two equally slow pull requests do not swap
+        // places between loads -- `fetch.rs`'s waves complete out of order
+        // by design, so without a tie-break the list would reshuffle on
+        // refresh with no data change.
+        let mut slowest = prs.clone();
+        slowest.sort_by(|a, b| {
+            b.cycle_time_hours
+                .total_cmp(&a.cycle_time_hours)
+                .then_with(|| a.repo.cmp(&b.repo))
+                .then_with(|| a.number.cmp(&b.number))
+        });
+        slowest.truncate(OUTLIERS);
+        let mut largest = prs;
+        largest.sort_by(|a, b| {
+            b.size
+                .cmp(&a.size)
+                .then_with(|| a.repo.cmp(&b.repo))
+                .then_with(|| a.number.cmp(&b.number))
+        });
+        largest.truncate(OUTLIERS);
+
+        let mut repo_counts: Vec<RepoCount> = by_repo
+            .into_iter()
+            .map(|(repo, merged)| RepoCount { repo, merged })
+            .collect();
+        repo_counts.sort_by(|a, b| b.merged.cmp(&a.merged).then_with(|| a.repo.cmp(&b.repo)));
+
+        Self {
+            rows,
+            total,
+            retrieved,
+            // All three channels, not just the node count. A refusal can
+            // leave the node list the right LENGTH while blanking fields
+            // inside it, and `retrieved == total` would then read as
+            // complete over data GitHub admitted it did not give.
+            complete: truncated.is_empty() && refused_fields == 0 && retrieved == total,
+            truncated_slices: truncated,
+            refused_fields,
+            slices: slices.len(),
+            rounds,
+            spend,
+            slowest,
+            largest,
+            repo_counts,
+        }
+    }
+}
+
+/// Hours from open to merge, or `None` for a pull request that has not
+/// merged.
+///
+/// `None` rather than a duration against "now", deliberately: an open pull
+/// request measured that way gets slower every second it stays open and
+/// would dominate a "slowest to merge" list while not having failed to merge
+/// at all. The distinction is available only because `mergedAt` is null on
+/// those, so it is read rather than inferred from a state field the document
+/// does not carry.
+///
+/// A NEGATIVE result is also `None`. It should be impossible -- a merge
+/// cannot precede its own creation -- but the two timestamps come from
+/// GitHub independently, and a negative cycle time would sort to the TOP of
+/// an ascending distribution and drag a median below zero. Dropped rather
+/// than clamped to 0, because a clamped zero is a measurement claim and this
+/// is a value nobody can explain.
+fn cycle_hours(node: &serde_json::Value) -> Option<f64> {
+    let created = node["createdAt"].as_str()?;
+    let merged = node["mergedAt"].as_str()?;
+    let c = chrono::DateTime::parse_from_rfc3339(created).ok()?;
+    let m = chrono::DateTime::parse_from_rfc3339(merged).ok()?;
+    let hours = (m - c).num_seconds() as f64 / 3600.0;
+    (hours >= 0.0).then_some(hours)
+}
+
+/// The bucket for a pull request whose author no longer exists.
+///
+/// A literal rather than an `Option<String>` on the row, because the row's
+/// `login` is what every chart labels and what `row_for` matches -- making
+/// it optional would push a `None` case into the UI for a situation that
+/// is rare, unactionable, and already honestly described by a name. The
+/// leading space cannot occur in a GitHub login, so this can never collide
+/// with a real person.
+pub const GHOST: &str = "(deleted user)";
+
+/// Load a board for one scope and window.
+///
+/// Reuses #827's layer end to end and adds no second pagination path: the
+/// planner probes and subdivides (`slice.rs`), `load_detail_chunked`
+/// fetches the nodes with its degradation ladder, and this module maps the
+/// result. #826's instruction was explicit that the slicing layer is to be
+/// used rather than reimplemented, and the reason is stronger than reuse:
+/// the planner's tiling property (contiguous, no gap, no overlap) is what
+/// makes a board complete, and it is asserted by `slice.rs`'s tests. A
+/// second path would have to re-earn that.
+///
+/// The subject is `None` by construction. A board counts EVERYONE in the
+/// scope and ranks them, so an `author:` qualifier would return a board
+/// with one row -- `scope.rs` has a test named for exactly that mistake.
+/// The viewer's own numbers come from `Board::row_for`, not from a
+/// narrower query, which is also why Mine and Others cost ONE load
+/// between them rather than two.
+pub async fn load_board(
+    client: &GitHubClient,
+    scope: &Scope,
+    measure: super::scope::Measure,
+    window: Slice,
+    budget: &Budget,
+) -> Result<Board, ClientError> {
+    // ONE ceiling around the WHOLE load, which is the rule
+    // `fetch::LOAD_TIMEOUT`'s own doc states: "only a wall-clock ceiling
+    // around the whole thing bounds what the user is actually waiting on".
+    //
+    // Without this the board had TWO sequential 60-second bounds -- the
+    // planner's and the detail fetch's -- so it could legitimately run 120s
+    // where `load_count` bounds itself at 60. Found in review. The inner
+    // bounds are left in place: they are what the other callers of those
+    // functions get, and the outer one is what makes this caller obey the same
+    // contract as the count path.
+    match tokio::time::timeout(
+        super::fetch::LOAD_TIMEOUT,
+        board_inner(client, scope, measure, window, budget),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => Err(ClientError::Timeout(super::fetch::LOAD_TIMEOUT.as_secs())),
+    }
+}
+
+async fn board_inner(
+    client: &GitHubClient,
+    scope: &Scope,
+    measure: super::scope::Measure,
+    window: Slice,
+    budget: &Budget,
+) -> Result<Board, ClientError> {
+    let q = StatsQuery::new(None, scope.clone(), measure);
+    // Subdivided to the PAGE, not to the search cap. This is the line that
+    // makes a board a ranking rather than a sample, and it was a real defect
+    // in my first implementation -- see `fetch::plan_to` for the measurement:
+    // at the count path's threshold of 800, a 30-day org window of 569 merged
+    // pull requests planned as ONE slice and retrieved 50 of them.
+    let plan = super::fetch::plan_to(
+        client,
+        &q,
+        window,
+        budget,
+        u64::from(super::fetch::SLICE_PAGE_FULL),
+    )
+    .await?;
+    let slices: Vec<Slice> = plan.slices.iter().map(|s| s.slice.clone()).collect();
+    let map =
+        super::fetch::load_detail_chunked(client, &q, &slices, budget, BOARD_ALIAS_CHUNK).await?;
+    let mut board = Board::from_alias_map(&map, &slices, plan.rounds, budget.snapshot());
+    // An irreducible slice cannot be divided further, so its nodes are a
+    // sample BY CONSTRUCTION -- before any request was made. Folded in here
+    // rather than left to the node-count comparison in the mapper, which
+    // would catch it only if the response also happened to come back short.
+    //
+    // This is reachable on the board's threshold in a way it is not on the
+    // count's: a SINGLE DAY holding more than one page of pull requests
+    // cannot be cut (GitHub's search grammar has no sub-day range), so a very
+    // busy day is a genuine partial. On the measured window the busiest day
+    // held 47 against a 50-node page, so there is headroom -- but a busier
+    // org will reach it, and then the board says so rather than quietly
+    // ranking over part of a day.
+    if !plan.is_retrievable() {
+        board.complete = false;
+    }
+    Ok(board)
+}
+
+/// Whether a login is the ghost bucket rather than a person.
+///
+/// Exists so the UI can decline to link it to a GitHub profile without
+/// duplicating the literal.
+pub fn is_ghost(login: &str) -> bool {
+    login == GHOST
+}
+
+/// The viewer's login, for splitting a board into Mine and Others.
+///
+/// A thin wrapper over `Subject::cache_key`, which already resolves
+/// `Subject::Viewer` against a fetched login. Here so a caller holding a
+/// `Subject` does not have to know that the cache-key method is also the
+/// "who is this, really" method.
+pub fn resolve_login(subject: &Subject, viewer: &str) -> String {
+    subject.cache_key(viewer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A spend for a mapper test, which measures no cost.
+    ///
+    /// Built here rather than by deriving `Default` on `Spend` itself,
+    /// deliberately: a derived default is a zero-point spend, and
+    /// `Spend::is_exact` would report it as an exact zero. That is a
+    /// measurement claim -- "this load cost nothing" -- available to
+    /// production code by accident. `unmetered: 1` marks it as a floor
+    /// instead, which is the honest reading of a spend nobody measured.
+    fn unmeasured() -> super::super::budget::Spend {
+        super::super::budget::Spend {
+            points: 0,
+            requests: 0,
+            unmetered: 1,
+            remaining: None,
+            reset_at: None,
+        }
+    }
+
+    fn slices(n: usize) -> Vec<Slice> {
+        (0..n)
+            .map(|i| {
+                let d = i + 1;
+                Slice::new(format!("2026-08-{d:02}"), format!("2026-08-{d:02}"))
+            })
+            .collect()
+    }
+
+    /// A merged pull request node, with a one-hour cycle time.
+    ///
+    /// Carries the identity fields too, so a fixture exercises the same
+    /// shape the live document returns rather than a subset that would let
+    /// an outlier-mapping bug pass.
+    fn node(login: &str, add: u64, del: u64, files: u64, reviews: u64) -> serde_json::Value {
+        json!({
+            "number": 1,
+            "title": "a pull request",
+            "url": "https://github.com/owner/repo/pull/1",
+            "repository": { "nameWithOwner": "owner/repo" },
+            "author": { "login": login },
+            "createdAt": "2026-08-01T00:00:00Z",
+            "mergedAt": "2026-08-01T01:00:00Z",
+            "additions": add,
+            "deletions": del,
+            "changedFiles": files,
+            "reviews": { "totalCount": reviews },
+        })
+    }
+
+    /// A node with the caller's identity, timestamps and size, for the
+    /// outlier and cycle-time tests where those are the subject.
+    #[allow(clippy::too_many_arguments)]
+    fn pr(
+        login: &str,
+        number: u64,
+        repo: &str,
+        created: &str,
+        merged: Option<&str>,
+        add: u64,
+        del: u64,
+    ) -> serde_json::Value {
+        json!({
+            "number": number,
+            "title": format!("pr {number}"),
+            "url": format!("https://github.com/{repo}/pull/{number}"),
+            "repository": { "nameWithOwner": repo },
+            "author": { "login": login },
+            "createdAt": created,
+            "mergedAt": merged,
+            "additions": add,
+            "deletions": del,
+            "changedFiles": 1,
+            "reviews": { "totalCount": 0 },
+        })
+    }
+
+    /// The happy path: two slices, three authors, every figure summed
+    /// across slices rather than per slice.
+    ///
+    /// Asserted on the WHOLE row rather than on one field, because the
+    /// bug this guards is a field accumulated into the wrong bucket --
+    /// which a single-field check passes while the board is wrong.
+    #[test]
+    fn rows_aggregate_across_slices() {
+        let map = json!({
+            "s0": { "issueCount": 2, "nodes": [
+                node("alice", 10, 5, 2, 1),
+                node("bob", 100, 0, 1, 0),
+            ]},
+            "s1": { "issueCount": 2, "nodes": [
+                node("alice", 1, 1, 1, 3),
+                node("carol", 7, 7, 7, 7),
+            ]},
+        });
+        let b = Board::from_alias_map(&map, &slices(2), 1, unmeasured());
+        assert!(b.complete, "nothing was short: {:?}", b.truncated_slices);
+        assert_eq!(b.total, 4);
+        assert_eq!(b.retrieved, 4);
+        assert_eq!(
+            b.row_for("alice"),
+            Some(&AuthorRow {
+                login: "alice".into(),
+                prs: 2,
+                additions: 11,
+                deletions: 6,
+                changed_files: 3,
+                reviews_received: 4,
+                // Both of alice's fixtures are merged an hour after opening.
+                cycle_time_hours: vec![1.0, 1.0],
+            })
+        );
+        assert_eq!(b.row_for("alice").unwrap().lines_changed(), 17);
+        // Three authors, and nobody invented.
+        let mut logins: Vec<&str> = b.rows.iter().map(|r| r.login.as_str()).collect();
+        logins.sort_unstable();
+        assert_eq!(logins, ["alice", "bob", "carol"]);
+    }
+
+    /// A slice that returned fewer nodes than its own `issueCount` makes
+    /// the board INCOMPLETE and names the gap.
+    ///
+    /// This is the failure a ranking cannot survive silently: #802 and
+    /// #790 both shipped a truncation that looked like a smaller number.
+    #[test]
+    fn a_short_slice_is_named_and_sized() {
+        let map = json!({
+            "s0": { "issueCount": 50, "nodes": [node("alice", 1, 1, 1, 0)] },
+        });
+        let b = Board::from_alias_map(&map, &slices(1), 1, unmeasured());
+        assert!(!b.complete, "a short slice must not read as complete");
+        assert_eq!(b.total, 50);
+        assert_eq!(b.retrieved, 1);
+        assert_eq!(b.missing(), 49);
+        assert_eq!(
+            b.truncated_slices,
+            vec![ShortSlice {
+                from: "2026-08-01".into(),
+                to: "2026-08-01".into(),
+                issue_count: 50,
+                retrieved: 1,
+            }]
+        );
+        assert_eq!(b.truncated_slices[0].missing(), 49);
+    }
+
+    /// An alias MISSING from the map is reported, not treated as an empty
+    /// slice.
+    ///
+    /// `fetch::probe_round` states the rule for the probe document and
+    /// this is the same rule for the detail document. The stakes are
+    /// higher here: a dropped slice in a ranking can change who is first,
+    /// where in a count it only shrinks a total.
+    #[test]
+    fn a_missing_alias_is_not_an_empty_slice() {
+        // Two slices planned, only one came back.
+        let map = json!({
+            "s0": { "issueCount": 1, "nodes": [node("alice", 1, 1, 1, 0)] },
+        });
+        let b = Board::from_alias_map(&map, &slices(2), 1, unmeasured());
+        assert!(!b.complete, "a dropped slice must not read as complete");
+        assert_eq!(
+            b.truncated_slices.len(),
+            1,
+            "the absent alias must be reported: {:?}",
+            b.truncated_slices
+        );
+        assert_eq!(b.truncated_slices[0].from, "2026-08-02");
+        // Its true size is UNKNOWN, and claiming 0 would be a guess.
+        assert_eq!(b.truncated_slices[0].issue_count, 0);
+    }
+
+    /// A REFUSED field makes the board incomplete even when the node
+    /// count matches.
+    ///
+    /// This is the channel #827 left at 0 on the sliced path, flagged
+    /// rather than silently zeroed. A refusal can blank fields inside
+    /// nodes that are all present, so `retrieved == total` is not enough
+    /// to call a board complete.
+    ///
+    /// The fixture carries `__refused` rather than an `errors` array,
+    /// which is the shape this layer actually receives and is worth
+    /// stating because it is not the shape GitHub sends.
+    /// `graphql_partial_ok` consumes the `errors` array and injects the
+    /// count INTO `data` (`client.rs:1204-1213`), so by the time a
+    /// response reaches a mapper the errors are gone and the count is a
+    /// field. A fixture built from GitHub's own wire format would
+    /// therefore pass this test while asserting nothing -- which is how
+    /// it failed first time round.
+    #[test]
+    fn a_refused_field_is_not_an_absence() {
+        let map = json!({
+            "s0": { "issueCount": 1, "nodes": [node("alice", 1, 1, 1, 0)] },
+            "__refused": 3,
+        });
+        let b = Board::from_alias_map(&map, &slices(1), 1, unmeasured());
+        assert_eq!(b.retrieved, b.total, "the node count itself matched");
+        assert_eq!(
+            b.refused_fields, 3,
+            "the refusal count must be carried, not dropped"
+        );
+        assert!(
+            !b.complete,
+            "a board over refused fields must not read as complete"
+        );
+    }
+
+    /// The refusal channel is read through `client::refused_fields_of`,
+    /// not through a second reading of the response.
+    ///
+    /// Guarded because the key is `__refused` -- a private-looking name
+    /// that a reader would not guess, and that a second implementation
+    /// would spell differently while still compiling and still returning
+    /// 0. A board that always reported 0 refusals is exactly the state
+    /// #827 left behind and this module exists to fix, so the wiring
+    /// needs an assertion rather than only a call.
+    #[test]
+    fn the_refusal_count_comes_from_the_clients_own_reader() {
+        let map = json!({ "__refused": 7, "s0": { "issueCount": 0, "nodes": [] } });
+        assert_eq!(
+            crate::github::client::refused_fields_of(&map),
+            7,
+            "the client's reader is the one source for this count"
+        );
+        let b = Board::from_alias_map(&map, &slices(1), 1, unmeasured());
+        assert_eq!(b.refused_fields, 7);
+    }
+
+    /// A person with NO activity has no row -- not a zero row.
+    ///
+    /// #826's empty-means-empty rule. `None` is what lets the UI print
+    /// "no activity" instead of a `0` that might be a failed query.
+    #[test]
+    fn absence_is_absence_not_zero() {
+        let map = json!({
+            "s0": { "issueCount": 1, "nodes": [node("alice", 1, 1, 1, 0)] },
+        });
+        let b = Board::from_alias_map(&map, &slices(1), 1, unmeasured());
+        assert!(b.row_for("alice").is_some());
+        assert_eq!(
+            b.row_for("bob"),
+            None,
+            "an inactive member must be absent, not zero"
+        );
+    }
+
+    /// Ranking is by the measure asked for, highest first, capped at
+    /// TOP_N, and a zero is excluded rather than padding the board.
+    #[test]
+    fn top_by_ranks_on_the_measure_it_is_given() {
+        let map = json!({
+            "s0": { "issueCount": 6, "nodes": [
+                // Most PRs, fewest lines.
+                node("many_prs", 1, 0, 1, 0),
+                node("many_prs", 1, 0, 1, 0),
+                node("many_prs", 1, 0, 1, 0),
+                // Fewest PRs, most lines -- a generated diff, which is
+                // exactly the gameability #823 accepted and labelled.
+                node("big_diff", 90_000, 10_000, 2, 0),
+                node("reviewed", 5, 5, 5, 42),
+                node("quiet", 0, 0, 0, 0),
+            ]},
+        });
+        let b = Board::from_alias_map(&map, &slices(1), 1, unmeasured());
+
+        let by_prs = b.top_by(|r| r.prs);
+        assert_eq!(by_prs[0].login, "many_prs");
+        let by_lines = b.top_by(|r| r.lines_changed());
+        assert_eq!(
+            by_lines[0].login, "big_diff",
+            "the three rankings must be able to disagree, or only one is needed"
+        );
+        let by_reviews = b.top_by(|r| r.reviews_received);
+        assert_eq!(by_reviews[0].login, "reviewed");
+
+        // `quiet` merged a PR with no lines and no reviews. It appears on
+        // the PR board and on NEITHER of the other two: a zero has no
+        // rank, and padding a top-five with zeroes presents people as
+        // ranked on a measure they do not appear in at all.
+        assert!(by_prs.iter().any(|r| r.login == "quiet"));
+        assert!(!by_lines.iter().any(|r| r.login == "quiet"));
+        assert!(!by_reviews.iter().any(|r| r.login == "quiet"));
+    }
+
+    /// A tie breaks on login, so the board does not reorder between
+    /// loads when nothing changed.
+    ///
+    /// The arrival order of `fetch.rs`'s concurrent waves is
+    /// nondeterministic by design, so without an explicit tie-break two
+    /// equal rows would swap on refresh -- which reads as a bug in the
+    /// data rather than in the sort.
+    #[test]
+    fn ties_break_deterministically() {
+        let map = json!({
+            "s0": { "issueCount": 2, "nodes": [
+                node("zoe", 10, 0, 1, 0),
+                node("adam", 10, 0, 1, 0),
+            ]},
+        });
+        let b = Board::from_alias_map(&map, &slices(1), 1, unmeasured());
+        let top = b.top_by(|r| r.lines_changed());
+        assert_eq!(
+            top.iter().map(|r| r.login.as_str()).collect::<Vec<_>>(),
+            ["adam", "zoe"]
+        );
+    }
+
+    /// TOP_N is honoured, and the cap is the reason the constant is
+    /// exported rather than spelled in the UI.
+    #[test]
+    fn top_by_caps_at_top_n() {
+        let nodes: Vec<serde_json::Value> = (0..12)
+            .map(|i| node(&format!("user{i:02}"), 100 - i, 0, 1, 0))
+            .collect();
+        let map = json!({ "s0": { "issueCount": 12, "nodes": nodes } });
+        let b = Board::from_alias_map(&map, &slices(1), 1, unmeasured());
+        assert_eq!(b.top_by(|r| r.lines_changed()).len(), TOP_N);
+        assert_eq!(
+            b.rows.len(),
+            12,
+            "the board keeps everyone; only the CHART cuts"
+        );
+    }
+
+    /// Mine and Others partition the board with nobody lost and nobody
+    /// double-counted.
+    #[test]
+    fn mine_and_others_partition_the_board() {
+        let map = json!({
+            "s0": { "issueCount": 3, "nodes": [
+                node("me", 1, 1, 1, 0),
+                node("them", 2, 2, 2, 0),
+                node("other", 3, 3, 3, 0),
+            ]},
+        });
+        let b = Board::from_alias_map(&map, &slices(1), 1, unmeasured());
+        let mine = b.row_for("me").expect("my row");
+        let others: Vec<&str> = b.others("me").map(|r| r.login.as_str()).collect();
+        assert_eq!(others, ["other", "them"]);
+        assert_eq!(
+            1 + others.len(),
+            b.rows.len(),
+            "Mine plus Others must be the whole board"
+        );
+        assert_eq!(mine.prs, 1);
+    }
+
+    /// A deleted author is bucketed, not dropped -- so the rows still sum
+    /// to `retrieved` and the board's own arithmetic holds.
+    #[test]
+    fn a_deleted_author_is_bucketed_not_dropped() {
+        let map = json!({
+            "s0": { "issueCount": 2, "nodes": [
+                node("alice", 1, 1, 1, 0),
+                { "author": null, "additions": 5, "deletions": 5,
+                  "changedFiles": 1, "reviews": { "totalCount": 0 } },
+            ]},
+        });
+        let b = Board::from_alias_map(&map, &slices(1), 1, unmeasured());
+        assert_eq!(b.retrieved, 2);
+        let summed: u64 = b.rows.iter().map(|r| r.prs).sum();
+        assert_eq!(
+            summed, b.retrieved,
+            "every retrieved PR must land in exactly one row"
+        );
+        assert!(b.row_for(GHOST).is_some());
+        assert!(is_ghost(GHOST));
+        assert!(!is_ghost("alice"));
+    }
+
+    /// A board asks about EVERYONE, so its query carries no `author:`.
+    ///
+    /// `scope.rs` has the same assertion for `StatsQuery` directly; this
+    /// one guards the call site, because the bug is not a broken
+    /// `StatsQuery` but a caller that passes `Some(subject)` into it and
+    /// renders a one-row leaderboard.
+    #[test]
+    fn a_board_query_names_nobody() {
+        let q = StatsQuery::new(
+            None,
+            Scope::Org("FNX-Labs".into()),
+            super::super::scope::Measure::Merged,
+        );
+        let s = q.search_query("2026-08-01", "2026-08-31");
+        assert!(
+            !s.contains("author:"),
+            "a leaderboard constrained to one author is a board with one name on it: {s}"
+        );
+        assert!(s.contains("org:FNX-Labs"));
+    }
+
+    /// The document this module reads must spell `reviews` the FREE way.
+    ///
+    /// MEASURED 2026-09-11 (module docs carry the table): `reviews
+    /// { totalCount }` costs nothing extra at 3, 6 and 15 searches, while
+    /// `reviews(first: 1) { totalCount }` costs 2 points from 6 searches
+    /// up. The difference is four characters, and it is the difference
+    /// between a free reviewer leaderboard and one that multiplies the
+    /// cost of every detail request.
+    ///
+    /// Asserted against the generated document, not a comment, because a
+    /// comment cannot fail.
+    #[test]
+    fn the_reviews_field_is_the_unpaged_spelling() {
+        let q = StatsQuery::new(
+            None,
+            Scope::Org("FNX-Labs".into()),
+            super::super::scope::Measure::Merged,
+        );
+        let doc = super::super::query::slice_detail_query(&q, &slices(1), 0, 50);
+        assert!(
+            doc.contains("reviews { totalCount }"),
+            "the reviewer board needs a review count: {doc}"
+        );
+        assert!(
+            !doc.contains("reviews("),
+            "a PAGED reviews connection is priced per search; the unpaged \
+             form measured free. See the table in board.rs's module docs."
+        );
+    }
+
+    /// This document's chunk is SMALLER than the probe's, and that is a
+    /// measurement rather than caution.
+    ///
+    /// 10 aliases x 50 nodes measured 0 of 3 against real dense
+    /// day-slices, every failure at 10.6s against #827's ~11s deadline.
+    /// The probe document at the same 10 aliases answered in 1.4-1.5s
+    /// because it materialises no nodes, so the two chunk sizes are
+    /// genuinely different numbers for genuinely different documents.
+    #[test]
+    fn the_board_document_is_chunked_smaller_than_the_probe() {
+        const {
+            assert!(BOARD_ALIAS_CHUNK >= 1);
+            assert!(
+                BOARD_ALIAS_CHUNK < super::super::query::ALIAS_CHUNK,
+                "10 aliases x 50 nodes measured 0 of 3 on dense data; \
+                 re-measure before raising this to the probe's chunk"
+            );
+        }
+        // And it stays inside the ceiling the probe document is held to,
+        // which is the weaker of the two bounds but the one a reviewer
+        // editing a chunk size will look for.
+        const {
+            assert!(BOARD_ALIAS_CHUNK <= super::super::query::ALIAS_CEILING);
+        }
+    }
+
+    /// TOP_N is five, because #826 says top five. Pinned so the UI and
+    /// the Rust side cannot disagree about what "top five" cuts at.
+    #[test]
+    fn top_n_is_five() {
+        const {
+            assert!(TOP_N == 5);
+        }
+    }
+
+    /// An UNMERGED pull request gets no cycle time, and is kept out of the
+    /// outliers and the repo counts.
+    ///
+    /// This is the figure most easily turned into an accusation: measured
+    /// against "now", an open pull request gets slower every second and
+    /// would top a "slowest to merge" list while not having failed to merge
+    /// at all. It still counts toward `prs` and the line totals, because it
+    /// IS work -- so the row's `cycle_time_hours` is deliberately shorter
+    /// than its `prs`, which the field's doc comment states because a caller
+    /// dividing one by the other would be wrong.
+    #[test]
+    fn an_open_pull_request_has_no_cycle_time() {
+        let map = json!({
+            "s0": { "issueCount": 2, "nodes": [
+                pr("alice", 1, "owner/repo", "2026-08-01T00:00:00Z",
+                   Some("2026-08-02T00:00:00Z"), 10, 0),
+                // Still open: `mergedAt` is null.
+                pr("alice", 2, "owner/repo", "2026-08-01T00:00:00Z", None, 99_999, 0),
+            ]},
+        });
+        let b = Board::from_alias_map(&map, &slices(1), 1, unmeasured());
+        let row = b.row_for("alice").expect("alice");
+        assert_eq!(row.prs, 2, "an open PR is still work and still counted");
+        assert_eq!(row.additions, 100_009, "its lines still count");
+        assert_eq!(
+            row.cycle_time_hours,
+            vec![24.0],
+            "only the merged one has a cycle time"
+        );
+        // And the open one -- by far the largest -- is absent from the
+        // outliers, because "largest merged" and "slowest to merge" must be
+        // drawn from the same population as each other.
+        assert_eq!(b.largest.len(), 1);
+        assert_eq!(b.largest[0].number, 1);
+        assert_eq!(b.slowest.len(), 1);
+        assert_eq!(
+            b.repo_counts,
+            vec![RepoCount {
+                repo: "owner/repo".into(),
+                merged: 1
+            }],
+            "repo counts are MERGED counts, matching the figure above them"
+        );
+    }
+
+    /// A negative cycle time is dropped rather than clamped.
+    ///
+    /// It should be impossible -- a merge cannot precede its own creation --
+    /// but the timestamps arrive independently, and a negative value sorts
+    /// to the TOP of an ascending distribution and drags a median below
+    /// zero. Clamping to 0 would be a measurement claim about a value
+    /// nobody can explain.
+    #[test]
+    fn a_negative_cycle_time_is_dropped_not_clamped() {
+        let map = json!({
+            "s0": { "issueCount": 1, "nodes": [
+                pr("alice", 1, "owner/repo", "2026-08-02T00:00:00Z",
+                   Some("2026-08-01T00:00:00Z"), 1, 1),
+            ]},
+        });
+        let b = Board::from_alias_map(&map, &slices(1), 1, unmeasured());
+        let row = b.row_for("alice").expect("alice");
+        assert_eq!(row.prs, 1);
+        assert!(
+            row.cycle_time_hours.is_empty(),
+            "an inexplicable duration must not become a 0 the UI reports"
+        );
+    }
+
+    /// Cycle times come back ASCENDING, which is the contract the UI's
+    /// `percentile()` indexes against.
+    ///
+    /// `MergedDetail::cycle_time_hours` documents the same requirement for
+    /// the unscoped page. Unsorted, `percentile(x, 0.5)` returns whichever
+    /// value happens to sit in the middle of the arrival order -- a number
+    /// that is not a median and not anything else either.
+    #[test]
+    fn cycle_times_are_sorted_ascending() {
+        let map = json!({
+            "s0": { "issueCount": 3, "nodes": [
+                pr("alice", 1, "o/r", "2026-08-01T00:00:00Z", Some("2026-08-01T05:00:00Z"), 1, 0),
+                pr("alice", 2, "o/r", "2026-08-01T00:00:00Z", Some("2026-08-01T01:00:00Z"), 1, 0),
+                pr("alice", 3, "o/r", "2026-08-01T00:00:00Z", Some("2026-08-01T09:00:00Z"), 1, 0),
+            ]},
+        });
+        let b = Board::from_alias_map(&map, &slices(1), 1, unmeasured());
+        assert_eq!(
+            b.row_for("alice").unwrap().cycle_time_hours,
+            vec![1.0, 5.0, 9.0]
+        );
+    }
+
+    /// Outliers are the SCOPE's extremes, chosen after the whole window is
+    /// mapped rather than per slice, and capped at `OUTLIERS`.
+    ///
+    /// Picked per slice they would be the last slice's extremes, which on a
+    /// sliced org window is an arbitrary month -- and nothing on screen
+    /// would say so.
+    #[test]
+    fn outliers_are_the_whole_windows_extremes() {
+        let map = json!({
+            // The biggest and the slowest are in the FIRST slice, so a
+            // per-slice or last-wins implementation fails this.
+            "s0": { "issueCount": 2, "nodes": [
+                pr("alice", 10, "o/r", "2026-08-01T00:00:00Z", Some("2026-08-20T00:00:00Z"), 50_000, 0),
+                pr("bob", 11, "o/r", "2026-08-01T00:00:00Z", Some("2026-08-01T01:00:00Z"), 1, 0),
+            ]},
+            "s1": { "issueCount": 1, "nodes": [
+                pr("carol", 12, "o/r", "2026-08-02T00:00:00Z", Some("2026-08-02T02:00:00Z"), 9, 0),
+            ]},
+        });
+        let b = Board::from_alias_map(&map, &slices(2), 1, unmeasured());
+        assert_eq!(b.largest[0].number, 10, "the largest is in the first slice");
+        assert_eq!(b.slowest[0].number, 10, "and so is the slowest");
+        assert_eq!(b.largest[0].size, 50_000);
+        // Identity carried through, which is the entire point of the
+        // outlier lists: a figure that cannot name its pull request is the
+        // defect `Outliers` exists to fix.
+        assert_eq!(b.largest[0].repo, "o/r");
+        assert_eq!(b.largest[0].author, "alice");
+        assert!(b.largest[0].url.contains("/pull/10"));
+        assert!(b.largest.len() <= OUTLIERS && b.slowest.len() <= OUTLIERS);
+    }
+
+    /// Repo counts are ordered most-merged first, with a deterministic tie
+    /// break.
+    #[test]
+    fn repo_counts_rank_by_merged_count() {
+        let map = json!({
+            "s0": { "issueCount": 4, "nodes": [
+                pr("a", 1, "o/zeta", "2026-08-01T00:00:00Z", Some("2026-08-01T01:00:00Z"), 1, 0),
+                pr("a", 2, "o/alpha", "2026-08-01T00:00:00Z", Some("2026-08-01T01:00:00Z"), 1, 0),
+                pr("a", 3, "o/busy", "2026-08-01T00:00:00Z", Some("2026-08-01T01:00:00Z"), 1, 0),
+                pr("a", 4, "o/busy", "2026-08-01T00:00:00Z", Some("2026-08-01T01:00:00Z"), 1, 0),
+            ]},
+        });
+        let b = Board::from_alias_map(&map, &slices(1), 1, unmeasured());
+        assert_eq!(
+            b.repo_counts,
+            vec![
+                RepoCount {
+                    repo: "o/busy".into(),
+                    merged: 2
+                },
+                // Equal counts break on the NAME, so the list does not
+                // reshuffle between loads when nothing changed.
+                RepoCount {
+                    repo: "o/alpha".into(),
+                    merged: 1
+                },
+                RepoCount {
+                    repo: "o/zeta".into(),
+                    merged: 1
+                },
+            ]
+        );
+    }
+
+    /// A board is planned against the PAGE, not against the search cap.
+    ///
+    /// This is the defect I shipped first and then measured: at the count
+    /// path's threshold of `SUBDIVIDE_AT = 800`, a 30-day `org:FNX-Labs`
+    /// window of **569** merged pull requests plans as ONE slice -- correct
+    /// for a count, since `issueCount` is exact at any size -- and the detail
+    /// fetch then retrieves `SLICE_PAGE_FULL = 50` of them. A 9% sample. The
+    /// board reported it honestly, and a top-five over 9% of the data is
+    /// still not a ranking.
+    ///
+    /// Asserted on `split_factor_for`, the function that decides it, with the
+    /// real measured numbers rather than round ones -- so the test fails if
+    /// someone "simplifies" the threshold back to one value.
+    #[test]
+    fn a_board_subdivides_to_the_page_not_to_the_search_cap() {
+        use super::super::fetch::SLICE_PAGE_FULL;
+        use super::super::slice::{split_factor_for, SUBDIVIDE_AT};
+
+        // The measured window. Against the COUNT threshold it is not split
+        // at all, which is what made the board a sample.
+        let measured_window = 569u64;
+        assert!(
+            measured_window < SUBDIVIDE_AT,
+            "the whole point: 569 is UNDER the count path's threshold, so that \
+             threshold cannot be what a board uses"
+        );
+
+        // Against the PAGE threshold it splits, and by enough to matter.
+        let page = u64::from(SLICE_PAGE_FULL);
+        let n = split_factor_for(measured_window, page);
+        assert!(
+            n >= 2,
+            "a 569-PR window must be cut against a {page}-node page, got {n}"
+        );
+        // Capped at ALIAS_CHUNK so one subdivision's probes fit one request,
+        // so 569/50 = 12 pieces takes two rounds rather than one. That is
+        // cheap -- the 30-alias probe document measured 1 point and 3.5s --
+        // and it is why the cap is not raised here.
+        assert!(n <= super::super::query::ALIAS_CHUNK as u32);
+    }
+
+    /// A board load has ONE wall-clock ceiling, not two in series.
+    ///
+    /// `load_board` calls `plan_to` and then `load_detail_chunked`, each of
+    /// which carries its own `LOAD_TIMEOUT`. Without an outer bound the board
+    /// could run twice the ceiling -- 120s against the 60 `load_count` holds
+    /// itself to -- which breaks the rule `LOAD_TIMEOUT`'s own doc states.
+    /// Found in review.
+    ///
+    /// Asserted on the source, because the property is structural: it is about
+    /// WHERE the timeout sits, and no value a function returns reveals that.
+    /// The alternative -- an integration test that waits two minutes for a
+    /// hung request -- is a test nobody would run.
+    #[test]
+    fn a_board_load_is_bounded_once_around_the_whole_thing() {
+        let src = include_str!("board.rs");
+        let body = src
+            .split_once("pub async fn load_board(")
+            .expect("load_board")
+            .1;
+        let head = body
+            .split_once("async fn board_inner")
+            .expect("the split")
+            .0;
+        assert!(
+            head.contains("tokio::time::timeout"),
+            "load_board must bound the whole load, not leave it to the two \
+             inner ceilings running in series"
+        );
+        assert!(
+            head.contains("board_inner"),
+            "the bounded thing must be the WHOLE load, which is what \
+             `board_inner` is for"
+        );
+        // And the work itself must not also be inline in `load_board`, which
+        // would mean the timeout wraps only part of it.
+        assert!(
+            !head.contains("load_detail_chunked"),
+            "the detail fetch belongs inside the bounded inner function"
+        );
+    }
+
+    /// The threshold is a PARAMETER, and the two callers pass different
+    /// values. Guarded because collapsing them back to one constant is the
+    /// obvious-looking simplification that reintroduces the sample.
+    #[test]
+    fn the_count_and_board_thresholds_are_different_numbers() {
+        use super::super::fetch::SLICE_PAGE_FULL;
+        use super::super::slice::SUBDIVIDE_AT;
+        const {
+            assert!(
+                (SLICE_PAGE_FULL as u64) < SUBDIVIDE_AT,
+                "a board's threshold must be the page size, which is far below \
+                 the count path's; if these ever meet, a board over a busy \
+                 scope silently becomes a sample again"
+            );
+        }
+    }
+
+    /// A zero threshold cuts as far as the grammar allows rather than
+    /// dividing by zero.
+    ///
+    /// A caller asking for slices holding fewer than zero pull requests has a
+    /// bug; panicking inside a planner, or silently substituting the count
+    /// path's number for a question nobody asked, are both worse than cutting
+    /// to the limit and letting `is_one_day` stop the recursion.
+    #[test]
+    fn a_zero_threshold_does_not_divide_by_zero() {
+        let n = super::super::slice::split_factor_for(100, 0);
+        assert!(n >= 2);
+        assert!(n <= super::super::query::ALIAS_CHUNK as u32);
+    }
+
+    /// The detail document carries the identity the outliers need.
+    ///
+    /// Asserted on the generated document rather than on a comment, because
+    /// the outlier lists degrade silently without these: a missing `url`
+    /// renders a link to nowhere and a missing `title` an empty row, neither
+    /// of which fails a mapper test built from a fixture that has them.
+    #[test]
+    fn the_detail_document_carries_pull_request_identity() {
+        let q = StatsQuery::new(
+            None,
+            Scope::Org("FNX-Labs".into()),
+            super::super::scope::Measure::Merged,
+        );
+        let doc = super::super::query::slice_detail_query(&q, &slices(1), 0, 50);
+        for field in ["number", "title", "url", "repository { nameWithOwner }"] {
+            assert!(
+                doc.contains(field),
+                "the outlier lists cannot name a pull request without {field}: {doc}"
+            );
+        }
+        // MEASURED 2026-09-11: all four leave the document at cost 1. The
+        // guard is that they are OBJECTS and scalars rather than paged
+        // connections -- `repository` would be priced if it were asked for
+        // a page of something.
+        assert!(
+            !doc.contains("repository("),
+            "a paged `repository` would be the priced shape"
+        );
+    }
+}

@@ -8,7 +8,9 @@
 //! here -- see the table in #824.
 
 use super::budget::Budget;
-use super::query::{probe_query, slice_detail_query, Slice, ALIAS_CHUNK, REPO_CONNECTION_QUERY};
+use super::query::{
+    probe_query, slice_detail_query, Slice, ALIAS_CEILING, ALIAS_CHUNK, REPO_CONNECTION_QUERY,
+};
 use super::scope::{Scope, StatsQuery};
 use super::slice::{self, Plan};
 use crate::github::client::{ClientError, GitHubClient};
@@ -275,7 +277,10 @@ async fn load_count_inner(
         log::warn!("single-repo scope is not owner/name; falling back to search");
     }
 
-    let plan = plan(client, q, window, budget).await?;
+    // The COUNT path's threshold, which is the one `slice::SUBDIVIDE_AT`
+    // exists for: just under the 1,000-result search cap, so the assembled
+    // total is exact. A board needs a much smaller one -- see `plan_to`.
+    let plan = plan(client, q, window, budget, slice::SUBDIVIDE_AT).await?;
     Ok(Outcome {
         total: plan.total(),
         retrievable: plan.is_retrievable(),
@@ -296,11 +301,88 @@ async fn load_count_inner(
 /// means -- and the chunks WITHIN a round are parallel. That is the only
 /// parallelism available here, and it is the one that matters: a round is
 /// one request per `ALIAS_CHUNK` slices.
+///
+/// # Why this is public as of #826
+///
+/// `load_count` discards the plan after summing it, which is all a count
+/// needs. A leaderboard needs the SLICES: it has to fetch nodes for each
+/// one and then map them to people, so it needs the same tiling the
+/// planner produced rather than a second division of the window.
+///
+/// Exposing the planner is the alternative to `board.rs` writing its own,
+/// and #826 is explicit that it must not ("USE that layer; do not write a
+/// second pagination path"). The reason is not reuse for its own sake: the
+/// planner's tiling property -- contiguous, no gap, no overlap -- is what
+/// makes a board complete, and `slice.rs`'s `ranges_tile` is the assertion
+/// that earns it. A second path would have to earn it again, and a gap in
+/// it would lose PRs silently.
+pub async fn plan_window(
+    client: &GitHubClient,
+    q: &StatsQuery,
+    window: Slice,
+    budget: &Budget,
+) -> Result<Plan, ClientError> {
+    plan_to(client, q, window, budget, slice::SUBDIVIDE_AT).await
+}
+
+/// [`plan_window`] with the caller's subdivision threshold.
+///
+/// # The threshold a COUNT needs is not the threshold a BOARD needs
+///
+/// `slice::SUBDIVIDE_AT` is 800, sized just under the 1,000-result search cap
+/// so that a count is exact. That is the right threshold for a count, and it
+/// is the WRONG one for anything that reads nodes, because the two are
+/// limited by different numbers:
+///
+/// - a count reads `issueCount`, which is exact at any size;
+/// - a board reads `nodes`, and gets at most [`SLICE_PAGE_FULL`] of them.
+///
+/// MEASURED 2026-09-11, and this is a defect I found in my own first
+/// implementation rather than a hypothetical: a 30-day `org:FNX-Labs` window
+/// holds **569** merged pull requests. At 800 the planner leaves it as ONE
+/// slice -- correctly, for a count -- and the detail fetch then retrieves
+/// **50 of 569**, a 9% sample. The board reported `complete: false` and named
+/// the short slice, so it was honest; but a top-five over 9% of the data is
+/// not a ranking, and #826's rule is "never a confident top-five over a
+/// sample". Honest and useless is still useless.
+///
+/// Passing `SLICE_PAGE_FULL` instead subdivides until every slice fits in one
+/// page. On that same window it plans 30 day-slices holding 1-47 each
+/// (measured: the per-day counts are 16, 18, 20, 21, 13, 23, 39, 47, 14, 34,
+/// 15, 29, 31, 39, 22, 46, 26, 12, 7, 11, 18, 23, 6, 8, 1, 7, 4, 6, 5, 8 --
+/// none over a 50-node page), and the whole 30-alias probe document costs
+/// **1 point in 3.5s**.
+///
+/// # Why not cursor-page each slice instead
+///
+/// I measured that too, and it works: `search(..., after: <cursor>)` paged a
+/// 569-PR slice at 1 point and 1.8-3.0s per page. It is the wrong mechanism
+/// here because each page needs the PREVIOUS page's cursor, so 569 PRs is 12
+/// SERIAL round-trips -- roughly 25s of wall clock against the planner's
+/// parallel waves, and inside a 60-second `LOAD_TIMEOUT` that a busier scope
+/// would exceed. Subdividing keeps the fan-out parallel at
+/// [`READ_CONCURRENCY`], and it reuses the tiling property `slice.rs`'s
+/// `ranges_tile` already proves rather than adding the second pagination path
+/// #826 explicitly rules out.
+pub async fn plan_to(
+    client: &GitHubClient,
+    q: &StatsQuery,
+    window: Slice,
+    budget: &Budget,
+    subdivide_at: u64,
+) -> Result<Plan, ClientError> {
+    match tokio::time::timeout(LOAD_TIMEOUT, plan(client, q, window, budget, subdivide_at)).await {
+        Ok(r) => r,
+        Err(_) => Err(ClientError::Timeout(LOAD_TIMEOUT.as_secs())),
+    }
+}
+
 async fn plan(
     client: &GitHubClient,
     q: &StatsQuery,
     window: Slice,
     budget: &Budget,
+    subdivide_at: u64,
 ) -> Result<Plan, ClientError> {
     // `plan_with` is synchronous and takes a closure, because that is
     // what makes the completeness property testable without a network
@@ -318,7 +400,11 @@ async fn plan(
         let mut next = Vec::new();
         for (s, count) in pending.into_iter().zip(counts) {
             let probed = slice::ProbedSlice { slice: s, count };
-            if !probed.too_big() {
+            // The threshold comes from the CALLER, because a count and a
+            // board are limited by different numbers -- see `plan_to`.
+            // `ProbedSlice::too_big` still pins the count path's 800 and is
+            // what `slice.rs`'s completeness tests assert against.
+            if probed.count < subdivide_at {
                 done.push(probed);
                 continue;
             }
@@ -327,7 +413,14 @@ async fn plan(
                 done.push(probed);
                 continue;
             }
-            let pieces = slice::subdivide(&probed.slice, slice::split_factor(probed.count));
+            // Split proportionally to how far over the threshold the slice
+            // is, not by halving: each round is a request, and halving a
+            // 569-PR slice against a 50-node page would need four rounds
+            // where one proportional split needs one.
+            let pieces = slice::subdivide(
+                &probed.slice,
+                slice::split_factor_for(probed.count, subdivide_at),
+            );
             if pieces.len() < 2 {
                 irreducible.push(probed.clone());
                 done.push(probed);
@@ -472,9 +565,49 @@ pub async fn load_detail(
     slices: &[Slice],
     budget: &Budget,
 ) -> Result<serde_json::Value, ClientError> {
+    load_detail_chunked(client, q, slices, budget, ALIAS_CHUNK).await
+}
+
+/// [`load_detail`] with the caller's chunk size rather than
+/// [`ALIAS_CHUNK`].
+///
+/// # Why a caller gets to choose, as of #826
+///
+/// `ALIAS_CHUNK` is 10 and sizes BOTH documents this layer issues, which
+/// is one number doing two jobs that measure seven times apart. #826
+/// measured the detail document at 10 aliases x `SLICE_PAGE_FULL` against
+/// real dense day-slices (`org:FNX-Labs`, 2026-08, 245 merged PRs over 10
+/// days) and it failed **0 of 3**, every failure at 10.6s against the ~11s
+/// deadline this module's docs establish. The probe document at the same 10
+/// aliases answered in 1.4-1.5s, because it materialises no nodes at all.
+///
+/// #827's own figure for this document was 3 aliases x 50 at 3.42-3.68s,
+/// which is correct and was measured at a third of the chunk it then
+/// shipped. Nothing between 3 and 10 was measured, and 10 is where it
+/// breaks -- so this is a gap in the measurement rather than an error in
+/// the reasoning, and the reasoning already says pages matter more than
+/// aliases.
+///
+/// The degradation ladder is unchanged and still sheds pages before
+/// aliases: a smaller starting chunk reduces how often the ladder is
+/// needed, it does not replace it. `board::BOARD_ALIAS_CHUNK` is the
+/// measured value for the board's document.
+pub async fn load_detail_chunked(
+    client: &GitHubClient,
+    q: &StatsQuery,
+    slices: &[Slice],
+    budget: &Budget,
+    chunk: usize,
+) -> Result<serde_json::Value, ClientError> {
+    // Clamped rather than trusted. The chunk reaches here from a caller's
+    // constant today, but a 0 would make `slices.chunks(0)` panic and a
+    // value over the ceiling would build a document the deadline refuses
+    // -- and the ceiling exists precisely because a reviewer cannot see
+    // either failure in a diff.
+    let chunk = chunk.clamp(1, ALIAS_CEILING);
     match tokio::time::timeout(
         LOAD_TIMEOUT,
-        detail_with_ladder(client, q, slices, budget, ALIAS_CHUNK, SLICE_PAGE_FULL),
+        detail_with_ladder(client, q, slices, budget, chunk, SLICE_PAGE_FULL),
     )
     .await
     {
@@ -522,6 +655,7 @@ async fn detail_round(
     page: u32,
 ) -> Result<serde_json::Value, ClientError> {
     let mut merged = serde_json::Map::new();
+    let mut refused = 0usize;
     let per_wave = chunk * READ_CONCURRENCY;
     for (w, wave) in slices.chunks(per_wave).enumerate() {
         let base = w * per_wave;
@@ -547,9 +681,195 @@ async fn detail_round(
                     merged.insert(k.clone(), val.clone());
                 }
             }
+            // `__refused` is a TOP-LEVEL key on each response, not an alias,
+            // so the blanket insert above makes the last refusing chunk's
+            // count win instead of accumulating. Summed explicitly.
+            //
+            // Found in review, and it understated rather than hid: any
+            // non-zero count still trips `complete`, and `graphql_partial_ok`
+            // inserts the key only when there ARE refusals
+            // (`client.rs:1204-1213`), so a clean chunk could not zero a
+            // dirty one. But the FIGURE drives the SAML remediation message,
+            // and "GitHub refused 4 fields" when it refused 7 is the kind of
+            // wrong number that makes a reader distrust the advice attached
+            // to it.
+            //
+            // `series_inner` below already accumulates per chunk, which is
+            // what the two paths now have in common.
+            refused += crate::github::client::refused_fields_of(&v);
         }
     }
+    // Written back as the merged map's own key, so `Board::from_alias_map`
+    // keeps reading the count through `client::refused_fields_of` -- one
+    // reader for this value rather than a second convention for the merged
+    // shape. Inserted only when non-zero, matching `graphql_partial_ok`'s own
+    // rule: the key's ABSENCE means no refusal, and a written 0 would be a
+    // second way of saying that.
+    if refused > 0 {
+        merged.insert("__refused".into(), refused.into());
+    }
     Ok(serde_json::Value::Object(merged))
+}
+
+/// One day of scoped activity.
+///
+/// Fields named to match the existing `HistoryPoint` the chart component
+/// already consumes, so the scoped series renders through the SAME chart
+/// rather than a second one -- #826 is explicit that the existing chart
+/// components are to be reused rather than a second charting idiom
+/// introduced.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScopedPoint {
+    /// `YYYY-MM-DD` in UTC, which is the bucket GitHub's bare date
+    /// qualifiers actually use. `ActivityChart` already discloses that
+    /// boundary ("Opened and merged per day (UTC)") and the scoped series
+    /// inherits the same distortion for the same reason, so the disclosure
+    /// covers it rather than needing a second one.
+    pub date: String,
+    pub opened: u64,
+    pub merged: u64,
+}
+
+/// The scoped series, with the honesty fields a partial one needs.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Series {
+    /// One point per day, oldest first.
+    pub points: Vec<ScopedPoint>,
+    /// Days whose counts did not come back.
+    ///
+    /// Named rather than counted, and NOT defaulted to zero. A day missing
+    /// from the response that rendered as `0` would draw a trough in the
+    /// chart that looks like a quiet Tuesday -- the most legible possible
+    /// lie, because a chart invites the eye to read shape. `probe_round`
+    /// records the same rule for the count path and the reasoning is
+    /// stronger here.
+    pub failed_days: Vec<String>,
+    /// Fields GitHub refused across the series responses.
+    pub refused_fields: usize,
+    pub spend: super::budget::Spend,
+}
+
+impl Series {
+    /// Whether every day in the window was measured.
+    pub fn is_complete(&self) -> bool {
+        self.failed_days.is_empty() && self.refused_fields == 0
+    }
+}
+
+/// Fetch the scoped daily series, chunked and bounded.
+///
+/// Count-only, so this is the cheap half of a scope load: MEASURED
+/// 2026-09-11, 10 count-only aliases over dense day-slices answered in
+/// 1.4-1.5s. It is issued as its OWN request rather than folded into the
+/// board's, because `StatsPage.tsx:12-22` records that three independent
+/// queries rendering as each lands beat one combined gate -- and #826 notes
+/// an org "Others" view has more parts and more variance, so a single gate
+/// would be worse here than there.
+///
+/// A failed chunk does not fail the series: its days are reported in
+/// `failed_days` and the rest of the chart draws. That is the opposite of
+/// the count path, which errors on a missing alias -- and the asymmetry is
+/// deliberate. A count is ONE number and a short one is simply wrong, while
+/// a chart of 30 days missing 2 is still the most informative thing
+/// available, provided it says which 2.
+pub async fn load_series(
+    client: &GitHubClient,
+    q: &StatsQuery,
+    days: &[String],
+    budget: &Budget,
+) -> Result<Series, ClientError> {
+    match tokio::time::timeout(LOAD_TIMEOUT, series_inner(client, q, days, budget)).await {
+        Ok(r) => r,
+        Err(_) => Err(ClientError::Timeout(LOAD_TIMEOUT.as_secs())),
+    }
+}
+
+async fn series_inner(
+    client: &GitHubClient,
+    q: &StatsQuery,
+    days: &[String],
+    budget: &Budget,
+) -> Result<Series, ClientError> {
+    // Indexed rather than pushed, so chunks completing out of order cannot
+    // reorder the chart -- `query.rs:667-678`'s absolute-index rule.
+    let mut merged = vec![None::<u64>; days.len()];
+    let mut opened = vec![None::<u64>; days.len()];
+    let mut refused = 0usize;
+    let per_wave = ALIAS_CHUNK * READ_CONCURRENCY;
+
+    for (w, wave) in days.chunks(per_wave).enumerate() {
+        let base = w * per_wave;
+        let mut set = tokio::task::JoinSet::new();
+        for (n, chunk) in wave.chunks(ALIAS_CHUNK).enumerate() {
+            let first_index = base + n * ALIAS_CHUNK;
+            let doc = super::query::series_query(q, chunk, first_index);
+            let client = client.clone();
+            let budget = budget.clone();
+            let len = chunk.len();
+            set.spawn(async move {
+                let v = client.stats_graphql(&json!({ "query": doc })).await?;
+                budget.record(&v);
+                let refused = crate::github::client::refused_fields_of(&v);
+                let mut out = Vec::with_capacity(len);
+                for i in 0..len {
+                    let (m, o) = super::query::day_aliases(first_index + i);
+                    // `None` rather than 0 for a missing alias. The caller
+                    // turns it into a named failed day; defaulting here
+                    // would draw a trough that reads as a quiet day.
+                    out.push((v[&m]["issueCount"].as_u64(), v[&o]["issueCount"].as_u64()));
+                }
+                Ok::<(usize, Vec<(Option<u64>, Option<u64>)>, usize), ClientError>((
+                    first_index,
+                    out,
+                    refused,
+                ))
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            // A chunk that FAILED outright leaves its days as `None`, and
+            // they become named failed days. Not propagated as an error:
+            // see `load_series`' doc for why a chart differs from a count
+            // here. A panic IS propagated, because a dropped task is a bug
+            // rather than a server refusal.
+            match joined.map_err(|e| ClientError::Join(e.to_string()))? {
+                Ok((first_index, out, r)) => {
+                    refused += r;
+                    for (i, (m, o)) in out.into_iter().enumerate() {
+                        merged[first_index + i] = m;
+                        opened[first_index + i] = o;
+                    }
+                }
+                Err(e) => log::warn!(
+                    "a scoped series chunk failed ({e}); its days are reported as \
+                     unmeasured rather than as zero"
+                ),
+            }
+        }
+    }
+
+    let mut points = Vec::with_capacity(days.len());
+    let mut failed_days = Vec::new();
+    for (i, d) in days.iter().enumerate() {
+        match (merged[i], opened[i]) {
+            (Some(m), Some(o)) => points.push(ScopedPoint {
+                date: d.clone(),
+                merged: m,
+                opened: o,
+            }),
+            // EITHER half missing makes the day unmeasured. A point with a
+            // merged count and no opened count would render as "opened
+            // nothing", which is a claim rather than a gap.
+            _ => failed_days.push(d.clone()),
+        }
+    }
+
+    Ok(Series {
+        points,
+        failed_days,
+        refused_fields: refused,
+        spend: budget.snapshot(),
+    })
 }
 
 /// Which scopes route through the connection rather than search.
@@ -619,6 +939,122 @@ mod tests {
         let (chunk, page) = degrade(ALIAS_CHUNK, SLICE_PAGE_FULL).expect("first rung");
         assert_eq!(page, SLICE_PAGE_REDUCED);
         assert_eq!(chunk, ALIAS_CHUNK, "parallelism is kept on rung one");
+    }
+
+    /// Parameterising the threshold did not change the COUNT path.
+    ///
+    /// `plan` used to branch on `ProbedSlice::too_big()`, which is
+    /// `count >= SUBDIVIDE_AT`, and now branches on `count < subdivide_at`
+    /// with the count path passing `slice::SUBDIVIDE_AT`. Those are exact
+    /// complements at that value, so the shipped behaviour is unchanged -- but
+    /// "unchanged" is a claim about two conditions written in opposite
+    /// directions in different functions, which is precisely the kind of
+    /// refactor that silently shifts a boundary by one.
+    ///
+    /// Asserted across the boundary rather than at one value, because an
+    /// off-by-one is invisible anywhere else.
+    #[test]
+    fn the_count_path_keeps_its_exact_subdivision_boundary() {
+        use slice::{ProbedSlice, SUBDIVIDE_AT};
+        for count in [
+            0,
+            1,
+            SUBDIVIDE_AT - 2,
+            SUBDIVIDE_AT - 1,
+            SUBDIVIDE_AT,
+            SUBDIVIDE_AT + 1,
+            slice::SEARCH_CAP,
+            u64::MAX,
+        ] {
+            let probed = ProbedSlice {
+                slice: Slice::new("2026-08-01", "2026-08-31"),
+                count,
+            };
+            // The OLD condition and the NEW one, on the same input.
+            let kept_by_old = !probed.too_big();
+            let kept_by_new = probed.count < SUBDIVIDE_AT;
+            assert_eq!(
+                kept_by_old, kept_by_new,
+                "count {count}: the parameterised condition must be the exact \
+                 complement of `too_big()` at the count path's threshold"
+            );
+        }
+    }
+
+    /// Refusals ACROSS chunks are summed, not overwritten.
+    ///
+    /// `__refused` is a top-level key on every response rather than an alias,
+    /// so the alias-merge loop made the last refusing chunk's count win. Three
+    /// refusals in one chunk plus four in another reported **4**, and that
+    /// figure is what `partialityCaveat` quotes beside the SAML remediation
+    /// advice -- a wrong number makes a reader distrust the advice attached to
+    /// it.
+    ///
+    /// Found in review. The shape is reproduced directly rather than through a
+    /// mocked two-chunk fetch, because the bug is in the MERGE and a test that
+    /// needed a network to reach it would not have been written.
+    #[test]
+    fn refusals_across_chunks_are_summed_not_overwritten() {
+        // Two chunk responses, each carrying its own top-level count.
+        let chunks = [
+            serde_json::json!({ "s0": { "issueCount": 1, "nodes": [] }, "__refused": 3 }),
+            serde_json::json!({ "s1": { "issueCount": 1, "nodes": [] }, "__refused": 4 }),
+        ];
+        // The merge this module performs, in the order it performs it.
+        let mut merged = serde_json::Map::new();
+        let mut refused = 0usize;
+        for v in &chunks {
+            if let Some(obj) = v.as_object() {
+                for (k, val) in obj {
+                    merged.insert(k.clone(), val.clone());
+                }
+            }
+            refused += crate::github::client::refused_fields_of(v);
+        }
+        // The blanket insert alone loses the sum -- this is the bug, asserted
+        // so a future edit that drops the explicit accumulation fails here
+        // rather than understating a figure in the UI.
+        assert_eq!(
+            merged["__refused"].as_u64(),
+            Some(4),
+            "the alias merge alone keeps only the LAST count; if this ever \
+             reads 7, the merge has started summing and the explicit \
+             accumulation below is redundant"
+        );
+        assert_eq!(refused, 7, "the accumulator is what carries the total");
+        if refused > 0 {
+            merged.insert("__refused".into(), refused.into());
+        }
+        assert_eq!(
+            crate::github::client::refused_fields_of(&serde_json::Value::Object(merged)),
+            7,
+            "the merged map must report the TOTAL, which is what the board reads"
+        );
+    }
+
+    /// No refusals means the key is ABSENT, not zero.
+    ///
+    /// `graphql_partial_ok` inserts `__refused` only when there are refusals
+    /// (`client.rs:1204-1213`), and the merge keeps that convention: a written
+    /// 0 would be a second way of saying "none", and two spellings of one fact
+    /// is how a reader ends up checking the wrong one.
+    #[test]
+    fn a_clean_load_writes_no_refusal_key() {
+        let mut merged = serde_json::Map::new();
+        merged.insert(
+            "s0".into(),
+            serde_json::json!({ "issueCount": 1, "nodes": [] }),
+        );
+        let refused = 0usize;
+        if refused > 0 {
+            merged.insert("__refused".into(), refused.into());
+        }
+        assert!(!merged.contains_key("__refused"));
+        assert_eq!(
+            crate::github::client::refused_fields_of(&serde_json::Value::Object(merged)),
+            0,
+            "an absent key reads as zero, which is why it need not be written"
+        );
     }
 
     /// The DEFAULT page is already the reduced one, because 3 node-heavy

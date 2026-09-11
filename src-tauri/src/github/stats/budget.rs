@@ -41,11 +41,26 @@
 //! from 3 to 4 while the guard's count did not move.
 //!
 //! For this feature specifically: `additions`, `deletions` and
-//! `changedFiles` are scalars and cost nothing extra, while
-//! `reviews { totalCount }` is a CONNECTION and is priced per search. A
-//! leaderboard over lines changed is therefore affordable; one that adds
-//! a review count is not free, and `MEASURED_*` below records what I
-//! measured rather than what I assumed.
+//! `changedFiles` are scalars and cost nothing extra. This module said
+//! `reviews { totalCount }` was "a CONNECTION and priced per search" and
+//! that a leaderboard adding it "is not free". **Both halves are wrong**,
+//! corrected by measurement for #826 -- and correcting them here rather
+//! than only where the new code lives, because a wrong fact left in a
+//! module doc is the one a future reader finds first.
+//!
+//! What GitHub prices is the `first:` ARGUMENT, not the connection.
+//! MEASURED live 2026-09-11 on the real detail document:
+//! `reviews { totalCount }` costs 1 point at 3, 6 and 15 searches, exactly
+//! tracking a scalars-only control, while `reviews(first: 1) { totalCount }`
+//! costs 2 from 6 searches up. `labels` behaves identically both ways. So a
+//! reviewer leaderboard IS free, and `board.rs`'s module docs carry the
+//! full table.
+//!
+//! This narrows `poll.rs:1503-1580` rather than contradicting it: every
+//! connection on that test's cost list is a paged one, so its figures were
+//! right about the query it measured. The rule to apply before adding a
+//! field here is therefore "does it take `first:`", and `MEASURED_*` below
+//! records what was measured rather than what was assumed.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -91,16 +106,37 @@ pub const MEASURED_PROBE_COST: u64 = 1;
 /// it was worth measuring rather than assuming: 1,200 PR nodes with
 /// per-PR diff statistics for one point is not what the
 /// `MERGED_DETAIL_QUERY` experience suggests. The difference is that
-/// those three fields are SCALARS. `MERGED_DETAIL_QUERY` costs what it
-/// costs (and measures 6.5s for 100 nodes, `client.rs:1024-1050`)
-/// because of its `reviews { totalCount }` and `comments { totalCount }`
-/// connections, not because of the diff statistics.
+/// those three fields are SCALARS.
 ///
-/// The LATENCY, not the cost, is what bounds this shape, and it is bounded
-/// by NODES materialised rather than by aliases -- 3 aliases at `first:
-/// 100` over dense ranges intermittently 502'd at 11.0s while the same 3
-/// at `first: 50` took 3.4s. See `query::ALIAS_CHUNK` and
-/// `fetch::SLICE_PAGE_FULL`.
+/// # A correction to this comment, measured for #826
+///
+/// It said `MERGED_DETAIL_QUERY` "costs what it costs ... because of its
+/// `reviews { totalCount }` and `comments { totalCount }` connections". I
+/// ran that query verbatim against the live API, with and without those two
+/// fields, 2026-09-11:
+///
+/// | `first:` | with reviews+comments | without |
+/// |---|---|---|
+/// | 50 | **cost 1**, 4.26s | **cost 1**, 2.02s |
+/// | 100 | **cost 1**, 5.39s | **cost 1**, 2.50s |
+///
+/// **The cost is 1 either way**, so those connections are not what it costs
+/// -- consistent with the module docs above: an unpaged connection read for
+/// `totalCount` is free, and both of these are unpaged.
+///
+/// What they DO cost is LATENCY, and roughly double it: 2.0s to 4.3s at 50
+/// nodes, 2.5s to 5.4s at 100. So the observation behind the original
+/// comment was real and the attribution was wrong -- it was a latency
+/// finding recorded as a cost one, which matters because the two are
+/// bounded by different things and mitigated differently.
+///
+/// # Latency, not cost, is what bounds this shape
+///
+/// And it is bounded by NODES materialised rather than by aliases -- 3
+/// aliases at `first: 100` over dense ranges intermittently 502'd at 11.0s
+/// while the same 3 at `first: 50` took 3.4s. See `query::ALIAS_CHUNK` and
+/// `fetch::SLICE_PAGE_FULL`, and `board::BOARD_ALIAS_CHUNK` for the figure
+/// that made the board's document narrower than the probe's.
 pub const MEASURED_DETAIL_CHUNK_COST: u64 = 1;
 
 /// What one scope load spent.

@@ -248,6 +248,8 @@ pub fn run() {
             commands::get_merged_detail,
             commands::stats_count,
             commands::stats_tree,
+            commands::stats_board,
+            commands::stats_series,
             commands::get_auth_state,
             remote::pairing::issue_pairing_token,
             remote::pairing::respond_to_pairing,
