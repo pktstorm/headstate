@@ -227,19 +227,56 @@ describe("UpdateWizard", () => {
     fireEvent.click(screen.getByRole("button", { name: /^apply/i }));
 
     await waitFor(() => expect(applyFn).toHaveBeenCalledTimes(1));
-    // `undefined` for the branch: the field was left at its derived
-    // value, so the backend derives it too rather than being handed a
-    // string the user never chose.
+    // The DERIVED name is sent, not `undefined` (#797).
+    //
+    // `undefined` used to be right: the name was a pure function of the
+    // package list, so the backend deriving its own produced the same
+    // string. The name now ends in a UTC timestamp, and two clock reads a
+    // second apart give two different names -- so the wizard must send
+    // what it showed, or the field names one branch and the run creates
+    // another.
     expect(applyFn).toHaveBeenCalledWith(
       "/code/app",
       // `project: ""` is the repository root, which is what a row
       // carrying no project means and what every request meant before
       // the field existed.
       [{ name: "lodash", version: "2.0.0", ecosystem: "npm", project: "" }],
-      undefined,
+      expect.stringMatching(/^headstate\/npm-deps-\d{8}-\d{6}$/),
     );
     // Closed on click, not on completion.
     expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  /// The invariant the timestamp created: whatever the field SHOWS is
+  /// what the run USES. Asserted by reading the field and comparing it to
+  /// the argument rather than by matching a pattern twice -- a pattern
+  /// would pass on two different names that happen to share a shape,
+  /// which is exactly the failure mode.
+  it("sends the very name the field was showing", async () => {
+    show([pkg("lodash")]);
+    fireEvent.click(screen.getByRole("checkbox"));
+    const shown = (screen.getByLabelText(/branch/i) as HTMLInputElement).value;
+    fireEvent.click(screen.getByRole("button", { name: /^apply/i }));
+
+    await waitFor(() => expect(applyFn).toHaveBeenCalledTimes(1));
+    expect(applyFn.mock.calls[0][2]).toBe(shown);
+  });
+
+  /// Two runs in one repository must not collide, which is the part of
+  /// #797 that broke a real workflow: the old name keyed on the PACKAGE
+  /// COUNT, and `create_worktree` refuses a branch that already exists --
+  /// so the second 153-package Poetry run in enc-api failed outright.
+  ///
+  /// A mixed selection also names no ecosystem, so this doubles as the
+  /// check that such a name is still a valid ref rather than
+  /// `headstate/-deps-…`.
+  it("names a mixed selection without a stray dash", async () => {
+    const crate: Outdated = { ...pkg("serde"), ecosystem: "cargo" };
+    show([pkg("lodash"), crate]);
+    for (const box of screen.getAllByRole("checkbox")) fireEvent.click(box);
+    const field = screen.getByLabelText(/branch/i) as HTMLInputElement;
+    await waitFor(() => expect(field.value).toMatch(/^headstate\/deps-\d{8}-\d{6}$/));
+    expect(screen.queryByText(/cannot start with/i)).toBeNull();
   });
 
   it("says the run has started rather than closing silently", async () => {
@@ -273,11 +310,33 @@ describe("UpdateWizard", () => {
   /// #409: "Branch name auto-populates and stays overridable" -- the
   /// last line of that issue's scope, and the reason it stayed open
   /// after both phases shipped.
+  ///
+  /// The name says the ECOSYSTEM and a UTC stamp since #797, not the
+  /// package. Matched as a pattern because the stamp is the current time;
+  /// the exact strings are pinned at a fixed instant in
+  /// `src/lib/branchName.test.ts`, against the Rust assertions.
   it("auto-populates the branch name from the selection", async () => {
     show([pkg("lodash")]);
     fireEvent.click(screen.getByRole("checkbox"));
     const field = screen.getByLabelText(/branch/i) as HTMLInputElement;
-    await waitFor(() => expect(field.value).toBe("headstate/update-lodash"));
+    await waitFor(() =>
+      expect(field.value).toMatch(/^headstate\/npm-deps-\d{8}-\d{6}$/),
+    );
+  });
+
+  /// The stamp is frozen when the dialog OPENS, not read per render.
+  /// Otherwise it ticks under the cursor in a field the user may be about
+  /// to edit, and every unrelated keystroke moves it.
+  it("holds the stamp steady while the selection changes", async () => {
+    const crate: Outdated = { ...pkg("serde"), ecosystem: "npm" };
+    show([pkg("lodash"), crate]);
+    const boxes = screen.getAllByRole("checkbox");
+    fireEvent.click(boxes[0]);
+    const field = screen.getByLabelText(/branch/i) as HTMLInputElement;
+    await waitFor(() => expect(field.value).toMatch(/^headstate\/npm-deps-/));
+    const first = field.value;
+    fireEvent.click(boxes[1]);
+    expect(field.value).toBe(first);
   });
 
   it("sends an edited branch name instead of the derived one", async () => {
