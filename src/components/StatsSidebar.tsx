@@ -9,6 +9,7 @@ import {
 import { type View, useActiveFilters, useFilters } from "@/store/filters";
 import { ViewSwitcher } from "@/components/ViewSwitcher";
 import { useStatsTree } from "@/api/hooks";
+import type { Filters } from "@/lib/derive";
 import type { MemberRow, OrgTree, RepoRow } from "@/types/pr";
 
 /// The PR Stats sidebar: the organisations, repositories and people a stats
@@ -86,11 +87,7 @@ export function StatsSidebar({
   const toggle = (login: string) =>
     setOpen((o) => ({ ...o, [login]: !o[login] }));
 
-  const selected = (
-    kind: NonNullable<ReturnType<typeof useActiveFilters>>["statsScopeKind"],
-    value: string | undefined,
-    subject: string | undefined,
-  ) =>
+  const selected: IsSelected = (kind, value, subject) =>
     filters.statsScopeKind === kind &&
     filters.statsScopeValue === value &&
     filters.statsSubject === subject;
@@ -244,6 +241,30 @@ function Row({
   );
 }
 
+/// Which scope a row selects, as the store spells it.
+///
+/// One alias shared by every level of the tree, rather than each child
+/// narrowing to the kinds it happens to emit. Narrow signatures read as
+/// tighter typing but force the parent's wider function through an `as` cast
+/// at each boundary -- and a cast in the selection path is precisely where a
+/// genuine kind/value mismatch would hide, since that is the one place the
+/// compiler has been told to stop checking.
+type ScopeKind = NonNullable<Filters["statsScopeKind"]>;
+
+/// Whether a row is the current selection.
+type IsSelected = (
+  kind: ScopeKind,
+  value: string | undefined,
+  subject: string | undefined,
+) => boolean;
+
+/// Select a row: a scope, and a person within it when the row names one.
+type OnSelect = (
+  kind: ScopeKind,
+  value: string | undefined,
+  subject: string | undefined,
+) => void;
+
 /// How many repository rows render before the rest go behind "Show all".
 ///
 /// # The list-length decision, made deliberately (#825 asks for it)
@@ -289,8 +310,8 @@ function RepoList({
   /// What GitHub says the true count is, which may exceed `repos.length`.
   total: number;
   depth: number;
-  selected: (kind: "repo", value: string, subject: undefined) => boolean;
-  onSelect: (kind: "repo", value: string, subject: undefined) => void;
+  selected: IsSelected;
+  onSelect: OnSelect;
 }) {
   const [expanded, setExpanded] = useState(false);
   const shown = expanded ? repos : repos.slice(0, REPO_PREVIEW);
@@ -368,16 +389,8 @@ function OrgSection({
   org: OrgTree;
   open: boolean;
   onToggle: () => void;
-  selected: (
-    kind: "org" | "repo",
-    value: string | undefined,
-    subject: string | undefined,
-  ) => boolean;
-  onSelect: (
-    kind: "org" | "repo",
-    value: string | undefined,
-    subject: string | undefined,
-  ) => void;
+  selected: IsSelected;
+  onSelect: OnSelect;
 }) {
   return (
     <>
@@ -432,12 +445,8 @@ function OrgSection({
               repos={org.repos}
               total={org.reposTotal}
               depth={2}
-              selected={
-                selected as (k: "repo", v: string, s: undefined) => boolean
-              }
-              onSelect={
-                onSelect as (k: "repo", v: string, s: undefined) => void
-              }
+              selected={selected}
+              onSelect={onSelect}
             />
 
             <Heading>Members</Heading>
