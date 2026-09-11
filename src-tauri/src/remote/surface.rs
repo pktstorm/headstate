@@ -193,6 +193,32 @@ pub const SURFACE: &[(&str, Class)] = &[
     // its gate re-classifies the worktree from scratch, so unlocking
     // buys a phone no shortcut to deleting anything.
     ("unlock_worktree", Class::Write),
+    // Clears a repository's stale worktree registrations (#793). Write,
+    // not Destructive, and the line is the one this table draws
+    // everywhere else: nothing recoverable is deleted.
+    //
+    // `git worktree prune` removes entries under `.git/worktrees/` whose
+    // directory is ALREADY gone -- git itself reports them as "gitdir
+    // file points to non-existent location". So there is no tree to lose
+    // work from, no file leaves the disk, no branch is touched and no
+    // commit becomes unreachable. It is strictly less destructive than
+    // `unlock_worktree` above, which at least removes a guard; the worst
+    // case here is that it does nothing, which is also a legitimate
+    // result it reports as 0.
+    //
+    // Deliberately NOT Destructive, even though the name reads like
+    // `docker_prune_cache` which IS. That one deletes build cache a
+    // later build would otherwise reuse -- real bytes, real rebuild
+    // cost. This deletes a dangling pointer. Routing it through the
+    // step-up signature would tell the phone's user they are about to
+    // destroy something, and spending that prompt on bookkeeping is how
+    // it stops being read on the removals that matter.
+    //
+    // Removal is unaffected: `remove_worktree` and
+    // `remove_worktree_forced` stay Destructive, and pruning buys a
+    // phone no shortcut to either -- a registration it clears had no
+    // directory for them to act on.
+    ("prune_worktrees", Class::Write),
     // destructive: deletes files, branches, images, or volumes.
     ("delete_head_branch", Class::Destructive),
     ("delete_branches", Class::Destructive),
@@ -587,6 +613,12 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "unlock_worktree" => {
             res(commands::unlock_worktree(a.get("repoPath")?, a.get("worktreePath")?).await)
         }
+        // Beside the other worktree arms rather than up in the write
+        // block, because the repository-path argument and the
+        // re-classify-afterwards contract are what it shares -- it is
+        // `Class::Write` and carries no step-up signature. Takes no
+        // worktree path: `git worktree prune` is repo-wide.
+        "prune_worktrees" => res(commands::prune_worktrees(a.get("repoPath")?).await),
         "remove_artifacts" => res(commands::remove_artifacts(app.clone(), a.get("paths")?).await),
         "remove_venvs" => res(commands::remove_venvs(app.clone(), a.get("paths")?).await),
         "remove_orphan" => res(commands::remove_orphan(a.get("path")?).await),
