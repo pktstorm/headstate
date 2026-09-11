@@ -112,7 +112,7 @@ const EMPTY = {
   docker: {},
   artifacts: {},
   packages: {},
-  "claude-md": {}, "system-health": {},
+  "claude-md": {}, "pr-stats": {}, "system-health": {},
 };
 
 beforeEach(() => {
@@ -138,7 +138,12 @@ describe("App shell on the desktop", () => {
     renderApp();
     const nav = screen.getByRole("navigation");
     expect(within(nav).getByText("All repositories")).toBeTruthy();
-    expect(within(nav).getByText("Stats")).toBeTruthy();
+    // "PR Stats" is inside the view switcher's menu now, not pinned to
+    // the column (#794), so it is not in the DOM until the menu opens.
+    // What this test is about is the SHELL -- inline sidebar, no menu
+    // button, no banner -- so it checks the switcher is present and
+    // leaves what the menu holds to `ViewSwitcher`'s own tests.
+    expect(within(nav).getByRole("button", { name: /my pull requests/i })).toBeTruthy();
     expect(screen.queryByRole("button", { name: /open navigation/i })).toBeNull();
     expect(screen.queryByText(/octocat's laptop/)).toBeNull();
   });
@@ -235,26 +240,50 @@ describe("Stats on the companion build", () => {
     vi.unstubAllEnvs();
   });
 
-  it("offers no Stats entry", async () => {
+  /// The deliberate mobile classification from #794: PR Stats stays off
+  /// the phone. It was never offered there, and promoting it from `panel`
+  /// to `View` is a move between desktop surfaces, not a decision to ship
+  /// it. `MOBILE_HIDDEN_VIEWS` is where that is recorded; this asserts
+  /// the switcher honours it.
+  it("offers no PR Stats entry in the view switcher", async () => {
     stubViewport(390);
     await renderMobileApp();
     fireEvent.click(screen.getByRole("button", { name: /open navigation/i }));
     await waitFor(() => expect(screen.getByRole("navigation")).toBeTruthy());
-    expect(within(screen.getByRole("navigation")).queryByText("Stats")).toBeNull();
+    const nav = within(screen.getByRole("navigation"));
+    // Open the switcher: the entry must be absent from the MENU, not
+    // merely absent from a collapsed control that lists one view.
+    fireEvent.click(nav.getByRole("button", { name: /my pull requests/i }));
+    expect(nav.queryByText("PR Stats")).toBeNull();
+    // A view the phone DOES have, so this proves the menu rendered.
+    expect(nav.getByRole("menuitem", { name: /worktrees/i })).toBeTruthy();
   });
 
-  it("shows the list rather than Stats even when Stats was the last panel", async () => {
-    // The panel persists across launches, and a desktop that closed on
-    // Stats must not open a companion on a page it does not have.
-    useFilters.setState({ panel: "stats" } as never);
+  it("shows the list rather than PR Stats even when that was the stored view", async () => {
+    // `view` persists across launches exactly as `panel` did, so a
+    // desktop that closed on PR Stats must not open a companion on a page
+    // it does not have -- and with the entry hidden there would be no
+    // switcher row to leave it by.
+    useFilters.setState({ view: "pr-stats" } as never);
     stubViewport(390);
     await renderMobileApp();
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Pull requests");
     expect(screen.getByText(/^\d+ Open$/)).toBeTruthy();
   });
 
-  it("keeps Stats on a narrow DESKTOP window", async () => {
-    // The case the viewport guard got wrong.
+  /// The stored value is NOT corrected, only declined. The phone and the
+  /// desktop can share a persisted store, so writing "my-prs" back would
+  /// silently move the desktop off PR Stats too.
+  it("leaves the stored view alone rather than rewriting it", async () => {
+    useFilters.setState({ view: "pr-stats" } as never);
+    stubViewport(390);
+    await renderMobileApp();
+    expect(useFilters.getState().view).toBe("pr-stats");
+  });
+
+  it("keeps PR Stats on a narrow DESKTOP window", async () => {
+    // The case the viewport guard got wrong (#598): a desktop dragged
+    // under 768px still has every page a desktop has.
     vi.stubEnv("VITE_TARGET", "desktop");
     vi.resetModules();
     const { default: DesktopApp } = await import("./App");
@@ -267,7 +296,9 @@ describe("Stats on the companion build", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: /open navigation/i }));
     await waitFor(() => expect(screen.getByRole("navigation")).toBeTruthy());
-    expect(within(screen.getByRole("navigation")).getByText("Stats")).toBeTruthy();
+    const nav = within(screen.getByRole("navigation"));
+    fireEvent.click(nav.getByRole("button", { name: /my pull requests/i }));
+    expect(nav.getByRole("menuitem", { name: /pr stats/i })).toBeTruthy();
   });
 });
 

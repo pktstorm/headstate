@@ -159,9 +159,11 @@ with admin access on that repository.
 nobody else — real merge conflicts or failing CI — so the thing you need to
 fix first doesn't get lost in a longer list. Quiet when nothing is blocked.
 
-**Stats.** A history view behind the "Stats" button pinned to the bottom of
-the sidebar, answering what the open-PR list cannot: how much is actually
-getting done, and whether that is improving.
+**PR Stats.** A history view, chosen from the view menu at the top of the
+sidebar, answering what the open-PR list cannot: how much is actually getting
+done, and whether that is improving. Whole-account: the repository rows
+beside it do not narrow it. Desktop only — the companion app does not offer
+it.
 
 - **Four headline figures** — merged and opened this week, merged this
   month, and median cycle time — each with its change against the previous

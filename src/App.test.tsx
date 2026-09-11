@@ -110,7 +110,7 @@ function renderApp() {
 describe("App — priorities strip scoping", () => {
   afterEach(() => {
     useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "system-health": {} }, view: "my-prs", panel: "list" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} }, view: "my-prs", panel: "list" } as never);
     vi.clearAllMocks();
   });
 
@@ -131,7 +131,7 @@ describe("App — priorities strip scoping", () => {
     mockPrs.mockReturnValue([here, elsewhere]);
 
     useFilters.setState({ filtersByView: { "my-prs": { repo: "octocat/hello-world" }, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "system-health": {} }, view: "my-prs", panel: "list" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} }, view: "my-prs", panel: "list" } as never);
     renderApp();
 
     // Scope to the strip: the selected repo's PR also appears in the list
@@ -167,7 +167,7 @@ describe("App — priorities strip scoping", () => {
     ]);
 
     useFilters.setState({ filtersByView: { "my-prs": { repo: "octocat/hello-world" }, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "system-health": {} }, view: "my-prs", panel: "list" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} }, view: "my-prs", panel: "list" } as never);
     renderApp();
 
     // One pull request in scope, so the denominator is 1 -- not 3.
@@ -188,17 +188,21 @@ describe("App — priorities strip scoping", () => {
     mockPrs.mockReturnValue([here, elsewhere]);
 
     useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "system-health": {} }, view: "my-prs", panel: "list" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} }, view: "my-prs", panel: "list" } as never);
     renderApp();
 
     expect(screen.getByText(/Needs your attention \(2\)/)).toBeDefined();
   });
 
-  /// Stats is a read-only summary, not a triage surface -- the strip
+  /// PR Stats is a read-only summary, not a triage surface -- the strip
   /// belongs beside the list it acts on. Asserting the strip is ABSENT
   /// rather than just that cards render: an extra panel above the cards
   /// would still pass a cards-are-present check.
-  it("shows no priorities strip on the stats view", () => {
+  ///
+  /// Set through `view` since #794, not `panel`. The page is routed on
+  /// one axis now, and a test that still set the old panel value would
+  /// render the PR list and pass for the wrong reason.
+  it("shows no priorities strip on the PR Stats view", () => {
     const blocked = prWithState("failure", "mergeable", "none", {
       number: 101,
       repo: "octocat/hello-world",
@@ -207,7 +211,7 @@ describe("App — priorities strip scoping", () => {
     mockPrs.mockReturnValue([blocked]);
 
     useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "system-health": {} }, view: "my-prs", panel: "stats" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} }, view: "pr-stats", panel: "list" } as never);
     renderApp();
 
     expect(screen.queryByText(/Needs your attention/)).toBeNull();
@@ -229,7 +233,7 @@ describe("App — priorities strip scoping", () => {
     mockPrs.mockReturnValue([blocked, ...PR_FIXTURES]);
 
     useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "system-health": {} }, view: "my-prs", panel: "list" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} }, view: "my-prs", panel: "list" } as never);
     renderApp();
 
     const strip = screen.getByText(/Needs your attention/).closest("section");
@@ -309,7 +313,7 @@ describe("opening a pull request from To review", () => {
       panel: "list",
       selectedPr: null,
       filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "system-health": {} },
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} },
     });
   });
 
@@ -351,7 +355,7 @@ describe("an incomplete refresh", () => {
       panel: "list",
       selectedPr: null,
       filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "system-health": {} },
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} },
     });
   });
 

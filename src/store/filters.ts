@@ -25,10 +25,39 @@ export const ALL_VIEWS = [
   "artifacts",
   "packages",
   "claude-md",
+  // Promoted out of `panel` in #794. It was a sub-page of My PRs,
+  // pinned to the sidebar's bottom; it is now a peer view reached from
+  // the switcher. Placed before `system-health` because it is still
+  // about the user's pull requests, and that entry is deliberately last
+  // as the only one that is not.
+  "pr-stats",
   "system-health",
 ] as const;
 
 export type View = (typeof ALL_VIEWS)[number];
+
+/// Views the mobile companion does not offer, whatever is persisted.
+///
+/// A BUILD-time set, not a viewport one, for the reason `lib/target.ts`
+/// gives: "the companion does not offer this" is a statement about which
+/// app this is, and hiding by width takes a page away from a desktop
+/// user who dragged their window narrow.
+///
+/// Why this exists at all: until #794, Stats was a `panel` value, and
+/// `App.tsx` kept it off the phone by downgrading a stored
+/// `panel === "stats"` to `"list"` on every render. Promoting it to a
+/// `View` makes that downgrade dead code -- a persisted `view` is read by
+/// the switcher, the header and the body route, and patching one of them
+/// leaves the other two offering a page the phone cannot show. One set,
+/// read everywhere a view is offered or routed.
+///
+/// `pr-stats` is the only member, and the classification is deliberate
+/// rather than inherited: Stats has never been offered on the phone, the
+/// companion's first release scoped it out, and #794 moves it between
+/// desktop surfaces without changing that. The local-machine views stay
+/// on mobile (that is the companion's whole purpose) -- this is not a
+/// precedent for hiding them.
+export const MOBILE_HIDDEN_VIEWS: ReadonlySet<View> = new Set<View>(["pr-stats"]);
 
 /// The System Health sub-pages, in sidebar order (#687).
 ///
@@ -75,18 +104,19 @@ interface FilterStore {
   /// Worktrees, which has an entirely different repo list.
   filtersByView: Record<View, Filters>;
   view: View;
-  /// Within My PRs: the list, or the stats page. Stats is a property of
-  /// that view rather than a fourth peer, so it stays pinned in the
-  /// sidebar rather than joining the switcher. Inlined rather than an
-  /// exported type, since nothing imports the name.
-  /// The sub-page within a view: the PR list versus Stats, and images
-  /// versus builds inside Docker. A separate axis from `view` for the
-  /// same reason it always was.
-  panel: "list" | "stats" | "builds";
+  /// The sub-page within a view: images versus builds inside Docker. A
+  /// separate axis from `view` for the same reason it always was.
+  ///
+  /// `"stats"` is GONE as of #794 -- Stats is the `pr-stats` view now,
+  /// not a sub-page of My PRs. Dropping the value rather than keeping it
+  /// unused is the point: a value still in the union is one a component
+  /// can set, and a `panel` nobody routes on would be a silent no-op.
+  /// The v3 migration below rewrites a persisted `"stats"`.
+  panel: "list" | "builds";
   setFilter: <K extends keyof Filters>(key: K, value: Filters[K]) => void;
   applyPreset: (filters: Filters) => void;
   setView: (view: View) => void;
-  setPanel: (panel: "list" | "stats" | "builds") => void;
+  setPanel: (panel: "list" | "builds") => void;
   /// Which System Health page is open (#687).
   ///
   /// Deliberately NOT persisted, unlike `view` and `panel`. Those
@@ -149,6 +179,12 @@ const EMPTY_FILTERS: Record<View, Filters> = {
   artifacts: {},
   packages: {},
   "claude-md": {},
+  // PR Stats keeps the repo sidebar (#794), so a repo clicked there
+  // writes here -- and `useActiveFilters` reads `[view]` on every render
+  // whether or not the page consults the result. `StatsPage` does not
+  // consult it yet; the entry is still mandatory, because a missing key
+  // is the undefined-crash this record exists to prevent.
+  "pr-stats": {},
   // System Health has an entry like every other view even though it
   // has no filters to hold. `filtersByView` must be TOTAL over `View`
   // -- `useActiveFilters` reads `[view]` and every consumer reads
@@ -269,24 +305,70 @@ export const useFilters = create<FilterStore>()(
       // conflating view with panel -- rehydrates straight into the new
       // shape, leaving `filtersByView` undefined and crashing on first
       // render. Tests never caught it because they always start empty.
-      version: 2,
+      //
+      // v3 (#794): Stats stopped being a `panel` value and became the
+      // `pr-stats` VIEW. A store written by v2 can hold
+      // `panel: "stats"`, which now routes nowhere -- such a user would
+      // land on the PR list with no sign their Stats page had moved.
+      version: 3,
       migrate: (persisted: unknown, from: number) => {
-        if (from >= 2) return persisted as never;
-        // v1 -> v2: lift the single filter set into the active view, and
-        // split `view` into view + panel. An unrecognised value falls back
-        // to the defaults rather than propagating a bad state.
-        const old = (persisted ?? {}) as {
-          filters?: Filters;
-          view?: string;
-        };
-        const view: View =
-          old.view === "reviewing" ? "to-review" : "my-prs";
-        const panel: "list" | "stats" = old.view === "dashboard" ? "stats" : "list";
-        return {
-          filtersByView: { ...EMPTY_FILTERS, [view]: old.filters ?? {} },
-          view,
-          panel,
-        } as never;
+        // Run in ORDER and fall through, rather than one branch per
+        // starting version. A v1 store that sat unopened across both
+        // changes has to go v1 -> v2 -> v3; a chain of
+        // `if (from === n)` arms would apply one and skip the other,
+        // which is exactly the black-window class of bug the comment
+        // below this is about.
+        let state = persisted ?? {};
+        if (from < 2) {
+          // v1 -> v2: lift the single filter set into the active view,
+          // and split `view` into view + panel. An unrecognised value
+          // falls back to the defaults rather than propagating a bad
+          // state.
+          const old = state as { filters?: Filters; view?: string };
+          // "dashboard" was v1's name for the stats page. v2 mapped it
+          // onto `panel: "stats"`; since #794 the destination is the
+          // view itself, so the hop through `panel` is gone and this
+          // lands where v3 would have put it anyway.
+          const view: View =
+            old.view === "dashboard"
+              ? "pr-stats"
+              : old.view === "reviewing"
+                ? "to-review"
+                : "my-prs";
+          state = {
+            // The old flat filters belong to the view they were
+            // filtering. "dashboard" had none of its own -- it showed
+            // the whole account -- but `pr-stats` keeps the repo
+            // sidebar, so carrying them there is what the user had.
+            filtersByView: { ...EMPTY_FILTERS, [view]: old.filters ?? {} },
+            view,
+            panel: "list",
+          };
+        }
+        if (from < 3) {
+          // v2 -> v3: a stored `panel: "stats"` meant "My PRs, showing
+          // the stats page". That destination is now a view, so move
+          // the user THERE and reset `panel` to the only value My PRs
+          // and Docker still share. Left as "stats" it would be a value
+          // no route reads, and the user would silently lose the page
+          // they closed the app on.
+          const old = state as { panel?: string; view?: string };
+          if (old.panel === "stats") {
+            state = {
+              ...old,
+              // Only from My PRs. `panel` is shared with Docker, and a
+              // Docker user cannot have set "stats" -- but a store hand-
+              // edited or written by a build mid-rename could, and
+              // teleporting someone off Docker would be worse than
+              // dropping a value that was never reachable there.
+              ...(old.view === "my-prs" || old.view === undefined
+                ? { view: "pr-stats" }
+                : {}),
+              panel: "list",
+            };
+          }
+        }
+        return state as never;
       },
       // Stored state is REPLACED into the store, not merged, so adding a
       // view to the `View` union silently breaks every existing install:
