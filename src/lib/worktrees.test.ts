@@ -184,13 +184,25 @@ describe("safetyReason", () => {
 
   // #753: this used to read "could not determine: directory is
   // missing" -- true, but it names neither the cause nor the cure for
-  // something one safe command fixes.
-  it("explains a stale registration rather than hedging", () => {
+  // something one safe command fixes. #814 then reordered it: naming the
+  // cure is not enough while the sentence still OPENS with a loss.
+  it("leads a stale registration with the reassurance, not the problem", () => {
     const stale = safetyReason({
       kind: "prunable",
       detail: "gitdir file points to non-existent location",
     });
-    expect(stale).toContain("prunable");
+    // THE ORDER is the issue. Asserted as a prefix rather than a
+    // `contains`, because "directory is gone — nothing to lose" would
+    // pass a containment check while being the exact sentence #814
+    // objects to: the answer has to arrive before the problem.
+    expect(stale.startsWith("nothing to lose")).toBe(true);
+    // The remedy survives, named as a VERB the user can act on rather
+    // than as the adjective "prunable" -- git vocabulary was half of what
+    // made the row read as a warning.
+    expect(stale).toContain("prune to clear");
+    // And git's own reason is still carried: #814 asked for a reordering,
+    // not for evidence to be dropped.
+    expect(stale).toContain("non-existent location");
     expect(stale).not.toContain("could not determine");
   });
 

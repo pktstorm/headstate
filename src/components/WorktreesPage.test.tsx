@@ -2143,6 +2143,11 @@ describe("WorktreesPage", () => {
     /// A prunable worktree is not disk to reclaim -- the directory is
     /// already gone -- so reporting it as "safe to remove" would claim
     /// recoverable space that does not exist.
+    ///
+    /// Still a separate count after #814, and still its own number: what
+    /// that issue changed is that the two now read as PEERS rather than as
+    /// a figure and a caveat on it. Hence "to clear", and the colour
+    /// assertion in the test below.
     it("counts stale registrations separately from safe ones", () => {
       state.classified = [
         wt({ path: "/code/a", safety: { kind: "safe" } }),
@@ -2154,7 +2159,58 @@ describe("WorktreesPage", () => {
       // The exact string, anchored: the Prune BUTTON also says "2 stale
       // registrations", and this assertion is about the count being its
       // own fact on the line rather than only a label on an action.
-      expect(screen.getByText("2 stale registrations")).toBeTruthy();
+      expect(screen.getByText("2 stale registrations to clear")).toBeTruthy();
+    });
+
+    /// The two counts read as PEERS (#814).
+    ///
+    /// The issue was filed twice, and this is why: a green "N safe to
+    /// remove" beside a grey "N stale registrations" invites reading the
+    /// second as a warning, or as something the green count had declined
+    /// to vouch for. Both are clearable and only the verb differs, so the
+    /// shade must not be what carries the difference.
+    ///
+    /// Asserted on the COLOUR, because that is what the user reads before
+    /// any of the words. Grey is the specific regression: it is the tone
+    /// this page uses for "nothing to act on", which is the opposite of
+    /// the truth about a row one button clears.
+    ///
+    /// NOT a claim that Remove works on these rows. `isSafe` still
+    /// excludes `prunable`, the per-row button stays disabled, and the
+    /// separate button names the separate verb -- all of which #814 says
+    /// explicitly should not change.
+    it("shows the stale count in the same tone as the safe count", () => {
+      state.classified = [
+        wt({ path: "/code/a", safety: { kind: "safe" } }),
+        prunableWt("/code/b"),
+      ];
+      render(<WorktreesPage />);
+      const stale = screen.getByText("1 stale registration to clear");
+      expect(stale.className).toContain("3fb950");
+      expect(screen.getByText(/1 safe to remove/i).className).toContain("3fb950");
+      // The regression, named: grey is this page's "nothing to act on".
+      expect(stale.className).not.toContain("8b949e");
+    });
+
+    /// The row must not be the only place the reassurance lives, and the
+    /// tooltip must not be a second copy of the row (#814).
+    ///
+    /// Before this, the row read "directory is gone — prunable (...)" and
+    /// the tooltip opened by repeating that whole sentence before adding
+    /// the remedy. The reassurance is now on the row itself, so the
+    /// tooltip carries only what the row cannot say: which affordance to
+    /// use, and why it is not on this row.
+    it("says the safe part on the row, not only in a tooltip", () => {
+      state.classified = [prunableWt("/code/b")];
+      render(<WorktreesPage />);
+      // On the ROW, leading.
+      expect(screen.getByText(/^nothing to lose/)).toBeTruthy();
+      const remove = screen.getByRole("button", { name: /^remove$/i });
+      const tip = remove.getAttribute("title") ?? "";
+      // The remedy is named...
+      expect(tip).toContain("Prune stale registrations");
+      // ...without restating the row's own verdict back at the user.
+      expect(tip).not.toContain("nothing to lose");
     });
 
     /// One affordance over the repository, because `git worktree prune`

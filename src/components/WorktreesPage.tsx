@@ -429,11 +429,21 @@ function Row({
                   // disabled -- there is no directory to remove -- and
                   // the tooltip restating "directory is gone — prunable"
                   // told the user a diagnosis they had already read on
-                  // the row, with no remedy. Now it names the header
+                  // the row, with no remedy. So it names the header
                   // affordance, and says why the action is not here: the
                   // verb is repository-wide.
+                  //
+                  // It no longer PREFIXES `safetyReason` (#814). It used
+                  // to, because the row's own text led with the problem
+                  // and the reassurance had to be smuggled in here --
+                  // "nothing can be lost" was a tooltip fact. The row now
+                  // opens with "nothing to lose", so repeating it would
+                  // make the tooltip a second copy of the line it hangs
+                  // off. What is left is the only thing the row cannot say
+                  // for itself: which affordance to use, and why it is not
+                  // on this row.
                   wt.safety.kind === "prunable"
-                  ? `${safetyReason(wt.safety)} — there is nothing to remove. Use “Prune stale registrations” above the list; git prunes a whole repository at once.`
+                  ? "Nothing to remove — the directory is already gone. Use “Prune stale registrations” above the list; git prunes a whole repository at once."
                   : safetyReason(wt.safety)
           }
           className={`shrink-0 rounded border px-2 py-0.5 text-xs ${
@@ -1420,20 +1430,35 @@ export function WorktreesPage() {
             <HelpButton topic="worktree-safety" />
           </span>
         )}
-        {/* A SECOND count, in its own words and its own colour (#793).
+        {/* A SECOND count, still in its own words and its own number
+            (#793) -- but no longer in its own colour (#814).
 
             "12 stale registrations" is not a subset of "safe to remove"
             and must not read as one: there is no directory behind these,
             so they are not disk to reclaim and the Remove button is
-            rightly disabled on them. Grey, matching the rows' own tone,
-            because nothing here is at risk and nothing is being asked of
-            the user's judgement.
+            rightly disabled on them. That part of #793 stands, and so does
+            the separate count.
+
+            What changed is the COLOUR. Grey beside a green "N safe to
+            remove" made the second number read as a caveat on the first --
+            a warning, or a leftover the green count had declined to
+            vouch for. Both are clearable and only the verb differs, so the
+            shade must not be what carries the difference; the word
+            "clear" does instead. The issue was filed twice, which is the
+            signal that a correct distinction had become an invisible one.
+
+            Green does NOT claim Remove works here. It means "nothing is
+            stopping you getting rid of this", which is as true of a
+            dangling registration as of a merged worktree -- more so, since
+            nothing can be lost. The button beside it names the verb, and
+            `isSafe` still excludes the kind, so nothing about the action
+            has widened.
 
             Silent at zero. Most repositories have none, and a permanent
             "0 stale registrations" would be furniture. */}
         {safeKnown && prunableCount > 0 ? (
-          <span className="text-xs text-[#8b949e]">
-            {prunableCount} stale registration{prunableCount === 1 ? "" : "s"}
+          <span className="text-xs text-[#3fb950]">
+            {prunableCount} stale registration{prunableCount === 1 ? "" : "s"} to clear
           </span>
         ) : null}
         {/* The action #793 found missing entirely. `git worktree prune`

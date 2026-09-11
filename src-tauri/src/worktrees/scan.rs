@@ -3910,11 +3910,35 @@ prunable gitdir file points to non-existent location
             "expected Prunable, got {s:?}"
         );
         assert!(!s.is_safe(), "safe-by-default: {}", s.reason());
-        // The remedy, which is the fact the old wording never carried.
-        assert!(s.reason().contains("prunable"), "{}", s.reason());
+        // The REMEDY, which is the fact the old wording never carried.
+        //
+        // Asserted as the verb "prune" rather than as the adjective
+        // "prunable" (#814). The row used to open with "directory is gone
+        // — prunable", leading with a loss and a piece of git vocabulary;
+        // it now opens with the answer and names something to do. Pinning
+        // the jargon was pinning the thing the issue asked to remove, so
+        // the assertion moved to what it was always standing in for.
+        assert!(s.reason().contains("prune"), "{}", s.reason());
+        // LEADS with the reassurance, which is the whole of #814. Asserted
+        // as a PREFIX, because "directory is gone — nothing to lose" would
+        // satisfy a containment check while being the exact sentence the
+        // issue objects to: the answer has to arrive before the problem.
+        assert!(
+            s.reason().starts_with("nothing to lose"),
+            "the safe part comes first: {}",
+            s.reason()
+        );
         assert!(
             !s.reason().contains("could not determine"),
             "it is determined, and git said why: {}",
+            s.reason()
+        );
+        // Git's own reason survives the reordering. It is what git
+        // actually said, and #814 asked for an order change rather than
+        // for evidence to be dropped.
+        assert!(
+            s.reason().contains("non-existent location"),
+            "git's reason is still carried: {}",
             s.reason()
         );
     }

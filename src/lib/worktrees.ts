@@ -39,9 +39,11 @@ export function isSafe(s: Safety): boolean {
   // Its absence makes removal safer rather than riskier. Those rows were
   // `unknown` with no action offered, which is the dead end #819 reports.
   //
-  // `prunable` stays out, deliberately: there is no directory to remove,
-  // so remove is the wrong verb and this allowlist guards directory
-  // deletion. That row is cleared by the header's Prune action instead.
+  // `prunable` stays out, deliberately and per #814: there is no
+  // directory to remove, so remove is the wrong verb, and this allowlist
+  // guards directory deletion. That row is cleared by the header's Prune
+  // action instead -- #814 is a fix to how it READS, not to what it
+  // permits.
   return (
     s.kind === "safe" ||
     s.kind === "merged_upstream_deleted" ||
@@ -272,11 +274,28 @@ export function safetyReason(s: Safety): string {
       // reason still follows, unrewritten -- demoted, not dropped.
       return lockReason(s.detail);
     case "prunable":
-      // Says the remedy. Unlike the other refusals there IS one, it is
-      // safe, and it is one command -- where the old wording for this
-      // state, "could not determine: directory is missing", named
-      // neither the cause nor the cure.
-      return `directory is gone — prunable (${s.detail})`;
+      // THE SAFE PART FIRST, then the mechanism (#814).
+      //
+      // #753 gave this row "directory is gone — prunable (<reason>)",
+      // which beat "could not determine: directory is missing" by naming
+      // a remedy where the old wording named neither cause nor cure, and
+      // #793 shipped that remedy as a button. What both left is the
+      // READING: the row still opened with a loss and a piece of git
+      // vocabulary, while the reassurance that nothing can be lost lived
+      // only in a tooltip. The issue was filed twice, which is the signal
+      // -- the page answered "can I clear this?" with a vocabulary lesson
+      // instead of a yes.
+      //
+      // So the order is inverted. "Nothing to lose" is the answer, the
+      // missing directory is why, and git's own reason stays in
+      // parentheses because it is what git actually said.
+      //
+      // The VERB is still prune, not remove, and `isSafe` still excludes
+      // this kind. That distinction is right -- there is no directory to
+      // remove, and `git worktree prune` is repo-wide -- and #814 is
+      // explicit that it is not asking for the allowlist to widen. It
+      // asks that being correct stop reading as a warning.
+      return `nothing to lose — its directory is already gone, prune to clear (${s.detail})`;
     case "pending":
       return "checking…";
     case "orphaned":

@@ -485,11 +485,34 @@ impl Safety {
                 }
                 s
             }
-            // Says the remedy, because unlike every other refusal here
-            // there is one, it is safe, and it is one command. The old
-            // wording for this state was "could not determine:
-            // directory is missing", which named neither.
-            Safety::Prunable(why) => format!("directory is gone — prunable ({why})"),
+            // THE SAFE PART FIRST, then the mechanism (#814).
+            //
+            // #753 gave this row "directory is gone — prunable
+            // (<git's reason>)", a large improvement on "could not
+            // determine: directory is missing" -- it named a remedy where
+            // the old wording named neither cause nor cure -- and #793
+            // shipped that remedy as a button. What both left is the
+            // READING: the row still opened with a loss ("directory is
+            // gone") and a piece of git vocabulary ("prunable"), while the
+            // reassurance that nothing can be lost lived only in a
+            // tooltip. The issue was filed twice, which is the signal --
+            // the page was answering "can I clear this?" with a
+            // vocabulary lesson instead of a yes.
+            //
+            // So the order is inverted. "Nothing to lose" is the answer,
+            // the missing directory is why, and git's own reason stays in
+            // parentheses because it is what git actually said and
+            // occasionally differs.
+            //
+            // The VERB is still prune, not remove, and `is_safe` still
+            // excludes this state. That distinction is correct -- there is
+            // no directory to remove, and `git worktree prune` is
+            // repo-wide rather than per-row -- and #814 is explicit that
+            // it is not asking for the allowlist to widen. What it asks is
+            // that being correct stop reading as a warning.
+            Safety::Prunable(why) => {
+                format!("nothing to lose — its directory is already gone, prune to clear ({why})")
+            }
             Safety::Pending => "checking…".into(),
             // Says what IS known, not what could not be checked. The
             // parent repository is gone, so nothing about this
@@ -637,9 +660,9 @@ mod tests {
             // the back of a copy fix is not what was asked for.
             Safety::Empty,
             Safety::Unmerged,
-            // This allowlist stays strict: there is no directory to
-            // remove, so remove is the wrong verb, and prune is
-            // repo-wide.
+            // #814 is explicit that this allowlist stays strict: there is
+            // no directory to remove, so remove is the wrong verb, and
+            // prune is repo-wide. That issue is about how the row READS.
             Safety::Prunable("gitdir file points to non-existent location".into()),
             Safety::Orphaned,
             Safety::Pending,
