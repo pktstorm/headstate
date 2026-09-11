@@ -63,38 +63,26 @@ vi.mock("./api/hooks", () => ({
   useCommentOnPr: () => () => Promise.resolve(),
   useRerunChecks: () => () => Promise.resolve(),
   useViewer: () => ({ data: undefined }),
-  useCycleTrend: () => ({ data: undefined }),
   // StatsPage owns these; this suite only asserts the shell's layout, so
-  // they return a settled empty result rather than real figures.
-  // Non-zero on purpose: an all-zero account now renders a single
-  // "no merged pull requests yet" message instead of the card grid, and
-  // this suite asserts on a card being present.
-  usePeriods: () => ({
-    data: {
-      week_current: 5,
-      week_previous: 3,
-      opened_week_current: 6,
-      opened_week_previous: 4,
-      month_current: 20,
-      month_previous: 18,
-    },
-    isLoading: false,
-    isError: false,
+  // they return a pending result rather than real figures. #826 replaced the
+  // four `author:@me` hooks this block used to stub (`usePeriods`,
+  // `useHistory`, `useMergedDetail`, `useCycleTrend`) with the scoped trio.
+  //
+  // `scopeIsLoadable` is the REAL one rather than a stub, so the page takes
+  // its no-selection branch here for the same reason it would in the app --
+  // a stub returning true would have this suite rendering a scope page for a
+  // scope that does not exist.
+  scopeIsLoadable: (s: unknown) => !!s,
+  useScopedCounts: () => ({
+    merged: undefined,
+    opened: undefined,
+    pending: 2,
+    failed: 0,
+    error: undefined,
     refetch: () => {},
   }),
-  useHistory: () => ({
-    data: {
-      points: [],
-      week_current: 0,
-      week_previous: 0,
-      opened_week_current: 0,
-      opened_week_previous: 0,
-      month_current: 0,
-      month_previous: 0,
-    },
-    isLoading: false,
-  }),
-  useMergedDetail: () => ({ data: undefined, isLoading: false }),
+  useStatsSeries: () => ({ data: undefined, isError: false, refetch: () => {} }),
+  useStatsBoard: () => ({ data: undefined, isError: false, refetch: () => {} }),
 }));
 
 vi.mock("./components/AuthGate", () => ({
@@ -222,7 +210,13 @@ describe("App — priorities strip scoping", () => {
     expect(screen.queryByText(/Needs your attention/)).toBeNull();
     // The stats content itself still renders, so this is proving the strip
     // is absent from a populated page rather than from a blank one.
-    expect(screen.getByText(/Merged this week/)).toBeDefined();
+    //
+    // The assertion is on the scope prompt rather than on a figure, because
+    // #826's page measures nothing until a scope is clicked and this suite
+    // stubs the hooks as pending. The prompt is what a populated PR Stats
+    // view renders with no selection, and it is still StatsPage's own
+    // content -- which is what makes the absence of the strip meaningful.
+    expect(screen.getByText(/pick something to measure/i)).toBeDefined();
   });
 
   /// A repo selection scopes the strip; a label filter must not. Something

@@ -26,11 +26,10 @@ import {
   getCached,
   actOnPrs,
   updatePrBranch,
-  getHistory,
-  getMergedDetail,
-  getCycleTrend,
-  getPeriods,
   statsTree,
+  statsBoard,
+  statsSeries,
+  statsCount,
   getPollInterval,
   getRemoteEnabled,
   setRemoteEnabled,
@@ -314,19 +313,6 @@ export function usePollError(): string | null {
   }, []);
 
   return useSyncExternalStore(subscribe, getSnapshot);
-}
-
-/// Median cycle time this week against last.
-///
-/// The Stats page could prove throughput but not improvement: cycle time
-/// was a single window with no prior value, which is why its delta card
-/// was hardcoded to null. Same 5-minute staleness as the other stats.
-export function useCycleTrend() {
-  return useQuery({
-    queryKey: ["cycle-trend"],
-    queryFn: getCycleTrend,
-    staleTime: 5 * 60 * 1000,
-  });
 }
 
 /// Whether the poll loop is currently fetching.
@@ -1799,6 +1785,204 @@ export function useStatsTree(enabled: boolean) {
   });
 }
 
+/// A scope selection, as the sidebar writes it and the stats commands read
+/// it (#825 / #826).
+///
+/// Carried as one object rather than three loose arguments because the three
+/// ARE one selection -- `setStatsScope`'s doc comment records why writing
+/// them separately passes through states that are not selections at all.
+/// Keeping them together through the query layer means a hook cannot be
+/// handed a subject with the wrong scope.
+export interface StatsScope {
+  kind: "repo" | "org" | "user" | "all";
+  value: string | undefined;
+  /// The person, or `undefined` for the viewer. Only a Members row sets
+  /// one, and it KEEPS the org scope.
+  subject: string | undefined;
+}
+
+/// Whether a scope is loadable at all.
+///
+/// `all` needs no value; every other kind does. Checked here rather than in
+/// each hook so a half-written selection cannot reach a command and come
+/// back as "scope org needs a value" -- an error message about an internal
+/// contract, shown to a user who only clicked a row.
+export function scopeIsLoadable(scope: StatsScope | undefined): scope is StatsScope {
+  return !!scope && (scope.kind === "all" || !!scope.value);
+}
+
+/// A stable cache key fragment for a scope.
+///
+/// Built from the three fields rather than from the object, because a
+/// TanStack query key is compared structurally and an object literal rebuilt
+/// each render would be a new key on every render. Prefixed per field so
+/// `org:a` and `user:a` cannot collide -- genuinely different questions, and
+/// a board computed for one must never be served for the other. Mirrors the
+/// Rust `Scope::cache_key`'s reasoning at the cache layer that actually
+/// holds the answer.
+///
+/// The subject is part of the key for the series (which narrows to one
+/// person) and deliberately NOT passed to the board (which is about
+/// everyone). Both are below.
+function scopeKey(scope: StatsScope): string {
+  return `${scope.kind}:${scope.value ?? ""}`;
+}
+
+/// The per-author board behind the Mine and Others views (#826).
+///
+/// # Nothing loads until clicked
+///
+/// `enabled` is threaded from the caller, which is the live pattern every
+/// expensive hook here follows (`useArtifacts`, `useAllWorktreeSizes`,
+/// `useDockerImages`, `useSystemFootprint`). The old "Measure button" is
+/// gone -- #796 removed the last one and `SystemHealthPage.tsx:1763-1788`
+/// argues against re-adding one -- so the gate is a prop, and the click that
+/// opens it is the sidebar row.
+///
+/// A scope with no value is not loadable and is gated out here rather than
+/// erroring in Rust, so arriving at the view with nothing selected shows an
+/// empty state rather than a failed query.
+///
+/// # The query key carries no collection size
+///
+/// `hooks.ts:1741-1755`'s rule: a count in a key makes every sibling key
+/// change when one item is removed, refetching everything. So the key is the
+/// QUESTION -- scope, measure, window -- and never the number of authors or
+/// slices the answer happens to contain. The answer's own size is in the
+/// answer.
+///
+/// Deliberately NOT keyed on `subject` either. A board is about everyone in
+/// the scope, so clicking a colleague in the sidebar must NOT refetch it:
+/// the same board answers "how is this org doing" and "how is this person
+/// doing in it", and the UI picks a row. That is what makes a Members click
+/// free after the org has been loaded once.
+///
+/// # `staleTime`
+///
+/// Five minutes, matching the other stats hooks. The window ends yesterday,
+/// so the answer for a closed window cannot change at all; five minutes is
+/// about the window that includes today, and about not re-spending a
+/// multi-point load because the user switched tabs and came back.
+///
+/// `retry: false`, for `useAllWorktreeSizes`' reason rather than by default:
+/// a failed board is an expensive thing to repeat silently, and the view has
+/// an explicit retry that tells the user it is trying again.
+export function useStatsBoard(
+  scope: StatsScope | undefined,
+  measure: "merged" | "opened",
+  days: number,
+  enabled: boolean,
+) {
+  const loadable = scopeIsLoadable(scope);
+  return useQuery({
+    queryKey: [
+      "stats-board",
+      loadable ? scopeKey(scope) : "none",
+      measure,
+      days,
+    ],
+    queryFn: () => statsBoard(scope!.kind, scope!.value, measure, days),
+    enabled: enabled && loadable,
+    staleTime: 5 * 60 * 1000,
+    retry: false,
+  });
+}
+
+/// The scoped daily activity series (#826).
+///
+/// A SEPARATE query from the board, which is the progressive-rendering
+/// requirement rather than a preference: `StatsPage.tsx:12-22` records that
+/// three independent queries rendering as each lands beat one combined gate,
+/// because the costs differ enough that blocking on the slowest left the
+/// fast numbers finished and invisible. This one is count-only and lands in
+/// about a second per ten days; a board over a busy organisation is seconds
+/// of node fetching. #826 notes an org "Others" view has MORE parts and more
+/// variance, so a single gate would be worse here than it was there.
+///
+/// Keyed ON the subject, unlike the board, and the asymmetry is the point: a
+/// chart draws one line, so "this person in this org" is a different chart
+/// and must not be served the organisation's.
+export function useStatsSeries(
+  scope: StatsScope | undefined,
+  days: number,
+  enabled: boolean,
+) {
+  const loadable = scopeIsLoadable(scope);
+  return useQuery({
+    queryKey: [
+      "stats-series",
+      loadable ? scopeKey(scope) : "none",
+      scope?.subject ?? "*",
+      days,
+    ],
+    queryFn: () => statsSeries(scope!.subject, scope!.kind, scope!.value, days),
+    enabled: enabled && loadable,
+    staleTime: 5 * 60 * 1000,
+    retry: false,
+  });
+}
+
+/// The scoped counts behind the headline cards (#826).
+///
+/// Two `stats_count` calls -- merged and opened -- run as independent
+/// queries rather than one, so the faster of the two paints first and a
+/// failure in one does not blank the other. That is the same progressive
+/// rule as above applied one level down, and it matters here because the two
+/// are genuinely independent questions to GitHub.
+///
+/// # `failed` is counted separately from `pending`
+///
+/// `hooks.ts:1397-1434`'s rule, and the reason is stated there: "a failed
+/// repository leaves `pending` and never comes back: a caller that only
+/// watches `pending` sees the number fall to zero and concludes everything
+/// was measured". The same shape applies to two counts -- a caller watching
+/// only `pending` would render a page that looks fully measured while one
+/// card is missing. #826 requires a failed sub-query be distinguishable from
+/// a zero, and this is where that distinction is produced.
+export function useScopedCounts(
+  scope: StatsScope | undefined,
+  days: number,
+  enabled: boolean,
+) {
+  const loadable = scopeIsLoadable(scope);
+  const results = useQueries({
+    queries: (["merged", "opened"] as const).map((measure) => ({
+      // The subject IS in this key: a count is about one person or about
+      // everyone, and those are different numbers. `stats_count` takes a
+      // login or `null` for the viewer -- it has no "everyone", which is
+      // `stats_board`'s question -- so an unset subject means the viewer.
+      queryKey: [
+        "stats-count",
+        loadable ? scopeKey(scope) : "none",
+        scope?.subject ?? "@me",
+        measure,
+        days,
+      ],
+      queryFn: () =>
+        statsCount(scope!.subject, scope!.kind, scope!.value, measure, days),
+      enabled: enabled && loadable,
+      staleTime: 5 * 60 * 1000,
+      retry: false,
+    })),
+  });
+  const [merged, opened] = results;
+  return {
+    merged: merged?.data,
+    opened: opened?.data,
+    /// Still in flight.
+    pending: results.filter((r) => r.isFetching).length,
+    /// FAILED, which is not the same as still pending and not the same as
+    /// zero. A caller must be able to say "could not measure" rather than
+    /// printing a 0 it did not verify.
+    failed: results.filter((r) => r.isError).length,
+    /// The first error, for a message the user can act on.
+    error: results.find((r) => r.isError)?.error,
+    refetch: () => {
+      for (const r of results) void r.refetch();
+    },
+  };
+}
+
 /// Build history. Failed builds are kept: a failing build is usually
 /// what the user came to investigate.
 export function useDockerBuilds(enabled: boolean) {
@@ -2355,43 +2539,27 @@ export function useTruncation(): number | null {
   return total;
 }
 
-/// The period comparisons behind the delta cards.
+/// `usePeriods`, `useHistory`, `useMergedDetail` and `useCycleTrend` WERE
+/// here, and #826 removed all four.
 ///
-/// Separate from `useHistory` so the four headline numbers appear in about
-/// a second rather than waiting on the whole daily series. Same staleTime,
-/// so the two stay consistent within a session.
-export function usePeriods() {
-  return useQuery({
-    queryKey: ["periods"],
-    queryFn: getPeriods,
-    staleTime: 5 * 60 * 1000,
-  });
-}
-
-/// The daily series behind the activity chart.
+/// Each wrapped a command hardcoded to `author:@me` -- `get_periods`,
+/// `get_history`, `get_merged_detail`, `get_cycle_trend` -- which is the one
+/// thing #823 named as blocking its second audience: there was no way to ask
+/// about anybody else. `StatsPage` now asks through the parameterised layer
+/// (`useScopedCounts`, `useStatsSeries`, `useStatsBoard`), which answers the
+/// same questions for any scope and carries the completeness facts the old
+/// commands had no field for.
 ///
-/// Held for five minutes rather than the list's live cadence: these counts
-/// move on the order of hours, and the query is only mounted while the
-/// Stats view is open, so a shorter window would spend rate limit for no
-/// visible change.
-export function useHistory(days: number) {
-  return useQuery({
-    queryKey: ["history", days],
-    queryFn: () => getHistory(days),
-    staleTime: 5 * 60 * 1000,
-  });
-}
-
-/// The merged-PR sample behind the insight cards and repo table. Kept
-/// separate from `useHistory` so a slow or failed detail fetch leaves the
-/// chart and cards fully rendered.
-export function useMergedDetail() {
-  return useQuery({
-    queryKey: ["merged-detail"],
-    queryFn: getMergedDetail,
-    staleTime: 5 * 60 * 1000,
-  });
-}
+/// Removed rather than left unused, because an unused hook is one a future
+/// page can reach for and quietly get the viewer's own account back under a
+/// scope heading -- which would be wrong in a way nothing on screen would
+/// contradict.
+///
+/// The Rust commands remain registered and on both remote surfaces. They are
+/// not dead: `transport.test.ts` exercises the wrappers, and the phone's
+/// `remote_call` can still reach them. Retiring the commands themselves is a
+/// separate change with its own surface-guard implications, and this PR is
+/// already the largest of the three.
 
 /// Branches for one repository, fetched only when it is selected.
 ///

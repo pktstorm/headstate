@@ -33,16 +33,29 @@
 //!    measurably does not work.
 //! 4. [`budget`] accumulates what the whole load cost, read off
 //!    `rateLimit` on every request rather than assumed.
+//! 5. [`board`] maps the nodes to people: per-author aggregates, the two
+//!    views (#826's Mine and Others) and the three leaderboards. It owns
+//!    the mapping, which is why it also owns the refusal attribution
+//!    `fetch::Outcome` could not do.
 //!
 //! # The one number worth knowing before editing any document here
 //!
-//! Cost is driven by NESTED CONNECTIONS, not by the number of searches,
+//! Cost is driven by connections that PAGE, not by the number of searches,
 //! and a connection nested inside another is invisible to a substring
 //! count of its parent. `poll.rs:1503-1580` is the richest record of that
 //! in this repo and is worth reading in full before adding a field.
-//! `additions`, `deletions` and `changedFiles` are free scalars;
-//! `reviews { totalCount }` is a connection and priced per search.
+//!
+//! The precise rule, MEASURED for #826 and narrower than what #823 and
+//! #827 believed: it is the `first:` ARGUMENT that is priced, not the
+//! connection. `additions`, `deletions` and `changedFiles` are free
+//! scalars; `reviews { totalCount }` is ALSO free (1 point at 3, 6 and 15
+//! searches, tracking the scalars-only control exactly), while
+//! `reviews(first: 1) { totalCount }` costs 2 from 6 searches up. `labels`
+//! behaves the same both ways. That reconciles with `poll.rs` rather than
+//! contradicting it -- every connection on its cost list is a paged one.
+//! `board.rs`'s module docs carry the table.
 
+pub mod board;
 pub mod budget;
 pub mod fetch;
 pub mod query;
@@ -53,8 +66,9 @@ pub mod slice;
 /// two requests, one point each, no statistics.
 pub mod tree;
 
+pub use board::{load_board, AuthorRow, Board, ShortSlice, TOP_N};
 pub use budget::{Budget, Spend};
-pub use fetch::{load_count, load_detail, Outcome};
+pub use fetch::{load_count, load_detail, load_series, Outcome, ScopedPoint, Series};
 pub use query::Slice;
 pub use scope::{Measure, Scope, StatsQuery, Subject};
 pub use tree::{load_tree, MemberRow, OrgTree, RepoRow, Tree};

@@ -92,6 +92,20 @@ pub const SURFACE: &[(&str, Class)] = &[
     // desktop-specific -- unlike `reveal_in_finder`, a phone could act on
     // this answer perfectly well.
     ("stats_tree", Class::Read),
+    // The per-author board behind the Mine and Others views (#826). A
+    // Read, and the most expensive one in this table: it probes, slices,
+    // and fetches per-PR nodes across a whole scope.
+    //
+    // Classed by what it does rather than by which screens call it, the
+    // same rule `stats_tree` above is classed by. Its wall-clock ceiling,
+    // read-concurrency cap and budget refusal all live INSIDE the command,
+    // so a phone's `remote_call` inherits every one of them -- which is
+    // the property that makes exposing the expensive path safe rather
+    // than a second set of limits to keep in sync.
+    ("stats_board", Class::Read),
+    // The scoped daily activity series (#826). A Read, and the cheap half
+    // of a scope page: count-only searches, no nodes.
+    ("stats_series", Class::Read),
     ("get_reviewing", Class::Read),
     ("count_reviewing", Class::Read),
     ("get_pr_detail", Class::Read),
@@ -452,6 +466,26 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         )
         .await),
         "stats_tree" => res(commands::stats_tree(app.state()).await),
+        // No `subject`, deliberately, and not an omission: a board asks
+        // about everyone in the scope, and a subject qualifier would render
+        // a leaderboard with one name on it. The viewer's login comes back
+        // IN the answer so the caller can split Mine from Others.
+        "stats_board" => res(commands::stats_board(
+            app.state(),
+            a.get("scopeKind")?,
+            a.get("scopeValue")?,
+            a.get("measure")?,
+            a.get("days")?,
+        )
+        .await),
+        "stats_series" => res(commands::stats_series(
+            app.state(),
+            a.get("subject")?,
+            a.get("scopeKind")?,
+            a.get("scopeValue")?,
+            a.get("days")?,
+        )
+        .await),
         "get_reviewing" => res(commands::get_reviewing(app.clone(), app.state()).await),
         "count_reviewing" => res(commands::count_reviewing(app.state()).await),
         "get_pr_detail" => {

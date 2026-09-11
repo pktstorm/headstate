@@ -201,6 +201,33 @@ const ROWS: Row[] = [
   // Argument-free: the scope hierarchy is everything the TOKEN can see, so
   // there is nothing for a caller to narrow. #825.
   row(api.statsTree, [], "stats_tree"),
+  // The scoped stats trio (#826). Argument order matters more here than on
+  // most rows: all three take a scope kind and an optional value, and two of
+  // them take a subject as well -- so a transposed pair would send a login
+  // where a repository name belongs and come back with a plausible answer to
+  // the wrong question.
+  row(api.statsCount, ["octocat", "org", "acme", "merged", 30], "stats_count", {
+    subject: "octocat",
+    scopeKind: "org",
+    scopeValue: "acme",
+    measure: "merged",
+    days: 30,
+  }),
+  // No `subject` at all, which is the board's defining property: it asks
+  // about everyone in the scope. A subject here would render a leaderboard
+  // with one name on it.
+  row(api.statsBoard, ["org", "acme", "merged", 30], "stats_board", {
+    scopeKind: "org",
+    scopeValue: "acme",
+    measure: "merged",
+    days: 30,
+  }),
+  row(api.statsSeries, ["octocat", "org", "acme", 30], "stats_series", {
+    subject: "octocat",
+    scopeKind: "org",
+    scopeValue: "acme",
+    days: 30,
+  }),
   row(api.systemHealth, [], "system_health"),
   row(api.systemHealthHistory, [], "system_health_history"),
   row(api.systemFootprint, [], "system_footprint"),
