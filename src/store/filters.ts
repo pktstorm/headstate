@@ -244,12 +244,25 @@ export const useFilters = create<FilterStore>()(
       // Preset navigation replaces the filter set wholesale, so a click
       // never inherits a filter the user forgot was active and shows a
       // count that doesn't match the list it opens.
+      //
+      // FILTERS AND PANEL ONLY. `density` and `setDensity` used to sit in
+      // this object -- an indentation slip that read as two more top-level
+      // store members (#806). It reset the user's density to "comfortable"
+      // on every preset click, silently and with nothing on screen to
+      // explain it, and rebuilt `setDensity` as a side effect of a filter
+      // update, so the action had a second definition to keep in sync and
+      // an identity that changed under anything holding a reference.
+      //
+      // The rule this encodes: a preset is about WHICH PRs you are looking
+      // at, and density is about the user's eyes and screen -- so anything
+      // a preset writes here has to be part of "which PRs", or it is
+      // clobbering a preference the user set deliberately. The store test
+      // asserts density outlives a preset, because nothing did and that is
+      // precisely why this survived.
       applyPreset: (filters) =>
         set((s) => ({
           filtersByView: { ...s.filtersByView, [s.view]: filters },
           panel: "list",
-      density: "comfortable",
-      setDensity: (density) => set({ density }),
         })),
       // Selection clears with the view: a working set assembled on My
       // PRs means nothing on the review list, and carrying it across
