@@ -55,6 +55,18 @@ jobs:
         run: ./scripts/check-privacy.sh
       - name: Workflow shells
         run: python3 scripts/check-workflow-shells.py
+      # Asked BEFORE the heavy jobs, and asked at all because the ignore
+      # rule alone cannot enforce this. A committed symlink whose target
+      # is absolute or climbs out of the tree resolves only on the
+      # machine that made it -- so it passes every local run and fails
+      # every runner. The #813 instance took out nine of ten jobs with
+      # `ENOTDIR ... mkdir node_modules`, named a different package each
+      # run so it read as a flaky registry fetch, and got one wrong fix
+      # shipped (#811) before anyone looked at the index.
+      - name: Committed symlinks
+        run: |
+          python3 scripts/check-symlinks.test.py
+          python3 scripts/check-symlinks.py
       # The mobile jobs skip their own steps when nothing mobile changed.
       # The failure mode of getting that wiring wrong is a job that
       # reports green having compiled nothing, forever -- so it is

@@ -141,6 +141,13 @@ lint-deps:
 	# breaks is a job reporting green having compiled nothing. Cheap to
 	# ask here, invisible until a phone release otherwise.
 	python3 scripts/check-mobile-gate.py
+	# A committed symlink escaping the repo resolves only on the machine
+	# that made it. One cost nine of ten CI jobs, a varying error message
+	# that read as a flaky fetch, and a wrong fix (#813, #811) -- and it
+	# passes every local run, because locally the target exists. The
+	# cheapest place to ask is here, before anything installs.
+	python3 scripts/check-symlinks.test.py
+	python3 scripts/check-symlinks.py
 
 # The shared step-up crate again: a path dependency is compiled by the
 # desktop's clippy but its own tests are not, and `cargo fmt --check`
