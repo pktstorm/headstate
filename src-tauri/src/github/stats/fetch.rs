@@ -941,6 +941,46 @@ mod tests {
         assert_eq!(chunk, ALIAS_CHUNK, "parallelism is kept on rung one");
     }
 
+    /// Parameterising the threshold did not change the COUNT path.
+    ///
+    /// `plan` used to branch on `ProbedSlice::too_big()`, which is
+    /// `count >= SUBDIVIDE_AT`, and now branches on `count < subdivide_at`
+    /// with the count path passing `slice::SUBDIVIDE_AT`. Those are exact
+    /// complements at that value, so the shipped behaviour is unchanged -- but
+    /// "unchanged" is a claim about two conditions written in opposite
+    /// directions in different functions, which is precisely the kind of
+    /// refactor that silently shifts a boundary by one.
+    ///
+    /// Asserted across the boundary rather than at one value, because an
+    /// off-by-one is invisible anywhere else.
+    #[test]
+    fn the_count_path_keeps_its_exact_subdivision_boundary() {
+        use slice::{ProbedSlice, SUBDIVIDE_AT};
+        for count in [
+            0,
+            1,
+            SUBDIVIDE_AT - 2,
+            SUBDIVIDE_AT - 1,
+            SUBDIVIDE_AT,
+            SUBDIVIDE_AT + 1,
+            slice::SEARCH_CAP,
+            u64::MAX,
+        ] {
+            let probed = ProbedSlice {
+                slice: Slice::new("2026-08-01", "2026-08-31"),
+                count,
+            };
+            // The OLD condition and the NEW one, on the same input.
+            let kept_by_old = !probed.too_big();
+            let kept_by_new = probed.count < SUBDIVIDE_AT;
+            assert_eq!(
+                kept_by_old, kept_by_new,
+                "count {count}: the parameterised condition must be the exact \
+                 complement of `too_big()` at the count path's threshold"
+            );
+        }
+    }
+
     /// Refusals ACROSS chunks are summed, not overwritten.
     ///
     /// `__refused` is a top-level key on every response rather than an alias,
