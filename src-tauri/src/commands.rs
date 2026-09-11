@@ -685,17 +685,52 @@ pub async fn list_worktrees(app: AppHandle) -> Result<Vec<crate::worktrees::Repo
 }
 
 /// Classify one repo's worktrees. See `list_worktrees`.
+///
+/// Each worktree is ALSO emitted on `worktree-safety` as its verdict is
+/// reached, so a row can fill the moment its own answer exists rather
+/// than holding a skeleton until the slowest branch in the repository
+/// finishes. That is #830: a 111-worktree repository showed sizes and
+/// counted to 111, and the safety column -- the reason the page exists --
+/// stayed skeletal indefinitely, because this command returned only when
+/// every worktree was done. The return value is kept so a caller that
+/// only wants the final set can ignore the events entirely.
+///
+/// This is the `size_worktrees` treatment arriving at the pass that
+/// needed it more. The size pass was split out first because it was
+/// assumed to be the only slow one -- `hooks.ts` records the "three
+/// orders of magnitude" reasoning -- and classification was left whole
+/// on the strength of a ~16s figure. A bound per git call was mistaken
+/// for a bound per worktree; `CLASSIFY_TIMEOUT` explains why it is not.
+///
+/// A `Safety::Unknown` verdict carrying "classification did not finish"
+/// is emitted like any other answer, and DELIBERATELY rather than
+/// omitted: a skeleton is a promise that a value is coming, and #830 is
+/// what that promise looks like when it is never kept. "Could not
+/// classify" is an answer. It must never be flattened toward `Safe` --
+/// `is_safe()` is a two-variant allowlist precisely so that a verdict we
+/// could not reach can never authorise a deletion.
 #[tauri::command]
 pub async fn classify_worktrees(
+    app: AppHandle,
     repo_path: String,
 ) -> Result<Vec<crate::worktrees::Worktree>, String> {
     // Two failure modes, both real: the join can fail if the blocking
     // task panicked, and classification itself can fail if git refuses.
     // Flattened rather than swallowed, so an unreadable repo surfaces as
     // an error instead of as zero worktrees.
-    tauri::async_runtime::spawn_blocking(move || crate::worktrees::classify_repo(&repo_path))
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut out = Vec::new();
+        crate::worktrees::classify_repo_streaming(&repo_path, &mut |w| {
+            // Emitted per worktree rather than batched, for the reason
+            // `size_worktrees` gives: batching would reintroduce exactly
+            // the wait this exists to remove.
+            let _ = app.emit("worktree-safety", w);
+            out.push(w.clone());
+        })?;
+        Ok(out)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Disk sizes for one repo's worktrees, as `(path, bytes)` pairs.

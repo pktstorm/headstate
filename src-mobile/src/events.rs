@@ -87,6 +87,21 @@ pub const EVENT_NAMES: &[&str] = &[
     // window open, so what it can show is what arrives while it is in
     // the foreground.
     "worktree-size",
+    // The thirteenth, and the richest payload here: a whole `Worktree` --
+    // path, branch name, and safety verdict (#830).
+    //
+    // Same test as the entry above, same answer. `classify_worktrees` is
+    // already an allowlisted Read that RETURNS a `Vec<Worktree>` of these
+    // values to this phone over this transport; the event is that data
+    // arriving per worktree rather than in one batch, so it widens no
+    // boundary the command has not already opened.
+    //
+    // Needed because classification is unbounded in a way a per-call
+    // timeout cannot see: `content_landed` on the desktop spends up to
+    // four git calls per CHANGED FILE, so one branch is an unbounded
+    // number of individually-bounded calls. #830 is a 111-worktree
+    // repository whose safety column never resolved at all.
+    "worktree-safety",
 ];
 
 /// The event whose payload is the PR list, cached as the snapshot.

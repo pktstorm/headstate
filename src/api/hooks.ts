@@ -1263,15 +1263,142 @@ export function useWorktrees(enabled = true) {
   });
 }
 
-/// Safety for one repo's worktrees, fetched only when that repo is
-/// selected -- classifying all 37 up front would take ~16s.
-export function useWorktreeSafety(repoPath: string | undefined) {
-  return useQuery({
+/// Verdicts streaming in from the Rust side, one worktree at a time.
+///
+/// The Rust command emits `worktree-safety` per worktree as it reaches a
+/// verdict, and this collects them into a map that grows while the
+/// command is still running.
+///
+/// Why a subscription rather than just awaiting the command -- the
+/// `useStreamingSizes` argument, arriving at the column that needed it
+/// more (#830). Classification's cost tracks CHANGED FILES, not worktree
+/// count: MEASURED per worktree, a 114ms median against a 3295ms max
+/// INSIDE one repository, a 29x spread. Awaiting the whole set means
+/// every row waits on the worst branch in the repository, which on a
+/// 111-worktree machine was a safety column that never resolved at all.
+/// Partial answers are the entire point, so they must be observable
+/// before the promise settles.
+///
+/// Keyed by absolute path, which is unique across repositories, so one
+/// subscription serves every view without them having to agree on
+/// anything -- exactly as the size stream does.
+///
+/// Unlike the size stream there is no null-versus-absent distinction to
+/// keep: a worktree that could not be classified arrives with a real
+/// `Safety` value (`unknown`, carrying why), because the Rust side has an
+/// honest verdict for that case and the size pass had no honest number.
+/// An absent key still means "no verdict yet".
+function useStreamingSafety(): Map<string, Worktree> {
+  const [seen, setSeen] = useState<Map<string, Worktree>>(() => new Map());
+
+  useEffect(() => {
+    // The same guarded teardown as every other listener here -- see
+    // `usePullRequests` for why the promise cannot be unwrapped naively.
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    listen<Worktree>("worktree-safety", (e) => {
+      const w = e.payload;
+      setSeen((prev) => {
+        // A fresh Map, not a mutation: React compares by identity, and
+        // an in-place `set` would leave every row showing its skeleton
+        // because nothing re-rendered.
+        const next = new Map(prev);
+        next.set(w.path, w);
+        return next;
+      });
+    }).then((fn) => {
+      if (cancelled) safeUnlisten(fn);
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      safeUnlisten(unlisten);
+    };
+  }, []);
+
+  return seen;
+}
+
+/// Safety for one repo's worktrees, landing one worktree at a time.
+///
+/// Fetched only when that repo is selected -- classifying all 37
+/// repositories up front would take ~16s.
+///
+/// `partial` carries the verdicts that have landed while the query is
+/// still in flight. Until #830 this hook offered only the settled `data`,
+/// so the page had nothing to show between "started" and "every worktree
+/// classified" -- and on the reporting machine that gap never ended. The
+/// size pass got this treatment in #754 on the argument that it was the
+/// slow one; classification was left whole on the strength of a ~16s
+/// figure that assumed a bounded number of git calls per worktree. It is
+/// not bounded (see `classifyWorktrees`), so the gap had no ceiling.
+///
+/// `pending`, `total` and `failed` are reported for the reason
+/// `useAllWorktreeSizes` reports them, and with the same separation of
+/// `failed` from `pending`: a caller that only watches `pending` sees it
+/// fall to zero and concludes everything was classified. Here the two
+/// numbers mean:
+///
+///   - `pending` -- listed worktrees with no verdict yet. Falls to zero
+///     when every row has heard something, success or not.
+///   - `failed` -- worktrees whose verdict is `unknown`, i.e. the Rust
+///     side gave up (`CLASSIFY_TIMEOUT`) or git refused. These have
+///     ARRIVED, so they are not pending; they are also not answers the
+///     user can act on, so reporting them inside `pending` would hide
+///     them and reporting them as successes would be a lie.
+///
+/// `total` is the number of worktrees the listing says exist, which is
+/// the only honest denominator: counting only what has arrived would make
+/// "3 of 3" true at every instant of a 111-worktree classification.
+///
+/// NOT the default `retry: 3`. The `useWorktreeSizes` reasoning applies
+/// unchanged and with a sharper edge: this pass is now bounded per
+/// worktree, so a rejection is a real refusal rather than a timeout, and
+/// three silent re-runs of a pass measured in seconds-to-minutes puts the
+/// column back on skeletons for four times as long before saying
+/// anything. A failed classification is not a flaky network call.
+export function useWorktreeSafety(repoPath: string | undefined, listed?: Worktree[]) {
+  const streamed = useStreamingSafety();
+  const query = useQuery({
+    // Keyed on the repo alone, and deliberately NOT on the worktree
+    // count. A count in the key makes every sibling key change the
+    // moment one worktree is removed, which refetches the entire view --
+    // the mistake `useArtifactSizes` records at length.
     queryKey: ["worktree-safety", repoPath],
     queryFn: () => classifyWorktrees(repoPath as string),
     enabled: Boolean(repoPath),
     staleTime: 30_000,
+    retry: false,
   });
+
+  // The settled answer wins on any path it has: it is the authoritative
+  // set, and the stream is only ever an early view of the same pass.
+  // Streamed values go in FIRST so that ordering holds -- the same rule
+  // `useAllWorktreeSizes` merges by.
+  const verdicts = useMemo(() => {
+    const out = new Map<string, Worktree>();
+    // Only this repository's rows. The stream is keyed by absolute path
+    // across every repository, so a previously-opened repository's
+    // verdicts are still in the map and must not be counted against this
+    // one's totals.
+    const paths = new Set((listed ?? []).map((w) => w.path));
+    for (const [p, w] of streamed) if (paths.size === 0 || paths.has(p)) out.set(p, w);
+    if (query.data) for (const w of query.data) out.set(w.path, w);
+    return out;
+  }, [streamed, query.data, listed]);
+
+  const total = listed?.length ?? query.data?.length ?? 0;
+  const failed = [...verdicts.values()].filter((w) => w.safety.kind === "unknown").length;
+  return {
+    ...query,
+    partial: verdicts,
+    /// Listed worktrees with no verdict of any kind yet. Never negative:
+    /// the stream can carry a path the current listing does not have if a
+    /// worktree was removed mid-pass.
+    pending: Math.max(0, total - verdicts.size),
+    total,
+    failed,
+  };
 }
 
 /// Sizes streaming in from the Rust side, one worktree at a time.

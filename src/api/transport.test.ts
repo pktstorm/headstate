@@ -298,6 +298,14 @@ const POLL_EVENTS: [string, () => unknown][] = [
   // `listen` directly would work on the desktop and silently never
   // fire on the phone — which is the whole reason this list exists.
   ["worktree-size", () => hooks.useWorktreeSizes("/code/app")],
+  // The thirteenth (#830). Verdicts stream per worktree because
+  // classification makes an UNBOUNDED number of git calls per worktree --
+  // up to four per changed file -- so a per-call timeout never bounded
+  // the pass and a 111-worktree repository never resolved its safety
+  // column at all. Here for the same reason as the entry above: a hook
+  // that imported Tauri's `listen` directly would work on the desktop
+  // and silently never fire on the phone.
+  ["worktree-safety", () => hooks.useWorktreeSafety("/code/app")],
 ];
 
 function wrapper({ children }: { children: ReactNode }) {

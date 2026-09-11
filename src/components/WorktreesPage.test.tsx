@@ -10,6 +10,20 @@ const state = vi.hoisted(() => ({
   isError: false,
   classified: undefined as Worktree[] | undefined,
   classifying: false,
+  // The whole repository's classification rejected. The page has read
+  // `isError` since the pass could fail at all, but until #830 this mock
+  // had no field for it -- so the "could not check what is safe — retry"
+  // branch was unreachable from a test.
+  classifyFailed: false,
+  // Verdicts streamed in while the query is still in flight (#830).
+  //
+  // SEPARATE from `classified`, which is the settled whole-repository
+  // answer, because the bug was precisely that the page had only the
+  // latter: every row held a skeleton until the slowest branch finished.
+  // A test that wants the streaming behaviour sets this; the 140 tests
+  // that only care about a row's rendering keep setting `classified` and
+  // the mock below merges it in, exactly as the real hook does.
+  partialVerdicts: undefined as Map<string, Worktree> | undefined,
   assessed: [] as string[],
   prs: [] as import("@/types/pr").PullRequest[],
   // `number | null` values, not `number`: a null VALUE is a worktree
@@ -76,14 +90,59 @@ vi.mock("../api/hooks", () => ({
   }),
   useDockerImages: () => ({ data: dockerImages() }),
   useRemoveImages: () => removeImagesFn,
+  // `classified` stands in for the LISTING too, when a test set one
+  // (#830).
+  //
+  // The page now builds its rows from the listing and merges verdicts
+  // onto them, because that is the production invariant: the two passes
+  // describe the same repository a moment apart, and the row set must not
+  // depend on how far classification has got. This harness predates that
+  // -- most tests set `classified` alone and let `repos` keep its
+  // one-row default -- so without this the listing's default row would
+  // appear BESIDE every test's fixtures and silently change every
+  // ordering and count assertion.
+  //
+  // Substituting rather than making 140 tests set both keeps each test
+  // saying one thing, and it encodes the invariant rather than working
+  // around it: a test that deliberately sets BOTH (the streaming tests
+  // below) still gets exactly what it set.
   useWorktrees: () => ({
-    data: state.repos,
+    data:
+      state.classified && state.repos?.length === 1
+        ? [{ ...state.repos[0], worktrees: state.classified }]
+        : state.repos,
     isLoading: state.isLoading,
     isError: state.isError,
     error: "boom",
     refetch: vi.fn(),
   }),
-  useWorktreeSafety: () => ({ data: state.classified, isLoading: state.classifying }),
+  // Mirrors the real hook (#830): verdicts stream in per worktree, so
+  // `partial` is what the page renders from and the settled `data` wins
+  // on any path it has. `classified` is merged into `partial` here rather
+  // than in every test, so a test that only cares how a row RENDERS goes
+  // on setting `classified` and a test about streaming sets
+  // `partialVerdicts`.
+  //
+  // `pending`/`total`/`failed` are derived rather than stored, for the
+  // reason the real hook derives them: a stored `pending` can disagree
+  // with the verdicts actually present, and a mock that can lie in a way
+  // the real hook cannot would let a bug through.
+  useWorktreeSafety: (_repoPath?: string, listed?: Worktree[]) => {
+    const partial = new Map<string, Worktree>(state.partialVerdicts ?? []);
+    for (const w of state.classified ?? []) partial.set(w.path, w);
+    const total = listed?.length ?? state.classified?.length ?? 0;
+    return {
+      data: state.classified,
+      isLoading: state.classifying,
+      isError: state.classifyFailed,
+      error: "boom",
+      refetch: retryClassifyFn,
+      partial,
+      pending: Math.max(0, total - partial.size),
+      total,
+      failed: [...partial.values()].filter((w) => w.safety.kind === "unknown").length,
+    };
+  },
   useRemoveWorktree: () => removeFn,
   useRemoveWorktrees: () => removeManyFn,
   useRemoveWorktreeForced: () => forceFn,
@@ -134,6 +193,7 @@ const unlockManyFn = vi.hoisted(() =>
 // "cleared 12" from "there was nothing to do" (#793).
 const pruneFn = vi.hoisted(() => vi.fn<(repo: string) => Promise<number>>(() => Promise.resolve(0)));
 
+const retryClassifyFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 const markAssessedFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 const clearAssessedFn = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 const claudify = vi.hoisted(() =>
@@ -196,6 +256,12 @@ describe("WorktreesPage on a phone", () => {
       isError: false,
       classified: [wt({ safety: { kind: "safe" } })],
       classifying: false,
+      // #830. Leaked either way these are confusing: a stale
+      // `classifyFailed` replaces every verdict with a retry button, and
+      // stale streamed verdicts attach another test's safety to this
+      // test's rows.
+      classifyFailed: false,
+      partialVerdicts: undefined,
       sizes: undefined,
       partialSizes: undefined,
       allSizes: undefined,
@@ -271,6 +337,11 @@ describe("WorktreesPage", () => {
       isError: false,
       classified: undefined,
       classifying: false,
+      // #830, and the same reasoning as `sizingFailed` below: a leaked
+      // failure flag turns every later verdict assertion into a retry
+      // button, which is a confusing way to fail.
+      classifyFailed: false,
+      partialVerdicts: undefined,
       sizes: undefined,
       partialSizes: undefined,
       sizing: false,
@@ -2636,12 +2707,17 @@ describe("WorktreesPage", () => {
     ///
     /// The re-sort button used to render immediately before the bulk
     /// "Remove N safe worktrees" button in one `flex flex-wrap` toolbar,
-    /// so its arrival shoved a directory-deleting button sideways or
-    /// onto a second line. It now lives in a group with the Sort select
-    /// it modifies, which is both where it belongs and out of Remove's
-    /// way. Asserted structurally, since jsdom lays nothing out: the two
-    /// buttons have no common ancestor below the toolbar, so neither can
-    /// be a sibling the other displaces.
+    /// so its arrival shoved a directory-deleting button sideways or onto
+    /// a second line.
+    ///
+    /// Asserted STRUCTURALLY, because jsdom lays nothing out -- every
+    /// element has zero width here, so a geometric assertion would pass
+    /// against any markup at all and prove nothing. What decides the
+    /// layout in a `flex flex-wrap` row is DOCUMENT ORDER: an item can
+    /// only displace items that follow it. So the property to pin is that
+    /// the re-sort button comes after the Remove button, and that the
+    /// sequence of everything up to and including Remove is identical
+    /// whether the button is there or not.
     it("keeps the re-sort button out of the bulk Remove button's group", () => {
       state.classified = [
         wt({ path: "/code/measured", size_bytes: 500, safety: { kind: "safe" } }),
@@ -2659,6 +2735,317 @@ describe("WorktreesPage", () => {
       expect(group.querySelector("select[aria-label='Sort worktrees']")).toBeTruthy();
       // ...and the destructive button is outside that group entirely.
       expect(group.contains(remove)).toBe(false);
+    });
+
+    /// The bulk Remove button does not MOVE when the re-sort button
+    /// appears (#817).
+    ///
+    /// The criterion the reporter actually set -- "the button is useful
+    /// for showing that re-calc is being performed, but it shouldn't
+    /// displace everything" -- and the one the test above does not cover.
+    /// Grouping the button with the Sort select made the two stop being
+    /// siblings, which that test pins, but the GROUP was still a flex item
+    /// sitting before Remove in the same wrapping row: a button appearing
+    /// inside it widened the group and pushed Remove along regardless. So
+    /// "not siblings" was true and insufficient.
+    ///
+    /// Pinned as document order, for the reason the test above explains:
+    /// in a `flex flex-wrap` row an item displaces only what follows it,
+    /// and jsdom has no geometry to measure. The toolbar's children up to
+    /// and including Remove must be byte-identical across the button's
+    /// arrival -- which is only possible if the button renders after it.
+    it("never moves the bulk Remove button when the re-sort button appears", () => {
+      state.classified = [
+        wt({ path: "/code/measured", size_bytes: 500, safety: { kind: "safe" } }),
+        wt({ path: "/code/pending", size_bytes: null, safety: { kind: "safe" } }),
+      ];
+      state.sizing = true;
+
+      /// Where the bulk Remove button sits among the toolbar's children:
+      /// its index, and how many siblings precede it.
+      ///
+      /// The INDEX rather than the children's text. The text of the
+      /// preceding items legitimately changes as the pass runs -- the size
+      /// total updates, "measuring sizes — 1 of 2 to go" counts down --
+      /// and none of that is a layout shift; asserting on it would pin the
+      /// progress wording to this test instead of pinning the layout. What
+      /// must not change is Remove's POSITION, which in a `flex flex-wrap`
+      /// row is decided by how many items come before it.
+      const removeIndex = () => {
+        const remove = screen.getByRole("button", { name: /remove 2 safe worktrees/i });
+        const toolbar = remove.parentElement as HTMLElement;
+        return [...toolbar.children].indexOf(remove);
+      };
+
+      const { rerender } = render(<WorktreesPage />);
+      // No measurement has landed yet, so there is no re-sort button.
+      expect(screen.queryByRole("button", { name: /re-sort/i })).toBeNull();
+      const before = removeIndex();
+
+      // A size lands. The button appears -- and nothing up to Remove
+      // changes.
+      state.partialSizes = new Map([["/code/pending", 9_000_000]]);
+      rerender(<WorktreesPage />);
+      expect(screen.getByRole("button", { name: /re-sort/i })).toBeTruthy();
+      expect(removeIndex()).toBe(before);
+
+      // The COUNT changing must not move it either: the button grows
+      // wider as more rows go stale, and a wider advisory control is the
+      // same hazard as a new one.
+      state.assessed = ["/code/measured"];
+      rerender(<WorktreesPage />);
+      expect(screen.getByRole("button", { name: /re-sort/i }).textContent).toMatch(
+        /2 out of date/,
+      );
+      expect(removeIndex()).toBe(before);
+
+      // And the button is genuinely AFTER Remove in document order, which
+      // is what makes all of the above true by construction rather than
+      // by coincidence.
+      const resort = screen.getByRole("button", { name: /re-sort/i });
+      const remove = screen.getByRole("button", { name: /remove 2 safe worktrees/i });
+      expect(remove.compareDocumentPosition(resort) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    });
+  });
+
+  /// #830: a repository with 111 worktrees showed sizes, counted the
+  /// re-sort to 111, and left the safety column skeletal forever. The page
+  /// rendered everything except the column it exists for.
+  ///
+  /// These pin the four properties the issue asks for by name: verdicts
+  /// arrive progressively, one bad worktree does not hold the others, a
+  /// row that cannot be classified says so rather than showing a
+  /// skeleton, and progress distinguishes pending from failed.
+  describe("streaming safety verdicts", () => {
+    /// A repository of three worktrees with NO verdicts yet, as the page
+    /// sees it in the moment between the listing and the classification.
+    const threeUnclassified = () => {
+      state.classified = undefined;
+      state.repos = [
+        {
+          identity: null,
+          name: "proj",
+          path: "/code/proj",
+          worktrees: [
+            wt({ path: "/code/one", safety: { kind: "pending" } }),
+            wt({ path: "/code/two", safety: { kind: "pending" } }),
+            wt({ path: "/code/three", safety: { kind: "pending" } }),
+          ],
+        },
+      ];
+      state.classifying = true;
+    };
+
+    /// A verdict that has landed renders IMMEDIATELY, without waiting for
+    /// the rest of the repository.
+    ///
+    /// The heart of #830. The old hook exposed only the settled whole-
+    /// repository `data`, so a row's own answer -- which exists long
+    /// before the slowest branch finishes -- was withheld from it.
+    it("renders a verdict as soon as that row's own answer lands", () => {
+      threeUnclassified();
+      state.partialVerdicts = new Map([
+        ["/code/two", wt({ path: "/code/two", safety: { kind: "safe" } })],
+      ]);
+      const { container } = render(<WorktreesPage />);
+
+      // The row that has an answer shows it as TEXT...
+      expect(screen.getAllByText(/merged, pushed/i).length).toBeGreaterThan(0);
+      // ...while the rows that do not still hold a skeleton, which
+      // carries "checking…" in its `title` rather than as text.
+      //
+      // Both states on screen AT ONCE is the property being pinned.
+      // Before #830 a single unresolved worktree meant NO row showed a
+      // verdict, because the page read only the settled whole-repository
+      // answer -- so this mixture was unreachable, and on the reporting
+      // machine the all-skeleton state was permanent.
+      expect(container.querySelectorAll('[title="checking…"]').length).toBeGreaterThan(0);
+    });
+
+    /// One unclassifiable worktree must not suppress the others.
+    ///
+    /// The issue's second acceptance criterion verbatim: "a hung or
+    /// failing single worktree does not prevent the other rows from
+    /// resolving". Before the fix the whole pass was one promise, so the
+    /// bad row did not merely fail -- it took the other 110 with it.
+    it("resolves the other rows when one worktree cannot be classified", () => {
+      threeUnclassified();
+      state.partialVerdicts = new Map([
+        ["/code/one", wt({ path: "/code/one", safety: { kind: "safe" } })],
+        [
+          "/code/two",
+          wt({
+            path: "/code/two",
+            safety: { kind: "unknown", detail: "classification did not finish within 45s" },
+          }),
+        ],
+        ["/code/three", wt({ path: "/code/three", safety: { kind: "unmerged" } })],
+      ]);
+      state.classifying = false;
+      render(<WorktreesPage />);
+
+      // The bad row says what happened, in its own words...
+      expect(screen.getByText(/could not determine: classification did not finish/i)).toBeTruthy();
+      // ...and the other two carry real verdicts regardless.
+      expect(screen.getByText(/merged, pushed/i)).toBeTruthy();
+      expect(screen.getByText(/branch not merged/i)).toBeTruthy();
+      // Nothing is still pretending to work.
+      expect(screen.queryByText(/checking…/i)).toBeNull();
+    });
+
+    /// A row that could not be classified must never show a skeleton.
+    ///
+    /// "An indefinite skeleton is itself a bug" -- a skeleton is a promise
+    /// that a value is coming, and #830 is what that promise looks like
+    /// when it is never kept. `unknown` is an ANSWER and must render as
+    /// one.
+    it("shows an unclassifiable row its reason, never a skeleton", () => {
+      state.classified = [
+        wt({
+          path: "/code/stuck",
+          safety: { kind: "unknown", detail: "classification did not finish within 45s" },
+        }),
+      ];
+      state.classifying = false;
+      render(<WorktreesPage />);
+
+      expect(screen.getByText(/could not determine: classification did not finish/i)).toBeTruthy();
+      expect(screen.queryByText(/checking…/i)).toBeNull();
+    });
+
+    /// A verdict nobody could reach is never removable.
+    ///
+    /// The safety property underneath all of this, and the reason an
+    /// honest "could not classify" is not merely nicer than a skeleton: if
+    /// `unknown` counted toward "safe to remove" the bound would have
+    /// turned a hang into a directory deletion.
+    it("never counts an unclassifiable row as safe to remove", () => {
+      state.classified = [
+        wt({ path: "/code/ok", safety: { kind: "safe" } }),
+        wt({
+          path: "/code/stuck",
+          safety: { kind: "unknown", detail: "classification did not finish within 45s" },
+        }),
+      ];
+      state.classifying = false;
+      render(<WorktreesPage />);
+
+      expect(screen.getByText(/^1 safe to remove$/)).toBeTruthy();
+      // And the unclassifiable row's Remove button is DISABLED. It is
+      // present -- every row has one, so the column does not reflow --
+      // but it cannot be clicked, which is the guarantee that matters:
+      // `isSafe` is a two-variant allowlist precisely so a verdict nobody
+      // could reach can never authorise deleting a directory.
+      const buttons = screen.getAllByRole("button", { name: /^remove$/i });
+      expect(buttons.length).toBe(2);
+      expect(buttons.filter((b) => !(b as HTMLButtonElement).disabled).length).toBe(1);
+    });
+
+    /// Progress falls as verdicts land, so "still working" is
+    /// distinguishable from "stopped".
+    ///
+    /// The old header said only "checking what is safe to remove…", which
+    /// read identically at second 2 and at minute 15 -- the user could not
+    /// tell a pass that was moving from one that had stalled, which is
+    /// most of why #830 was reported as a hang rather than as slowness.
+    it("counts down the worktrees still to be checked", () => {
+      threeUnclassified();
+      const { rerender } = render(<WorktreesPage />);
+      expect(screen.getByText(/3 to go/)).toBeTruthy();
+
+      state.partialVerdicts = new Map([
+        ["/code/one", wt({ path: "/code/one", safety: { kind: "safe" } })],
+        ["/code/two", wt({ path: "/code/two", safety: { kind: "unmerged" } })],
+      ]);
+      rerender(<WorktreesPage />);
+      expect(screen.getByText(/1 to go/)).toBeTruthy();
+    });
+
+    /// FAILED is counted separately from PENDING, and said out loud.
+    ///
+    /// `useAllWorktreeSizes` records the lesson this pins: "a caller that
+    /// only watches `pending` sees the number fall to zero and concludes
+    /// everything was measured." Here that mistake is worse, because the
+    /// figure beside it counts directories the user is invited to delete
+    /// -- a pass where 1 of 3 could not be classified finishes with
+    /// nothing pending and a confident green count, and without this the
+    /// page would not say that a row was never answered.
+    it("says how many worktrees could not be checked, beside the safe count", () => {
+      state.classified = [
+        wt({ path: "/code/ok", safety: { kind: "safe" } }),
+        wt({ path: "/code/also", safety: { kind: "safe" } }),
+        wt({
+          path: "/code/stuck",
+          safety: { kind: "unknown", detail: "classification did not finish within 45s" },
+        }),
+      ];
+      state.classifying = false;
+      render(<WorktreesPage />);
+
+      // Both numbers, each in its own words: the green count does not
+      // absorb the unanswered row, and the unanswered row is not hidden.
+      expect(screen.getByText(/^2 safe to remove$/)).toBeTruthy();
+      expect(screen.getByText(/1 could not be checked/)).toBeTruthy();
+    });
+
+    /// A landing verdict must not blank the size the listing already had.
+    ///
+    /// The merge order in `withSizes` is load-bearing: a streamed verdict
+    /// is a whole `Worktree`, so it carries a `size_bytes` that
+    /// classification never measured and that is null on arrival. Spread
+    /// over the row AFTER the size assignment, it would blank every size
+    /// the moment a verdict landed -- replacing one column's bug with
+    /// another's. This pins the order so that cannot regress silently.
+    it("keeps a row's size when its verdict arrives", () => {
+      state.classified = undefined;
+      state.repos = [
+        {
+          identity: null,
+          name: "proj",
+          path: "/code/proj",
+          worktrees: [wt({ path: "/code/sized", size_bytes: 2048, safety: { kind: "pending" } })],
+        },
+      ];
+      state.classifying = true;
+      const { rerender } = render(<WorktreesPage />);
+      expect(screen.getByText("2.0 KB")).toBeTruthy();
+
+      // The verdict lands, carrying no size of its own.
+      state.partialVerdicts = new Map([
+        ["/code/sized", wt({ path: "/code/sized", size_bytes: null, safety: { kind: "safe" } })],
+      ]);
+      rerender(<WorktreesPage />);
+
+      expect(screen.getAllByText(/merged, pushed/i).length).toBeGreaterThan(0);
+      expect(screen.getByText("2.0 KB")).toBeTruthy();
+    });
+
+    /// Silent when everything was answered. A permanent "0 could not be
+    /// checked" is furniture, and the rule every other conditional count
+    /// in this header follows.
+    it("says nothing about failures when there are none", () => {
+      state.classified = [wt({ path: "/code/ok", safety: { kind: "safe" } })];
+      state.classifying = false;
+      render(<WorktreesPage />);
+      expect(screen.queryByText(/could not be checked/)).toBeNull();
+    });
+
+    /// A whole-pass rejection offers a RETRY rather than a skeleton.
+    ///
+    /// The page has read `isError` since the pass could fail at all, but
+    /// the harness had no field for it until #830 -- so this branch was
+    /// unreachable from a test, which is how an error path stays broken.
+    it("offers a retry when the whole classification fails", () => {
+      state.classified = undefined;
+      state.classifying = false;
+      state.classifyFailed = true;
+      render(<WorktreesPage />);
+
+      const retry = screen.getByRole("button", { name: /could not check what is safe/i });
+      fireEvent.click(retry);
+      expect(retryClassifyFn).toHaveBeenCalled();
+      // And it does NOT claim a safe count it never established.
+      expect(screen.queryByText(/safe to remove/)).toBeNull();
     });
   });
 });

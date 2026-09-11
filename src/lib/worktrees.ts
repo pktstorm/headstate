@@ -484,10 +484,29 @@ export function pathBasename(path: string): string {
 
 /// Whether a row is still waiting on its safety check.
 ///
-/// The fast listing lands in ~2.6s and classification takes up to ~57s,
-/// so this is most of the first minute on a large tree -- long enough
-/// that the row must say "still working" rather than show a value that
-/// reads as final.
+/// The fast listing lands in ~2.6s; classification follows it. The figure
+/// that used to be here -- "takes up to ~57s" -- was a TOTAL for one tree
+/// on one machine, and quoting a total is how #830 went unnoticed: a
+/// total cannot distinguish "many worktrees, each quick" from "one
+/// worktree that never answers", which are the same number and completely
+/// different bugs.
+///
+/// MEASURED per worktree instead, serial, by
+/// `live_classification_cost_per_worktree`:
+///
+/// ```text
+///   repo          worktrees   p50     p90      max
+///   ghstat           18      140ms    576ms    724ms
+///   enc-api          15      114ms   3139ms   3295ms
+/// ```
+///
+/// The spread is what matters: within ONE repository the slowest worktree
+/// costs 29x the median, because the cost tracks CHANGED FILES rather
+/// than worktree count. So "how long until this row resolves" has no
+/// single answer, and a row must say "still working" only while that is
+/// true of IT -- which is why verdicts now stream per worktree and a row
+/// that cannot be classified says so (`Safety.kind === "unknown"`)
+/// instead of holding this skeleton indefinitely.
 export function isPending(s: Safety): boolean {
   return s.kind === "pending";
 }
