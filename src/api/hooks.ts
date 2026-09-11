@@ -30,6 +30,13 @@ import {
   statsBoard,
   statsSeries,
   statsCount,
+  // The four unscoped account-wide commands (#826). Their wrappers never
+  // left `tauri.ts` -- #829 deleted only the hooks -- so restoring the page
+  // is these four imports and the hooks below, not a rebuilt feature.
+  getPeriods,
+  getHistory,
+  getMergedDetail,
+  getCycleTrend,
   getPollInterval,
   getRemoteEnabled,
   setRemoteEnabled,
@@ -1981,6 +1988,88 @@ export function useScopedCounts(
       for (const r of results) void r.refetch();
     },
   };
+}
+
+/// The period comparisons behind the unscoped page's delta cards.
+///
+/// # Restored by #826's reopening, after #829 removed it as "superseded"
+///
+/// It was not superseded, and the distinction is the whole reason this hook
+/// exists beside the scoped ones above. A scope page answers "how is THIS
+/// organisation / repository / person doing", which requires choosing one
+/// first. This answers "how am I doing, across everything" with NO selection
+/// at all -- and `search` with an `author:@me` qualifier and NO repository
+/// qualifier is the only query shape that spans every organisation the
+/// viewer contributes to, owned or not (`github/query.rs:241-258`).
+///
+/// MEASURED live 2026-09-11, 30-day window ending yesterday, one aliased
+/// document at cost 1: account-wide `author:@me is:merged` returns **893**
+/// merged pull requests. The nearest scoped equivalent, `Personal` /
+/// `All repos` (`user:pktstorm`), returns **317** -- 35% of it. The rest is
+/// `org:FNX-Labs` (494) and `org:Stohic` (82): org repositories the viewer
+/// contributes to without owning, which no single sidebar row covers and
+/// which on this account is most of the activity. So "All repos" is not a
+/// narrower spelling of account-wide; it is a different and much smaller
+/// number, and presenting the scoped page as a replacement lost 576 of 893
+/// pull requests with nothing on screen to say so.
+///
+/// Separate from `useHistory` so the four headline numbers appear in about
+/// a second rather than waiting on the whole daily series. Same staleTime,
+/// so the two stay consistent within a session.
+export function usePeriods() {
+  return useQuery({
+    queryKey: ["periods"],
+    queryFn: getPeriods,
+    staleTime: 5 * 60 * 1000,
+  });
+}
+
+/// The daily series behind the unscoped page's activity chart.
+///
+/// Held for five minutes rather than the list's live cadence: these counts
+/// move on the order of hours, and the query is only mounted while the
+/// Stats view is open, so a shorter window would spend rate limit for no
+/// visible change.
+///
+/// Restored with `usePeriods` above; see its doc for why the unscoped page
+/// was not superseded by the scoped one.
+export function useHistory(days: number) {
+  return useQuery({
+    queryKey: ["history", days],
+    queryFn: () => getHistory(days),
+    staleTime: 5 * 60 * 1000,
+  });
+}
+
+/// The merged-PR sample behind the insight cards and repo table. Kept
+/// separate from `useHistory` so a slow or failed detail fetch leaves the
+/// chart and cards fully rendered.
+///
+/// This one is a SAMPLE -- the most recent 100 merged pull requests
+/// (`github/query.rs:175-195`) -- which is why the unscoped page carries a
+/// page-level "from a sample of recent merged pull requests" caveat that a
+/// scope page does not need. The scope pages measure a whole window and say
+/// so; this measures a fixed recent slice and says THAT. Two honest claims
+/// about two different populations, which is the reason both pages exist.
+export function useMergedDetail() {
+  return useQuery({
+    queryKey: ["merged-detail"],
+    queryFn: getMergedDetail,
+    staleTime: 5 * 60 * 1000,
+  });
+}
+
+/// Median cycle time this week against last, for the unscoped page.
+///
+/// The Stats page could prove throughput but not improvement: cycle time
+/// was a single window with no prior value, which is why its delta card
+/// was hardcoded to null. Same 5-minute staleness as the other stats.
+export function useCycleTrend() {
+  return useQuery({
+    queryKey: ["cycle-trend"],
+    queryFn: getCycleTrend,
+    staleTime: 5 * 60 * 1000,
+  });
 }
 
 /// Build history. Failed builds are kept: a failing build is usually

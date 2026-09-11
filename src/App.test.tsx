@@ -83,6 +83,13 @@ vi.mock("./api/hooks", () => ({
   }),
   useStatsSeries: () => ({ data: undefined, isError: false, refetch: () => {} }),
   useStatsBoard: () => ({ data: undefined, isError: false, refetch: () => {} }),
+  // The account-wide page's four (#826's reopening). Reached here because
+  // `StatsPage` routes to it when nothing is selected, which is this suite's
+  // state -- so these are the hooks the PR Stats route actually mounts.
+  usePeriods: () => ({ data: undefined, isError: false, refetch: () => {} }),
+  useHistory: () => ({ data: undefined, isError: false, refetch: () => {} }),
+  useMergedDetail: () => ({ data: undefined, isError: false, refetch: () => {} }),
+  useCycleTrend: () => ({ data: undefined, isError: false, refetch: () => {} }),
 }));
 
 vi.mock("./components/AuthGate", () => ({
@@ -211,12 +218,14 @@ describe("App — priorities strip scoping", () => {
     // The stats content itself still renders, so this is proving the strip
     // is absent from a populated page rather than from a blank one.
     //
-    // The assertion is on the scope prompt rather than on a figure, because
-    // #826's page measures nothing until a scope is clicked and this suite
-    // stubs the hooks as pending. The prompt is what a populated PR Stats
-    // view renders with no selection, and it is still StatsPage's own
-    // content -- which is what makes the absence of the strip meaningful.
-    expect(screen.getByText(/pick something to measure/i)).toBeDefined();
+    // The assertion is on the account-wide page's caveat line rather than on
+    // a figure, because this suite stubs every hook as pending. With no scope
+    // selected the view now renders the ACCOUNT-WIDE page (#826's reopening
+    // restored it and made it the default) rather than the scope prompt it
+    // showed between #829 and that reopening -- and the caveat line is
+    // StatsPage's own content either way, which is what makes the absence of
+    // the strip meaningful.
+    expect(screen.getByText(/across every organization/i)).toBeDefined();
   });
 
   /// A repo selection scopes the strip; a label filter must not. Something

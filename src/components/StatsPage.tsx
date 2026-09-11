@@ -2,6 +2,10 @@ import { useState } from "react";
 import {
   type StatsScope,
   scopeIsLoadable,
+  useCycleTrend,
+  useHistory,
+  useMergedDetail,
+  usePeriods,
   useScopedCounts,
   useStatsBoard,
   useStatsSeries,
@@ -11,7 +15,9 @@ import type { ShortSlice } from "../types/pr";
 import { QueryError, errorMessage } from "./QueryError";
 import { ActivityChart } from "./stats/ActivityChart";
 import { CycleTime } from "./stats/CycleTime";
+import { DeltaCards } from "./stats/DeltaCards";
 import { HelpButton } from "./HelpButton";
+import { InsightCards } from "./stats/InsightCards";
 import { Leaderboards } from "./stats/Leaderboard";
 import { Outliers } from "./stats/Outliers";
 import { RepoTable } from "./stats/RepoTable";
@@ -65,9 +71,17 @@ type Half = "mine" | "others";
 /// button" pattern is gone -- #796 removed the last one and
 /// `SystemHealthPage.tsx:1763-1788` argues against re-adding one -- so the
 /// gate is the selection, and the sidebar row is the click that opens it.
+///
+/// # The account-wide page and the scoped pages BOTH live here
+///
+/// Two pages, routed by one condition: `UnscopedStats` when nothing is
+/// selected or "Everything" is, `ScopedStats` otherwise. #826's reopening
+/// requires the account-wide view be reachable WITHOUT choosing a scope
+/// first, and the reason is measured rather than a preference -- see
+/// `UnscopedStats` for the 893-against-317 figures. The scoped pages are
+/// good and unchanged; what was wrong was treating one as a replacement for
+/// the other.
 export function StatsPage() {
-  const [days, setDays] = useState(30);
-  const [half, setHalf] = useState<Half>("mine");
   const filters = useActiveFilters();
 
   // The selection the sidebar wrote, as one object. The three keys ARE one
@@ -80,6 +94,31 @@ export function StatsPage() {
         subject: filters.statsSubject,
       }
     : undefined;
+
+  // The account-wide page, on BOTH of the two ways to ask for it: the
+  // "Everything" row, and no selection at all.
+  //
+  // Making it the default is what restores the capability #829 removed. The
+  // scoped page's empty state ("Pick something to measure") was a correct
+  // thing to show when the account-wide page did not exist, but with it back
+  // there is a better answer to "I have not chosen yet" than a prompt: the
+  // question the user most likely has, already answered. A zero-click
+  // overview is the specific thing that was lost, and an "Everything" row
+  // the user must find and click would only have halved the regression.
+  //
+  // `kind === "all"` rather than a fourth store field. `Filters.statsScopeKind`
+  // has had an `"all"` variant since #825 ("the widest scope was deliberately
+  // clicked") with nothing selecting it; this is the row that does, so the
+  // sidebar highlight, the store and the page agree without a new axis to
+  // keep in sync.
+  if (!scope || scope.kind === "all") return <UnscopedStats />;
+  return <ScopedStats scope={scope} />;
+}
+
+/// A scope page: the headline counts, the chart, and the two views.
+function ScopedStats({ scope }: { scope: StatsScope }) {
+  const [days, setDays] = useState(30);
+  const [half, setHalf] = useState<Half>("mine");
   const loadable = scopeIsLoadable(scope);
 
   const counts = useScopedCounts(scope, days, loadable);
@@ -93,8 +132,15 @@ export function StatsPage() {
   const board = boardQ.data;
   const series = seriesQ.data;
 
-  // Nothing selected. Not an error and not a loading state -- the user has
-  // simply not asked a question yet, and the sidebar is where they ask it.
+  // A half-written selection: a kind with no value, which `scopeIsLoadable`
+  // refuses so it cannot reach a command and come back as "scope org needs a
+  // value" -- an error about an internal contract shown to a user who only
+  // clicked a row.
+  //
+  // No longer the "nothing clicked yet" state: that now routes to
+  // `UnscopedStats`, which answers the question rather than asking for one.
+  // This branch survives because the store can still hold a kind without a
+  // value, and a page that rendered nothing for it would look broken.
   if (!loadable) {
     return (
       <div className="rounded-md border border-[#30363d] px-4 py-12 text-center">
@@ -102,9 +148,10 @@ export function StatsPage() {
           Pick something to measure
         </p>
         <p className="mx-auto mt-2 max-w-md text-sm text-[#8b949e]">
-          Choose an organization, a repository or a person in the sidebar.
-          Nothing is measured until you do -- a scope-wide load costs rate
-          limit, so it waits for a click.
+          Choose an organization, a repository or a person in the sidebar -- or
+          "Everything" for your account-wide figures. Nothing is measured
+          until you do: a scope-wide load costs rate limit, so it waits for a
+          click.
         </p>
       </div>
     );
@@ -351,6 +398,208 @@ export function StatsPage() {
         />
       ) : (
         <SkeletonRow count={4} cols="sm:grid-cols-2 lg:grid-cols-4" />
+      )}
+    </div>
+  );
+}
+
+/// The account-wide Stats page: "how am I doing, across everything".
+///
+/// # Why this exists beside the scoped pages (#826, reopened)
+///
+/// #829 deleted it as "superseded" by the scoped board. It was not, and the
+/// reason is a different question rather than a narrower one. A scope page
+/// answers "how is THIS organisation / repository / person doing", which
+/// requires choosing one first; this answers "how am I doing, across
+/// everything" with no selection at all. The zero-click overview became a
+/// two-click drill-down, and no issue asked for that.
+///
+/// The scoped pages are good and unchanged. What was wrong was treating one
+/// as a replacement for the other.
+///
+/// # `All repos` is NOT account-wide, and the gap is measured
+///
+/// This is the part that makes the removal a correctness problem rather than
+/// a taste one. The queries behind this page carry `author:@me` and NO
+/// repository qualifier (`github/query.rs:241-258`), which is the only shape
+/// that spans every organisation the viewer contributes to, owned or not.
+///
+/// MEASURED live 2026-09-11, 30-day window ending yesterday, one aliased
+/// document at cost 1:
+///
+/// | Query | Merged PRs |
+/// |---|---|
+/// | `author:@me` (this page) | **893** |
+/// | `author:@me user:pktstorm` (Personal / All repos) | **317** |
+/// | `author:@me org:FNX-Labs` | 494 |
+/// | `author:@me org:Stohic` | 82 |
+///
+/// So the nearest scoped equivalent shows **35%** of the viewer's activity,
+/// and no single sidebar row covers the other 576 pull requests -- they are
+/// in organisations the viewer contributes to without owning, which on this
+/// account is most of the work. Presenting the scoped page as a replacement
+/// lost two thirds of the number with nothing on screen to say so, which is
+/// the exact failure mode this feature's every other rule exists to prevent.
+///
+/// # Three independent queries, each rendering as IT lands
+///
+/// The property #829 kept for the scope pages and which applies here
+/// unchanged: periods ~1.6s, the daily series ~3.7s, the merged sample
+/// ~3.7s. Blocking on the slowest left the fast numbers finished and
+/// invisible. Each section keeps its own footprint while loading, so nothing
+/// jumps as the later queries arrive.
+///
+/// # It is a SAMPLE, and says so once
+///
+/// `useMergedDetail` reads the most recent 100 merged pull requests
+/// (`github/query.rs:175-195`), so the insight cards and repo shares are of a
+/// fixed recent sample rather than of a window. That caveat governs every
+/// figure below it and is stated once at the top rather than on each card --
+/// and it is precisely why `RepoTable` takes `sampleSize` here and a `hint`
+/// on a scope page: two honest claims about two different populations, which
+/// is the reason both pages exist.
+function UnscopedStats() {
+  const [days, setDays] = useState(30);
+  const periodsQ = usePeriods();
+  const historyQ = useHistory(days);
+  const detailQ = useMergedDetail();
+  const { data: cycleTrend } = useCycleTrend();
+  const { data: periods } = periodsQ;
+  const { data: history } = historyQ;
+  const { data: detail } = detailQ;
+
+  // Every section gates on truthy data, so without an explicit error branch
+  // a REJECTED query is indistinguishable from a pending one and its
+  // skeleton pulses forever. Nothing else covers this: `poll-error` is
+  // emitted only by the PR poll loop, so the AuthGate banner structurally
+  // cannot reach these three commands.
+  const allFailed = periodsQ.isError && historyQ.isError && detailQ.isError;
+  const retryAll = () => {
+    void periodsQ.refetch();
+    void historyQ.refetch();
+    void detailQ.refetch();
+  };
+
+  if (allFailed) {
+    return (
+      <QueryError
+        title="Could not load your statistics"
+        message={errorMessage(periodsQ.error)}
+        onRetry={retryAll}
+      />
+    );
+  }
+
+  // A brand-new user, or one back from holiday, otherwise met four cards
+  // reading 0 and "--", plus "over 0 merged", plus "No activity in this
+  // period", plus "No merged pull requests in this sample" -- four
+  // uncoordinated fragments where one sentence is clearer. Tolerates
+  // `detail` being absent, since the two queries land independently and a
+  // flicker would be worse than the fragments.
+  const nothingYet =
+    periods !== undefined &&
+    periods.week_current === 0 &&
+    periods.month_current === 0 &&
+    periods.opened_week_current === 0 &&
+    (detail === undefined || detail.sample_size === 0);
+
+  if (nothingYet) {
+    return (
+      <div className="rounded-md border border-[#30363d] px-4 py-12 text-center">
+        <p className="text-sm font-semibold text-[#e6edf3]">
+          No merged pull requests yet
+        </p>
+        <p className="mx-auto mt-2 max-w-md text-sm text-[#8b949e]">
+          Statistics appear here once you have merged some pull requests.
+          Headstate counts only pull requests you opened. Pick an organization
+          or a person in the sidebar to measure somebody else's.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      {/* One line for what is being measured AND the caveat that governs
+          every figure below: these are drawn from a SAMPLE, and p90 is the
+          maximum on a small one. If the sample caveat can be made in only
+          one place, it is at the top of the view rather than on a card.
+
+          The scope half is named explicitly -- "across every organization"
+          -- because that is the property a reader cannot otherwise see and
+          it is the one that distinguishes this page from `Personal` /
+          `All repos`, which is 317 of these 893 pull requests. A page whose
+          scope is invisible is one a reader will mistake for the narrower
+          one beside it. */}
+      <div className="flex items-center gap-1 text-xs text-[#8b949e]">
+        <span>
+          Your pull requests across every organization, from a sample of
+          recent merges
+        </span>
+        <HelpButton topic="stats-sample" />
+      </div>
+      {periods ? (
+        <DeltaCards periods={periods} />
+      ) : periodsQ.isError ? (
+        <QueryError
+          title="Could not load the headline figures"
+          message={errorMessage(periodsQ.error)}
+          onRetry={() => void periodsQ.refetch()}
+        />
+      ) : (
+        <SkeletonRow count={4} cols="sm:grid-cols-2 lg:grid-cols-4" />
+      )}
+
+      {history ? (
+        <ActivityChart
+          points={history.points}
+          days={days}
+          onDaysChange={setDays}
+        />
+      ) : historyQ.isError ? (
+        <QueryError
+          title="Could not load the activity chart"
+          message={errorMessage(historyQ.error)}
+          onRetry={() => void historyQ.refetch()}
+        />
+      ) : (
+        <SkeletonChart
+          title="Pull request activity"
+          hint="Opened and merged per day"
+        />
+      )}
+
+      {detail ? (
+        <>
+          <InsightCards detail={detail} trend={cycleTrend} />
+          {/* `slowestBy` is REQUIRED by `Outliers` rather than defaulted,
+              and this is the call site that proves why: `MergedPr` spells
+              the field `cycle_time_hours` where `BoardPr` spells it
+              `cycleTimeHours`. A default matching either one would hand the
+              other caller 0 for every row and draw a silent list of zeroes.
+              The component was widened for these two callers in #829 and its
+              doc comment names this page as one of them -- so the widening
+              was right and the deletion of the caller was not. */}
+          <Outliers
+            slowest={detail.slowest}
+            largest={detail.largest}
+            slowestBy={(pr) => pr.cycle_time_hours}
+          />
+          {/* `sampleSize`, NOT a `hint`. These shares are of the last N
+              merged pull requests rather than of a window, and the component
+              renders "share of the last 100 merged" from it -- the honest
+              claim for this page, where a scope page's is about a whole
+              window. */}
+          <RepoTable repos={detail.repo_counts} sampleSize={detail.sample_size} />
+        </>
+      ) : detailQ.isError ? (
+        <QueryError
+          title="Could not load the merged-PR sample"
+          message={errorMessage(detailQ.error)}
+          onRetry={() => void detailQ.refetch()}
+        />
+      ) : (
+        <SkeletonRow count={3} cols="md:grid-cols-3" />
       )}
     </div>
   );
