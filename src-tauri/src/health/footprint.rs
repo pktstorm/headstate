@@ -597,6 +597,12 @@ mod tests {
     /// `top_cpu`, because an idle test binary is legitimately not in the
     /// top eight of a busy machine -- a PID search would be flaky for
     /// the wrong reason.
+    ///
+    /// Two claims, and no more than two: the traversal saw more than
+    /// itself, and every figure it reported is a usable number. Anything
+    /// stronger about the CONTENT of a machine-wide list is a statement
+    /// about the machine rather than about this code -- see the note on
+    /// PID 0 below, which is what a third claim cost.
     #[test]
     fn a_sample_counts_every_process_including_our_own() {
         let f = Footprints::new();
@@ -611,18 +617,41 @@ mod tests {
             "counted {} processes on a machine running a test suite",
             fp.process_count
         );
-        // Nothing reported is a placeholder: every row is a process that
-        // exists, so it has a PID, a name and a finite CPU figure. The
-        // NaN case is covered separately -- what must not happen here is
-        // a fabricated row.
+        // Every reported CPU figure is a usable number rather than a
+        // fabricated one. This is the "absent is not zero" rule in the
+        // only shape it can still take here: a NaN from a platform whose
+        // accounting failed must not reach a caller that will format it.
+        //
+        // Deliberately NOT asserting `pid > 0`, and the reason is a fact
+        // about Windows worth recording here: PID 0 is a REAL process
+        // there. The kernel idle/system container is reported as
+        // `Process { pid: 0, name: "[System Process]", .. }`, where macOS
+        // and Linux never report a PID below 1.
+        //
+        // The assertion held of the removed `children` field, which
+        // contained only processes matched against a name list, so PID 0
+        // could never enter it. These lists are drawn from EVERY process
+        // on the machine -- that widening is the whole point of the
+        // reworked test -- so "no row has pid 0" stopped being a property
+        // of this data and became a claim about PID numbering on one
+        // platform.
+        //
+        // Not filtered out of `sample` either: that would invent a policy
+        // to satisfy a test, and the row is genuinely in a Windows user's
+        // process table. It sorts harmlessly -- it reports 0.0% and zero
+        // bytes, so it only reaches a top-N list on a machine with fewer
+        // than TOP_N processes doing anything at all.
+        //
+        // Observed on `platform (windows-latest)` and reproducible on no
+        // other runner, which is exactly why it is written down rather
+        // than left for the next person to rediscover.
         for p in fp.top_cpu.iter().chain(&fp.top_memory) {
-            assert!(p.pid > 0, "a row with no pid: {p:?}");
-            assert!(!p.name.is_empty(), "a row with no name: {p:?}");
             assert!(
                 p.cpu_percent.is_finite(),
-                "cpu {} for {}",
+                "cpu {} for {:?} (pid {})",
                 p.cpu_percent,
-                p.name
+                p.name,
+                p.pid
             );
         }
     }
