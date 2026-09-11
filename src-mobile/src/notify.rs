@@ -447,39 +447,75 @@ impl Seen {
     }
 }
 
+/// What [`decode_prs`] made of a `get_cached` payload.
+///
+/// # Why this is not just an empty `Vec`
+///
+/// It was, and that was a latent burst. "The desktop has no open pull
+/// requests" and "this build cannot read the desktop's list" are
+/// OPPOSITE answers, and the caller does different things with them: the
+/// first is a real list to remember, the second must leave the stored
+/// record alone.
+///
+/// Collapsed into an empty `Vec`, the unreadable case overwrote the seen
+/// set with nothing -- and the next window that COULD read the payload
+/// saw every pull request as new and fired one notification each. That is
+/// exactly the failure [`Previous::First`] exists to prevent, arriving by
+/// the back door, and an empty `Vec` is one `unwrap_or_default()` away
+/// from reintroducing it. Hence a type the caller cannot ignore.
+///
+/// Same reasoning as `health::Sample`'s "absent is not zero" rule, and
+/// the same reasoning that makes [`Previous`] an enum rather than an
+/// `Option<Vec<Pr>>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decoded {
+    /// The list, which may legitimately be empty.
+    List(Vec<Pr>),
+    /// The payload was not a list this build can read.
+    Unreadable,
+}
+
 /// Decode the pull requests out of a `get_cached` payload.
 ///
-/// Lenient by design: a payload that is not an array, or whose entries
-/// do not carry the four fields [`Pr`] needs, yields an empty list
-/// rather than an error. The phone's notifications are an affordance,
-/// and a desktop whose list shape this build does not recognise should
-/// cost the user notifications, not a failed refresh window -- the
-/// snapshot that window also stores is handed to the webview verbatim
-/// and is unaffected either way.
+/// Lenient about INDIVIDUAL entries and strict about the shape: an entry
+/// missing the fields [`Pr`] needs is skipped, but a payload that is not
+/// JSON, or not an array, or whose every entry was skipped, is
+/// [`Decoded::Unreadable`] -- see that type on why the distinction is
+/// load-bearing rather than tidy.
 ///
-/// Logged at debug when it yields nothing from a non-empty payload, so
-/// "the phone stopped notifying after a desktop upgrade" is answerable
-/// from a log rather than by guessing.
-pub fn decode_prs(json: &str) -> Vec<Pr> {
+/// Never an error: the phone's notifications are an affordance, and a
+/// desktop whose list shape this build does not recognise must cost the
+/// user notifications rather than a failed refresh window. The snapshot
+/// that window also stores is handed to the webview verbatim and is
+/// unaffected either way.
+///
+/// Logged when it cannot read a non-empty payload, so "the phone stopped
+/// notifying after a desktop upgrade" is answerable from a log rather
+/// than by guessing.
+pub fn decode_prs(json: &str) -> Decoded {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
-        log::debug!("notify: the cached list is not JSON; no notifications from it");
-        return Vec::new();
+        log::debug!("notify: the cached list is not JSON");
+        return Decoded::Unreadable;
     };
     let Some(array) = value.as_array() else {
-        log::debug!("notify: the cached list is not an array; no notifications from it");
-        return Vec::new();
+        log::debug!("notify: the cached list is not an array");
+        return Decoded::Unreadable;
     };
     let prs: Vec<Pr> = array
         .iter()
         .filter_map(|v| serde_json::from_value::<Pr>(v.clone()).ok())
         .collect();
+    // A genuinely empty list is a real answer and is remembered as one.
+    // Entries that were ALL skipped is not: the desktop said it had
+    // pull requests and this build could not read any of them.
     if prs.is_empty() && !array.is_empty() {
         log::debug!(
             "notify: none of the {} cached entries carried repo/number/title",
             array.len()
         );
+        return Decoded::Unreadable;
     }
-    prs
+    Decoded::List(prs)
 }
 
 /// Decode the conditions out of a `health_alerts` payload.
@@ -908,13 +944,20 @@ mod tests {
 
     // ---- Decoding ----------------------------------------------------
 
+    fn list(json: &str) -> Vec<Pr> {
+        match decode_prs(json) {
+            Decoded::List(prs) => prs,
+            Decoded::Unreadable => panic!("expected a readable list: {json}"),
+        }
+    }
+
     #[test]
     fn the_cached_list_decodes_to_the_fields_a_notification_needs() {
         let json = r#"[
             {"repo":"octocat/hello-world","number":1347,"title":"Add a spoon","isDraft":false,"ci":"success"},
             {"repo":"octocat/hello-world","number":1348,"title":"Remove a fork","is_draft":true}
         ]"#;
-        let prs = decode_prs(json);
+        let prs = list(json);
         assert_eq!(prs.len(), 2, "{prs:?}");
         assert_eq!(prs[0].number, 1347);
         assert_eq!(prs[0].title, "Add a spoon");
@@ -928,19 +971,56 @@ mod tests {
     /// unknown shape must not silence every notification.
     #[test]
     fn a_missing_draft_flag_is_not_a_draft() {
-        let prs = decode_prs(r#"[{"repo":"o/r","number":1,"title":"x"}]"#);
+        let prs = list(r#"[{"repo":"o/r","number":1,"title":"x"}]"#);
         assert_eq!(prs.len(), 1);
         assert!(!prs[0].is_draft);
     }
 
-    /// A payload this build cannot read costs notifications, not the
-    /// refresh window.
+    /// A payload this build cannot read is `Unreadable`, not an empty
+    /// list.
     #[test]
-    fn an_unreadable_payload_yields_no_pull_requests() {
-        assert!(decode_prs("not json").is_empty());
-        assert!(decode_prs(r#"{"prs": []}"#).is_empty());
-        assert!(decode_prs(r#"[{"unexpected": true}]"#).is_empty());
-        assert!(decode_prs("[]").is_empty());
+    fn an_unreadable_payload_is_not_an_empty_list() {
+        assert_eq!(decode_prs("not json"), Decoded::Unreadable);
+        assert_eq!(decode_prs(r#"{"prs": []}"#), Decoded::Unreadable);
+        assert_eq!(decode_prs(r#"[{"unexpected": true}]"#), Decoded::Unreadable);
+    }
+
+    /// **The distinction that prevents a burst.**
+    ///
+    /// "The desktop has no open pull requests" and "this build cannot
+    /// read the desktop's list" are OPPOSITE answers. A genuinely empty
+    /// array is a real list and is remembered as one; a non-empty array
+    /// whose every entry was skipped is not, because remembering it as
+    /// empty would wipe the seen set -- and the next window that COULD
+    /// read the payload would see every pull request as new and fire one
+    /// notification each.
+    ///
+    /// That is the first-sync burst arriving by the back door, which is
+    /// why these two cases must not collapse into the same value.
+    #[test]
+    fn an_empty_list_is_a_real_answer_but_all_entries_skipped_is_not() {
+        assert_eq!(
+            decode_prs("[]"),
+            Decoded::List(vec![]),
+            "no open pull requests is a real list, and must be remembered"
+        );
+        assert_eq!(
+            decode_prs(r#"[{"shape":"from a newer desktop"},{"also":"unreadable"}]"#),
+            Decoded::Unreadable,
+            "the desktop said it had two; we could read neither, so we know nothing"
+        );
+        // A partially readable payload IS a list: one unreadable entry
+        // among readable ones is a skipped notification, not an unknown
+        // list.
+        assert_eq!(
+            decode_prs(r#"[{"shape":"unknown"},{"repo":"o/r","number":1,"title":"x"}]"#),
+            Decoded::List(vec![Pr {
+                repo: "o/r".into(),
+                number: 1,
+                title: "x".into(),
+                is_draft: false,
+            }])
+        );
     }
 
     /// `health_alerts` returns the desktop's own wording, which the phone

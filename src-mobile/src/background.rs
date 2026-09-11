@@ -215,20 +215,40 @@ async fn notify_pass(desktop: &Arc<dyn Desktop>, notifier: &Arc<dyn Notifier>, p
     // Recorded with notifications OFF for the same reason: switching
     // them on must announce what appears NEXT, not everything that
     // appeared while they were off.
-    let current = notify::decode_prs(prs_json);
-    if prefs.wants_new_pr() {
-        for pr in notify::newly_appeared(&notifier.seen(), &current) {
-            let (title, body) = notify::appeared_notification(&pr);
-            if let Err(e) = notifier.post(&title, &body) {
-                log::info!("notify: could not announce a new pull request: {e}");
+    match notify::decode_prs(prs_json) {
+        notify::Decoded::List(current) => {
+            if prefs.wants_new_pr() {
+                for pr in notify::newly_appeared(&notifier.seen(), &current) {
+                    let (title, body) = notify::appeared_notification(&pr);
+                    if let Err(e) = notifier.post(&title, &body) {
+                        log::info!("notify: could not announce a new pull request: {e}");
+                    }
+                }
+            }
+            if let Err(e) = notifier.remember(&current) {
+                // Worth a warning: the next pass will treat a failed
+                // write as a first sync and announce nothing, so a
+                // persistently failing store means the feature is
+                // silently dead.
+                log::warn!("notify: could not record what this pass saw: {e}");
             }
         }
-    }
-    if let Err(e) = notifier.remember(&current) {
-        // Worth a warning: the next pass will treat a failed write as a
-        // first sync and announce nothing, so a persistently failing
-        // store means the feature is silently dead.
-        log::warn!("notify: could not record what this pass saw: {e}");
+        // The payload could not be read -- a desktop whose list shape
+        // this build does not recognise. The seen set is LEFT ALONE.
+        //
+        // Overwriting it with the empty list this case used to produce
+        // was a burst waiting to happen: the record would be wiped, and
+        // the next window that COULD read the payload would see every
+        // pull request as new and fire one notification each. That is
+        // precisely the failure first-sync suppression exists to
+        // prevent, arriving by the back door.
+        //
+        // Leaving the record costs at most one round of missed
+        // appearances, which is the right direction for a best-effort
+        // channel.
+        notify::Decoded::Unreadable => {
+            log::info!("notify: the cached list could not be read; leaving the seen set alone");
+        }
     }
 
     // Health. Not asked for at all when nothing would be posted: a
@@ -548,18 +568,39 @@ mod tests {
     /// the enumeration is what makes "cannot open the stream" structural,
     /// and it only keeps working if every addition has to be written here
     /// by someone who has read this comment.
+    ///
+    /// Scanned LINE BY LINE rather than by searching for `"\n}\n"`.
+    /// `include_str!` preserves whatever line endings the checkout has,
+    /// so on a Windows checkout with `core.autocrlf` a byte-pattern
+    /// containing a bare `\n` finds nothing and the test panics on its
+    /// own `unwrap`. `str::lines` splits on both. This crate has no
+    /// Windows CI job, so nothing here would have caught it -- the
+    /// identical pattern DID fail on the desktop's `platform
+    /// (windows-latest)` job, and this is the same bug fixed in the same
+    /// change rather than left for whoever adds that job.
     #[test]
     fn the_seam_offers_only_what_a_window_needs() {
         let src = include_str!("background.rs");
-        let start = src.find("pub trait Desktop").unwrap();
-        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        let lines: Vec<&str> = src.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("pub trait Desktop"))
+            .expect("the seam exists");
+        let len = lines[start..]
+            .iter()
+            .position(|l| *l == "}")
+            .expect("the seam closes");
+        let body = &lines[start..start + len];
         let methods: Vec<&str> = body
-            .lines()
+            .iter()
             .filter_map(|l| l.trim().strip_prefix("fn "))
             .map(|l| l.split('(').next().unwrap())
             .collect();
         assert_eq!(methods, vec!["hello", "get_cached", "health_alerts"]);
-        assert!(!body.contains("events"), "no stream on the seam");
+        assert!(
+            !body.iter().any(|l| l.contains("events")),
+            "no stream on the seam"
+        );
     }
 
     // ---- Notifications (#789) ---------------------------------------
@@ -786,6 +827,73 @@ mod tests {
             notifier.titles(),
             vec!["Add a spoon"],
             "the pull request was still announced"
+        );
+    }
+
+    /// **The regression test for the back-door burst.**
+    ///
+    /// A window whose list this build cannot read must LEAVE THE SEEN SET
+    /// ALONE. Recording it as empty -- which an `Unreadable` collapsed
+    /// into an empty `Vec` used to do -- wipes the record, so the next
+    /// window that CAN read the payload sees every pull request as new
+    /// and fires one notification each. That is the first-sync burst
+    /// arriving by the back door, past the suppression built to stop it.
+    ///
+    /// Driven as two windows, because one cannot show it: the damage is
+    /// done in the first and only visible in the second.
+    #[test]
+    fn an_unreadable_list_does_not_wipe_the_seen_set_and_cause_a_burst() {
+        let notifier = FakeNotifier::new(crate::notify::Previous::First);
+
+        // Window one: a readable list, recorded. Nothing announced, as a
+        // first sync.
+        let many = r#"[{"repo":"o/r","number":1,"title":"a"},
+                       {"repo":"o/r","number":2,"title":"b"},
+                       {"repo":"o/r","number":3,"title":"c"}]"#;
+        let _ = run_notifying(&FakeDesktop::new(Ok(()), Ok(many.into())), &notifier);
+        assert!(notifier.posted().is_empty());
+        let recorded = notifier.remembered.lock().unwrap().len();
+        assert_eq!(recorded, 1);
+
+        // Window two: the desktop answers with a shape this build cannot
+        // read. `LIST` has no `repo`, so every entry is skipped.
+        let _ = run_notifying(&FakeDesktop::new(Ok(()), Ok(LIST.into())), &notifier);
+        assert!(notifier.posted().is_empty(), "nothing readable to announce");
+        assert_eq!(
+            notifier.remembered.lock().unwrap().len(),
+            recorded,
+            "the seen set must NOT be rewritten from a list we could not read"
+        );
+
+        // Window three: readable again, and the SAME three pull requests.
+        // None of them is new, so none is announced -- which is only true
+        // because window two left the record alone.
+        let _ = run_notifying(&FakeDesktop::new(Ok(()), Ok(many.into())), &notifier);
+        assert!(
+            notifier.posted().is_empty(),
+            "a burst of three: the unreadable window wiped the seen set: {:?}",
+            notifier.titles()
+        );
+    }
+
+    /// And the other side of that distinction: a GENUINELY empty list is
+    /// a real answer and IS recorded, so a pull request opened afterwards
+    /// is news.
+    #[test]
+    fn a_genuinely_empty_list_is_recorded_and_the_next_arrival_is_news() {
+        let notifier = FakeNotifier::new(crate::notify::Previous::First);
+        let _ = run_notifying(&FakeDesktop::new(Ok(()), Ok("[]".into())), &notifier);
+        assert_eq!(
+            notifier.remembered.lock().unwrap().len(),
+            1,
+            "an empty list is a real list"
+        );
+
+        let _ = run_notifying(&FakeDesktop::new(Ok(()), Ok(NOTIFIABLE.into())), &notifier);
+        assert_eq!(
+            notifier.titles(),
+            vec!["Add a spoon"],
+            "the first pull request after an empty list is news"
         );
     }
 

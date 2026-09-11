@@ -1235,20 +1235,38 @@ mod tests {
     /// ever becomes an `Alert`, a week of measurement becomes a week of
     /// interruptions -- so the absence of that conversion is asserted
     /// rather than left to review.
+    ///
+    /// Scanned LINE BY LINE rather than by searching for `"\n}\n"`.
+    /// `include_str!` preserves whatever line endings the checkout has,
+    /// and a Windows checkout with `core.autocrlf` has CRLF -- so a
+    /// byte-pattern containing a bare `\n` finds nothing there and the
+    /// test panics on its own `expect`. `str::lines` splits on both, so
+    /// this reads the same on every platform. (Observed: this test, on
+    /// the `platform (windows-latest)` job.)
     #[test]
     fn nothing_converts_a_shadow_into_an_alert() {
         let src = include_str!("runaway.rs");
-        let body = &src[..src.find("#[cfg(test)]").expect("tests exist")];
+        let body: Vec<&str> = src
+            .lines()
+            .take_while(|l| !l.starts_with("#[cfg(test)]"))
+            .collect();
+        assert!(!body.is_empty(), "the module body parsed to nothing");
         assert!(
-            !body.contains("impl From<Shadow>"),
+            !body.iter().any(|l| l.contains("impl From<Shadow>")),
             "a Shadow must not be convertible into an Alert"
         );
-        // And exactly one Alert variant ships: a second one would mean
-        // a deferred tier had gone live.
-        let start = body.find("pub enum Alert {").expect("Alert exists");
-        let end = start + body[start..].find("\n}\n").expect("Alert closes");
-        let variants = body[start..end]
-            .lines()
+        // And exactly one Alert variant ships: a second one would mean a
+        // deferred tier had gone live.
+        let start = body
+            .iter()
+            .position(|l| l.trim() == "pub enum Alert {")
+            .expect("Alert exists");
+        let len = body[start..]
+            .iter()
+            .position(|l| *l == "}")
+            .expect("Alert closes");
+        let variants = body[start..start + len]
+            .iter()
             .filter(|l| l.trim_start().starts_with("DiffuseCpu"))
             .count();
         assert_eq!(variants, 1);
