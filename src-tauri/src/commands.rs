@@ -2369,12 +2369,17 @@ pub async fn health_alerts(app: AppHandle) -> Result<Vec<crate::health::AlertRep
         // timer, where a held instance is what makes a CPU delta mean
         // anything; this is an occasional question from a phone, so the
         // two refreshes it needs are done here and the instance is
-        // dropped. Without both, the first refresh reports every process
-        // at 0% and the aggregate rule would conclude that nothing
-        // explains the load -- firing on a legitimate build.
+        // dropped.
+        //
+        // `read_twice`, never two `read` calls: `sysinfo` will not
+        // recompute a CPU delta inside `MINIMUM_CPU_UPDATE_INTERVAL`, so
+        // back-to-back reads report every process at 0% -- and a zero
+        // `top_cpu_percent` makes the aggregate rule conclude that
+        // nothing explains the load, firing on a legitimate build. That
+        // wait is why `read_twice` exists and why it lives in
+        // `health::runaway` rather than here.
         let table = crate::health::runaway::Table::new();
-        let _ = table.read();
-        let (_, aggregate) = table.read();
+        let (_, aggregate) = table.read_twice();
         out.extend(
             crate::health::runaway::evaluate(&history, Some(&aggregate))
                 .into_iter()

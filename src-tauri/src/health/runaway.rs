@@ -697,11 +697,51 @@ impl Table {
         }
     }
 
+    /// Two passes [`sysinfo::MINIMUM_CPU_UPDATE_INTERVAL`] apart, for a
+    /// caller that does not already have a previous reading.
+    ///
+    /// # Why this exists, and why it SLEEPS
+    ///
+    /// `sysinfo` reports CPU use as a delta since the previous refresh
+    /// of the same `System`, and it refuses to recompute one inside
+    /// `MINIMUM_CPU_UPDATE_INTERVAL` -- so two back-to-back [`read`]
+    /// calls yield a second reading of ZERO for every process. That is
+    /// not a cosmetic zero here: a zero `top_cpu_percent` makes
+    /// [`Aggregate::one_process_explains_it`] answer `Some(false)`, which
+    /// is the clause that lets [`evaluate`] fire. A caller that forgot
+    /// the interval would therefore report "no single process explains
+    /// it" during a `yarn build` -- exactly the false positive
+    /// `a_legitimate_build_does_not_fire` exists to prevent, reintroduced
+    /// one layer down where that test cannot see it.
+    ///
+    /// So the wait lives HERE rather than at each call site, and the
+    /// sleep is the honest cost of asking a question that is defined as
+    /// a rate. The sampler loop does not use this -- it holds a `Table`
+    /// across its sixty-second ticks and already has an interval, which
+    /// is the whole reason the instance is long-lived.
+    ///
+    /// Blocking for the length of the interval (~200ms), so callers keep
+    /// it on a blocking worker.
+    ///
+    /// [`read`]: Table::read
+    pub fn read_twice(&self) -> (Vec<ProcessObservation>, Aggregate) {
+        let _ = self.read();
+        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+        self.read()
+    }
+
     /// One pass over the process table: the observations, and the
     /// aggregate rule's live half.
     ///
+    /// The CPU figures are a delta since the PREVIOUS pass of this same
+    /// `Table`, so a caller with no previous pass wants [`read_twice`]
+    /// instead -- see its docs on the false positive a missing interval
+    /// causes.
+    ///
     /// Blocking -- it reads the kernel -- so callers keep it on the
     /// sampler's own thread, which is already blocking by design.
+    ///
+    /// [`read_twice`]: Table::read_twice
     pub fn read(&self) -> (Vec<ProcessObservation>, Aggregate) {
         let mut sys = self.system.lock().unwrap_or_else(|e| e.into_inner());
         sys.refresh_processes_specifics(
@@ -1229,17 +1269,77 @@ mod tests {
         assert_eq!(a.key(), "diffuse_cpu");
     }
 
+    /// **The regression test for the zero-delta false positive.**
+    ///
+    /// `sysinfo` refuses to recompute a CPU delta inside
+    /// `MINIMUM_CPU_UPDATE_INTERVAL`, so two back-to-back `read` calls
+    /// report every process at 0%. A zero `top_cpu_percent` makes
+    /// `one_process_explains_it` answer `Some(false)` -- the clause that
+    /// lets `evaluate` fire -- so a caller without the interval would
+    /// report "no single process explains it" during a build.
+    ///
+    /// That is `a_legitimate_build_does_not_fire` reintroduced one layer
+    /// down, where that test cannot see it, so it is asserted here:
+    /// `read_twice` must find a busy process that a back-to-back pair
+    /// does not.
+    ///
+    /// Asserted as "strictly more than the zero-interval pair" rather
+    /// than against an absolute figure, because the only number a test
+    /// can rely on is the one it burned itself.
+    #[test]
+    fn read_twice_waits_long_enough_for_a_cpu_delta_to_exist() {
+        let spin = || {
+            let mut n = 0u64;
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(150);
+            while std::time::Instant::now() < until {
+                n = n.wrapping_add(1);
+            }
+            assert!(n > 0);
+        };
+
+        // Two reads with no interval between them: sysinfo has nothing
+        // to divide by, so nothing is busy.
+        let eager = Table::new();
+        let _ = eager.read();
+        spin();
+        let (_, no_interval) = eager.read();
+
+        // And the same thing done properly.
+        let patient = Table::new();
+        spin();
+        let (_, with_interval) = patient.read_twice();
+
+        assert!(
+            with_interval.top_cpu_percent > no_interval.top_cpu_percent,
+            "read_twice must leave an interval for a delta to exist: \
+             with={} without={}",
+            with_interval.top_cpu_percent,
+            no_interval.top_cpu_percent
+        );
+        assert!(
+            with_interval.top_cpu_percent > 0.0,
+            "this test burned a core for 150ms; something must be busy"
+        );
+        // And that figure is what keeps a busy machine from firing: a
+        // zero would have read as "nothing explains the load".
+        assert_eq!(
+            no_interval.one_process_explains_it(),
+            Some(false),
+            "which is exactly the false positive read_twice prevents"
+        );
+    }
+
     /// The real process table, on whatever machine runs the tests. Not
     /// an assertion about any particular process -- it cannot be -- but
     /// it does prove the reader works, which a pure-arithmetic suite
     /// never would.
     #[test]
     fn a_real_process_table_reads() {
-        let t = Table::new();
-        // Two passes: `sysinfo` reports CPU since the previous refresh,
-        // so the first one is all zeroes by construction.
-        let _ = t.read();
-        let (observations, aggregate) = t.read();
+        // `read_twice`, because `sysinfo` reports CPU since the previous
+        // refresh and will not recompute one inside
+        // `MINIMUM_CPU_UPDATE_INTERVAL` -- so a back-to-back pair would
+        // assert against an all-zero reading.
+        let (observations, aggregate) = Table::new().read_twice();
         assert!(!observations.is_empty(), "no processes at all");
         assert_eq!(observations.len(), aggregate.process_count);
         assert!(aggregate.top_cpu_percent.is_finite());
