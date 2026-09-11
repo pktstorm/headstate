@@ -365,8 +365,9 @@ async fn probe_round(
     budget: &Budget,
 ) -> Result<Vec<u64>, ClientError> {
     let mut counts = vec![0u64; slices.len()];
-    for wave in slices.chunks(ALIAS_CHUNK * READ_CONCURRENCY) {
-        let base = offset_of(slices, wave);
+    let per_wave = ALIAS_CHUNK * READ_CONCURRENCY;
+    for (w, wave) in slices.chunks(per_wave).enumerate() {
+        let base = w * per_wave;
         let mut set = tokio::task::JoinSet::new();
         for (n, chunk) in wave.chunks(ALIAS_CHUNK).enumerate() {
             let first_index = base + n * ALIAS_CHUNK;
@@ -409,17 +410,6 @@ async fn probe_round(
         }
     }
     Ok(counts)
-}
-
-/// Where `wave` starts within `all`, by pointer identity.
-///
-/// `chunks` yields subslices of the original, so this is exact and does
-/// not depend on the contents being distinct -- two identical date ranges
-/// in one round would break a content-based search.
-fn offset_of(all: &[Slice], wave: &[Slice]) -> usize {
-    let base = all.as_ptr() as usize;
-    let here = wave.as_ptr() as usize;
-    (here - base) / std::mem::size_of::<Slice>()
 }
 
 /// An exact count for ONE repository, through the uncapped connection.
@@ -532,8 +522,9 @@ async fn detail_round(
     page: u32,
 ) -> Result<serde_json::Value, ClientError> {
     let mut merged = serde_json::Map::new();
-    for wave in slices.chunks(chunk * READ_CONCURRENCY) {
-        let base = offset_of(slices, wave);
+    let per_wave = chunk * READ_CONCURRENCY;
+    for (w, wave) in slices.chunks(per_wave).enumerate() {
+        let base = w * per_wave;
         let mut set = tokio::task::JoinSet::new();
         for (n, part) in wave.chunks(chunk).enumerate() {
             let first_index = base + n * chunk;
@@ -743,17 +734,48 @@ mod tests {
         );
     }
 
-    /// Chunk offsets are computed by pointer identity, so two identical
-    /// date ranges in one round cannot confuse the pairing.
+    /// Absolute alias indices must cover every slice exactly once -- no
+    /// repeat and no gap -- whatever the wave and chunk sizes.
+    ///
+    /// This is the property the whole merge rests on. Chunks complete out
+    /// of order into one map keyed by alias, so a REPEATED index silently
+    /// overwrites a slice's count and a GAP silently leaves it at zero --
+    /// and zero reads as "no activity in that range", which is a wrong
+    /// total that looks entirely right. The same failure
+    /// `query.rs:667-678` guards for the history series.
+    ///
+    /// Derived from `enumerate()` rather than from pointer arithmetic: an
+    /// earlier version of this computed the wave offset from the pointer
+    /// distance between the subslice and its parent, which needed an
+    /// `unsafe` block and a safety argument to save nothing over
+    /// multiplying the wave number by the wave size.
     #[test]
-    fn wave_offsets_survive_duplicate_ranges() {
-        let all: Vec<Slice> = (0..25)
-            .map(|_| Slice::new("2026-08-01", "2026-08-31"))
-            .collect();
-        let waves: Vec<&[Slice]> = all.chunks(10).collect();
-        assert_eq!(offset_of(&all, waves[0]), 0);
-        assert_eq!(offset_of(&all, waves[1]), 10);
-        assert_eq!(offset_of(&all, waves[2]), 20);
+    fn absolute_alias_indices_tile_every_slice_exactly_once() {
+        // Boundaries either side of one wave and one chunk, plus an
+        // empty input -- `chunks` yields no waves at all for 0, which is
+        // the case a pointer-based offset would have had to special-case.
+        for n in [0usize, 1, 9, 10, 11, 25, 60, 61, 137] {
+            for chunk in [1usize, 3, ALIAS_CHUNK] {
+                // Deliberately IDENTICAL ranges: the indices must not
+                // depend on the contents being distinguishable.
+                let slices: Vec<Slice> = (0..n)
+                    .map(|_| Slice::new("2026-08-01", "2026-08-31"))
+                    .collect();
+                let per_wave = chunk * READ_CONCURRENCY;
+                let mut seen = Vec::new();
+                for (w, wave) in slices.chunks(per_wave).enumerate() {
+                    let base = w * per_wave;
+                    for (c, part) in wave.chunks(chunk).enumerate() {
+                        let first = base + c * chunk;
+                        for i in 0..part.len() {
+                            seen.push(first + i);
+                        }
+                    }
+                }
+                seen.sort_unstable();
+                assert_eq!(seen, (0..n).collect::<Vec<_>>(), "n={n} chunk={chunk}");
+            }
+        }
     }
 
     /// One wave is `ALIAS_CHUNK * READ_CONCURRENCY` slices, which is the
