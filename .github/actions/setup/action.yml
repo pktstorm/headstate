@@ -43,8 +43,38 @@ runs:
     - shell: bash
       run: corepack enable
 
+    # Retried, because the fetch step is a network operation with no retry
+    # of its own and it fails non-deterministically (#811). The symptom is
+    # `Error: While persisting <cache>/<pkg>.zip/...` on a DIFFERENT package
+    # each time, on all three platforms, while the same lockfile installs
+    # cleanly moments later -- so the failure says nothing about the tree
+    # being installable. Unretried it took down nine of ten jobs at once,
+    # which reads as "this branch is broken" rather than "the installer
+    # hiccuped", and cost six CI cycles across the #799 batch.
+    #
+    # Three attempts with a widening pause. `--immutable` keeps every
+    # attempt honest: a retry cannot quietly resolve to different versions
+    # or rewrite the lockfile, so this trades a slower failure for no loss
+    # of strictness. A tree that genuinely cannot install still fails, just
+    # three times over.
+    #
+    # A plain bash loop rather than a retry action: one fewer third-party
+    # action to pin and audit for a dozen lines of shell, and it behaves
+    # identically on macOS, Linux and Windows (bash is `shell: bash`
+    # everywhere here, Git Bash on the Windows runners).
     - shell: bash
-      run: yarn install --immutable
+      run: |
+        for attempt in 1 2 3; do
+          if yarn install --immutable; then
+            exit 0
+          fi
+          if [ "$attempt" -lt 3 ]; then
+            echo "::warning::yarn install failed (attempt $attempt/3); retrying -- see #811"
+            sleep $((attempt * 15))
+          fi
+        done
+        echo "::error::yarn install failed three times; this is not the transient in #811"
+        exit 1
 
     - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       with:
