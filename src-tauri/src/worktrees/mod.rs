@@ -18,7 +18,7 @@ pub(crate) mod scan;
 pub use assess::{assess, Assessment};
 pub use model::{Repo, Worktree};
 pub use scan::{
-    classify_repo, head_oid, prune_worktrees, pull_checkout, remove_orphan, remove_worktree,
-    remove_worktree_forced, remove_worktrees_with_progress, repo_identity, scan_dirs_fast,
-    size_repo_streaming, unlock_worktree, RemovalOutcome,
+    classify_repo_streaming, head_oid, prune_worktrees, pull_checkout, remove_orphan,
+    remove_worktree, remove_worktree_forced, remove_worktrees_with_progress, repo_identity,
+    scan_dirs_fast, size_repo_streaming, unlock_worktree, RemovalOutcome,
 };

@@ -301,8 +301,21 @@ export const statsSeries = (
 /// ~800ms for 37 repos and 295 worktrees; safe to block a view on.
 export const listWorktrees = () => call<WorktreeRepo[]>("list_worktrees");
 
-/// Classify one repo's worktrees. Four git calls each, ~16s across all
-/// 295 -- so this is per repo, filling in as results arrive.
+/// Classify one repo's worktrees. Per repo, and STREAMING: each verdict
+/// is also emitted on `worktree-safety` as it is reached.
+///
+/// "Four git calls each" is what this comment used to say, and it is
+/// wrong in the direction that caused #830. The count is UNBOUNDED:
+/// `content_landed` on the Rust side spends up to four git calls per
+/// CHANGED FILE, so one branch touching 100 files is ~400 calls. That is
+/// why a per-call timeout never bounded this pass, and why a 111-worktree
+/// repository could show sizes, count to 111, and never resolve a single
+/// safety verdict. MEASURED per worktree, serial: a 114ms median against
+/// a 3295ms max inside ONE repository -- a 29x spread, because the cost
+/// tracks changed files rather than worktree count.
+///
+/// Await this for the settled set; subscribe to `worktree-safety` for the
+/// rows as they land. `useWorktreeSafety` does both.
 export const classifyWorktrees = (repoPath: string) =>
   call<Worktree[]>("classify_worktrees", { repoPath });
 
