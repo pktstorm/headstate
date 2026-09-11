@@ -1143,6 +1143,13 @@ function seedFromRow(row: PullRequest): PrDetail {
     comment_count: row.comment_count,
     comments: [],
     review_threads: [],
+    // Zero for the same reason as `checks_total` below: `ReviewThreads`
+    // renders nothing while the list is empty, and a non-zero total
+    // against it would claim "Showing 0 of 12" about threads nobody has
+    // fetched. The row does carry `unresolved_threads`, but that is a
+    // count of OPEN threads and not the connection total, so it is not a
+    // stand-in here (#802).
+    review_threads_total: 0,
     checks: [],
     checks_total: 0,
   };

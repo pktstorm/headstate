@@ -34,8 +34,11 @@ const thread = (over: Partial<ReviewThread> = {}): ReviewThread => ({
   ...over,
 });
 
-const view = (threads: ReviewThread[]) =>
-  render(<ReviewThreads threads={threads} repo="o/r" number={7} />);
+/// `total` defaults to "nothing missing", which is what every test that
+/// is not about truncation means -- a default of 0 would instead make the
+/// complete case the untested one.
+const view = (threads: ReviewThread[], total = threads.length) =>
+  render(<ReviewThreads threads={threads} total={total} repo="o/r" number={7} />);
 
 beforeEach(() => {
   resolve.mockClear();
@@ -170,5 +173,64 @@ describe("ReviewThreads", () => {
   it("says when a thread has more comments than it shows", () => {
     view([thread({ comment_count: 12 })]);
     expect(screen.getByText(/Showing 1 of 12/)).toBeTruthy();
+  });
+
+  /// #802: the defect was SILENCE, not the window. A list short of the
+  /// real count must say so, because an unresolved blocking conversation
+  /// can sit in the gap while the section looks finished.
+  it("says when conversations are missing from the list", () => {
+    view([thread(), thread({ id: "RT_2" })], 25);
+    expect(screen.getByText(/Showing 2 of 25 conversations/)).toBeTruthy();
+  });
+
+  /// The complement, and the more important half: a complete list must
+  /// not be annotated. A "showing 7 of 7" on every pull request trains
+  /// the reader to ignore the line that matters.
+  it("says nothing when every conversation arrived", () => {
+    view([thread(), thread({ id: "RT_2" })]);
+    expect(screen.queryByText(/Showing 2 of/)).toBeNull();
+  });
+
+  /// A total BELOW the length is possible -- the two numbers can come
+  /// from slightly different moments -- and is not a shortfall. Subtract
+  /// instead of comparing and this renders "Showing 2 of 1".
+  it("says nothing when the total is smaller than what arrived", () => {
+    view([thread(), thread({ id: "RT_2" })], 1);
+    expect(screen.queryByText(/Showing/)).toBeNull();
+  });
+
+  /// The header counts what ARRIVED, and admits the total beside it only
+  /// when the two differ -- the same rule as the notice.
+  it("shows both counts in the header only when truncated", () => {
+    const { unmount } = view([thread()], 9);
+    expect(screen.getByText("1 of 9")).toBeTruthy();
+    unmount();
+
+    view([thread()]);
+    expect(screen.queryByText(/1 of/)).toBeNull();
+  });
+
+  /// Settled threads normally collapse because they are history. When the
+  /// list is truncated they open anyway: "resolved" is only known about
+  /// the threads that arrived, so a wall of collapsed cards over a
+  /// truncation notice is the reassuring-looking view #802 is about. Same
+  /// reasoning as the Checks panel opening when capped (#790).
+  it("opens settled conversations when the list is truncated", () => {
+    view([thread({ id: "RT_done", is_resolved: true })], 40);
+    const toggles = screen
+      .getAllByRole("button")
+      .filter((b) => b.getAttribute("aria-expanded") !== null);
+    expect(toggles[0].getAttribute("aria-expanded")).toBe("true");
+  });
+
+  /// And the user can still close it: forcing the INITIAL state open must
+  /// not pin it, or the truncation notice has taken a control away.
+  it("lets a force-opened conversation still be collapsed", () => {
+    view([thread({ id: "RT_done", is_resolved: true })], 40);
+    const toggle = screen
+      .getAllByRole("button")
+      .filter((b) => b.getAttribute("aria-expanded") !== null)[0];
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
   });
 });

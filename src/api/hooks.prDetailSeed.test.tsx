@@ -117,6 +117,11 @@ describe("usePrDetail seeding", () => {
     // Zero against an empty list, so the Checks panel cannot claim
     // "showing 0 of N" on data nobody fetched.
     expect(result.current.data?.checks_total).toBe(0);
+    // Same reasoning one section up (#802). The row DOES carry
+    // `unresolved_threads`, which makes a non-zero value here tempting --
+    // but that counts open threads, not the connection total, so it would
+    // annotate an empty list with a shortfall it cannot support.
+    expect(result.current.data?.review_threads_total).toBe(0);
     // The list query does not select the diff size, so this is genuinely
     // unknown. The view suppresses the line at zero rather than printing
     // "+0 −0 across 0 files".
