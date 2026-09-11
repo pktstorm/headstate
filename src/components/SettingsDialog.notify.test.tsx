@@ -97,3 +97,90 @@ describe("notification settings", () => {
     expect(screen.getByText(/never on first launch/i)).toBeTruthy();
   });
 });
+
+/// #789 gave the app two categories it had never had: a pull request
+/// APPEARING, and this machine's health.
+describe("the new-PR and health categories (#789)", () => {
+  beforeEach(() => {
+    prefsState.prefs = {
+      enabled: true,
+      ci_failed: true,
+      conflicted: true,
+      ready_to_review: true,
+      new_pr: true,
+      health_battery: true,
+      health_cpu: true,
+    };
+  });
+
+  it("offers a toggle for a pull request appearing", () => {
+    show();
+    const box = screen.getByRole("checkbox", { name: /a pull request appears/i });
+    fireEvent.click(box);
+    expect(setPrefs).toHaveBeenCalledWith(
+      expect.objectContaining({ new_pr: false, ready_to_review: true }),
+    );
+  });
+
+  /// **The gap #789 closed.** Until now the battery alerts notified
+  /// unconditionally -- only the threshold was adjustable -- so a user
+  /// who wanted pull-request notifications and not machine ones had no
+  /// way to say so.
+  it("offers separate toggles for battery and CPU", () => {
+    show();
+    fireEvent.click(screen.getByRole("checkbox", { name: /battery problems/i }));
+    expect(setPrefs).toHaveBeenCalledWith(
+      expect.objectContaining({ health_battery: false, health_cpu: true }),
+    );
+
+    setPrefs.mockClear();
+    fireEvent.click(screen.getByRole("checkbox", { name: /cpu is busy/i }));
+    expect(setPrefs).toHaveBeenCalledWith(
+      expect.objectContaining({ health_cpu: false, health_battery: true }),
+    );
+  });
+
+  /// A threshold for an alert that cannot fire is a control that does
+  /// nothing, and leaving it live would imply the alert was still
+  /// coming.
+  it("disables the battery threshold when battery notifications are off", () => {
+    prefsState.prefs = {
+      enabled: true,
+      ci_failed: true,
+      conflicted: true,
+      ready_to_review: true,
+      new_pr: true,
+      health_battery: false,
+      health_cpu: true,
+    };
+    show();
+    expect(
+      screen.getByRole("spinbutton", { name: /battery charge warning threshold/i }),
+    ).toHaveProperty("disabled", true);
+  });
+
+  /// The CPU row must say what it looks for. "Tell me when my machine is
+  /// busy" is something nobody wants and is not what the rule does: the
+  /// aggregate shape is the whole point, because ten runaway processes
+  /// each look unremarkable in a sorted list.
+  it("says the CPU alert is about load nothing explains", () => {
+    show();
+    expect(screen.getByText(/no single process accounts for/i)).toBeTruthy();
+  });
+
+  it("silences both health categories through the master switch", () => {
+    prefsState.prefs = {
+      enabled: false,
+      ci_failed: true,
+      conflicted: true,
+      ready_to_review: true,
+      new_pr: true,
+      health_battery: true,
+      health_cpu: true,
+    };
+    show();
+    for (const name of [/battery problems/i, /cpu is busy/i, /a pull request appears/i]) {
+      expect(screen.getByRole("checkbox", { name })).toHaveProperty("disabled", true);
+    }
+  });
+});

@@ -61,6 +61,7 @@ LOCKS = ("src-tauri/Cargo.lock", "src-mobile/Cargo.lock")
 RUST_ONLY = {
     "tauri-plugin",
     "tauri-plugin-headstate-keys",
+    "tauri-plugin-headstate-notify",
     "tauri-plugin-headstate-refresh",
     "tauri-plugin-autostart",
     "tauri-plugin-log",

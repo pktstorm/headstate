@@ -194,6 +194,16 @@ pub enum BreakageKind {
     /// name wrong, so it is called out here rather than left to be
     /// discovered.
     ReadyToReview,
+    /// A pull request that was not in the previous tick's list (#789).
+    ///
+    /// The FOURTH variant in a type called `BreakageKind`, which by now
+    /// makes the name plainly wrong -- two of the four are not breakage.
+    /// Still not renamed, for the reason `ReadyToReview` gives: the name
+    /// appears at every call site and on the wire in `NotifyPrefs`, and
+    /// a rename buys nothing behavioural while touching the settings
+    /// struct users have stored values for. If a fifth arrives, rename
+    /// it then and migrate the preference keys in the same change.
+    Appeared,
 }
 
 impl BreakageKind {
@@ -203,6 +213,7 @@ impl BreakageKind {
             BreakageKind::CiFailed => "CI is failing",
             BreakageKind::Conflicted => "has merge conflicts",
             BreakageKind::ReadyToReview => "is ready for your review",
+            BreakageKind::Appeared => "just appeared",
         }
     }
 
@@ -212,6 +223,7 @@ impl BreakageKind {
             BreakageKind::CiFailed => prefs.ci_failed,
             BreakageKind::Conflicted => prefs.conflicted,
             BreakageKind::ReadyToReview => prefs.ready_to_review,
+            BreakageKind::Appeared => prefs.new_pr,
         }
     }
 }
@@ -339,6 +351,42 @@ pub struct NotifyPrefs {
     /// other notification setting to its default.
     #[serde(default = "default_true")]
     pub ready_to_review: bool,
+    /// Notify when a pull request APPEARS that was not there before
+    /// (#789).
+    ///
+    /// `serde(default)` like the field above, and for the same reason: a
+    /// stored preference written before this existed must still
+    /// deserialise, or a missing key would fail the whole struct and
+    /// silently reset every other notification setting.
+    #[serde(default = "default_true")]
+    pub new_pr: bool,
+    /// Notify about the battery: low charge, fast discharge, or
+    /// discharging on AC (#720, gated here for the first time by #789).
+    ///
+    /// **This is the first time the battery alerts are gateable at all.**
+    /// Until now they notified unconditionally, with only
+    /// `battery_low_percent` to adjust WHEN -- so a user who wanted
+    /// pull-request notifications and not machine ones had no way to say
+    /// so. The master switch turned off both or neither.
+    ///
+    /// One category for all three conditions rather than three, because
+    /// they are one subject to a person: "something is wrong with this
+    /// machine's power". The desktop already treats them as one -- only
+    /// the low threshold is configurable, because the other two have no
+    /// threshold worth setting.
+    ///
+    /// Defaults ON, so an upgrade does not silence an alert someone has
+    /// been relying on since #720.
+    #[serde(default = "default_true")]
+    pub health_battery: bool,
+    /// Notify when the CPU is busy with nothing in particular (#791).
+    ///
+    /// Its own category rather than folded into `health_battery`: the
+    /// two answer different questions -- "is this machine about to die"
+    /// and "is it burning cores for no reason" -- and someone who wants
+    /// one and not the other is making a reasonable choice.
+    #[serde(default = "default_true")]
+    pub health_cpu: bool,
 }
 
 impl Default for NotifyPrefs {
@@ -348,6 +396,11 @@ impl Default for NotifyPrefs {
             ci_failed: true,
             conflicted: true,
             ready_to_review: true,
+            new_pr: true,
+            // ON, matching what #720 and #791 do without a setting. An
+            // upgrade must not silently mute an alert someone relies on.
+            health_battery: true,
+            health_cpu: true,
         }
     }
 }
@@ -356,6 +409,31 @@ impl NotifyPrefs {
     /// Whether this breakage should interrupt the user.
     pub fn wants(&self, kind: BreakageKind) -> bool {
         self.enabled && kind.enabled_by(self)
+    }
+
+    /// Whether a health condition with this key should interrupt the
+    /// user (#789).
+    ///
+    /// Matches on `health::alerts::Alert::key` and
+    /// `health::runaway::Alert::key` -- the stable condition identities,
+    /// not the wording, so a reworded alert does not silently change
+    /// which category it belongs to.
+    ///
+    /// An UNKNOWN key is allowed through under `enabled`, deliberately.
+    /// A condition a future release adds would otherwise be silent until
+    /// someone remembered to add a match arm -- and "a category you
+    /// cannot yet switch off" is a much smaller problem than "a warning
+    /// you never received". This mirrors `PhoneNotifyPrefs::wants_health`
+    /// on the companion, which makes the same call for the same reason.
+    pub fn wants_health(&self, key: &str) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        match key {
+            "low" | "fast_discharge" | "draining_on_ac" => self.health_battery,
+            "diffuse_cpu" => self.health_cpu,
+            _ => true,
+        }
     }
 }
 
@@ -423,6 +501,53 @@ pub fn newly_ready(previous: &[PullRequest], current: &[PullRequest]) -> Vec<Bre
             number: pr.number,
             url: pr.url.clone(),
             kind: BreakageKind::ReadyToReview,
+        })
+        .collect()
+}
+
+/// Pull requests that have just APPEARED (#789).
+///
+/// Same shape as [`newly_ready`] and [`newly_broken`]: a pure comparison
+/// of the previous list against the current one, returning what changed
+/// rather than what is true.
+///
+/// # First-tick suppression is the caller's job, and it is not optional
+///
+/// Every pull request is absent from `previous` on the first tick, so
+/// this would announce the whole list -- thirteen notifications at once
+/// on launch. The guard lives in the caller, which skips this entirely
+/// until it has one tick of history, exactly as it does for
+/// [`newly_ready`]. That is why an absent prior state counts as "did not
+/// exist" here rather than "skip": the two rules each need the other
+/// half to be correct.
+///
+/// Note this is the OPPOSITE treatment from the battery alerts, which
+/// deliberately re-arm on relaunch (`lib.rs`). A battery alert is a
+/// standing condition and restating it once is a service; a pull request
+/// appearing is an EVENT, and re-announcing it after a restart would
+/// claim an event that did not happen.
+///
+/// # Drafts are excluded
+///
+/// A draft is work its author has explicitly marked as not ready to be
+/// looked at, so its creation is not news -- the same judgement
+/// [`ready_for_review`] makes. It leaving draft would be news, and that
+/// is a transition this release does not detect.
+pub fn newly_appeared(previous: &[PullRequest], current: &[PullRequest]) -> Vec<Breakage> {
+    current
+        .iter()
+        .filter(|pr| !pr.is_draft)
+        .filter(|pr| {
+            !previous
+                .iter()
+                .any(|p| p.repo == pr.repo && p.number == pr.number)
+        })
+        .map(|pr| Breakage {
+            title: pr.title.clone(),
+            repo: pr.repo.clone(),
+            number: pr.number,
+            url: pr.url.clone(),
+            kind: BreakageKind::Appeared,
         })
         .collect()
 }
@@ -672,6 +797,14 @@ pub fn spawn(
 ) {
     tauri::async_runtime::spawn(async move {
         let mut previous: Vec<PullRequest> = Vec::new();
+        // Whether a tick has ever completed, so `newly_appeared` has
+        // something real to compare against (#789).
+        //
+        // Not `!previous.is_empty()`: a user whose last pull request
+        // merged has a genuinely empty list, and the next one they open
+        // is news. "Empty" and "never looked" are different answers, and
+        // only this flag distinguishes them.
+        let mut had_a_tick = false;
         // The review queue as of the last tick, and whether there HAS
         // been one.
         //
@@ -754,6 +887,32 @@ pub fn spawn(
                             notify_breakage(&app, &b);
                         }
                     }
+                    // Newly APPEARED pull requests (#789).
+                    //
+                    // Gated on `had_a_tick` rather than on `previous`
+                    // being non-empty, and that distinction is the whole
+                    // of the first-tick suppression. `previous` starts
+                    // EMPTY, so `!previous.is_empty()` would be false on
+                    // the first tick and also false on the first tick of
+                    // a user whose last pull request merged -- and the
+                    // second of those is a real empty list whose next
+                    // arrival IS news. A separate flag says "we have
+                    // compared at least once", which is the actual
+                    // question.
+                    //
+                    // `newly_broken` above needs no such guard: it never
+                    // fires for a pull request absent from `previous`, so
+                    // an empty previous list announces nothing by
+                    // construction. This rule is the opposite shape --
+                    // absent means new -- so it needs the flag.
+                    if had_a_tick {
+                        for b in newly_appeared(&previous, &prs) {
+                            if prefs.wants(b.kind) {
+                                notify_breakage(&app, &b);
+                            }
+                        }
+                    }
+                    had_a_tick = true;
                     // Ready-to-review, from the queue fetched above.
                     //
                     // Skipped entirely until there is one tick of
@@ -988,9 +1147,7 @@ mod tests {
     fn the_master_switch_silences_every_kind() {
         let p = NotifyPrefs {
             enabled: false,
-            ci_failed: true,
-            conflicted: true,
-            ready_to_review: true,
+            ..Default::default()
         };
         assert!(!p.wants(BreakageKind::CiFailed));
         assert!(!p.wants(BreakageKind::Conflicted));
@@ -1006,30 +1163,24 @@ mod tests {
     #[test]
     fn kinds_are_silenced_independently() {
         let no_conflicts = NotifyPrefs {
-            enabled: true,
-            ci_failed: true,
             conflicted: false,
-            ready_to_review: true,
+            ..Default::default()
         };
         assert!(no_conflicts.wants(BreakageKind::CiFailed));
         assert!(!no_conflicts.wants(BreakageKind::Conflicted));
         assert!(no_conflicts.wants(BreakageKind::ReadyToReview));
 
         let no_ci = NotifyPrefs {
-            enabled: true,
             ci_failed: false,
-            conflicted: true,
-            ready_to_review: true,
+            ..Default::default()
         };
         assert!(!no_ci.wants(BreakageKind::CiFailed));
         assert!(no_ci.wants(BreakageKind::Conflicted));
 
         // And the new kind is independent of both.
         let no_ready = NotifyPrefs {
-            enabled: true,
-            ci_failed: true,
-            conflicted: true,
             ready_to_review: false,
+            ..Default::default()
         };
         assert!(!no_ready.wants(BreakageKind::ReadyToReview));
         assert!(no_ready.wants(BreakageKind::CiFailed));
@@ -1545,6 +1696,238 @@ mod tests {
             let mut p = ready(1);
             p.in_merge_queue = true;
             assert!(newly_ready(&[], &[p]).is_empty());
+        }
+    }
+
+    /// #789: a notification when a pull request APPEARS that was not
+    /// there before.
+    mod appeared {
+        use super::*;
+
+        fn open(number: u64) -> PullRequest {
+            pr_full("o/r", number, CiState::Pending, MergeState::Mergeable)
+        }
+
+        /// The rule, stated: absent before, present now.
+        ///
+        /// Unlike `newly_ready` this says nothing about the pull
+        /// request's STATE -- a red, conflicted, unreviewable pull
+        /// request appearing is still news. That is the whole difference
+        /// between "something new exists" and "something became
+        /// actionable".
+        #[test]
+        fn a_pull_request_absent_from_the_previous_tick_has_appeared() {
+            let out = newly_appeared(&[open(1)], &[open(1), open(2)]);
+            assert_eq!(out.len(), 1, "{out:?}");
+            assert_eq!(out[0].number, 2);
+            assert_eq!(out[0].kind, BreakageKind::Appeared);
+            assert_eq!(out[0].kind.reason(), "just appeared");
+        }
+
+        /// A red, conflicted pull request appearing is still an
+        /// appearance. If this test fails, the rule has quietly acquired
+        /// a readiness clause it should not have.
+        #[test]
+        fn a_broken_pull_request_appearing_is_still_news() {
+            let broken = pr_full("o/r", 9, CiState::Failure, MergeState::Conflicted);
+            let out = newly_appeared(&[], &[broken]);
+            assert_eq!(out.len(), 1, "{out:?}");
+        }
+
+        /// An unchanged list announces nothing, however many ticks pass.
+        #[test]
+        fn an_unchanged_list_announces_nothing() {
+            let list = vec![open(1), open(2)];
+            assert!(newly_appeared(&list, &list).is_empty());
+        }
+
+        /// A pull request that DISAPPEARED -- merged, closed -- is not an
+        /// appearance. Only one direction is in scope.
+        #[test]
+        fn a_closed_pull_request_announces_nothing() {
+            assert!(newly_appeared(&[open(1), open(2)], &[open(1)]).is_empty());
+        }
+
+        /// The identity is `(repo, number)`, so the same number in two
+        /// repositories is two pull requests.
+        #[test]
+        fn the_identity_is_the_repo_and_the_number() {
+            let a = pr_full(
+                "octocat/hello-world",
+                7,
+                CiState::Success,
+                MergeState::Mergeable,
+            );
+            let b = pr_full(
+                "octocat/spoon-knife",
+                7,
+                CiState::Success,
+                MergeState::Mergeable,
+            );
+            let out = newly_appeared(std::slice::from_ref(&a), &[a.clone(), b]);
+            assert_eq!(out.len(), 1, "{out:?}");
+            assert_eq!(out[0].repo, "octocat/spoon-knife");
+        }
+
+        /// A draft appearing is not news: its author has explicitly said
+        /// it is not ready to be looked at.
+        #[test]
+        fn a_new_draft_is_not_announced() {
+            let mut d = open(2);
+            d.is_draft = true;
+            assert!(newly_appeared(&[open(1)], &[open(1), d]).is_empty());
+        }
+
+        /// **The first-tick trap, stated as a test of the FUNCTION's
+        /// contract rather than the loop's.**
+        ///
+        /// With an empty `previous` this function announces the whole
+        /// list, by design -- and that is exactly why the caller must
+        /// gate it on having had a tick. A future refactor that removed
+        /// the caller's guard would make this the launch burst, so the
+        /// behaviour is pinned here with the reason attached.
+        #[test]
+        fn an_empty_previous_list_announces_everything_which_is_why_the_caller_gates_it() {
+            let out = newly_appeared(&[], &[open(1), open(2), open(3)]);
+            assert_eq!(
+                out.len(),
+                3,
+                "the suppression lives in the poll loop's `had_a_tick`, not here"
+            );
+        }
+
+        /// And the `NotifyPrefs` category gates it.
+        #[test]
+        fn the_new_pr_category_gates_the_notification() {
+            let off = NotifyPrefs {
+                new_pr: false,
+                ..Default::default()
+            };
+            assert!(!off.wants(BreakageKind::Appeared));
+            assert!(
+                off.wants(BreakageKind::CiFailed),
+                "turning one category off must not touch another"
+            );
+            assert!(NotifyPrefs::default().wants(BreakageKind::Appeared));
+        }
+    }
+
+    /// #789: the health categories, which until now had none -- the
+    /// battery alerts notified unconditionally.
+    mod health_categories {
+        use super::*;
+
+        /// The keys are the ones `health::alerts` and `health::runaway`
+        /// actually produce. Asserted against their own `key()` rather
+        /// than transcribed, so a rename there fails here instead of
+        /// silently moving a condition into the "unknown" bucket.
+        #[test]
+        fn the_keys_match_the_modules_that_produce_them() {
+            use crate::health::alerts::Alert as Battery;
+            use crate::health::runaway::Alert as Cpu;
+            let d = NotifyPrefs::default();
+            for key in [
+                Battery::Low {
+                    percent: 10.0,
+                    threshold: 25,
+                }
+                .key(),
+                Battery::FastDischarge {
+                    percent_per_min: 1.0,
+                }
+                .key(),
+                Battery::DrainingOnAc {
+                    percent_per_min: 1.0,
+                }
+                .key(),
+                Cpu::DiffuseCpu {
+                    percent: 70.0,
+                    minutes: 20.0,
+                    process_count: 900,
+                }
+                .key(),
+            ] {
+                assert!(d.wants_health(key), "{key} is not wanted by default");
+            }
+
+            let no_battery = NotifyPrefs {
+                health_battery: false,
+                ..Default::default()
+            };
+            assert!(!no_battery.wants_health(
+                Battery::Low {
+                    percent: 10.0,
+                    threshold: 25
+                }
+                .key()
+            ));
+            assert!(no_battery.wants_health(
+                Cpu::DiffuseCpu {
+                    percent: 70.0,
+                    minutes: 20.0,
+                    process_count: 900
+                }
+                .key()
+            ));
+        }
+
+        /// All three battery conditions are ONE category: they are one
+        /// subject to a person.
+        #[test]
+        fn the_three_battery_conditions_are_one_category() {
+            let off = NotifyPrefs {
+                health_battery: false,
+                ..Default::default()
+            };
+            for key in ["low", "fast_discharge", "draining_on_ac"] {
+                assert!(!off.wants_health(key), "{key}");
+            }
+        }
+
+        #[test]
+        fn the_master_switch_silences_health_too() {
+            let off = NotifyPrefs {
+                enabled: false,
+                ..Default::default()
+            };
+            assert!(!off.wants_health("low"));
+            assert!(!off.wants_health("diffuse_cpu"));
+            assert!(!off.wants_health("something_new"));
+            assert!(
+                off.health_battery && off.health_cpu,
+                "the choices survive the master switch"
+            );
+        }
+
+        /// A condition a future release adds is allowed through rather
+        /// than silently dropped: a category you cannot yet switch off is
+        /// a smaller problem than a warning you never received.
+        #[test]
+        fn an_unknown_condition_is_not_silently_dropped() {
+            let off_everything_known = NotifyPrefs {
+                health_battery: false,
+                health_cpu: false,
+                ..Default::default()
+            };
+            assert!(off_everything_known.wants_health("thermal_critical"));
+        }
+
+        /// The upgrade path: a stored preference written before these
+        /// fields existed still decodes, and decodes to ON.
+        ///
+        /// Without `serde(default)` the missing keys would fail the whole
+        /// struct, and `unwrap_or_default()` in `read_notify_prefs` would
+        /// silently reset every OTHER notification setting the user had
+        /// chosen.
+        #[test]
+        fn a_stored_preference_from_before_these_fields_still_decodes() {
+            let stored = r#"{"enabled":true,"ci_failed":false,"conflicted":true}"#;
+            let p: NotifyPrefs = serde_json::from_str(stored).unwrap();
+            assert!(!p.ci_failed, "the stored choice survives");
+            assert!(p.new_pr, "and the new fields default to ON");
+            assert!(p.health_battery);
+            assert!(p.health_cpu);
+            assert!(p.ready_to_review);
         }
     }
 

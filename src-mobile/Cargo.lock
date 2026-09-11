@@ -2188,6 +2188,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-barcode-scanner",
  "tauri-plugin-headstate-keys",
+ "tauri-plugin-headstate-notify",
  "tauri-plugin-headstate-refresh",
  "tauri-plugin-log",
  "tauri-plugin-opener",
@@ -5369,6 +5370,18 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tauri",
+ "tauri-plugin",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "tauri-plugin-headstate-notify"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "serde",
+ "serde_json",
  "tauri",
  "tauri-plugin",
  "thiserror 2.0.20",

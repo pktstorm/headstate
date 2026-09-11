@@ -10,6 +10,7 @@ import { PairedDesktopPanel } from "./PairedDesktopPanel";
 import { ALWAYS_OFFERED, VIEWS } from "./ViewSwitcher";
 import { IS_MOBILE_BUILD } from "@/lib/target";
 import { PairedDevicesList } from "./PairedDevicesList";
+import { PhoneNotifyPanel } from "./PhoneNotifyPanel";
 import {
   useAutostart,
   useNotifyPrefs,
@@ -512,20 +513,81 @@ export function SettingsDialog({
               />
               A pull request becomes ready for your review
             </label>
+            {/* #789. Beside `ready_to_review` because both are about a
+                pull request arriving, and deliberately worded to say
+                what makes them different: this one fires whatever
+                state the pull request is in, where that one waits for
+                it to be green and assigned to you. */}
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                disabled={!(prefs?.enabled ?? true)}
+                checked={prefs?.new_pr ?? true}
+                onChange={() => prefs && void setPrefs({ ...prefs, new_pr: !prefs.new_pr })}
+              />
+              A pull request appears, whatever state it is in
+            </label>
           </div>
-          {/* The battery alerts (#720). Under the same master switch
-              because it is the same interruption from the user's side,
-              but NOT under `prefs` -- those three are pull-request
-              transitions, and adding a battery to that struct would
-              make a type that describes two unrelated things.
+          {/* The machine's own health: the battery alerts (#720) and the
+              CPU one (#791).
 
-              A number, not a checkbox, because the only question worth
-              asking is WHEN: everyone wants to know their laptop is
-              about to die, and they disagree only about how much
-              warning they want. The other two conditions -- draining
-              fast, draining while plugged in -- have no threshold to
-              set, because a plugged-in machine losing charge is worth
-              saying at any speed. */}
+              Until now these notified UNCONDITIONALLY, with only the
+              threshold below to adjust when -- so a user who wanted pull
+              request notifications and not machine ones had no way to
+              say so, because the master switch turned off both or
+              neither. #789 gives them categories.
+
+              Under the same master switch, because it is the same
+              interruption from the user's side. Two categories rather
+              than one, because "is this machine about to die" and "is it
+              burning cores for no reason" are different questions and
+              wanting one without the other is reasonable.
+
+              Three battery CONDITIONS under one checkbox, though: low
+              charge, draining fast and draining while plugged in are one
+              subject to a person -- something is wrong with this
+              machine's power. */}
+          <span className="mt-3 text-sm font-medium">This machine</span>
+          <div className="ml-6 flex flex-col gap-2">
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                disabled={!(prefs?.enabled ?? true)}
+                checked={prefs?.health_battery ?? true}
+                onChange={() =>
+                  prefs && void setPrefs({ ...prefs, health_battery: !prefs.health_battery })
+                }
+              />
+              Battery problems
+            </label>
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                disabled={!(prefs?.enabled ?? true)}
+                checked={prefs?.health_cpu ?? true}
+                onChange={() =>
+                  prefs && void setPrefs({ ...prefs, health_cpu: !prefs.health_cpu })
+                }
+              />
+              The CPU is busy with nothing in particular
+            </label>
+            {/* Says what the CPU alert actually looks for, because
+                otherwise it reads as "tell me when my machine is busy"
+                -- which nobody wants and which is not what it does.
+                The aggregate shape is the whole point: ten runaway
+                processes each look unremarkable in a sorted list. */}
+            <p className="text-xs text-[#8b949e]">
+              Sustained CPU use that no single process accounts for — usually
+              several runaway or orphaned processes rather than one busy program.
+            </p>
+          </div>
+          {/* A number, not a checkbox, because the only question worth
+              asking about LOW CHARGE is WHEN: everyone wants to know
+              their laptop is about to die, and they disagree only about
+              how much warning they want. The other two conditions --
+              draining fast, draining while plugged in -- have no
+              threshold to set, because a plugged-in machine losing
+              charge is worth saying at any speed. */}
           <label className="mt-1 flex items-center gap-2 text-sm">
             <span>Warn when battery charge falls below</span>
             <input
@@ -533,7 +595,11 @@ export function SettingsDialog({
               min={5}
               max={90}
               className="w-16 rounded border border-[#30363d] bg-[#0d1117] px-2 py-1 text-sm tabular-nums"
-              disabled={!(prefs?.enabled ?? true)}
+              // Also disabled when battery notifications are off: a
+              // threshold for an alert that cannot fire is a control
+              // that does nothing, and leaving it live would imply the
+              // alert was still coming.
+              disabled={!(prefs?.enabled ?? true) || !(prefs?.health_battery ?? true)}
               // `|| 25` renders the stored 0 as the default it actually
               // resolves to in Rust, rather than showing a 0 that reads
               // as "alert at zero percent" -- which is what a user
@@ -566,6 +632,21 @@ export function SettingsDialog({
             Only when something newly changes — never repeated for a pull request
             already in that state, and never on first launch.
           </p>
+          {/* The PHONE's notifications (#789), on the phone only.
+
+              Its own panel rather than extra checkboxes in the one
+              above, because they are a different device's settings. The
+              desktop's `get_notify_prefs` is `Class::Local` on the
+              remote surface -- the phone cannot read or write it, and
+              correctly so: which notifications a desktop shows at that
+              desktop is decided there.
+
+              It is also right on the merits. The two devices are in
+              different places, and wanting CI failures on the laptop you
+              are working at and only new pull requests on the phone in
+              your pocket is a reasonable thing to want that one shared
+              setting could not express. */}
+          {IS_MOBILE_BUILD && <PhoneNotifyPanel />}
         </div>
 
             </div>

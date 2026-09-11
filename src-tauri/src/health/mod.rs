@@ -58,6 +58,9 @@ pub mod collect;
 pub mod footprint;
 pub mod gpu;
 pub mod netproc;
+/// The CPU runaway rules (#791): the aggregate alert that ships, and
+/// the shadow log for the two per-process tiers that do not yet.
+pub mod runaway;
 
 pub use footprint::Footprint;
 pub use gpu::Gpu;
@@ -220,4 +223,44 @@ pub struct Interface {
     /// does not have to add them all up.
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+}
+
+/// One health condition, flattened for a caller that cannot run the
+/// rules itself (#789).
+///
+/// # Why this type exists
+///
+/// The phone needs to notify about the DESKTOP's health, and the
+/// alternative was for the phone to fetch `system_health_history` and
+/// evaluate the rules over it. That would be a second implementation of
+/// every threshold in [`alerts`] and [`runaway`], in a separate crate
+/// with a separate lockfile -- and the two copies would drift silently,
+/// which is the worst possible failure for a rule whose whole job is
+/// deciding when to interrupt someone.
+///
+/// So the rules run in exactly one place, the desktop, and this is what
+/// crosses the wire: the verdict, not the data it was drawn from.
+///
+/// # Why the wording comes too
+///
+/// `key` alone would be enough to notify, if the caller held a copy of
+/// every `title()` and `body()`. It would also be a second place for the
+/// wording to live -- and a phone showing different words for the same
+/// condition is the same drift in a more visible form. The desktop owns
+/// the sentence; the phone adds only the machine's name in front of it,
+/// which is the one thing the desktop cannot know (see
+/// `src-mobile/src/notify.rs` on why a health notification on a phone
+/// must name whose machine it is about).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AlertReport {
+    /// The stable condition identity: `alerts::Alert::key` or
+    /// `runaway::Alert::key`.
+    ///
+    /// Keyed on the condition and never on the numbers, which is what
+    /// lets a caller deduplicate a standing condition without
+    /// re-notifying as the figures wander. Both modules document that
+    /// choice on their own `key`.
+    pub key: String,
+    pub title: String,
+    pub body: String,
 }

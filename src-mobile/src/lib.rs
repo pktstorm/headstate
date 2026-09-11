@@ -43,6 +43,7 @@ mod connection;
 pub mod discovery;
 mod events;
 mod keys;
+pub mod notify;
 mod pairing;
 mod stepup;
 mod store;
@@ -193,6 +194,14 @@ pub fn run() {
         // puts in state. On a desktop host it registers an inert
         // scheduler.
         .plugin(tauri_plugin_headstate_refresh::init())
+        // Local user notifications (#789), posted from inside the window
+        // the plugin above is granted -- which is the whole delivery
+        // path, and the reason delivery is best-effort rather than
+        // instant. On a desktop host it registers an `Unavailable`
+        // bridge whose every call SAYS SO in the log, so a platform
+        // with no notification API is distinguishable from one with
+        // nothing to say.
+        .plugin(tauri_plugin_headstate_notify::init())
         // External links, exactly as the desktop registers them:
         // the shared frontend's `ExternalLink` calls `openUrl` for
         // every PR title and every "View on GitHub", and the phone
@@ -223,6 +232,11 @@ pub fn run() {
             connection_state,
             remote_call,
             subscribe_events,
+            // The phone's own notification preferences (#789). NOT the
+            // desktop's `get_notify_prefs`, which is `Class::Local` and
+            // correctly so -- see `notify::PhoneNotifyPrefs`.
+            notify::get_phone_notify_prefs,
+            notify::set_phone_notify_prefs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Headstate Companion");

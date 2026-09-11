@@ -19,9 +19,20 @@ import type { Transport } from "./transport";
 ///   file does not keep a copy.
 /// - The companion's own commands (`CLIENT_COMMANDS`), invoked directly:
 ///   `pair_from_qr({payload, deviceName?})`, `unpair()`,
-///   `connection_state()`, `subscribe_events()`. `connection.ts` polls
+///   `connection_state()`, `subscribe_events()`, and the phone's own
+///   notification preferences (#789). `connection.ts` polls
 ///   `connection_state` through here; its `stale` field is the marker
 ///   for a list that may be out of date.
+///
+///   `get_phone_notify_prefs` / `set_phone_notify_prefs` are the phone's
+///   OWN settings and deliberately not the desktop's: the desktop's
+///   `get_notify_prefs` is `Class::Local` on the remote surface, and
+///   correctly so -- which notifications a desktop shows at that desktop
+///   is a decision made there. It is also the right answer on the
+///   merits: the two devices are in different places, and someone may
+///   well want CI failures on the laptop they are working at and only
+///   new pull requests on the phone in their pocket. One shared setting
+///   could not express that.
 ///
 /// Events need no forwarding: the companion re-emits each desktop event
 /// under its own name (`prs-updated`, `poll-state`, ...), plus
@@ -35,6 +46,8 @@ const CLIENT_COMMANDS = new Set([
   "connection_state",
   "remote_call",
   "subscribe_events",
+  "get_phone_notify_prefs",
+  "set_phone_notify_prefs",
 ]);
 
 let installed = false;
