@@ -495,7 +495,15 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "build_target" => ok(commands::build_target()),
         "latest_release" => ok(commands::latest_release(app.clone()).await),
         "list_worktrees" => res(commands::list_worktrees(app.clone()).await),
-        "classify_worktrees" => res(commands::classify_worktrees(a.get("repoPath")?).await),
+        // `app.clone()` since #830, exactly as `size_worktrees` below:
+        // the command now emits `worktree-safety` per worktree, and the
+        // handle is what carries those events to this phone through the
+        // hub. A phone that only awaited the return value would see the
+        // whole repository land at once -- which is the wait #830 is
+        // about, and the client least able to wait it out.
+        "classify_worktrees" => {
+            res(commands::classify_worktrees(app.clone(), a.get("repoPath")?).await)
+        }
         "size_worktrees" => res(commands::size_worktrees(app.clone(), a.get("repoPath")?).await),
         "list_branches" => res(commands::list_branches(app.clone(), a.get("repoPath")?).await),
         "scan_artifacts" => res(commands::scan_artifacts(app.clone()).await),

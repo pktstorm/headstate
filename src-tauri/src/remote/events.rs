@@ -107,6 +107,27 @@ pub const EVENT_NAMES: &[&str] = &[
     // rather than worktree count. Batching at the end is what left a
     // 100-worktree page showing skeletons for ten minutes.
     "worktree-size",
+    // The thirteenth, and it carries the richest payload on this list: a
+    // whole `Worktree`, so a path, a branch name, and a safety verdict
+    // (#830).
+    //
+    // Weighed on the `worktree-size` test rather than waved through, and
+    // it passes the same way: `classify_worktrees` -- already on the
+    // command allowlist as a Read -- RETURNS a `Vec<Worktree>` of these
+    // very values to this phone over this transport. The event is that
+    // same data arriving per worktree instead of in one batch at the
+    // end, so it opens nothing the command has not already opened, and
+    // withholding it would not hide a branch name, only delay it.
+    //
+    // It has to be here because classification has no useful upper bound
+    // either, and for a reason a per-call timeout cannot catch:
+    // `content_landed` spends up to four git calls PER CHANGED FILE, so
+    // one branch can cost an unbounded number of individually-bounded
+    // calls. `CLASSIFY_TIMEOUT` is the ceiling; this event is how a row
+    // hears the verdict before the slowest branch in the repository is
+    // done. A phone feels that hardest: it cannot leave a window open,
+    // so what it can show is what arrives while it is in the foreground.
+    "worktree-safety",
 ];
 
 /// The event name the opening snapshot frame is sent under, so the

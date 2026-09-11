@@ -2079,6 +2079,54 @@ pub fn size_repo_streaming(
 /// threads only add contention.
 const CLASSIFY_WORKERS: usize = 8;
 
+/// How long ONE worktree's classification may run before it is
+/// abandoned (#830).
+///
+/// `GIT_TIMEOUT` bounds a single `git` invocation and was believed to
+/// bound this pass through it. It does not, and that is the whole of
+/// #830: classification makes an UNBOUNDED NUMBER of git calls per
+/// worktree. `content_landed` loops over every file the branch changed
+/// and spends up to four calls on each -- `rev-parse HEAD:{path}`,
+/// `rev-parse {default}:{path}`, `added_lines`' `diff -U0`, and
+/// `show {default}:{path}`. So a branch touching 100 files has a worst
+/// case of 100 x 4 x `GIT_TIMEOUT` = over three hours, every individual
+/// call of which is perfectly within its bound. A per-call ceiling
+/// cannot see that; only a ceiling around the worktree can.
+///
+/// MEASURED by `live_classification_cost_per_worktree`, serial, on this
+/// machine:
+///
+/// ```text
+///   repo            worktrees   p50     p90      p99      max
+///   ghstat             18      140ms    576ms    724ms    724ms
+///   enc-api            15      114ms   3139ms   3295ms   3295ms
+///   enc-ui-aws          5      123ms    266ms      -      266ms
+/// ```
+///
+/// The spread is the argument, not the total. Within ONE repository
+/// (enc-api) the slowest worktree costs 29x the median, because the cost
+/// tracks CHANGED FILES rather than worktree count -- the same shape
+/// `SIZE_TIMEOUT` found for bytes. Extrapolating enc-api's p50 to #830's
+/// 111 worktrees gives ~12.7s serial, ~1.6s across `CLASSIFY_WORKERS`.
+/// Volume therefore cannot explain a column that never resolves at all,
+/// which is how we know #830 is one unbounded worktree rather than many
+/// slow ones.
+///
+/// 45s, and the reasoning is `SIZE_TIMEOUT`'s rather than a new one. The
+/// bound exists to convert "never" into "could not classify", NOT to
+/// tighten a latency target, so it sits far above the slowest honest
+/// measurement (3.3s, a 13x margin) and far below the wait that made
+/// #830 look like a hang. Above `GIT_TIMEOUT`'s 30s deliberately: a
+/// worktree whose FIRST git call times out honestly must still be able
+/// to report that timeout as its verdict, and a ceiling at or below 30s
+/// would pre-empt it and report the less specific message instead.
+///
+/// Not `SIZE_TIMEOUT`'s 60s, because these are different units of work
+/// with different honest maxima: a 60s sizing walk is a real answer for
+/// a 200 GB tree (38.63s measured), where 45s of git calls on one
+/// worktree is 13x the worst thing ever measured here.
+const CLASSIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
 /// Classify a worktree and, when merged, date it.
 ///
 /// The single place both scan paths go through: `classify_repo` and
@@ -2141,9 +2189,178 @@ fn merged_date(repo: &Path, head: &str, default_branch: &str) -> Option<String> 
     (!first.is_empty()).then(|| first.to_string())
 }
 
-/// Classify one repo's worktrees. Called per repo so the UI can fill in
-/// results as they arrive rather than waiting for all 37.
+/// A verdict's variant name, with none of its payload.
+///
+/// For the diagnostic log, which a user pastes into a public issue. The
+/// payload-carrying arms hold git's own free text -- a lock reason with a
+/// pid, an `Unknown` with a git error quoting a branch or a path -- and
+/// none of it is needed to answer the question the log is for: which
+/// worktree was slow, and did it produce a verdict. `{:?}` on the value
+/// would carry all of it.
+fn safety_label(s: &Safety) -> &'static str {
+    match s {
+        Safety::Safe => "safe",
+        Safety::MainCheckout => "main",
+        Safety::Dirty(_) => "dirty",
+        Safety::Unpushed(_) => "unpushed",
+        Safety::NeverPushed => "never_pushed",
+        Safety::MergedUpstreamDeleted => "merged_upstream_deleted",
+        Safety::DetachedMerged(_) => "detached_merged",
+        Safety::Empty => "empty",
+        Safety::Unmerged => "unmerged",
+        Safety::Locked(_) => "locked",
+        Safety::Prunable(_) => "prunable",
+        Safety::Orphaned => "orphaned",
+        // Never reached from a finished classification -- it is the
+        // value a row carries BEFORE one. Mapped rather than
+        // `unreachable!()`, because a panic inside diagnostic logging
+        // would take down the classification the log exists to explain.
+        Safety::Pending => "pending",
+        Safety::Unknown(_) => "unknown",
+    }
+}
+
+/// `classify`, abandoning the worktree once `budget` is spent (#830).
+///
+/// Returns whether the verdict is a real one. `false` means the budget
+/// ran out and `w.safety` is now `Unknown`, which callers count
+/// SEPARATELY from a verdict -- see `classify_repo_streaming`.
+///
+/// The work runs on a BORROWED THREAD and the caller stops waiting on
+/// it; it is not cancelled, because nothing here can cancel it. `classify`
+/// is a straight-line sequence of `Command::spawn`/`wait` calls with no
+/// cancellation point, and the `git` helper does not hand back a handle
+/// to kill the child with -- its own comment says so, for exactly this
+/// reason. So the honest description is "gives up on", not "stops".
+///
+/// The abandoned thread exits when its git calls do, and it costs one
+/// thread, not one POOL thread: this is `std::thread`, deliberately
+/// OUTSIDE tokio's blocking pool. That distinction is the one
+/// `GIT_TIMEOUT` documents -- a hung call that parks a pool thread
+/// "wedges every worktree operation until restart" -- and routing the
+/// abandonment through the pool would reproduce it at worktree
+/// granularity.
+///
+/// `Unknown` rather than a new variant. The enum already has the arm for
+/// "we could not say", every consumer already treats it as never-safe
+/// (`is_safe` is a two-variant allowlist), and the message is what makes
+/// it actionable. A new `Timeout` variant would need handling in every
+/// match in both languages to say the same thing this one already says.
+fn classify_within(
+    w: &mut Worktree,
+    repo: &Path,
+    default_branch: &str,
+    budget: std::time::Duration,
+) -> bool {
+    // The main checkout is decided without a single git call
+    // (`worktree_safety` returns on `is_main` first), so spending a
+    // thread and a channel on it is pure overhead on the one row every
+    // repository has.
+    if w.is_main {
+        classify(w, repo, default_branch);
+        return true;
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    // A CLONE crosses the thread boundary, not a borrow. `w` is behind a
+    // `&mut` the caller still owns, and the whole point is that this
+    // thread may outlive the wait -- so it cannot be allowed to keep
+    // writing into the caller's row after the budget expires. It writes
+    // into its own copy and sends that back; on timeout the copy is
+    // simply dropped, whenever it finally arrives.
+    let mut owned = w.clone();
+    let repo = repo.to_path_buf();
+    let branch = default_branch.to_string();
+    std::thread::spawn(move || {
+        classify(&mut owned, &repo, &branch);
+        // The receiver is gone on timeout; that is expected, not an
+        // error -- the `git` helper's channel has the same contract.
+        let _ = tx.send(owned);
+    });
+
+    match rx.recv_timeout(budget) {
+        Ok(done) => {
+            *w = done;
+            true
+        }
+        Err(_) => {
+            w.safety = Safety::Unknown(format!(
+                "classification did not finish within {}s",
+                budget.as_secs()
+            ));
+            false
+        }
+    }
+}
+
+/// Classify one repo's worktrees, in git's listing order.
+///
+/// Kept as the collected form for the same reason `size_repo` is: the
+/// tests want the whole set as one value to assert on. Written in terms
+/// of the streaming form rather than the other way round, so there is
+/// one implementation of the bound and the parallelism.
+///
+/// RE-SORTED, because the streaming form deliberately reports in
+/// completion order and this form's callers compare it positionally
+/// against `scan_dirs`. Sorted by path rather than by restoring the
+/// porcelain order, since that is what `parse_porcelain` already yields
+/// for these fixtures and it is a total order a reader can verify
+/// without knowing how the work was scheduled.
+///
+/// Test-only since #830: production goes through the streaming form so a
+/// row can be filled the moment its own verdict exists.
+#[cfg(test)]
 pub fn classify_repo(repo_path: &str) -> Result<Vec<Worktree>, String> {
+    let mut out = Vec::new();
+    classify_repo_streaming(repo_path, &mut |w| out.push(w.clone()))?;
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+/// `classify_repo`, handing each worktree over the moment its verdict
+/// exists (#830).
+///
+/// Before this, classification was ONE all-or-nothing call: the command
+/// returned a `Vec` only when every worktree was done, so 111 rows held
+/// a skeleton behind whichever one was slowest. That is the same defect
+/// `size_repo_streaming` was written for (#754), on the column the page
+/// actually exists for, and it outlived the size fix because the size
+/// pass was assumed to be the only slow one -- `hooks.ts` records that
+/// assumption. `classify_repo` is ~16s across 295 worktrees where
+/// listing is ~800ms, so it was never fast enough to block a view on.
+///
+/// `report` is called once per worktree, from whichever thread finished
+/// it, and EXACTLY once -- including for a worktree whose budget ran
+/// out, reported then as `Safety::Unknown`. That guarantee is the fix,
+/// not the parallelism: #830's column stalled because some rows never
+/// heard anything at all, and a row that is told "could not classify"
+/// can at least stop promising.
+///
+/// A WORK-STEALING CURSOR, not the fixed `chunks_mut` this replaces.
+/// Fixed chunks were wrong here for `size_paths`' reason and the
+/// measurement is the same shape: cost tracks CHANGED FILES, not
+/// worktree count, and within one repository the slowest worktree
+/// measured 29x the median (see `CLASSIFY_TIMEOUT`). With 111 worktrees
+/// in 8 chunks of 14, one pathological branch parked its whole chunk --
+/// 13 innocent rows waiting behind it, and seven threads idle with
+/// nothing to take. Ordering is no longer preserved by chunking because
+/// ordering is no longer this function's business: it reports as results
+/// land, and every caller either collects into its own order or is a
+/// view that sorts for itself.
+///
+/// Width stays `CLASSIFY_WORKERS`, which was measured on the fixed-chunk
+/// form (28.3s serial -> 8.9s at 4 -> 7.9s at 8, regressing at 12) and
+/// is if anything conservative for a cursor: the knee came from process
+/// spawn contention, which does not move, while the idle-thread waste
+/// the cursor removes only helps.
+///
+/// Safe to parallelise because each verdict is computed purely from that
+/// worktree's own state -- the property `useRemoveWorktree` already
+/// relies on when it filters the cache instead of re-classifying.
+pub fn classify_repo_streaming(
+    repo_path: &str,
+    report: &mut (dyn FnMut(&Worktree) + Send),
+) -> Result<(), String> {
     let dir = Path::new(repo_path);
     // An empty vec on git failure resolved as SUCCESS, which left rows
     // stuck on "checking..." forever while the header confidently read
@@ -2152,31 +2369,52 @@ pub fn classify_repo(repo_path: &str) -> Result<Vec<Worktree>, String> {
     let list = git(dir, &["worktree", "list", "--porcelain"])
         .map_err(|e| format!("could not list worktrees: {e}"))?;
     let branch = default_branch(dir);
-    let mut wts = parse_porcelain(&list);
+    let wts = parse_porcelain(&list);
 
-    // Classified in parallel. git here is I/O-bound, not CPU-bound:
-    // measured on a real 145-worktree repo, 28.3s serial -> 8.9s at 4
-    // workers -> 7.9s at 8. Twelve and sixteen REGRESS, so the width is
-    // pinned rather than taken from the core count.
-    //
-    // Safe because each verdict is computed purely from that worktree's
-    // own state -- the same property `useRemoveWorktree` already relies
-    // on when it filters the cache instead of re-classifying. Ordering
-    // is preserved by chunking the slice rather than pushing to a shared
-    // collection, since a reshuffling sidebar is what `sort_for_sidebar`
-    // exists to prevent.
-    let chunk = wts.len().div_ceil(CLASSIFY_WORKERS).max(1);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let sink = std::sync::Mutex::new(report);
+    let workers = CLASSIFY_WORKERS.min(wts.len().max(1));
     std::thread::scope(|scope| {
-        for part in wts.chunks_mut(chunk) {
-            let branch = &branch;
-            scope.spawn(move || {
-                for w in part {
-                    classify(w, dir, branch);
+        for _ in 0..workers {
+            let (next, sink, branch, wts) = (&next, &sink, &branch, &wts);
+            scope.spawn(move || loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(w) = wts.get(i) else { break };
+                let mut w = w.clone();
+                // DIAGNOSTIC LOGGING (Settings > diagnostic log). The
+                // `size_paths` rationale, for the pass that still lacked
+                // it: #830 could not be attributed to a worktree from
+                // the log, because classification emitted nothing at
+                // all, so a stall was indistinguishable from a slow
+                // repository. The total says "slow"; this says WHICH.
+                let started = std::time::Instant::now();
+                let ok = classify_within(&mut w, dir, branch, CLASSIFY_TIMEOUT);
+                crate::diag!(
+                    "[diag] worktree-safety {} {}ms {}",
+                    w.path,
+                    started.elapsed().as_millis(),
+                    if ok {
+                        // The VERDICT's name only. Not the `Debug` of the
+                        // whole value: `Unknown` and `Locked` carry git's
+                        // own free-text reason, which can name a branch
+                        // or a path, and the diagnostic log is something
+                        // a user pastes into an issue (`get_pr_detail`
+                        // makes the same call about a repository name).
+                        safety_label(&w.safety).to_string()
+                    } else {
+                        format!("ABANDONED after {}s", CLASSIFY_TIMEOUT.as_secs())
+                    }
+                );
+                // A poisoned lock means another worker panicked
+                // mid-report. Dropping this one verdict beats panicking
+                // every remaining thread and losing the whole pass.
+                if let Ok(mut f) = sink.lock() {
+                    f(&w);
                 }
             });
         }
     });
-    Ok(wts)
+    Ok(())
 }
 
 /// Every repo with its worktrees fully classified, in one pass.
@@ -6449,6 +6687,351 @@ prunable gitdir file points to non-existent location
         }
     }
 
+    /// Classification, and the four things #830 turns on: that verdicts
+    /// arrive one at a time, that a worktree which will not finish
+    /// becomes "could not classify" rather than nothing at all, that one
+    /// such worktree does not stall the rest, and that a verdict nobody
+    /// could reach is never treated as removable.
+    ///
+    /// The `sizing` module above is the model, deliberately: #830 is
+    /// #754 and #769 in the other column, and the guarantees that fix
+    /// needed are the guarantees this one needs.
+    mod classifying {
+        use super::super::{
+            classify_repo_streaming, classify_within, Safety, Worktree, CLASSIFY_TIMEOUT,
+            CLASSIFY_WORKERS, GIT_TIMEOUT,
+        };
+        use std::path::Path;
+        use std::process::Command;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        /// A repository with `n` worktrees on unmerged branches.
+        ///
+        /// Unmerged on purpose: it is the verdict that costs the most git
+        /// calls, so it is the one whose streaming and bounding actually
+        /// matter. A repository of merged branches would classify fast
+        /// enough to hide the bug.
+        fn repo_with_worktrees(parent: &Path, n: usize) -> std::path::PathBuf {
+            let ident = [
+                ("GIT_AUTHOR_NAME", "octocat"),
+                ("GIT_COMMITTER_NAME", "octocat"),
+                ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+                ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+            ];
+            let run = |dir: &Path, args: &[&str]| {
+                let out = Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .envs(ident)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "git {args:?}");
+            };
+            let repo = parent.join("proj");
+            std::fs::create_dir_all(&repo).unwrap();
+            run(&repo, &["init", "-q", "-b", "main"]);
+            std::fs::write(repo.join("f"), "base\n").unwrap();
+            run(&repo, &["add", "-A"]);
+            run(&repo, &["commit", "-q", "-m", "base"]);
+            for i in 0..n {
+                let wt = parent.join(format!("proj-f{i}"));
+                run(
+                    &repo,
+                    &[
+                        "worktree",
+                        "add",
+                        "-q",
+                        "-b",
+                        &format!("f{i}"),
+                        wt.to_str().unwrap(),
+                    ],
+                );
+                std::fs::write(wt.join("f"), format!("work {i}\n")).unwrap();
+                run(&wt, &["add", "-A"]);
+                run(&wt, &["commit", "-q", "-m", "work"]);
+            }
+            repo
+        }
+
+        fn wt(path: &str) -> Worktree {
+            Worktree {
+                path: path.to_string(),
+                branch: "feature".into(),
+                head: "abc".into(),
+                safety: Safety::Pending,
+                is_main: false,
+                ..Default::default()
+            }
+        }
+
+        /// Each verdict is reported AS IT IS REACHED, not once at the end.
+        ///
+        /// The whole of #830: the command returned a `Vec` only when every
+        /// worktree was classified, so 111 rows held a skeleton behind
+        /// whichever branch was slowest. A caller can only stop promising
+        /// if it is handed partial answers.
+        #[test]
+        fn every_worktree_is_reported_individually() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let repo = repo_with_worktrees(tmp.path(), 5);
+
+            let seen = Mutex::new(Vec::new());
+            classify_repo_streaming(repo.to_str().unwrap(), &mut |w| {
+                seen.lock()
+                    .unwrap()
+                    .push((w.path.clone(), w.safety.clone()));
+            })
+            .unwrap();
+
+            let seen = seen.into_inner().unwrap();
+            // Five worktrees plus the main checkout.
+            assert_eq!(seen.len(), 6, "one report per worktree, not one batch");
+            for (path, safety) in &seen {
+                assert_ne!(
+                    *safety,
+                    Safety::Pending,
+                    "{path} was reported without a verdict"
+                );
+            }
+        }
+
+        /// A worktree that outruns its budget reports `Unknown`, not
+        /// nothing.
+        ///
+        /// The #830 bound, and the reason it is not `GIT_TIMEOUT`:
+        /// `classify` makes an unbounded NUMBER of individually-bounded
+        /// git calls, because `content_landed` spends up to four per
+        /// changed file. Without a ceiling around the worktree there is
+        /// no exit but completion, so the row never hears back -- the
+        /// column of skeletons the issue reported.
+        ///
+        /// A zero budget, so this cannot depend on machine speed.
+        #[test]
+        fn a_worktree_that_exceeds_its_budget_says_it_could_not_classify() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let repo = repo_with_worktrees(tmp.path(), 1);
+            let target = tmp.path().join("proj-f0");
+
+            let mut w = wt(target.to_str().unwrap());
+            let ok = classify_within(&mut w, &repo, "main", std::time::Duration::ZERO);
+
+            assert!(!ok, "a budget that is already spent must report failure");
+            assert!(
+                matches!(&w.safety, Safety::Unknown(m) if m.contains("did not finish")),
+                "an abandoned worktree must say it could not be classified, \
+                 not hold a skeleton: {:?}",
+                w.safety
+            );
+            // The SAFETY property, and the one that matters most: a
+            // verdict nobody could reach must never authorise a
+            // deletion.
+            assert!(
+                !w.safety.is_safe(),
+                "a worktree that could not be classified must never be safe"
+            );
+
+            // The same worktree classifies fine with a real budget, so
+            // the Unknown above is the BOUND firing rather than a broken
+            // classifier.
+            let mut w = wt(target.to_str().unwrap());
+            assert!(classify_within(&mut w, &repo, "main", CLASSIFY_TIMEOUT));
+            assert!(
+                !matches!(&w.safety, Safety::Unknown(m) if m.contains("did not finish")),
+                "a worktree with a real budget must reach a real verdict: {:?}",
+                w.safety
+            );
+        }
+
+        /// One unclassifiable worktree must not stall the others.
+        ///
+        /// The load-bearing guarantee of #830, and the acceptance
+        /// criterion the issue states: "a hung or failing single worktree
+        /// does not prevent the other rows from resolving". The old
+        /// `chunks_mut` could not offer it -- one pathological branch
+        /// parked its whole chunk of 14 while seven threads sat idle with
+        /// nothing to take.
+        ///
+        /// Asserts that EVERY worktree is reported, the bad one included.
+        /// Reporting the other N-1 is not enough: the bad row would still
+        /// hold its skeleton forever, which is the defect and not a
+        /// lesser version of it.
+        #[test]
+        fn one_unclassifiable_worktree_does_not_stall_the_others() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            // More worktrees than workers, so a parked worker would
+            // visibly starve the queue rather than merely finish last.
+            let n = CLASSIFY_WORKERS * 2;
+            let repo = repo_with_worktrees(tmp.path(), n);
+            // One worktree's directory is removed from under git. The
+            // registration survives, so it is still listed and still
+            // needs a verdict -- and it cannot get a normal one.
+            let broken = tmp.path().join("proj-f0");
+            std::fs::remove_dir_all(&broken).unwrap();
+
+            let seen = Mutex::new(Vec::new());
+            classify_repo_streaming(repo.to_str().unwrap(), &mut |w| {
+                seen.lock()
+                    .unwrap()
+                    .push((w.path.clone(), w.safety.clone()));
+            })
+            .unwrap();
+
+            let seen = seen.into_inner().unwrap();
+            assert_eq!(
+                seen.len(),
+                n + 1,
+                "every worktree must be reported, the broken one included \
+                 -- stalling at N-1 is #830"
+            );
+            // Matched on the final component, not on the whole path.
+            // Git reports the path it has on record, which on macOS is
+            // the CANONICAL one (`/private/var/...`) where `TempDir`
+            // hands back the symlinked spelling (`/var/...`) -- so a
+            // string comparison here fails for a reason that has nothing
+            // to do with what is being tested. `pathBasename` on the
+            // frontend exists for the same mismatch.
+            let tail = broken.file_name().unwrap().to_string_lossy().to_string();
+            let (_, bad) = seen
+                .iter()
+                .find(|(p, _)| {
+                    Path::new(p).file_name().map(|f| f.to_string_lossy())
+                        == Some(tail.clone().into())
+                })
+                .expect("the broken worktree must still be reported");
+            assert!(
+                !bad.is_safe(),
+                "a worktree whose directory is gone must never be safe: {bad:?}"
+            );
+            // And the others all reached a real verdict regardless.
+            for (p, s) in &seen {
+                assert_ne!(*s, Safety::Pending, "{p} never got a verdict");
+            }
+        }
+
+        /// The verdicts are computed concurrently.
+        ///
+        /// MEASURED on the fixed-chunk form this replaces, over a real
+        /// 145-worktree repository: 28.3s serial against 7.9s at eight
+        /// workers. The concurrency is load-bearing, so a refactor that
+        /// quietly removes it must fail here.
+        ///
+        /// Asserts overlap rather than wall-clock time: a timing
+        /// threshold on CI hardware is a flake generator. Same reasoning
+        /// as `sizing::paths_are_walked_concurrently`.
+        ///
+        /// Asserted from the REPORT ARRIVAL TIMES of the real function,
+        /// rather than by counting callbacks in flight. `sizing`'s
+        /// equivalent can count those because `size_paths` invokes its
+        /// callback from the worker with no lock held; here the callback
+        /// is serialised behind the sink mutex deliberately, so a
+        /// concurrency test written that way would measure the mutex and
+        /// fail against a perfectly parallel classifier.
+        ///
+        /// So: all `CLASSIFY_WORKERS` worktrees must be reported within a
+        /// window far shorter than the time one classification takes
+        /// times the count. The threshold is a RATIO of this machine's
+        /// own measured serial cost, taken in the same test, so it
+        /// carries no absolute timing assumption onto CI hardware.
+        #[test]
+        fn worktrees_are_classified_concurrently() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let repo = repo_with_worktrees(tmp.path(), CLASSIFY_WORKERS);
+
+            // What ONE worktree costs here, measured rather than assumed.
+            let listed = super::super::parse_porcelain(
+                &super::super::git(&repo, &["worktree", "list", "--porcelain"]).unwrap(),
+            );
+            let one = listed
+                .iter()
+                .find(|w| !w.is_main)
+                .expect("the fixture must have a non-main worktree");
+            let solo = std::time::Instant::now();
+            classify_within(&mut one.clone(), &repo, "main", CLASSIFY_TIMEOUT);
+            let solo = solo.elapsed();
+
+            let whole = std::time::Instant::now();
+            let n = AtomicUsize::new(0);
+            classify_repo_streaming(repo.to_str().unwrap(), &mut |_| {
+                n.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap();
+            let whole = whole.elapsed();
+
+            let count = n.load(Ordering::SeqCst);
+            assert_eq!(count, CLASSIFY_WORKERS + 1, "every worktree reported");
+            // Serial would be at least `count * solo`. Half of that is a
+            // generous line that still cannot be crossed by a serial
+            // implementation, and leaves room for process-spawn noise on
+            // a loaded machine.
+            let serial_floor = solo * count as u32;
+            assert!(
+                whole * 2 < serial_floor,
+                "classification must run worktrees concurrently: {count} \
+                 worktrees took {whole:?} against a {solo:?} solo cost, so \
+                 a serial floor of {serial_floor:?}. No overlap is the \
+                 3.6x-slower shape the fixed chunks had."
+            );
+        }
+
+        /// Fewer worktrees than workers must not spawn idle threads, and
+        /// a repository git cannot read must fail rather than resolve
+        /// empty.
+        #[test]
+        fn a_repository_that_cannot_be_listed_is_an_error_not_an_empty_set() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let not_a_repo = tmp.path().join("nope");
+            std::fs::create_dir_all(&not_a_repo).unwrap();
+
+            let err = classify_repo_streaming(not_a_repo.to_str().unwrap(), &mut |_| {
+                panic!("nothing could be listed, so nothing may be reported");
+            })
+            .unwrap_err();
+            assert!(
+                err.contains("could not list worktrees"),
+                "an unreadable repository must say so; resolving as an \
+                 empty success is what left rows on 'checking...' while \
+                 the header read '0 safe to remove': {err}"
+            );
+        }
+
+        /// The ceiling sits above `GIT_TIMEOUT`, and the order matters.
+        ///
+        /// A worktree whose FIRST git call honestly times out must be
+        /// able to report THAT -- "git did not respond within 30s", which
+        /// names the real failure. A classification ceiling at or below
+        /// 30s would pre-empt it and substitute the vaguer "did not
+        /// finish within Ns", losing the specific diagnosis for every
+        /// such worktree.
+        #[test]
+        fn the_ceiling_leaves_room_for_one_honest_git_timeout() {
+            assert!(
+                CLASSIFY_TIMEOUT > GIT_TIMEOUT,
+                "a worktree whose first git call times out must report \
+                 that, not be pre-empted by the outer ceiling"
+            );
+        }
+
+        /// The ceiling is generous enough not to reject honest work.
+        ///
+        /// MEASURED by `live_classification_cost_per_worktree`, the
+        /// slowest legitimate single worktree on this machine: 3295ms, in
+        /// a repository whose median was 114ms. A bound anywhere near the
+        /// median would turn real verdicts into "could not classify",
+        /// trading #830's silence for a wrong answer -- and since
+        /// `Unknown` is never removable, that wrong answer hides disk the
+        /// user came to reclaim.
+        #[test]
+        fn the_ceiling_leaves_room_for_the_slowest_honest_worktree() {
+            assert!(
+                CLASSIFY_TIMEOUT.as_secs() >= 10,
+                "the slowest MEASURED honest worktree was 3.295s against a \
+                 114ms median; a tight bound here discards real verdicts"
+            );
+        }
+    }
+
     /// A repo whose remote branch was squash-merged and DELETED, with
     /// the local remote-tracking ref deliberately left behind.
     ///
@@ -7747,6 +8330,69 @@ mod live {
         }
         for (k, n) in &tally {
             println!("{n:>4}  {k}");
+        }
+    }
+
+    /// How long classification takes PER WORKTREE, and what the spread
+    /// is (#830).
+    ///
+    /// The number this answers is the one `isPending` in
+    /// `src/lib/worktrees.ts` used to quote as "~57s", which was a TOTAL
+    /// for one tree on one machine and told a reader nothing about the
+    /// variable that actually matters. #830 is a 111-worktree repository
+    /// whose safety column never resolved at all, and a total cannot
+    /// distinguish "many worktrees, each quick" from "one worktree that
+    /// never answers" -- which are the same total and completely
+    /// different bugs.
+    ///
+    /// So this prints the per-worktree distribution, not just the sum:
+    /// the max against the median is the whole argument for a
+    /// per-worktree ceiling, because a bound set from the median would
+    /// throw away honest slow answers and a bound set from the total
+    /// would never fire.
+    ///
+    /// Serial on purpose, unlike production. `CLASSIFY_WORKERS` threads
+    /// would make each timing include its share of contention, and the
+    /// question here is what ONE worktree costs -- the figure a timeout
+    /// has to be set from.
+    #[test]
+    #[ignore]
+    fn live_classification_cost_per_worktree() {
+        let Ok(path) = std::env::var("HEADSTATE_REAL_REPO") else {
+            println!("set HEADSTATE_REAL_REPO to a repo with worktrees to run this");
+            return;
+        };
+        let repo = std::path::PathBuf::from(path);
+        if !repo.is_dir() {
+            println!("repo absent; nothing to check");
+            return;
+        }
+        let default = default_branch(&repo);
+        let listed = parse_porcelain(&git(&repo, &["worktree", "list", "--porcelain"]).unwrap());
+
+        let whole = std::time::Instant::now();
+        let mut each: Vec<(u128, String)> = Vec::new();
+        for w in &listed {
+            let mut w = w.clone();
+            let t = std::time::Instant::now();
+            classify(&mut w, &repo, &default);
+            each.push((t.elapsed().as_millis(), w.path.clone()));
+        }
+        let total = whole.elapsed();
+        each.sort_unstable();
+
+        let at = |q: f64| each[((each.len() as f64 - 1.0) * q).round() as usize].0;
+        println!(
+            "worktrees={} serial_total={:?} p50={}ms p90={}ms p99={}ms max={}ms",
+            each.len(),
+            total,
+            at(0.50),
+            at(0.90),
+            at(0.99),
+            each.last().map(|e| e.0).unwrap_or(0),
+        );
+        for (ms, p) in each.iter().rev().take(5) {
+            println!("  slowest {ms:>6}ms  {p}");
         }
     }
 

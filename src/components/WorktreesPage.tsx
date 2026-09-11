@@ -711,13 +711,21 @@ export function WorktreesPage() {
   const isMobile = useIsMobile();
 
   const selected = repos?.find((r) => r.path === filters.repo) ?? repos?.[0];
+  // `data` is deliberately NOT read here. `partial` already contains the
+  // settled set -- the hook merges `data` over the stream, so a row's
+  // authoritative verdict wins on any path it has -- and reading both
+  // would reintroduce the question "which of these two is the row's
+  // verdict?" that #830's merge exists to answer once.
   const {
-    data: classified,
     isLoading: classifying,
     isError: classifyFailed,
     error: classifyError,
     refetch: retryClassify,
-  } = useWorktreeSafety(selected?.path);
+    partial: verdicts,
+    pending: classifyPending,
+    total: classifyTotal,
+    failed: classifyUnknown,
+  } = useWorktreeSafety(selected?.path, selected?.worktrees);
   const sizesQuery = useWorktreeSizes(selected?.path);
   // The settled answer when there is one, and the sizes streamed so far
   // when there is not. Before #754 this was `data` alone, so every row
@@ -872,11 +880,10 @@ export function WorktreesPage() {
   // on every render of a list nobody is acting on.
   const assessed = new Set(assessedPaths ?? []);
 
-  // Classified data replaces the unclassified listing as it arrives, so
+  // Verdicts and sizes are merged onto the listing AS THEY ARRIVE, so
   // the page is useful immediately and gets more informative rather than
-  // blocking on ~16s of git calls. Sizes are merged in here rather than
-  // by refetching the list, so the page never flickers back to
-  // unclassified.
+  // blocking on git. Merged here rather than by refetching the list, so
+  // the page never flickers back to unclassified.
   //
   // Computed HERE, above every early return, because the sort below is a
   // hook: React requires the same hooks in the same order on every
@@ -886,8 +893,38 @@ export function WorktreesPage() {
   // abandoned, no number is coming" (#769), where an absent KEY is "not
   // measured yet". `??` collapses the two, so a row that gave up would
   // fall back to its stale size and keep its skeleton forever.
-  const withSizes = (classified ?? selected?.worktrees ?? []).map((w) => ({
+  //
+  // VERDICTS are merged the same way and for the same reason (#830).
+  // `classified` is the settled set and arrives only when the whole
+  // repository is done; `verdicts` carries each row's own answer the
+  // moment it exists. Before this the page read `classified` alone, so on
+  // a 111-worktree repository every row held its skeleton until the
+  // slowest branch finished -- and since classification makes an
+  // unbounded number of git calls per worktree, "until" could be never.
+  //
+  // The listing is the base, so the set of ROWS never depends on how far
+  // classification has got: a row appears with its name, branch and size,
+  // and its verdict fills in underneath it. A verdict for a path the
+  // listing does not have is APPENDED rather than dropped -- the two
+  // passes run against the same repository a moment apart, and a worktree
+  // created in that gap should appear rather than wait for the next
+  // listing refetch.
+  const listedRows = selected?.worktrees ?? [];
+  const rows = [
+    ...listedRows,
+    ...[...verdicts.values()].filter((v) => !listedRows.some((l) => l.path === v.path)),
+  ];
+  const withSizes = rows.map((w) => ({
     ...w,
+    // The verdict's fields win over the listing's -- that is the point --
+    // but ONLY for the fields classification actually answers. It also
+    // carries a `size_bytes`, which it does not measure and which is
+    // therefore stale or null on arrival, so the explicit assignment below
+    // has to come AFTER this spread. The fallback there reads `w`, the
+    // pre-spread row, so an unmeasured worktree keeps the LISTING's size
+    // rather than the verdict's empty one. Order is load-bearing here;
+    // swapping these two lines silently blanks every size.
+    ...(verdicts.get(w.path) ?? {}),
     size_bytes: sizes?.has(w.path) ? (sizes.get(w.path) ?? null) : w.size_bytes,
     /// This row's own walk was abandoned, OR the whole repository's
     /// sizing pass failed. Either way no number is coming for it, and
@@ -1409,9 +1446,23 @@ export function WorktreesPage() {
         )}
         {/* The count is withheld, not shown as a growing number: a
             "3 safe to remove" that climbs to 122 as rows resolve invites
-            acting on a figure that was never the answer. */}
+            acting on a figure that was never the answer.
+
+            The PROGRESS is shown, though, which is the half #830 was
+            missing. "checking what is safe to remove…" said only that
+            work was happening, so it read identically at second 2 and at
+            minute 15 -- the user could not tell a pass that was moving
+            from one that had stopped, which is the whole complaint. A
+            remaining count falls as verdicts land and is the one signal
+            that distinguishes the two.
+
+            Phrased as a remainder ("12 to go") rather than "99 of 111",
+            matching the size pass's own progress line on this page. */}
         {classifying ? (
-          <span className="text-xs text-[#58a6ff]">checking what is safe to remove…</span>
+          <span className="text-xs text-[#58a6ff]">
+            checking what is safe to remove
+            {classifyPending > 0 && classifyTotal > 0 ? ` — ${classifyPending} to go` : "…"}
+          </span>
         ) : classifyFailed ? (
           <button
             type="button"
@@ -1430,6 +1481,36 @@ export function WorktreesPage() {
             <HelpButton topic="worktree-safety" />
           </span>
         )}
+        {/* Worktrees that ARRIVED without a usable verdict, counted
+            separately from the ones still pending (#830).
+
+            The distinction is the lesson `useAllWorktreeSizes` records
+            about its own `failed`: "a caller that only watches `pending`
+            sees the number fall to zero and concludes everything was
+            measured." Here the same mistake is worse, because the figure
+            beside it is a count of directories the user is invited to
+            delete. A pass where 9 of 111 worktrees could not be
+            classified finishes with `pending` at zero and a confident
+            green "102 safe to remove", and nothing on screen would say
+            that 9 rows were never answered.
+
+            So it sits NEXT TO the green count rather than inside it, and
+            it is amber rather than red: these are not failures of the
+            app, they are questions git could not answer in the time
+            allowed, and each row already says so in its own words. The
+            number exists so the green count cannot be read as covering
+            the whole repository.
+
+            Silent at zero, like every other conditional count in this
+            row -- a permanent "0 could not be checked" is furniture. */}
+        {!classifying && !classifyFailed && classifyUnknown > 0 ? (
+          <span
+            className="text-xs text-[#d29922]"
+            title="These worktrees were listed but could not be classified — git refused, or the check ran past its time limit. Each row says which. They are never counted as safe to remove."
+          >
+            {classifyUnknown} could not be checked
+          </span>
+        ) : null}
         {/* A SECOND count, still in its own words and its own number
             (#793) -- but no longer in its own colour (#814).
 
@@ -1560,24 +1641,72 @@ export function WorktreesPage() {
             there are no headers to click. `ArtifactsPage` reached the
             same shape for the same reason, so this matches it rather
             than inventing a third pattern. */}
-        {/* ONE GROUP, and it is the fix for #817's first complaint.
+        {/* The count is in the label, so the scope is legible before
+            clicking rather than only in the dialog. 106 of 268 worktrees
+            are safe on a real machine, mostly in a few repos -- clicking
+            those one at a time adds no safety, only clicks.
+
+            BEFORE the Sort group, and that order is the rest of #817.
+            See the group's own comment below for why. */}
+        {safeCount > 1 && safeKnown ? (
+          <button
+            type="button"
+            disabled={bulkBusy}
+            onClick={() => setBulkOpen(true)}
+            className="rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#f85149] hover:bg-[#f85149]/10 disabled:opacity-50"
+          >
+            {/* A count, not a spinner: ~100 worktrees is around 30
+                seconds of sequential deletion, and a bare "Removing…"
+                for that long is indistinguishable from a hang. */}
+            {bulkBusy
+              ? removalProgress
+                ? `Removed ${removalProgress.done} of ${removalProgress.total}…`
+                : "Removing…"
+              : `Remove ${safeCount} safe worktree${safeCount === 1 ? "" : "s"}`}
+          </button>
+        ) : null}
+        {/* Beside the button rather than in the dialog: the question
+            ("can I leave this page?") occurs while it is running, which
+            is when the dialog is already gone. */}
+        {safeCount > 1 && safeKnown ? <HelpButton topic="bulk-removal" /> : null}
+
+        {/* ONE GROUP, placed AFTER the bulk Remove button. Both halves
+            are the fix for #817.
 
             The re-sort button used to sit directly before the bulk
             "Remove N safe worktrees" button in this `flex flex-wrap`
             row. So an ADVISORY control appearing -- which it does on its
-            own schedule, as measurements land -- pushed a DESTRUCTIVE
-            control sideways or onto a second line. That is the same
-            hazard the frozen row order exists to prevent, reproduced one
-            level up in the toolbar: a thing that deletes directories
-            must not move because something else arrived.
+            own schedule, as measurements and assessments land -- pushed a
+            DESTRUCTIVE control sideways or onto a second line. That is
+            the same hazard the frozen row order exists to prevent,
+            reproduced one level up in the toolbar: a thing that deletes
+            directories must not move because something else arrived.
 
-            Grouping them is better than reserving a fixed slot for the
-            button, which was the other option the issue offered. A
-            reserved slot would hold a permanent gap on a toolbar that is
-            usually complete without it -- and it would still sit beside
-            Remove, so the two would merely stop moving rather than stop
-            being neighbours. Here the appearing button displaces nothing
-            but the group's own right edge.
+            Grouping it with the Sort select fixed the ADJACENCY, and it
+            is where the button belongs -- it does nothing but re-run what
+            the select chose. But grouping alone did not fix the
+            DISPLACEMENT, which is what the reporter actually asked for
+            ("it shouldn't displace everything"): the group is still a
+            flex item in the same wrapping row, and it still sits where it
+            sat, so a button appearing inside it widens the group and
+            pushes everything after it along. The structural test that
+            shipped with it asserted only that the two buttons are not
+            siblings, which is true and insufficient.
+
+            Ordering is what actually settles it. With the group after
+            Remove, nothing upstream of Remove changes width when the
+            button appears, disappears, or changes its count -- so Remove
+            cannot move, by construction rather than by tuning. That is
+            stronger than reserving a fixed slot, the other option the
+            issue offered: a reserved slot holds a permanent gap on a
+            toolbar that is usually complete without it, and it only
+            stops the two from moving rather than stopping them from being
+            neighbours.
+
+            The cost is that Sort is no longer the last control before
+            "All repositories". Worth it: Sort is advisory and idempotent,
+            Remove deletes directories, and when only one of them can hold
+            a stable position it is not the advisory one.
 
             `shrink-0` so the group is not what the toolbar compresses,
             and no `flex-wrap` inside it: the button belongs to the
@@ -1600,27 +1729,25 @@ export function WorktreesPage() {
             </select>
           </label>
 
-          {/* The explicit gesture that makes the frozen order honest.
+          {/* The explicit gesture that makes the frozen order honest, and
+              it STAYS -- the reporter settled that: "the button is useful
+              for showing that re-calc is being performed, but it
+              shouldn't displace everything". It is a progress indicator,
+              not unwanted UX, so auto-sorting is off the table and the
+              `:734-765` safety rationale is not under pressure.
 
               Rows are ordered on what was known when the sort was
-              chosen, so a measurement or an assessment landing
-              afterwards does not move anything under the cursor -- but
-              it would leave a "Largest first" list quietly out of date
-              with no way to tell. This says how many rows have changed
-              since, and one click applies them. Silent when there is
-              nothing to apply, so it is not a permanent piece of
-              furniture.
-
-              Beside the Sort select rather than beside Remove, because
-              this is the control it modifies -- the button does nothing
-              but re-run what the select chose. That it also keeps an
-              appearing advisory control away from a destructive one is
-              the half of it #817 was actually reporting.
+              chosen, so a measurement or an assessment landing afterwards
+              does not move anything under the cursor -- but it would
+              leave a "Largest first" list quietly out of date with no way
+              to tell. This says how many rows have changed since, and one
+              click applies them. Silent when there is nothing to apply,
+              so it is not a permanent piece of furniture.
 
               "out of date" rather than the old "newly measured": the
-              count now includes assessments, which are not
-              measurements, and a label naming only one of its two
-              causes would misreport the other. */}
+              count now includes assessments, which are not measurements,
+              and a label naming only one of its two causes would
+              misreport the other. */}
           {restaleCount > 0 ? (
             <button
               type="button"
@@ -1633,32 +1760,6 @@ export function WorktreesPage() {
             </button>
           ) : null}
         </span>
-
-        {/* The count is in the label, so the scope is legible before
-            clicking rather than only in the dialog. 106 of 268 worktrees
-            are safe on a real machine, mostly in a few repos -- clicking
-            those one at a time adds no safety, only clicks. */}
-        {safeCount > 1 && safeKnown ? (
-          <button
-            type="button"
-            disabled={bulkBusy}
-            onClick={() => setBulkOpen(true)}
-            className="rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#f85149] hover:bg-[#f85149]/10 disabled:opacity-50"
-          >
-            {/* A count, not a spinner: ~100 worktrees is around 30
-                seconds of sequential deletion, and a bare "Removing…"
-                for that long is indistinguishable from a hang. */}
-            {bulkBusy
-              ? removalProgress
-                ? `Removed ${removalProgress.done} of ${removalProgress.total}…`
-                : "Removing…"
-              : `Remove ${safeCount} safe worktree${safeCount === 1 ? "" : "s"}`}
-          </button>
-        ) : null}
-        {/* Beside the button rather than in the dialog: the question
-            ("can I leave this page?") occurs while it is running, which
-            is when the dialog is already gone. */}
-        {safeCount > 1 && safeKnown ? <HelpButton topic="bulk-removal" /> : null}
 
         <button
           type="button"
