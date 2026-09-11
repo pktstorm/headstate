@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-post"
+description = "Enables the post command without any pre-configured scope."
+commands.allow = ["post"]
+
+[[permission]]
+identifier = "deny-post"
+description = "Denies the post command without any pre-configured scope."
+commands.deny = ["post"]

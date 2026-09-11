@@ -218,6 +218,7 @@ pub fn run() {
             commands::list_branches,
             commands::system_health,
             commands::system_health_history,
+            commands::health_alerts,
             commands::system_footprint,
             commands::system_network_processes,
             commands::delete_branches,
@@ -463,6 +464,19 @@ pub fn run() {
                                 store::health::history(&c).map_err(|e| e.to_string())
                             }) {
                             Ok(history) => {
+                                // Read per tick rather than cached, like
+                                // the poll loop's: a setting change
+                                // takes effect on the next sample
+                                // instead of at the next relaunch.
+                                //
+                                // Until #789 these alerts notified
+                                // UNCONDITIONALLY, with only
+                                // `battery_low_percent` to adjust when.
+                                // A user who wanted pull-request
+                                // notifications and not machine ones had
+                                // no way to say so; the master switch
+                                // turned off both or neither.
+                                let notify_prefs = commands::get_notify_prefs(app_handle.clone());
                                 let threshold = health::alerts::low_percent(
                                     commands::read_ui_prefs(&app_handle).battery_low_percent,
                                 );
@@ -475,8 +489,19 @@ pub fn run() {
                                     .last()
                                     .and_then(|s| s.battery.as_ref())
                                     .map(|b| b.percent);
+                                // The dedup runs whether or not the
+                                // category is wanted, and only the
+                                // POSTING is gated. Filtering before
+                                // `take_new` would make the fired-set
+                                // disagree with reality: a condition
+                                // that stood while its category was off
+                                // would read as cleared, so switching
+                                // the category back on would re-announce
+                                // a condition that had never stopped.
                                 for alert in fired.take_new(&alerts, charge) {
-                                    notify_battery(&app_handle, &alert);
+                                    if notify_prefs.wants_health(alert.key()) {
+                                        notify_battery(&app_handle, &alert);
+                                    }
                                 }
 
                                 // Tier 3, the one rule that notifies,
@@ -499,7 +524,14 @@ pub fn run() {
                                     cpu_alerts.iter().map(|a| a.key()).collect();
                                 let new = fired.take_new_keys(&["diffuse_cpu"], &present);
                                 for alert in &cpu_alerts {
-                                    if new.contains(&alert.key()) {
+                                    // Gated on the POSTING only, for the
+                                    // reason given above the battery
+                                    // loop: filtering before the dedup
+                                    // would let a standing condition
+                                    // read as cleared.
+                                    if new.contains(&alert.key())
+                                        && notify_prefs.wants_health(alert.key())
+                                    {
                                         notify_runaway(&app_handle, alert);
                                     }
                                 }

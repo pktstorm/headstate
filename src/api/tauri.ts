@@ -121,6 +121,21 @@ export interface NotifyPrefs {
   /// Notify when a pull request enters the "Ready for review" set: green
   /// checks, no blockers, and the user is a requested reviewer.
   ready_to_review: boolean;
+  /// Notify when a pull request APPEARS that was not there before
+  /// (#789). Unlike `ready_to_review` this says nothing about state: a
+  /// red, conflicted pull request appearing is still news.
+  new_pr: boolean;
+  /// Notify about this machine's battery: low charge, fast discharge, or
+  /// discharging while plugged in (#720).
+  ///
+  /// One category for all three, because they are one subject to a
+  /// person. Until #789 these notified unconditionally, with only the
+  /// threshold below to adjust WHEN -- there was no way to want pull
+  /// request notifications and not machine ones.
+  health_battery: boolean;
+  /// Notify when this machine's CPU is busy with nothing in particular
+  /// (#791).
+  health_cpu: boolean;
 }
 
 export const getNotifyPrefs = () => call<NotifyPrefs>("get_notify_prefs");

@@ -31,7 +31,11 @@ edition = "2021"
 # deny` runs. Everything above about what the lock proves applies to
 # them too.
 [workspace]
-members = ["plugins/headstate-keys", "plugins/headstate-refresh"]
+members = [
+    "plugins/headstate-keys",
+    "plugins/headstate-notify",
+    "plugins/headstate-refresh",
+]
 
 [lib]
 name = "headstate_companion_lib"
@@ -94,6 +98,12 @@ tauri-plugin-headstate-refresh = { version = "0.1.0", path = "plugins/headstate-
 # under plugins/headstate-keys. The version is stated so the path
 # dependency is not a wildcard for `cargo deny`.
 tauri-plugin-headstate-keys = { version = "0.1.0", path = "plugins/headstate-keys" }
+# Local user notifications (#789): UNUserNotificationCenter on iOS,
+# posted from inside the background window above. In-repo and iOS-only --
+# the Swift side lives under plugins/headstate-notify, and there is no
+# Android side by decision; see that plugin's build.rs. The version is
+# stated so the path dependency is not a wildcard for `cargo deny`.
+tauri-plugin-headstate-notify = { version = "0.1.0", path = "plugins/headstate-notify" }
 
 # ---- The client (#514) ---------------------------------------------------
 #

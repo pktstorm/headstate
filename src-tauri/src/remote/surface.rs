@@ -91,6 +91,17 @@ pub const SURFACE: &[(&str, Class)] = &[
     // signature and neither can reach the nonce path (#656).
     ("system_health", Class::Read),
     ("system_health_history", Class::Read),
+    // The evaluated health conditions (#789). A Read: it runs the rules
+    // over the same stored series `system_health_history` returns and
+    // reports verdicts rather than data.
+    //
+    // Exposed because the rules must exist in exactly ONE place. The
+    // phone could fetch the history and evaluate it itself, and that
+    // would be a second copy of every threshold in `health::alerts` and
+    // `health::runaway` -- in a separate crate with a separate lockfile,
+    // drifting silently while both suites stayed green. A drifted copy
+    // of a rule about when to interrupt someone is worse than no rule.
+    ("health_alerts", Class::Read),
     // What Headstate is costing the DESKTOP (#665). Exposed because
     // that is the whole point on the phone: the companion drives a
     // desktop, and this answers "is the app I am driving why that
@@ -395,6 +406,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "docker_images" => res(commands::docker_images(app.clone()).await),
         "system_health" => res(commands::system_health(app.state()).await),
         "system_health_history" => res(commands::system_health_history(app.clone()).await),
+        "health_alerts" => res(commands::health_alerts(app.clone()).await),
         "system_footprint" => res(commands::system_footprint(app.state()).await),
         "system_network_processes" => res(commands::system_network_processes().await),
         "docker_disk_usage" => res(commands::docker_disk_usage().await),

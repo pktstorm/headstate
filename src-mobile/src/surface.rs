@@ -60,6 +60,10 @@ pub const SURFACE: &[(&str, Class)] = &[
     // reads, so none carries a step-up signature.
     ("system_health", Class::Read),
     ("system_health_history", Class::Read),
+    // The evaluated health conditions (#789): the rules run on the
+    // desktop and this returns verdicts, so the phone holds no copy of
+    // any threshold. See the desktop's surface.rs for why that matters.
+    ("health_alerts", Class::Read),
     ("system_footprint", Class::Read),
     // Which processes are using the DESKTOP's network (#718). Costs
     // ~5s on the desktop, so the Network page calls it on its own slow

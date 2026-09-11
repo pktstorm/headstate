@@ -16,6 +16,7 @@ use crate::client::{Client, ClientError};
 use crate::connection::{Connection, EventSink, Report, State};
 use crate::events;
 use crate::keys::{DeviceKeys, KeyError};
+use crate::notify;
 use crate::pairing::{self, Desktop};
 use crate::stepup;
 use crate::store::Store;
@@ -443,6 +444,64 @@ impl Companion {
         events::save_snapshot(self.store.as_ref(), prs_json, now).map_err(|e| e.to_string())?;
         self.conn.mark_poll(now);
         Ok(())
+    }
+
+    /// Which notifications this phone should send (#789).
+    ///
+    /// An unreadable preference falls back to the default -- everything
+    /// on -- rather than to silence, matching `poll::read_notify_prefs`
+    /// on the desktop. A database problem must not quietly turn off a
+    /// feature the user is relying on, because the failure would be
+    /// indistinguishable from "nothing happened".
+    pub(crate) fn notify_prefs(&self) -> notify::PhoneNotifyPrefs {
+        match crate::store::get_json(self.store.as_ref(), notify::PREFS_KEY) {
+            Ok(Some(prefs)) => prefs,
+            Ok(None) => notify::PhoneNotifyPrefs::default(),
+            Err(e) => {
+                log::warn!("notify: preferences unreadable, using the defaults: {e}");
+                notify::PhoneNotifyPrefs::default()
+            }
+        }
+    }
+
+    pub(crate) fn set_notify_prefs(&self, prefs: &notify::PhoneNotifyPrefs) -> Result<(), String> {
+        crate::store::put_json(self.store.as_ref(), notify::PREFS_KEY, prefs)
+            .map_err(|e| e.to_string())
+    }
+
+    /// The pull requests the last notification pass compared against.
+    ///
+    /// An unreadable record is [`notify::Previous::First`], NOT an empty
+    /// list. That is the whole of the first-sync suppression: an empty
+    /// list would make every pull request on the machine look new and
+    /// fire a burst, which is exactly the failure a corrupt store must
+    /// not cause. The cost of getting it wrong in this direction is one
+    /// missed round of notifications.
+    pub(crate) fn notify_seen(&self) -> notify::Previous {
+        match crate::store::get_json::<notify::Seen>(self.store.as_ref(), notify::SEEN_KEY) {
+            Ok(Some(seen)) => seen.as_previous(),
+            Ok(None) => notify::Previous::First,
+            Err(e) => {
+                log::warn!("notify: the seen set is unreadable; suppressing this pass: {e}");
+                notify::Previous::First
+            }
+        }
+    }
+
+    pub(crate) fn record_notify_seen(&self, prs: &[notify::Pr]) -> Result<(), String> {
+        crate::store::put_json(
+            self.store.as_ref(),
+            notify::SEEN_KEY,
+            &notify::Seen::of(prs),
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    /// The paired desktop's name, for the copy that must say whose
+    /// machine a health alert is about.
+    pub(crate) fn desktop_name(&self) -> Option<String> {
+        let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        live.as_ref().map(|l| l.desktop.name.clone())
     }
 }
 

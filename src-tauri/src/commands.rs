@@ -2319,6 +2319,77 @@ pub async fn system_health_history(app: AppHandle) -> Result<Vec<crate::health::
     .map_err(|e| e.to_string())?
 }
 
+/// Every health condition currently true of this machine (#789).
+///
+/// The rules run HERE and nowhere else. A caller that wanted to notify
+/// about this machine's health -- the paired phone does -- would
+/// otherwise have to reimplement every threshold in `health::alerts` and
+/// `health::runaway`, in a separate crate, and the two copies would
+/// drift silently. A drifted copy of an interrupt-the-user rule is worse
+/// than no rule: it keeps passing its own tests while describing
+/// behaviour the app no longer has.
+///
+/// So this returns verdicts, not data: `health::AlertReport` carries the
+/// condition key and the desktop's own wording. The caller adds only
+/// what the desktop cannot know -- whose machine it is -- and
+/// deduplicates on the key.
+///
+/// # Why there is no `Fired` here
+///
+/// This reports what IS true, not what is NEW, exactly as
+/// `health::alerts::evaluate` does and for the same reason: dedup state
+/// belongs to whoever is doing the notifying. The desktop's sampler has
+/// its own `Fired`; the phone has its own; and a command that returned
+/// only transitions would make the answer depend on who asked last,
+/// which would mean two clients each seeing half the alerts.
+///
+/// Reads the stored series, like `system_health_history`, so both the
+/// charts and the rules see the same gap-preserving, downsampled data.
+/// The process table is read for the aggregate CPU rule's "no single
+/// process explains it" clause -- see `health::runaway`.
+#[tauri::command]
+pub async fn health_alerts(app: AppHandle) -> Result<Vec<crate::health::AlertReport>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
+        let history = crate::store::health::history(&conn).map_err(|e| e.to_string())?;
+        let threshold = crate::health::alerts::low_percent(read_ui_prefs(&app).battery_low_percent);
+
+        let mut out: Vec<crate::health::AlertReport> =
+            crate::health::alerts::evaluate(&history, threshold)
+                .into_iter()
+                .map(|a| crate::health::AlertReport {
+                    key: a.key().to_string(),
+                    title: a.title(),
+                    body: a.body(),
+                })
+                .collect();
+
+        // A fresh `Table` per call rather than managed state, unlike
+        // `Collector` and `Footprints`. Those are live readings on a
+        // timer, where a held instance is what makes a CPU delta mean
+        // anything; this is an occasional question from a phone, so the
+        // two refreshes it needs are done here and the instance is
+        // dropped. Without both, the first refresh reports every process
+        // at 0% and the aggregate rule would conclude that nothing
+        // explains the load -- firing on a legitimate build.
+        let table = crate::health::runaway::Table::new();
+        let _ = table.read();
+        let (_, aggregate) = table.read();
+        out.extend(
+            crate::health::runaway::evaluate(&history, Some(&aggregate))
+                .into_iter()
+                .map(|a| crate::health::AlertReport {
+                    key: a.key().to_string(),
+                    title: a.title(),
+                    body: a.body(),
+                }),
+        );
+        Ok(out)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// What Headstate itself is costing, right now (#665).
 ///
 /// The LIVE half of that panel only: our process, the `git`/`gh`/Docker
