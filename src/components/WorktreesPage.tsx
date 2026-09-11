@@ -1641,24 +1641,72 @@ export function WorktreesPage() {
             there are no headers to click. `ArtifactsPage` reached the
             same shape for the same reason, so this matches it rather
             than inventing a third pattern. */}
-        {/* ONE GROUP, and it is the fix for #817's first complaint.
+        {/* The count is in the label, so the scope is legible before
+            clicking rather than only in the dialog. 106 of 268 worktrees
+            are safe on a real machine, mostly in a few repos -- clicking
+            those one at a time adds no safety, only clicks.
+
+            BEFORE the Sort group, and that order is the rest of #817.
+            See the group's own comment below for why. */}
+        {safeCount > 1 && safeKnown ? (
+          <button
+            type="button"
+            disabled={bulkBusy}
+            onClick={() => setBulkOpen(true)}
+            className="rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#f85149] hover:bg-[#f85149]/10 disabled:opacity-50"
+          >
+            {/* A count, not a spinner: ~100 worktrees is around 30
+                seconds of sequential deletion, and a bare "Removing…"
+                for that long is indistinguishable from a hang. */}
+            {bulkBusy
+              ? removalProgress
+                ? `Removed ${removalProgress.done} of ${removalProgress.total}…`
+                : "Removing…"
+              : `Remove ${safeCount} safe worktree${safeCount === 1 ? "" : "s"}`}
+          </button>
+        ) : null}
+        {/* Beside the button rather than in the dialog: the question
+            ("can I leave this page?") occurs while it is running, which
+            is when the dialog is already gone. */}
+        {safeCount > 1 && safeKnown ? <HelpButton topic="bulk-removal" /> : null}
+
+        {/* ONE GROUP, placed AFTER the bulk Remove button. Both halves
+            are the fix for #817.
 
             The re-sort button used to sit directly before the bulk
             "Remove N safe worktrees" button in this `flex flex-wrap`
             row. So an ADVISORY control appearing -- which it does on its
-            own schedule, as measurements land -- pushed a DESTRUCTIVE
-            control sideways or onto a second line. That is the same
-            hazard the frozen row order exists to prevent, reproduced one
-            level up in the toolbar: a thing that deletes directories
-            must not move because something else arrived.
+            own schedule, as measurements and assessments land -- pushed a
+            DESTRUCTIVE control sideways or onto a second line. That is
+            the same hazard the frozen row order exists to prevent,
+            reproduced one level up in the toolbar: a thing that deletes
+            directories must not move because something else arrived.
 
-            Grouping them is better than reserving a fixed slot for the
-            button, which was the other option the issue offered. A
-            reserved slot would hold a permanent gap on a toolbar that is
-            usually complete without it -- and it would still sit beside
-            Remove, so the two would merely stop moving rather than stop
-            being neighbours. Here the appearing button displaces nothing
-            but the group's own right edge.
+            Grouping it with the Sort select fixed the ADJACENCY, and it
+            is where the button belongs -- it does nothing but re-run what
+            the select chose. But grouping alone did not fix the
+            DISPLACEMENT, which is what the reporter actually asked for
+            ("it shouldn't displace everything"): the group is still a
+            flex item in the same wrapping row, and it still sits where it
+            sat, so a button appearing inside it widens the group and
+            pushes everything after it along. The structural test that
+            shipped with it asserted only that the two buttons are not
+            siblings, which is true and insufficient.
+
+            Ordering is what actually settles it. With the group after
+            Remove, nothing upstream of Remove changes width when the
+            button appears, disappears, or changes its count -- so Remove
+            cannot move, by construction rather than by tuning. That is
+            stronger than reserving a fixed slot, the other option the
+            issue offered: a reserved slot holds a permanent gap on a
+            toolbar that is usually complete without it, and it only
+            stops the two from moving rather than stopping them from being
+            neighbours.
+
+            The cost is that Sort is no longer the last control before
+            "All repositories". Worth it: Sort is advisory and idempotent,
+            Remove deletes directories, and when only one of them can hold
+            a stable position it is not the advisory one.
 
             `shrink-0` so the group is not what the toolbar compresses,
             and no `flex-wrap` inside it: the button belongs to the
@@ -1681,27 +1729,25 @@ export function WorktreesPage() {
             </select>
           </label>
 
-          {/* The explicit gesture that makes the frozen order honest.
+          {/* The explicit gesture that makes the frozen order honest, and
+              it STAYS -- the reporter settled that: "the button is useful
+              for showing that re-calc is being performed, but it
+              shouldn't displace everything". It is a progress indicator,
+              not unwanted UX, so auto-sorting is off the table and the
+              `:734-765` safety rationale is not under pressure.
 
               Rows are ordered on what was known when the sort was
-              chosen, so a measurement or an assessment landing
-              afterwards does not move anything under the cursor -- but
-              it would leave a "Largest first" list quietly out of date
-              with no way to tell. This says how many rows have changed
-              since, and one click applies them. Silent when there is
-              nothing to apply, so it is not a permanent piece of
-              furniture.
-
-              Beside the Sort select rather than beside Remove, because
-              this is the control it modifies -- the button does nothing
-              but re-run what the select chose. That it also keeps an
-              appearing advisory control away from a destructive one is
-              the half of it #817 was actually reporting.
+              chosen, so a measurement or an assessment landing afterwards
+              does not move anything under the cursor -- but it would
+              leave a "Largest first" list quietly out of date with no way
+              to tell. This says how many rows have changed since, and one
+              click applies them. Silent when there is nothing to apply,
+              so it is not a permanent piece of furniture.
 
               "out of date" rather than the old "newly measured": the
-              count now includes assessments, which are not
-              measurements, and a label naming only one of its two
-              causes would misreport the other. */}
+              count now includes assessments, which are not measurements,
+              and a label naming only one of its two causes would
+              misreport the other. */}
           {restaleCount > 0 ? (
             <button
               type="button"
@@ -1714,32 +1760,6 @@ export function WorktreesPage() {
             </button>
           ) : null}
         </span>
-
-        {/* The count is in the label, so the scope is legible before
-            clicking rather than only in the dialog. 106 of 268 worktrees
-            are safe on a real machine, mostly in a few repos -- clicking
-            those one at a time adds no safety, only clicks. */}
-        {safeCount > 1 && safeKnown ? (
-          <button
-            type="button"
-            disabled={bulkBusy}
-            onClick={() => setBulkOpen(true)}
-            className="rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#f85149] hover:bg-[#f85149]/10 disabled:opacity-50"
-          >
-            {/* A count, not a spinner: ~100 worktrees is around 30
-                seconds of sequential deletion, and a bare "Removing…"
-                for that long is indistinguishable from a hang. */}
-            {bulkBusy
-              ? removalProgress
-                ? `Removed ${removalProgress.done} of ${removalProgress.total}…`
-                : "Removing…"
-              : `Remove ${safeCount} safe worktree${safeCount === 1 ? "" : "s"}`}
-          </button>
-        ) : null}
-        {/* Beside the button rather than in the dialog: the question
-            ("can I leave this page?") occurs while it is running, which
-            is when the dialog is already gone. */}
-        {safeCount > 1 && safeKnown ? <HelpButton topic="bulk-removal" /> : null}
 
         <button
           type="button"

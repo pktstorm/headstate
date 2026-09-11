@@ -2707,12 +2707,17 @@ describe("WorktreesPage", () => {
     ///
     /// The re-sort button used to render immediately before the bulk
     /// "Remove N safe worktrees" button in one `flex flex-wrap` toolbar,
-    /// so its arrival shoved a directory-deleting button sideways or
-    /// onto a second line. It now lives in a group with the Sort select
-    /// it modifies, which is both where it belongs and out of Remove's
-    /// way. Asserted structurally, since jsdom lays nothing out: the two
-    /// buttons have no common ancestor below the toolbar, so neither can
-    /// be a sibling the other displaces.
+    /// so its arrival shoved a directory-deleting button sideways or onto
+    /// a second line.
+    ///
+    /// Asserted STRUCTURALLY, because jsdom lays nothing out -- every
+    /// element has zero width here, so a geometric assertion would pass
+    /// against any markup at all and prove nothing. What decides the
+    /// layout in a `flex flex-wrap` row is DOCUMENT ORDER: an item can
+    /// only displace items that follow it. So the property to pin is that
+    /// the re-sort button comes after the Remove button, and that the
+    /// sequence of everything up to and including Remove is identical
+    /// whether the button is there or not.
     it("keeps the re-sort button out of the bulk Remove button's group", () => {
       state.classified = [
         wt({ path: "/code/measured", size_bytes: 500, safety: { kind: "safe" } }),
@@ -2730,6 +2735,76 @@ describe("WorktreesPage", () => {
       expect(group.querySelector("select[aria-label='Sort worktrees']")).toBeTruthy();
       // ...and the destructive button is outside that group entirely.
       expect(group.contains(remove)).toBe(false);
+    });
+
+    /// The bulk Remove button does not MOVE when the re-sort button
+    /// appears (#817).
+    ///
+    /// The criterion the reporter actually set -- "the button is useful
+    /// for showing that re-calc is being performed, but it shouldn't
+    /// displace everything" -- and the one the test above does not cover.
+    /// Grouping the button with the Sort select made the two stop being
+    /// siblings, which that test pins, but the GROUP was still a flex item
+    /// sitting before Remove in the same wrapping row: a button appearing
+    /// inside it widened the group and pushed Remove along regardless. So
+    /// "not siblings" was true and insufficient.
+    ///
+    /// Pinned as document order, for the reason the test above explains:
+    /// in a `flex flex-wrap` row an item displaces only what follows it,
+    /// and jsdom has no geometry to measure. The toolbar's children up to
+    /// and including Remove must be byte-identical across the button's
+    /// arrival -- which is only possible if the button renders after it.
+    it("never moves the bulk Remove button when the re-sort button appears", () => {
+      state.classified = [
+        wt({ path: "/code/measured", size_bytes: 500, safety: { kind: "safe" } }),
+        wt({ path: "/code/pending", size_bytes: null, safety: { kind: "safe" } }),
+      ];
+      state.sizing = true;
+
+      /// Where the bulk Remove button sits among the toolbar's children:
+      /// its index, and how many siblings precede it.
+      ///
+      /// The INDEX rather than the children's text. The text of the
+      /// preceding items legitimately changes as the pass runs -- the size
+      /// total updates, "measuring sizes — 1 of 2 to go" counts down --
+      /// and none of that is a layout shift; asserting on it would pin the
+      /// progress wording to this test instead of pinning the layout. What
+      /// must not change is Remove's POSITION, which in a `flex flex-wrap`
+      /// row is decided by how many items come before it.
+      const removeIndex = () => {
+        const remove = screen.getByRole("button", { name: /remove 2 safe worktrees/i });
+        const toolbar = remove.parentElement as HTMLElement;
+        return [...toolbar.children].indexOf(remove);
+      };
+
+      const { rerender } = render(<WorktreesPage />);
+      // No measurement has landed yet, so there is no re-sort button.
+      expect(screen.queryByRole("button", { name: /re-sort/i })).toBeNull();
+      const before = removeIndex();
+
+      // A size lands. The button appears -- and nothing up to Remove
+      // changes.
+      state.partialSizes = new Map([["/code/pending", 9_000_000]]);
+      rerender(<WorktreesPage />);
+      expect(screen.getByRole("button", { name: /re-sort/i })).toBeTruthy();
+      expect(removeIndex()).toBe(before);
+
+      // The COUNT changing must not move it either: the button grows
+      // wider as more rows go stale, and a wider advisory control is the
+      // same hazard as a new one.
+      state.assessed = ["/code/measured"];
+      rerender(<WorktreesPage />);
+      expect(screen.getByRole("button", { name: /re-sort/i }).textContent).toMatch(
+        /2 out of date/,
+      );
+      expect(removeIndex()).toBe(before);
+
+      // And the button is genuinely AFTER Remove in document order, which
+      // is what makes all of the above true by construction rather than
+      // by coincidence.
+      const resort = screen.getByRole("button", { name: /re-sort/i });
+      const remove = screen.getByRole("button", { name: /remove 2 safe worktrees/i });
+      expect(remove.compareDocumentPosition(resort) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     });
   });
 
