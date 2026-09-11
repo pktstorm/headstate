@@ -1,20 +1,26 @@
-import { BarChart3 } from "lucide-react";
 import type { PullRequest } from "@/types/pr";
 import { type View, useActiveFilters, useFilters } from "@/store/filters";
 import { ViewSwitcher } from "@/components/ViewSwitcher";
 import { repoCounts } from "@/lib/repos";
-import { IS_MOBILE_BUILD } from "@/lib/target";
 
 /// Repos where the user currently has open PRs, busiest first, plus an
 /// always-first "All repositories" entry that is the default (no `repo`
 /// filter set). Selecting a repo writes through the shared filter store --
 /// this component holds no filter state of its own.
 ///
-/// "Stats" is pinned to the bottom rather than sitting in the repo list:
-/// it is a different kind of destination (a whole-account view, not a
-/// repo), and the repo list above it grows with the number of repos you
-/// have PRs in. A column layout with the list scrolling and Stats outside
-/// the scroll area keeps it reachable at any repo count.
+/// This is the sidebar for My PRs AND for PR Stats (#794). Stats used to
+/// own a pinned row at the bottom of this column, outside the scroll area
+/// so it stayed reachable however many repos the list grew to. That row
+/// is gone: the destination moved into `ViewSwitcher`, which is where the
+/// rest of the app's navigation already lived, and a single column of
+/// repositories with nothing pinned under it is the simpler layout the
+/// old one was working around.
+///
+/// The rows stay live on both views, and highlight on either. On PR Stats
+/// a selection writes to that view's own filter set and nothing reads it
+/// yet -- `StatsPage` is a whole-account summary -- so the highlight is
+/// the honest thing to render: it says what was clicked. `ViewSwitcher`
+/// carries why the column is here at all rather than blank.
 export function RepoSidebar({
   prs,
   viewCounts,
@@ -24,19 +30,25 @@ export function RepoSidebar({
   viewCounts?: Partial<Record<View, number>>;
 }) {
   const filters = useActiveFilters();
-  const { setFilter, view, panel, setPanel } = useFilters();
+  const { setFilter, view } = useFilters();
   const counts = repoCounts(prs);
-  // Stats is desktop-only in the companion's first release, so the
-  // phone gets no entry that leads to it.
 
   const rowClass = (active: boolean) =>
     `flex w-full items-center justify-between rounded px-3 py-2 text-sm ${
       active ? "bg-[#1f6feb] text-white" : "text-[#e6edf3] hover:bg-[#161b22]"
     }`;
 
-  // A repo is only "selected" while the list is showing. On the stats view
-  // the sidebar highlight belongs to Stats, or two rows look active at once.
-  const listActive = view === "my-prs" && panel === "list";
+  // Both views this sidebar serves, not just My PRs (#794). The repo rows
+  // are the navigation for each, so a selection has to look selected on PR
+  // Stats too -- and there is no longer a pinned Stats row competing for
+  // the highlight, which is what the old `panel === "list"` half of this
+  // was avoiding.
+  //
+  // Still guarded on `view` at all, because this component is the
+  // FALLBACK sidebar in `App.tsx`: any future view that falls through to
+  // it would otherwise show a repo row highlighted for a page that never
+  // reads `filters.repo`.
+  const repoActive = view === "my-prs" || view === "pr-stats";
 
   return (
     <nav className="flex w-64 shrink-0 flex-col border-r border-[#30363d] p-3">
@@ -44,11 +56,8 @@ export function RepoSidebar({
       <div className="min-h-0 flex-1 overflow-y-auto">
         <button
           type="button"
-          onClick={() => {
-            setFilter("repo", undefined);
-            setPanel("list");
-          }}
-          className={rowClass(listActive && !filters.repo)}
+          onClick={() => setFilter("repo", undefined)}
+          className={rowClass(repoActive && !filters.repo)}
         >
           <span>All repositories</span>
           <span>{prs.length}</span>
@@ -57,38 +66,14 @@ export function RepoSidebar({
           <button
             type="button"
             key={repo}
-            onClick={() => {
-              setFilter("repo", repo);
-              setPanel("list");
-            }}
-            className={rowClass(listActive && filters.repo === repo)}
+            onClick={() => setFilter("repo", repo)}
+            className={rowClass(repoActive && filters.repo === repo)}
           >
             <span className="truncate">{repo}</span>
             <span className="ml-2 shrink-0">{count}</span>
           </button>
         ))}
       </div>
-
-      {/* Hidden on the mobile BUILD, not on a narrow viewport: Stats
-          being absent is a property of the companion app, and hiding
-          it by width took it away from a desktop user with a narrow
-          window. Kept in step with `App.tsx`, which maps a stored
-          `stats` panel back to the list on the same condition. */}
-      {IS_MOBILE_BUILD ? null : (
-      <div className="mt-2 shrink-0 border-t border-[#30363d] pt-2">
-        <button
-          type="button"
-          onClick={() => setPanel("stats")}
-          aria-pressed={view === "my-prs" && panel === "stats"}
-          className={rowClass(view === "my-prs" && panel === "stats")}
-        >
-          <span className="flex items-center gap-2">
-            <BarChart3 className="h-4 w-4 shrink-0" aria-hidden="true" />
-            Stats
-          </span>
-        </button>
-      </div>
-      )}
     </nav>
   );
 }

@@ -23,7 +23,7 @@ const PRS: PullRequest[] = [
 describe("TriageChips", () => {
   beforeEach(() => {
     useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "system-health": {} }, view: "my-prs", panel: "list" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} }, view: "my-prs", panel: "list" } as never);
   });
 
   it("shows a count for each non-empty triage state", () => {
@@ -60,7 +60,7 @@ describe("TriageChips", () => {
         "my-prs": { repo: "octocat/hello-world" },
         "to-review": {},
         worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "system-health": {},
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {},
       },
       view: "my-prs",
       panel: "list",
@@ -84,7 +84,7 @@ describe("TriageChips", () => {
       expect(listed).toBe(shown);
       // Reset for the next chip.
       useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "system-health": {} }, view: "my-prs", panel: "list" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} }, view: "my-prs", panel: "list" } as never);
     }
   });
 
