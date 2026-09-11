@@ -1,6 +1,5 @@
-import { BarChart3, Layers } from "lucide-react";
+import { Layers } from "lucide-react";
 import { type View, useFilters } from "../store/filters";
-import { useIsMobile } from "../lib/useIsMobile";
 import { ViewSwitcher } from "./ViewSwitcher";
 
 /// The Docker view's own sidebar.
@@ -13,10 +12,7 @@ export function DockerSidebar({
 }: {
   viewCounts?: Partial<Record<View, number>>;
 }) {
-  const { setPanel, setView } = useFilters();
-  // Stats is desktop-only in the companion's first release, so the
-  // phone gets no entry that leads to it.
-  const isMobile = useIsMobile();
+  const { setPanel } = useFilters();
 
   const rowClass = (active: boolean) =>
     `flex w-full items-center gap-2 rounded px-3 py-2 text-sm ${
@@ -48,22 +44,13 @@ export function DockerSidebar({
         </button>
       </div>
 
-      {/* Stats belongs to My PRs, so selecting it also switches view. */}
-      {isMobile ? null : (
-      <div className="mt-2 shrink-0 border-t border-[#30363d] pt-2">
-        <button
-          type="button"
-          onClick={() => {
-            setView("my-prs");
-            setPanel("stats");
-          }}
-          className={rowClass(false)}
-        >
-          <BarChart3 className="h-4 w-4 shrink-0" aria-hidden="true" />
-          Stats
-        </button>
-      </div>
-      )}
+      {/* The pinned Stats row is gone (#794). It existed because Stats
+          was a `panel` of My PRs and therefore unreachable from here
+          without setting both axes at once -- this row's whole job was
+          to do that. PR Stats is a view now, so the `ViewSwitcher` above
+          reaches it like every other destination, and a second control
+          for one of the nine views would be the only view in the app
+          with two ways in. */}
     </nav>
   );
 }

@@ -508,28 +508,129 @@ pub fn create_worktree(repo: &Path, branch: &str, dir: &Path) -> Result<(), Stri
     Ok(())
 }
 
-/// A branch name for an update run.
+/// The stamp format a generated branch name ends with: UTC, to the second.
 ///
-/// Sanitised because package names are not branch names: scoped npm
-/// packages carry `@` and `/`, and `/` in particular would nest the ref
-/// and can collide with an existing branch of the same prefix.
-pub fn branch_name(packages: &[String]) -> String {
-    let sanitise = |s: &str| -> String {
-        s.chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect()
+/// Mirrored in `src/lib/branchName.ts`, which builds the same string from
+/// a `Date`. Kept as one constant so the two can be compared by eye.
+const STAMP_FORMAT: &str = "%Y%m%d-%H%M%S";
+
+/// A branch name for an update run, stamped with the moment it starts.
+///
+/// Reads the clock; see [`branch_name_at`] for the derivation itself,
+/// which is pure and is what the tests and the TypeScript mirror pin.
+pub fn branch_name(packages: &[String], ecosystem: Option<Ecosystem>) -> String {
+    branch_name_at(packages, ecosystem, chrono::Utc::now())
+}
+
+/// The derivation, with the clock passed in.
+///
+/// # Why the name changed (#797)
+///
+/// It used to be `headstate/updates-<count>`, where the count was the
+/// NUMBER OF PACKAGES. Three things were wrong with that at once, and the
+/// third is the one that broke a real workflow:
+///
+/// 1. `153` read as an issue or pull request number. Every other number
+///    in this app's UI is one, and a quantity nobody asked for is a poor
+///    use of the one field a reader scans.
+/// 2. It said nothing about what the run WAS. The ecosystem is on every
+///    request already, so the run's own identity was being thrown away.
+/// 3. Keying on a COUNT means two runs in the same repository that happen
+///    to touch the same number of packages produce the same name, and
+///    `create_worktree` refuses when the branch or directory exists. So
+///    the second run failed outright -- loudly, which is correct of the
+///    guard, but the collision only existed because the name encoded a
+///    quantity rather than anything distinguishing.
+///
+/// Uniqueness per run mattered more than the exact spelling, so the name
+/// is now `headstate/<ecosystem>-deps-<UTC timestamp to the second>`:
+/// `headstate/poetry-deps-20260911-064512`.
+///
+/// ## Why a timestamp rather than a hash or a counter
+///
+/// A hash of the package list collides for exactly the runs that need
+/// telling apart -- re-running the same selection after a failure is the
+/// common case -- and says nothing a reader can use. A "next free
+/// number" counter needs to ask git what exists, which the wizard cannot
+/// do without the round trip #409 exists to avoid. A timestamp is
+/// unique at the only granularity that matters here (one update run per
+/// repository at a time, enforced by `runs::UpdateRuns::start`), sorts
+/// chronologically in `git branch` output, and tells the reader when the
+/// work happened -- which is the question a stranded update branch
+/// actually raises.
+///
+/// It is NOT mistakable for an issue number: eight digits, a dash, six
+/// more. `-deps-` in the middle says what the run was about, so the
+/// worktree directory leaf (`worktree_path` takes the branch's last
+/// segment) reads as `poetry-deps-20260911-064512` rather than the bare
+/// `updates-153` that started the investigation in #797.
+///
+/// ## What did NOT change
+///
+/// The `headstate/` prefix. #797 records that `headstate/` reads as a
+/// repo name rather than a creator, and that a different prefix would be
+/// better -- but it affects every existing branch in every repository, so
+/// it is deliberately left as a FOLLOW-UP and out of scope here. Existing
+/// `headstate/updates-*` branches and their `.worktrees/` directories are
+/// untouched; only newly created runs get the new shape.
+///
+/// ## The single-package case
+///
+/// Dropped, along with the package name it carried. It was the one case
+/// where the old name said something useful, but it was also the case
+/// where two runs collide most readily -- bumping `lodash` twice is
+/// ordinary -- and a name whose shape depends on how many packages were
+/// selected is a name the wizard has to re-derive on every checkbox
+/// click. One shape for every run is predictable for the user and for the
+/// mirror. The packages are still listed in the pull request body, which
+/// is where a list of nine belongs.
+///
+/// `_packages` is kept in the signature and deliberately unused: every
+/// caller has the list, and a name that wants a package in it again
+/// should not need the call sites rewritten to get one. Underscored to say
+/// so, matching `_names` in the TypeScript mirror.
+pub fn branch_name_at(
+    _packages: &[String],
+    ecosystem: Option<Ecosystem>,
+    at: chrono::DateTime<chrono::Utc>,
+) -> String {
+    // No sanitising. `slug()` is ASCII lowercase by test
+    // (`model::tests::every_slug_is_safe_in_a_ref`) and the stamp is
+    // digits and one dash, so nothing here can produce a character git
+    // would refuse -- unlike the package names the old name interpolated,
+    // which is what the sanitiser existed for.
+    //
+    // `None` is a MIXED run, not a missing value: the wizard's checkboxes
+    // are per row and a user may tick a crate and a pip package in one
+    // go. Naming such a branch after whichever request happens to be
+    // first would be arbitrary and wrong half the time, and listing both
+    // makes the length depend on the selection. "deps" alone says what is
+    // true of every run.
+    //
+    // Built as "<what>-<stamp>" with the ecosystem folded into `what`,
+    // rather than as two format! arms. Two arms drift in their
+    // separators, and an empty slug interpolated into one template leaves
+    // `headstate/-deps-…` -- a name `valid_branch_name` refuses, because
+    // git would read the leading dash as an option.
+    let what = match ecosystem {
+        Some(e) => format!("{}-deps", e.slug()),
+        None => "deps".to_string(),
     };
-    match packages {
-        [] => "headstate/updates".to_string(),
-        [one] => format!("headstate/update-{}", sanitise(one)),
-        many => format!("headstate/updates-{}", many.len()),
-    }
+    format!("headstate/{what}-{}", at.format(STAMP_FORMAT))
+}
+
+/// The one ecosystem a set of requests shares, or `None` when they differ.
+///
+/// Split out because the TypeScript mirror needs the same rule and a rule
+/// worth mirroring is worth naming. `None` for an empty slice too: there
+/// is no ecosystem to name, and `run` refuses an empty request list
+/// before this is reached anyway.
+pub fn sole_ecosystem(requests: &[UpdateRequest]) -> Option<Ecosystem> {
+    let first = requests.first()?.ecosystem;
+    requests
+        .iter()
+        .all(|r| r.ecosystem == first)
+        .then_some(first)
 }
 
 /// Whether a user-supplied branch name is one git will accept.
@@ -803,7 +904,7 @@ fn run_inner(
             valid_branch_name(b)?;
             b.to_string()
         }
-        None => branch_name(&names),
+        None => branch_name(&names, sole_ecosystem(requests)),
     };
     // Beside the repository, not inside it: a worktree inside the
     // checkout shows up in the parent's own status and in every tool
@@ -863,6 +964,18 @@ fn run_inner(
 fn worktree_path(repo: &Path, branch: &str) -> std::path::PathBuf {
     let leaf = branch.rsplit('/').next().unwrap_or(branch);
     repo.join(".worktrees").join(leaf)
+}
+
+/// A fixed instant, for asserting the stamped half of a branch name.
+///
+/// At module scope rather than inside one test module because both
+/// `tests` and `branch_override` pin the derivation, and the agreement
+/// cases that `src/lib/branchName.test.ts` mirrors live in the second.
+#[cfg(test)]
+fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .expect("a valid RFC3339 instant")
+        .with_timezone(&chrono::Utc)
 }
 
 #[cfg(test)]
@@ -1109,26 +1222,127 @@ mod tests {
         }
     }
 
-    /// Scoped npm names carry `@` and `/`; a `/` would nest the ref.
+    /// A package name can no longer reach the branch name at all (#797),
+    /// which is what retires the sanitiser's reason for existing HERE --
+    /// a scoped npm name carries `@` and `/`, and a `/` would nest the
+    /// ref. Kept as a test rather than deleted: the `packages` argument is
+    /// still in the signature, and a future name that interpolates one
+    /// again must not quietly reintroduce the hazard.
     #[test]
-    fn branch_names_are_sanitised() {
-        let b = branch_name(&["@scope/pkg".to_string()]);
+    fn a_package_name_cannot_reach_the_branch_name() {
+        let b = branch_name_at(
+            &["@scope/pkg".to_string()],
+            Some(Ecosystem::Npm),
+            at("2026-09-11T06:45:12Z"),
+        );
+        assert_eq!(b, "headstate/npm-deps-20260911-064512");
         assert!(!b.contains('@'), "{b}");
         assert!(
             b.matches('/').count() == 1,
             "only the headstate/ prefix may contain a slash: {b}"
         );
+        assert!(valid_branch_name(&b).is_ok(), "{b} must be a usable ref");
+    }
+
+    /// The collision #797 is actually about. The old name keyed on the
+    /// PACKAGE COUNT, so two runs in one repository touching the same
+    /// number of packages produced the same branch -- and
+    /// `create_worktree` refuses an existing one, so the second failed
+    /// outright. enc-api already held `headstate/updates-153`, which made
+    /// the next 153-package Poetry run there impossible.
+    #[test]
+    fn two_runs_with_the_same_package_count_do_not_collide() {
+        let same_count = ["a".to_string(), "b".to_string(), "c".to_string()];
+        let first = branch_name_at(
+            &same_count,
+            Some(Ecosystem::Poetry),
+            at("2026-09-11T06:45:12Z"),
+        );
+        let second = branch_name_at(
+            &same_count,
+            Some(Ecosystem::Poetry),
+            at("2026-09-11T06:45:13Z"),
+        );
+        assert_ne!(first, second);
+    }
+
+    /// A run's identity, not its size. Asserting the whole string rather
+    /// than a `contains`: the point of #797 is what the name READS as, and
+    /// a substring check passes on a name with the old count still in it.
+    #[test]
+    fn the_name_says_which_ecosystem() {
+        assert_eq!(
+            branch_name_at(&[], Some(Ecosystem::Poetry), at("2026-09-11T06:45:12Z")),
+            "headstate/poetry-deps-20260911-064512"
+        );
+        assert_eq!(
+            branch_name_at(&[], Some(Ecosystem::Cargo), at("2026-09-11T06:45:12Z")),
+            "headstate/cargo-deps-20260911-064512"
+        );
+    }
+
+    /// Nothing in a generated name can be read as an issue or pull
+    /// request number, which was the second of #797's three complaints:
+    /// every other number in this UI is one. A 14-character stamp split
+    /// by a dash is not mistakable for `#153`.
+    #[test]
+    fn no_part_of_the_name_looks_like_an_issue_number() {
+        let b = branch_name_at(
+            &["a".into()],
+            Some(Ecosystem::Npm),
+            at("2026-09-11T06:45:12Z"),
+        );
+        let leaf = b.rsplit('/').next().unwrap();
+        for run in leaf.split(['-', '.']) {
+            if run.chars().all(|c| c.is_ascii_digit()) {
+                assert!(
+                    run.len() >= 6,
+                    "{run:?} in {b} is short enough to read as an issue number"
+                );
+            }
+        }
+    }
+
+    /// A mixed selection gets "deps" and no ecosystem. Naming it after
+    /// whichever request came first would be arbitrary; the hazard the
+    /// assertion guards is the empty slug leaving `headstate/-deps-…`,
+    /// which git reads as an option and `valid_branch_name` refuses.
+    #[test]
+    fn a_mixed_run_is_named_deps_with_no_stray_dash() {
+        let b = branch_name_at(&[], None, at("2026-09-11T06:45:12Z"));
+        assert_eq!(b, "headstate/deps-20260911-064512");
+        assert!(valid_branch_name(&b).is_ok(), "{b} must be a usable ref");
     }
 
     #[test]
-    fn branch_name_summarises_multiple_packages() {
-        let b = branch_name(&["a".to_string(), "b".to_string(), "c".to_string()]);
-        assert!(b.contains('3'), "{b}");
+    fn sole_ecosystem_requires_agreement() {
+        let req = |eco| UpdateRequest {
+            name: "pkg".into(),
+            version: "1.0.0".into(),
+            ecosystem: eco,
+            project: String::new(),
+        };
+        assert_eq!(sole_ecosystem(&[]), None);
+        assert_eq!(
+            sole_ecosystem(&[req(Ecosystem::Uv), req(Ecosystem::Uv)]),
+            Some(Ecosystem::Uv)
+        );
+        assert_eq!(
+            sole_ecosystem(&[req(Ecosystem::Uv), req(Ecosystem::Cargo)]),
+            None
+        );
     }
 
+    /// Whatever the clock says, the result must be a ref git accepts.
+    /// The stamp is the only part that varies at runtime, so this is what
+    /// stands between a format change and a run that dies at
+    /// `git worktree add`.
     #[test]
-    fn branch_name_handles_no_packages() {
-        assert!(!branch_name(&[]).is_empty());
+    fn the_generated_name_is_always_a_valid_ref() {
+        for eco in [None, Some(Ecosystem::Npm), Some(Ecosystem::Cocoapods)] {
+            let b = branch_name(&["lodash".to_string()], eco);
+            assert!(valid_branch_name(&b).is_ok(), "{b} should be valid");
+        }
     }
 
     /// A real git repository, so worktree behaviour is exercised rather
@@ -1812,12 +2026,65 @@ mod branch_override {
 
     /// No override means the derived name, which is what every caller
     /// before #409 wanted.
+    ///
+    /// THESE ARE THE AGREEMENT CASES. `src/lib/branchName.test.ts` asserts
+    /// the identical three, because `derivedBranchName` is a second
+    /// implementation of this function -- the wizard has to show the name
+    /// the run will use before the run starts, and that is worth a mirror
+    /// only while the mirror is exact. If the two diverge the field shows
+    /// one name and the run uses another, which is worse than not offering
+    /// the field at all. Change one, change both, and change both test
+    /// files.
+    ///
+    /// The clock is passed in for exactly this reason: a derivation that
+    /// read `Utc::now()` internally could not be compared against
+    /// anything, so there would be nothing for the TypeScript side to
+    /// agree WITH.
     #[test]
     fn no_override_keeps_the_derived_name() {
-        assert_eq!(branch_name(&["lodash".into()]), "headstate/update-lodash");
+        let when = at("2026-09-11T06:45:12Z");
         assert_eq!(
-            branch_name(&["a".into(), "b".into(), "c".into()]),
-            "headstate/updates-3"
+            branch_name_at(&["lodash".into()], Some(Ecosystem::Npm), when),
+            "headstate/npm-deps-20260911-064512"
+        );
+        assert_eq!(
+            branch_name_at(
+                &["a".into(), "b".into(), "c".into()],
+                Some(Ecosystem::Poetry),
+                when
+            ),
+            "headstate/poetry-deps-20260911-064512"
+        );
+        assert_eq!(
+            branch_name_at(&[], None, when),
+            "headstate/deps-20260911-064512"
+        );
+    }
+
+    /// A single-digit month, day, hour, minute or second must be
+    /// zero-padded, or the stamp changes width and two runs an hour apart
+    /// sort wrongly in `git branch`. Asserted because the TypeScript
+    /// mirror builds the same string from `Date` getters, where padding is
+    /// manual and therefore the likeliest place for the two to diverge.
+    #[test]
+    fn the_stamp_is_zero_padded_throughout() {
+        assert_eq!(
+            branch_name_at(&[], Some(Ecosystem::Uv), at("2026-01-02T03:04:05Z")),
+            "headstate/uv-deps-20260102-030405"
+        );
+    }
+
+    /// UTC, not local time. A name derived in two zones for the same
+    /// instant must match, because the wizard predicts it on whatever
+    /// machine the user is on and the run derives it again on the
+    /// desktop -- a companion in a different zone would otherwise see a
+    /// different name.
+    #[test]
+    fn the_stamp_is_utc() {
+        // The same instant, written with an offset.
+        assert_eq!(
+            branch_name_at(&[], Some(Ecosystem::Npm), at("2026-09-11T06:45:12Z")),
+            branch_name_at(&[], Some(Ecosystem::Npm), at("2026-09-11T08:45:12+02:00"))
         );
     }
 }

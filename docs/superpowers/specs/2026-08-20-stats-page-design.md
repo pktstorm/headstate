@@ -1,7 +1,17 @@
 # Stats Page Design
 
 **Date:** 2026-08-20
-**Status:** Approved
+**Status:** Approved — implemented; navigation since changed by #794
+
+> **What changed:** the page and its two queries are as designed. Where it
+> lives in the UI is not: "the Stats view" throughout this document meant a
+> sub-page of My PRs, reached from a row pinned to the sidebar's bottom.
+> #794 made it a top-level view, `pr-stats`, labelled **"PR Stats"** in the
+> view switcher, and removed the pinned row. It keeps the repo sidebar it
+> had — the rows are inert on it, since these queries take no repository,
+> and `ViewSwitcher`'s doc comment records why that was still preferred to a
+> blank column. The caching note below ("while the Stats view is open") is
+> unaffected: the queries still mount and unmount with the page.
 
 ## Problem
 

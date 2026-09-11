@@ -12,21 +12,32 @@ import { useFilters } from "../store/filters";
 
 afterEach(() => stubViewport(null));
 
-describe("WorktreeSidebar on a phone", () => {
-  it("drops the Stats entry but keeps the repositories", () => {
+/// The pinned Stats row is gone from this sidebar too (#794) -- same
+/// reason as `DockerSidebar`: it only existed to set `view` and `panel`
+/// together, and PR Stats is a view the switcher reaches. `ViewSwitcher`
+/// is mocked away in this file, so these assertions see only the repo
+/// rows.
+///
+/// Both widths stay, because the removed row was gated by VIEWPORT and
+/// that is the rule #598 forbids. The two widths agreeing is the
+/// assertion.
+describe("WorktreeSidebar at either width", () => {
+  it("shows the repositories at a phone width, with nothing pinned below", () => {
     stubViewport(390);
     repos.mockReturnValue([repo("busy", 3)]);
     render(<WorktreeSidebar />);
-    expect(screen.queryByRole("button", { name: /stats/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^stats$/i })).toBeNull();
     expect(screen.getByText("busy")).toBeTruthy();
     expect(screen.getByText("All repositories")).toBeTruthy();
   });
 
-  it("keeps Stats at the desktop width", () => {
+  it("shows the same rows at the desktop width", () => {
     stubViewport(1400);
     repos.mockReturnValue([repo("busy", 3)]);
     render(<WorktreeSidebar />);
-    expect(screen.getByRole("button", { name: /stats/i })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^stats$/i })).toBeNull();
+    expect(screen.getByText("busy")).toBeTruthy();
+    expect(screen.getByText("All repositories")).toBeTruthy();
   });
 });
 
@@ -63,7 +74,7 @@ beforeEach(() => {
   repos.mockReturnValue([]);
   useFilters.setState({
     filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "system-health": {} },
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} },
     view: "worktrees",
   } as never);
 });

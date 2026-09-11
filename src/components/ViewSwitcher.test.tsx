@@ -6,7 +6,7 @@ import { useFilters } from "../store/filters";
 import { ViewSwitcher } from "./ViewSwitcher";
 
 const EMPTY = { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "system-health": {} } as const;
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} } as const;
 
 describe("ViewSwitcher", () => {
   beforeEach(() =>
@@ -73,7 +73,7 @@ describe("ViewSwitcher", () => {
   it("does not leak filters between views", () => {
     useFilters.setState({
       filtersByView: { "my-prs": { repo: "octocat/hello-world" }, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "system-health": {} },
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} },
       view: "my-prs",
       panel: "list",
     });
