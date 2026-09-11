@@ -18,7 +18,7 @@ const footprintFn = vi.hoisted(() => vi.fn<() => Promise<Footprint>>());
 // `useWorktrees`, `useArtifacts`, `useVenvs` and the four sizing ones --
 // were here for the footprint panels' "Measure disk use" button, which
 // #795 and #796 removed along with both panels. This page now reaches no
-// slow command at all, and `SystemHealthPage.footprint.test.tsx` is what
+// slow command at all, and `SystemHealthPage.transport.test.tsx` is what
 // proves that at the transport seam, where a forgotten `enabled` in
 // `hooks.ts` would actually show up.
 //
