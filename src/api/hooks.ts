@@ -30,6 +30,7 @@ import {
   getMergedDetail,
   getCycleTrend,
   getPeriods,
+  statsTree,
   getPollInterval,
   getRemoteEnabled,
   setRemoteEnabled,
@@ -1758,6 +1759,43 @@ export function useDockerImages(enabled: boolean) {
     queryFn: dockerImages,
     enabled,
     staleTime: 10_000,
+  });
+}
+
+/// The PR Stats scope hierarchy: organisations, their repositories and
+/// their members, plus the viewer's own repositories (#825).
+///
+/// `enabled` threads the explicit-load rule from the caller, which is the
+/// live pattern in this file (`useArtifacts`, `useDockerImages`,
+/// `useAllWorktreeSizes`, ...) and what #823 settled on after the "Measure"
+/// button it originally cited was removed by #796. Here it means the tree is
+/// enumerated when the PR Stats sidebar is on screen and not before -- a
+/// user on My PRs does not pay for a hierarchy they are not looking at.
+///
+/// # Why this is cheap enough to run on entering the view
+///
+/// It is DISCOVERY, not measurement, which is the split `useArtifacts` and
+/// `useArtifactSizes` are built around above. MEASURED on the live API: 2
+/// rate-limit points and ~1.6s for a 2-org / 8-member / 65-repository
+/// hierarchy, because it carries no statistics at all. The expensive part of
+/// this feature is what a CLICK on one of these rows costs, and that is
+/// `stats_count`'s problem, behind its own budget check.
+///
+/// # `staleTime`
+///
+/// Five minutes. Longer than the Docker hooks' ten seconds because the
+/// answer changes on a human timescale -- someone joins the org, someone
+/// creates a repository -- and far shorter than `useArtifacts`' because a
+/// stale roster offers scopes that may no longer exist. The Rust command
+/// deliberately does NOT cache this (unlike `stats_count`), so this
+/// `staleTime` is the only thing stopping a re-fetch per navigation, which
+/// is the right layer for "do not re-ask while the user is still here".
+export function useStatsTree(enabled: boolean) {
+  return useQuery({
+    queryKey: ["stats-tree"],
+    queryFn: statsTree,
+    enabled,
+    staleTime: 5 * 60 * 1000,
   });
 }
 

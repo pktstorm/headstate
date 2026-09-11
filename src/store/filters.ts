@@ -119,6 +119,27 @@ interface FilterStore {
   panel: "list" | "builds";
   setFilter: <K extends keyof Filters>(key: K, value: Filters[K]) => void;
   applyPreset: (filters: Filters) => void;
+  /// Pick a PR Stats scope, and optionally a person within it (#825).
+  ///
+  /// One action rather than three `setFilter` calls, because the three keys
+  /// are ONE selection. Written separately they would render three times
+  /// and pass through states that are not selections at all -- a subject
+  /// with the previous scope still set, which is a question about the wrong
+  /// organisation. The `repo` precedent in `setFilter` is the same idea at
+  /// one key: a navigation write is atomic with its consequences.
+  ///
+  /// `subject` is `undefined` for "the viewer", which is what every row
+  /// except a Members row selects -- so clicking a repository after
+  /// clicking a person CLEARS the person rather than silently keeping them
+  /// scoped to a new repository. That is the behaviour the caller gets by
+  /// default, which is why it is a required parameter rather than an
+  /// optional one: a forgotten argument would leave a stale subject, and
+  /// the leaderboard would quietly be about one person.
+  setStatsScope: (
+    kind: Filters["statsScopeKind"],
+    value: string | undefined,
+    subject: string | undefined,
+  ) => void;
   setView: (view: View) => void;
   setPanel: (panel: "list" | "builds") => void;
   /// Which System Health page is open (#687).
@@ -183,11 +204,16 @@ const EMPTY_FILTERS: Record<View, Filters> = {
   artifacts: {},
   packages: {},
   "claude-md": {},
-  // PR Stats keeps the repo sidebar (#794), so a repo clicked there
-  // writes here -- and `useActiveFilters` reads `[view]` on every render
-  // whether or not the page consults the result. `StatsPage` does not
-  // consult it yet; the entry is still mandatory, because a missing key
-  // is the undefined-crash this record exists to prevent.
+  // PR Stats holds its own scope selection (#825): `statsScopeKind`,
+  // `statsScopeValue` and `statsSubject`, written by `StatsSidebar`
+  // through `setStatsScope`. Empty here like every other view -- the entry
+  // is what makes `filtersByView` TOTAL over `View`, and
+  // `useActiveFilters` reads `[view]` on every render, so a missing key is
+  // the undefined-crash this record exists to prevent.
+  //
+  // Between #794 and #825 this held a `repo` written by the inherited
+  // `RepoSidebar` and read by nothing. The keys changed; the reason the
+  // entry exists did not.
   "pr-stats": {},
   // System Health has an entry like every other view even though it
   // has no filters to hold. `filtersByView` must be TOTAL over `View`
@@ -240,6 +266,18 @@ export const useFilters = create<FilterStore>()(
           // at, and closing the detail view on a label filter would
           // throw away what the user is reading.
           ...(key === "repo" ? { selectedPr: null } : {}),
+        })),
+      setStatsScope: (kind, value, subject) =>
+        set((s) => ({
+          filtersByView: {
+            ...s.filtersByView,
+            [s.view]: {
+              ...s.filtersByView[s.view],
+              statsScopeKind: kind,
+              statsScopeValue: value,
+              statsSubject: subject,
+            },
+          },
         })),
       // Preset navigation replaces the filter set wholesale, so a click
       // never inherits a filter the user forgot was active and shows a

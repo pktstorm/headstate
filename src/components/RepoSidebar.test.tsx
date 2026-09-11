@@ -105,21 +105,38 @@ describe("RepoSidebar", () => {
     expect(nav.lastElementChild?.className).toContain("overflow-y-auto");
   });
 
-  /// A repo selection highlights on PR Stats as well as on My PRs (#794).
-  /// There is no pinned Stats row competing for the highlight any more,
-  /// and a click that visibly does nothing is worse than one that filters
-  /// nothing.
-  it("highlights the selected repo on PR Stats too", () => {
+  /// This column no longer serves PR Stats (#825), which has its own
+  /// `StatsSidebar`, so it must NOT highlight a repo row for that view.
+  ///
+  /// The inverse of the assertion this replaces, and the replacement is
+  /// the point rather than a deletion: between #794 and #825 the rows were
+  /// live on PR Stats and read by nothing, and the highlight was defended
+  /// as "the honest thing to render: it says what was clicked". Now that
+  /// the view has a column whose rows DO something, a highlight here would
+  /// be for a filter key (`repo`) that PR Stats no longer uses -- its
+  /// scope lives in `statsScopeKind` / `statsScopeValue`.
+  ///
+  /// Kept as a rendered assertion rather than trusting `repoActive`,
+  /// because `App.tsx` is what stops this component reaching PR Stats at
+  /// all and a routing change could quietly bring it back.
+  it("does not highlight a repo row on PR Stats, which has its own sidebar", () => {
     useFilters.setState({ view: "pr-stats" });
     render(<RepoSidebar prs={PR_FIXTURES} />);
 
     fireEvent.click(screen.getByRole("button", { name: /octocat\/hello-world/ }));
 
-    // Written to PR Stats' own filter set, not My PRs'.
-    expect(useFilters.getState().filtersByView["pr-stats"].repo).toBe("octocat/hello-world");
+    // The write still lands in PR Stats' own filter set -- `setFilter`
+    // writes `[view]` and that is not this component's business -- but
+    // nothing reads `repo` for that view any more, so nothing lights up.
     expect(useFilters.getState().filtersByView["my-prs"].repo).toBeUndefined();
     expect(
       screen.getByRole("button", { name: /octocat\/hello-world/ }).className,
-    ).toContain("bg-[#1f6feb]");
+    ).not.toContain("bg-[#1f6feb]");
+    // And "All repositories" must not claim to be selected either: a view
+    // this column does not serve should look unselected all the way down,
+    // rather than defaulting to a highlight on the first row.
+    expect(screen.getByText("All repositories").closest("button")?.className).not.toContain(
+      "bg-[#1f6feb]",
+    );
   });
 });

@@ -67,27 +67,29 @@ export const ALWAYS_OFFERED: ReadonlySet<View> = new Set<View>(["my-prs"]);
 /// (Docker's images-versus-builds) is a genuine tab pair in a way
 /// list-versus-whole-account-summary never was.
 ///
-/// The implication about the sidebar was the real question, and the
-/// answer is recorded rather than dodged: PR Stats KEEPS the
-/// `RepoSidebar` it inherited as a panel, and the repo rows stay live on
-/// it -- a selection writes to `pr-stats`'s own filter set, which is why
-/// the view has an entry in `EMPTY_FILTERS`.
+/// The implication about the sidebar was the real question, and it has now
+/// been answered twice. #794 gave PR Stats the `RepoSidebar` it had
+/// inherited as a panel, on the reasoning that an inert repo list was a
+/// smaller lie than the blank column the issue offered -- while recording
+/// that `StatsPage` did not read `filters.repo`, so the rows were
+/// continuity and "a future scope hook, not a live filter", and that this
+/// was "worth revisiting if PR Stats is ever scoped per repo, at which
+/// point these rows stop being decoration".
 ///
-/// Stated plainly, because the alternative is a comment that ages into a
-/// lie: `StatsPage` does NOT read `filters.repo` today. It is a
-/// whole-account summary, and `get_periods` / `get_history` /
-/// `get_merged_detail` take no repository. So the sidebar is chosen for
-/// CONTINUITY -- the same column, in the same place, as the page the user
-/// reached from a row in it -- and for being the place a repo scope will
-/// go when the page grows one, not because it currently narrows anything.
+/// #825 is that revisit, and the prediction held: PR Stats now has its own
+/// `StatsSidebar`, and the rows are live. The column is a GitHub-sourced
+/// hierarchy of organisations, their repositories and their members, so
+/// "how is my team doing?" (#823's second audience) is askable from it. The
+/// old rows could not express that -- they came from `repoCounts(prs)`,
+/// repositories where the viewer has an OPEN PR, which holds neither an
+/// organisation nor a person and omits any repository that is quiet today.
 ///
-/// A blank column was the issue's own fallback and was not taken: an
-/// empty panel beside the widest page in the app reads as a sidebar that
-/// failed to load, which is the same misreading `system-health` avoids by
-/// putting its own pages there. That view has real navigation to offer;
-/// this one does not yet, and an inert repo list is a smaller lie than an
-/// empty frame. Worth revisiting if PR Stats is ever scoped per repo, at
-/// which point these rows stop being decoration.
+/// What survives from #794 unchanged: a selection writes to `pr-stats`'s
+/// OWN filter set, which is why the view has an entry in `EMPTY_FILTERS`.
+/// The keys are `statsScopeKind` / `statsScopeValue` / `statsSubject` now
+/// rather than `repo`, and they are navigation rather than filters -- see
+/// `activeFilterCount`, which excludes them for the same reason it excludes
+/// `repo`.
 export function ViewSwitcher({ counts }: { counts?: Partial<Record<View, number>> }) {
   const { view: storedView, setView } = useFilters();
   // The SAME fallback `App.tsx` applies, and it has to be the same or the
