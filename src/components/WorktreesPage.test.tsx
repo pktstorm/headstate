@@ -185,7 +185,7 @@ const wt = (over: Partial<Worktree>): Worktree => ({
 });
 
 const EMPTY = { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "system-health": {} } as const;
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} } as const;
 
 describe("WorktreesPage on a phone", () => {
   beforeEach(() => {
@@ -501,7 +501,7 @@ describe("WorktreesPage", () => {
     });
     useFilters.setState({
       filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "system-health": {} },
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} },
       view: "worktrees",
     } as never);
     render(<WorktreesPage />);
@@ -520,7 +520,7 @@ describe("WorktreesPage", () => {
     });
     useFilters.setState({
       filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "system-health": {} },
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} },
       view: "worktrees",
     } as never);
     render(<WorktreesPage />);

@@ -1,8 +1,6 @@
-import { BarChart3 } from "lucide-react";
 import { useWorktrees } from "../api/hooks";
 import { type View, useActiveFilters, useFilters } from "../store/filters";
 import { isOrphaned, ORPHAN_FILTER } from "../lib/worktrees";
-import { useIsMobile } from "../lib/useIsMobile";
 import { ViewSwitcher } from "./ViewSwitcher";
 
 /// Repos that have worktrees.
@@ -17,10 +15,7 @@ export function WorktreeSidebar({
 }) {
   const { data: repos } = useWorktrees();
   const filters = useActiveFilters();
-  const { setFilter, setView, setPanel } = useFilters();
-  // Stats is desktop-only in the companion's first release, so the
-  // phone gets no entry that leads to it.
-  const isMobile = useIsMobile();
+  const { setFilter } = useFilters();
 
   const rowClass = (active: boolean) =>
     `flex w-full items-center justify-between rounded px-3 py-2 text-sm ${
@@ -135,26 +130,12 @@ export function WorktreeSidebar({
         ) : null}
       </div>
 
-      {/* Stats belongs to My PRs, so selecting it also switches view --
-          otherwise the stats page would render beside a worktree sidebar
-          listing repos it knows nothing about. */}
-      {isMobile ? null : (
-      <div className="mt-2 shrink-0 border-t border-[#30363d] pt-2">
-        <button
-          type="button"
-          onClick={() => {
-            setView("my-prs");
-            setPanel("stats");
-          }}
-          className={rowClass(false)}
-        >
-          <span className="flex items-center gap-2">
-            <BarChart3 className="h-4 w-4 shrink-0" aria-hidden="true" />
-            Stats
-          </span>
-        </button>
-      </div>
-      )}
+      {/* The pinned Stats row is gone (#794), for the same reason as in
+          `DockerSidebar`. It had to set `view` AND `panel` together
+          because Stats was a sub-page of a different view; PR Stats is a
+          view, so `ViewSwitcher` above reaches it directly and the
+          sidebar it renders beside is its own `RepoSidebar` rather than
+          this list of worktree repos. */}
     </nav>
   );
 }

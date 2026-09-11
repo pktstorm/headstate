@@ -1,15 +1,17 @@
-import { Activity, ChevronDown, Container, Eye, FileText, FolderGit2, GitBranch, GitPullRequest, HardDrive, Package } from "lucide-react";
+import { Activity, BarChart3, ChevronDown, Container, Eye, FileText, FolderGit2, GitBranch, GitPullRequest, HardDrive, Package } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import { type View, useFilters } from "../store/filters";
+import { MOBILE_HIDDEN_VIEWS, type View, useFilters } from "../store/filters";
 import { useUiPrefs } from "../api/hooks";
+import { IS_MOBILE_BUILD } from "../lib/target";
 
 /// Every view, in sidebar order, with the label and icon each needs.
 ///
 /// Exported because `SettingsDialog` offers these as hide/show
 /// checkboxes and previously kept its OWN hand-written list. That list
-/// carried four of the nine, so five views could not be hidden at all
-/// and nothing said so -- the section simply looked complete (#675).
-/// One array, one order, one set of labels.
+/// carried four of the nine views there were then, so five could not be
+/// hidden at all and nothing said so -- the section simply looked
+/// complete (#675). One array, one order, one set of labels, which is why
+/// #794's tenth view needed no edit there.
 export const VIEWS: { id: View; label: string; Icon: typeof GitPullRequest }[] = [
   { id: "my-prs", label: "My pull requests", Icon: GitPullRequest },
   { id: "to-review", label: "To review", Icon: Eye },
@@ -19,6 +21,12 @@ export const VIEWS: { id: View; label: string; Icon: typeof GitPullRequest }[] =
   { id: "artifacts", label: "Artifacts", Icon: HardDrive },
   { id: "packages", label: "Package updates", Icon: Package },
   { id: "claude-md", label: "CLAUDE.md", Icon: FileText },
+  // "PR Stats", not "Stats" (#794). The bare word had the sidebar's
+  // context to lean on -- it sat under a list of repositories with open
+  // pull requests in them. In a flat menu beside "System health" it
+  // would read as stats about the machine, which is the one thing it is
+  // not about.
+  { id: "pr-stats", label: "PR Stats", Icon: BarChart3 },
   // Last, and deliberately so: it is the only entry that is not about
   // the user's code at all. Grouping it with the repo-scoped views
   // would imply it takes a repository, which it does not.
@@ -45,11 +53,55 @@ export const ALWAYS_OFFERED: ReadonlySet<View> = new Set<View>(["my-prs"]);
 /// sidebar's bottom, which was a flat list masquerading as a peer of the
 /// repo rows.
 ///
-/// Stats deliberately stays pinned at the bottom rather than joining this
-/// menu: it is a panel of My PRs, not a fourth view, and listing it here
-/// would imply it has its own repo sidebar.
+/// PR Stats joined this menu in #794, reversing the rule that used to
+/// stand here: that Stats was a panel of My PRs rather than a view, and
+/// that listing it here would imply it has its own repo sidebar. Both
+/// halves were true; the conclusion was wrong.
+///
+/// What decided it is that the pinned row was the only navigation in the
+/// app that was not in this menu, so "where do I go to see something
+/// else" had two answers -- and the bottom-left corner is where a
+/// reader looks last. Being a sub-page of My PRs was an implementation
+/// fact (`panel`), not something the user could see: nothing about the
+/// stats page is scoped to the My PRs list, and the rest of `panel`
+/// (Docker's images-versus-builds) is a genuine tab pair in a way
+/// list-versus-whole-account-summary never was.
+///
+/// The implication about the sidebar was the real question, and the
+/// answer is recorded rather than dodged: PR Stats KEEPS the
+/// `RepoSidebar` it inherited as a panel, and the repo rows stay live on
+/// it -- a selection writes to `pr-stats`'s own filter set, which is why
+/// the view has an entry in `EMPTY_FILTERS`.
+///
+/// Stated plainly, because the alternative is a comment that ages into a
+/// lie: `StatsPage` does NOT read `filters.repo` today. It is a
+/// whole-account summary, and `get_periods` / `get_history` /
+/// `get_merged_detail` take no repository. So the sidebar is chosen for
+/// CONTINUITY -- the same column, in the same place, as the page the user
+/// reached from a row in it -- and for being the place a repo scope will
+/// go when the page grows one, not because it currently narrows anything.
+///
+/// A blank column was the issue's own fallback and was not taken: an
+/// empty panel beside the widest page in the app reads as a sidebar that
+/// failed to load, which is the same misreading `system-health` avoids by
+/// putting its own pages there. That view has real navigation to offer;
+/// this one does not yet, and an inert repo list is a smaller lie than an
+/// empty frame. Worth revisiting if PR Stats is ever scoped per repo, at
+/// which point these rows stop being decoration.
 export function ViewSwitcher({ counts }: { counts?: Partial<Record<View, number>> }) {
-  const { view, setView } = useFilters();
+  const { view: storedView, setView } = useFilters();
+  // The SAME fallback `App.tsx` applies, and it has to be the same or the
+  // collapsed control names a page that is not on screen: the companion
+  // renders My PRs for a stored `pr-stats` (the view is declined, not
+  // rewritten, so the desktop sharing the store keeps it), and a button
+  // reading "PR Stats" above the PR list is worse than either.
+  //
+  // Derived here rather than passed in as a prop: five sidebars render
+  // this component, and a prop would be five call sites that have to
+  // remember. One rule, read from the store, in both places that route on
+  // it.
+  const view =
+    IS_MOBILE_BUILD && MOBILE_HIDDEN_VIEWS.has(storedView) ? "my-prs" : storedView;
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const current = VIEWS.find((v) => v.id === view) ?? VIEWS[0];
@@ -62,8 +114,17 @@ export function ViewSwitcher({ counts }: { counts?: Partial<Record<View, number>
   // - The CURRENT view, even when hidden, or the app would show a page
   //   its own switcher says does not exist -- with no way off it.
   const hidden = new Set(prefs?.hidden_views ?? []);
-  const offered = VIEWS.filter(
-    ({ id }) => ALWAYS_OFFERED.has(id) || id === view || !hidden.has(id),
+  // The build-time set is checked FIRST and overrides both escape
+  // hatches above. A view the companion does not ship is not hidden by
+  // preference -- it does not exist in this bundle, so "but it is the
+  // current view" cannot make it offerable: the phone has no page to
+  // show behind the entry. `App.tsx` is what keeps `view` off such a
+  // value in the first place, so the two cannot disagree about what is
+  // on screen.
+  const offered = VIEWS.filter(({ id }) =>
+    IS_MOBILE_BUILD && MOBILE_HIDDEN_VIEWS.has(id)
+      ? false
+      : ALWAYS_OFFERED.has(id) || id === view || !hidden.has(id),
   );
 
   // Dismiss on Escape and on a click elsewhere. Without both, the menu
