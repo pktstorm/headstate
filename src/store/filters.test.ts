@@ -9,8 +9,16 @@ const active = () => {
 };
 
 describe("useFilters", () => {
+  // `density` is reset here with the rest: the preset tests below set it to
+  // a non-default value, and a preference left dense would otherwise leak
+  // into whatever test runs next (#806).
   beforeEach(() =>
-    useFilters.setState({ filtersByView: { ...EMPTY }, view: "my-prs", panel: "list" }),
+    useFilters.setState({
+      filtersByView: { ...EMPTY },
+      view: "my-prs",
+      panel: "list",
+      density: "comfortable",
+    }),
   );
 
   it("sets an individual filter", () => {
@@ -30,6 +38,35 @@ describe("useFilters", () => {
     useFilters.getState().setPanel("builds");
     useFilters.getState().applyPreset({ staleOnly: true });
     expect(useFilters.getState().panel).toBe("list");
+  });
+
+  // A preset is about WHICH PRs you are looking at; density is about the
+  // user's eyes and screen. `applyPreset` used to carry
+  // `density: "comfortable"` inside its `set()` object, so every preset
+  // click silently threw away a deliberate preference (#806).
+  //
+  // Density is set through `setState` rather than `setDensity` so the test
+  // fails for the right reason: it is asserting what `applyPreset` leaves
+  // alone, not that `setDensity` works. It must be "dense" -- the
+  // non-default -- because the stray line wrote "comfortable", and a test
+  // starting from the default would pass against the bug.
+  it("a preset leaves the density preference alone", () => {
+    useFilters.setState({ density: "dense" });
+    useFilters.getState().applyPreset({ staleOnly: true });
+    expect(useFilters.getState().density).toBe("dense");
+  });
+
+  // The second half of #806, and a distinct failure: the stray members
+  // also rebuilt `setDensity` on every preset click. Identical to the real
+  // one, so nothing broke today -- but an action rebuilt as a side effect
+  // of a filter update has a second definition to keep in sync, and a
+  // changing identity under anything holding a reference to it. Asserting
+  // reference equality is the only way to see it; a behavioural check
+  // passes against both the stray closure and the real one.
+  it("a preset does not rebuild the setDensity action", () => {
+    const before = useFilters.getState().setDensity;
+    useFilters.getState().applyPreset({ staleOnly: true });
+    expect(useFilters.getState().setDensity).toBe(before);
   });
 
   // The reason filters are per-view: My PRs and Worktrees have entirely
