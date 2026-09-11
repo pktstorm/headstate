@@ -1,5 +1,5 @@
 import { Card } from "@/components/ui/card";
-import type { AuthorRow } from "@/types/pr";
+import type { AuthorRow, StatsReviewers } from "@/types/pr";
 
 /// How many rows a leaderboard shows.
 ///
@@ -23,15 +23,36 @@ export const TOP_N = 5;
 /// appears rather than re-worded per component.
 export const LINES_CHANGED_LABEL = "lines changed, including generated files";
 
-/// What the review count actually measures.
+/// What the review count on the AUTHOR board measures.
 ///
 /// RECEIVED, not given. It reads `reviews { totalCount }` off a pull request
 /// the author WROTE, so it counts how much review their work attracted --
 /// close to the opposite of what "top reviewers" would suggest to a reader
-/// skimming. A board of reviews GIVEN needs `reviewed-by:<login>`, which is
-/// one search per person and a different question entirely; until that is
-/// built the label has to carry the distinction.
+/// skimming.
+///
+/// Both boards now ship, which makes this label MORE load-bearing rather than
+/// less: with two review charts on one screen, the only thing separating them
+/// is what each says it counts. #829 was right to refuse the requested title
+/// over this measure; the fix was never to re-word this one, it was to build
+/// the other.
 export const REVIEWS_LABEL = "reviews received on their pull requests";
+
+/// What the reviews-GIVEN board measures.
+///
+/// GIVEN, and from a different search: `reviewed-by:<login>`, one per person,
+/// which finds pull requests by ANYONE that this person reviewed. The phrase
+/// names the population ("by anyone") because that is exactly the half a
+/// reader could otherwise assume away -- the natural misreading of a reviewer
+/// board is that it counts reviews within some narrower set.
+///
+/// MEASURED, and the two boards genuinely name different people on this
+/// account's own data (live API, 2026-09-11): a `reviewed-by:<viewer>` search
+/// over an org window returned two pull requests, both AUTHORED BY SOMEONE
+/// ELSE and each carrying one review. So the AUTHOR leads the received board
+/// and the REVIEWER the given one, on the same two rows of data. That is why
+/// both labels are exported constants asserted by tests rather than strings
+/// typed into two components.
+export const REVIEWS_GIVEN_LABEL = "reviews they gave on pull requests by anyone";
 
 /// One ranked list, as horizontal bars.
 ///
@@ -51,7 +72,7 @@ export const REVIEWS_LABEL = "reviews received on their pull requests";
 /// ranking unreadable. Against the leader, the shape answers the question a
 /// ranking is for: how far ahead is first place. The numbers are printed
 /// beside the bars so the absolute figures are never only a bar length.
-function Ranked({
+function Ranked<T extends { login: string }>({
   title,
   hint,
   rows,
@@ -61,12 +82,23 @@ function Ranked({
 }: {
   title: string;
   /// What the measure IS. Never optional: every measure here is either
-  /// gameable (lines changed) or easy to misread (reviews received), and
-  /// the hint is where that is said.
+  /// gameable (lines changed) or easy to misread (reviews received against
+  /// reviews given), and the hint is where that is said.
   hint: string;
-  rows: AuthorRow[];
-  value: (r: AuthorRow) => number;
-  format: (r: AuthorRow) => string;
+  /// Generic over the row, so the reviews-GIVEN board draws through THIS
+  /// component rather than a second ranked-bar idiom beside it. The
+  /// constraint is `{ login: string }` and nothing more: everything else a
+  /// ranking needs is reached through the two accessors below, which is the
+  /// same widening `Outliers` took in #829 for the same reason (#826 asks
+  /// that existing components be reused).
+  ///
+  /// The rows cannot be a union of the two shapes instead, because the two
+  /// boards are ranked on fields that do not both exist -- `ReviewerRow` has
+  /// no `prs` and `AuthorRow` has no reviews-given count at all, which is the
+  /// whole point of their being separate queries.
+  rows: T[];
+  value: (r: T) => number;
+  format: (r: T) => string;
   /// What to say when nobody qualifies. Distinct per measure, because "no
   /// pull requests" and "no lines changed" are different facts.
   emptyNote: string;
@@ -149,12 +181,43 @@ export function Leaderboards({
   rows,
   complete,
   caveat,
+  reviewers,
+  reviewersPending = false,
+  reviewersError = false,
+  reviewersAvailable = false,
 }: {
   /// Every author in scope. Ranked and cut here, per measure, because the
-  /// three rankings disagree -- the most prolific author is rarely the one
-  /// with the most lines.
+  /// rankings disagree -- the most prolific author is rarely the one with the
+  /// most lines.
   rows: AuthorRow[];
   complete: boolean;
+  /// The reviews-GIVEN board, from its own query (#826's reopening).
+  ///
+  /// A SEPARATE prop rather than a field on `rows`, because it is a different
+  /// search over a different population: the rows are authors in the window,
+  /// and a reviewer need not have authored anything at all. It also lands
+  /// independently, so the three board-derived rankings do not wait on it --
+  /// this page's progressive rule, one more part.
+  ///
+  /// `undefined` means "not here yet or not asked for", which the three flags
+  /// below disambiguate. They are separate rather than one status enum for
+  /// `useScopedCounts`' reason (`hooks.ts`): a pending board, a failed one and
+  /// one nothing enumerated are three different things to say, and collapsing
+  /// them is how a failure comes to render as a zero.
+  reviewers?: StatsReviewers;
+  /// In flight. Renders a loading board, never an empty one -- see
+  /// `ReviewsGiven`.
+  reviewersPending?: boolean;
+  /// The query failed. Distinct from an empty result, which is the rule this
+  /// whole feature is built on.
+  reviewersError?: boolean;
+  /// Whether a roster existed to ask about at all.
+  ///
+  /// False on a scope with no membership -- a repository, Personal,
+  /// Everything -- where the board is ABSENT rather than empty. "Nobody
+  /// reviewed" and "nothing enumerated the reviewers" are different claims,
+  /// and only one of them is ours to make.
+  reviewersAvailable?: boolean;
   /// Why the board is partial, in the caller's words -- the caller knows
   /// which of the three partiality channels applied and this component does
   /// not.
@@ -195,7 +258,13 @@ export function Leaderboards({
           These rankings are incomplete{caveat ? `. ${caveat}` : ", so the order may be wrong."}
         </div>
       ) : null}
-      <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
+      {/* Two columns at `md`, not three: a fourth board arrived with the
+          reviews-given ranking, and three columns would leave one board alone
+          on a second row at every width. Two pairs read as two pairs. The
+          login column inside `Ranked` is a fixed 10rem, so three boards on a
+          laptop truncated every name -- which on a leaderboard of colleagues
+          is the one field that must stay readable. */}
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
         <Ranked
           title={`Top ${TOP_N} pull request authors`}
           hint="pull requests in this window"
@@ -219,31 +288,166 @@ export function Leaderboards({
           }
           emptyNote="No lines changed in this window."
         />
-        {/* NOT titled "Top reviewers", which is what #826 asked for and
-            what the data cannot support. `reviews { totalCount }` hangs off
-            a pull request the author WROTE, so it counts review their work
-            ATTRACTED -- close to the opposite of the reading "top
-            reviewers" invites, and the person at the top of a board so
-            titled would be the one whose code was reviewed most, not the
-            one who reviewed most.
+        {/* Still NOT titled "Top reviewers", and the title is the whole
+            point. `reviews { totalCount }` hangs off a pull request the
+            author WROTE, so it counts review their work ATTRACTED -- the
+            person at the top of a board titled "top reviewers" would be the
+            one whose code was reviewed MOST, not the one who reviewed most.
+            #829 refused to ship that and was right to.
 
-            A board of reviews GIVEN is a real and answerable question
-            (`reviewed-by:<login>`), and it is one search PER PERSON -- a
-            fan-out over the org's whole membership, which is a different
-            cost class from this document's free scalar and needs its own
-            measurement. Recorded as a deliberate narrowing rather than
-            shipped under the requested title, because a correctly-titled
-            board of a different measure is the one version of this that
-            cannot mislead. */}
+            This board is KEPT rather than replaced, because it answers a
+            different and legitimate question: whose work draws the most
+            attention. With the reviews-given board now beside it, the two
+            titles are what keep them apart -- which is why both labels are
+            exported constants with tests on them. */}
         <Ranked
           title={`Top ${TOP_N} most-reviewed`}
           hint={REVIEWS_LABEL}
           rows={top((r) => r.reviewsReceived)}
           value={(r) => r.reviewsReceived}
           format={(r) => `${r.reviewsReceived.toLocaleString()} reviews`}
-          emptyNote="No reviews in this window."
+          emptyNote="No reviews received in this window."
         />
+        {/* The board #826 actually asked for, built on `reviewed-by:<login>`
+            (#826's reopening). Absent entirely when nothing enumerated a
+            roster, rather than rendered empty. */}
+        {reviewersAvailable && (
+          <ReviewsGiven
+            reviewers={reviewers}
+            pending={reviewersPending}
+            failed={reviewersError}
+          />
+        )}
       </div>
+    </div>
+  );
+}
+
+/// The reviews-GIVEN board: who reviewed the most, whoever wrote it.
+///
+/// # Why this is its own component rather than a fourth `Ranked` call
+///
+/// Not for the chart -- it draws through `Ranked` like the other three. It is
+/// for the four STATES a separately-fetched board has that a field on the
+/// shared rows does not: pending, failed, measured-empty, and partial with
+/// named people missing. Folding those into the call site would put four
+/// branches inside a JSX list, and the distinctions are exactly the ones this
+/// feature exists to keep ("partial data SAYS SO", "empty means empty").
+///
+/// # Why a reviewer with zero reviews is not on the board
+///
+/// `Leaderboards`' own rule, applied here: a zero has no rank. Rust returns
+/// measured zeroes deliberately (`fetch::Reviewers::rows`) so the UI can tell
+/// them from unmeasured ones, and the UI then declines to RANK them -- listing
+/// a colleague in a top five on the strength of reviewing nothing presents
+/// them as ranked on a measure they do not appear in.
+///
+/// This matters more than it sounds on real data. MEASURED on this account
+/// 2026-09-11: `org:FNX-Labs` over a 30-day window holds 569 merged pull
+/// requests and **zero** carrying a review by any of its four members -- the
+/// account merges without human review. So "No reviews given in this window"
+/// is the TRUE answer here, and that is precisely why it must be
+/// distinguishable from a failure: the state this board is usually in is the
+/// one that looks most like a broken query.
+function ReviewsGiven({
+  reviewers,
+  pending,
+  failed,
+}: {
+  reviewers?: StatsReviewers;
+  pending: boolean;
+  failed: boolean;
+}) {
+  const title = `Top ${TOP_N} reviewers`;
+
+  // Pending first. A board that printed its empty note while in flight would
+  // state "no reviews given" as a fact for the second before the answer
+  // arrives -- and on this account that transient is INDISTINGUISHABLE from
+  // the real answer, so a reader could not tell which they were looking at.
+  if (pending || (!reviewers && !failed)) {
+    return (
+      <Card className="px-4">
+        <div className="text-sm font-semibold">{title}</div>
+        <div className="text-xs text-[#8b949e]">{REVIEWS_GIVEN_LABEL}</div>
+        <div className="py-8 text-center text-sm text-[#8b949e]">
+          Counting reviews...
+        </div>
+      </Card>
+    );
+  }
+
+  // Failed, and said as a failure. NOT as zero and not as empty: one search
+  // per person means this board can fail while the other three succeeded, and
+  // rendering "no reviews given" over a query that never answered is the
+  // exact #802/#790 confusion this feature is built to prevent.
+  if (failed || !reviewers) {
+    return (
+      <Card className="px-4">
+        <div className="text-sm font-semibold">{title}</div>
+        <div className="text-xs text-[#8b949e]">{REVIEWS_GIVEN_LABEL}</div>
+        <div className="py-8 text-center text-sm text-[#d29922]">
+          Could not count reviews. This is a separate query from the other
+          boards, so they may be complete while this is not.
+        </div>
+      </Card>
+    );
+  }
+
+  const ranked = [...reviewers.rows]
+    // A zero has no rank -- see the doc above.
+    .filter((r) => r.reviews > 0)
+    // Ranked here as well as in Rust, for `board.rs`' reason: a caller that
+    // re-sorted locally must not be able to reintroduce the flicker that
+    // out-of-order chunk completion causes. Ties break on login, the same
+    // tie-break the author boards use, so a tie orders identically on both.
+    .sort((a, b) => b.reviews - a.reviews || a.login.localeCompare(b.login))
+    .slice(0, TOP_N);
+
+  return (
+    <div className="flex flex-col gap-2">
+      <Ranked
+        title={title}
+        hint={REVIEWS_GIVEN_LABEL}
+        rows={ranked}
+        value={(r) => r.reviews}
+        format={(r) => `${r.reviews.toLocaleString()} reviews`}
+        // "Given", explicitly, because the board beside this one has an empty
+        // note about reviews RECEIVED and two charts reading "No reviews in
+        // this window" would be one fact said twice rather than two facts.
+        emptyNote="No reviews given in this window."
+      />
+      {/* The people this ranking could not measure, NAMED. A ranking missing
+          one person can have the wrong name in first place, and "2 could not
+          be measured" does not say whether the leader is one of them. */}
+      {reviewers.unmeasured.length > 0 && (
+        <p className="text-xs text-[#d29922]">
+          {reviewers.unmeasured.length === 1 ? "1 person" : `${reviewers.unmeasured.length} people`}{" "}
+          could not be counted and {reviewers.unmeasured.length === 1 ? "is" : "are"}{" "}
+          absent from this ranking rather than shown as zero:{" "}
+          {reviewers.unmeasured.join(", ")}.
+        </p>
+      )}
+      {reviewers.refusedFields > 0 && (
+        <p className="text-xs text-[#d29922]">
+          GitHub refused {reviewers.refusedFields} field
+          {reviewers.refusedFields === 1 ? "" : "s"} on this ranking -- if this
+          organization uses SAML single sign-on, authorize your token for it.
+        </p>
+      )}
+      {/* Who is IN scope for this board, stated because it is a real and
+          unfixable gap rather than a caveat for form's sake. The roster comes
+          from the organisation's Members list, so somebody who reviewed
+          without being a member -- an outside collaborator, a bot -- is not
+          counted. Nothing enumerated them: a pull request node says how many
+          reviews it has, never who wrote them, so there is no cheaper
+          population to ask about. */}
+      <p className="text-xs text-[#8b949e]">
+        Counts reviews by this organization's {reviewers.rows.length + reviewers.unmeasured.length}{" "}
+        listed member
+        {reviewers.rows.length + reviewers.unmeasured.length === 1 ? "" : "s"}.
+        Reviews by anyone else -- an outside collaborator, a bot -- are not
+        counted here.
+      </p>
     </div>
   );
 }

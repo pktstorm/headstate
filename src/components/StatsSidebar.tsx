@@ -110,6 +110,42 @@ export function StatsSidebar({
           </p>
         ) : !data ? null : (
           <>
+            {/* The account-wide page, FIRST and outside every heading
+                (#826's reopening).
+
+                This is the row #829 removed the page behind. It is at the top
+                because it is the only scope that needs no knowledge of the
+                hierarchy below it -- and because it is the DEFAULT the page
+                renders with nothing selected, so its position should match
+                where the user already is rather than being buried under two
+                headings.
+
+                # Why it is not "All repos" under Personal
+
+                Because that row is a different and much smaller number, and
+                the difference is measured. `user:<login>` covers the viewer's
+                OWN repositories; this carries no repository qualifier at all,
+                which is the only shape that spans organisations the viewer
+                contributes to without owning. MEASURED live 2026-09-11 over a
+                30-day window: account-wide is **893** merged pull requests
+                against **317** for Personal / All repos -- 35%, with the
+                other 576 in FNX-Labs (494) and Stohic (82). Two rows,
+                because they are two answers.
+
+                Selected by `kind: "all"`, the variant `Filters` has carried
+                since #825 ("the widest scope was deliberately clicked") with
+                nothing selecting it until now -- so the highlight, the store
+                and the page agree without a new axis. `value` is `undefined`
+                because `scopeIsLoadable` exempts this kind from needing one:
+                "everything" has nothing to name. */}
+            <Row
+              depth={0}
+              label="Everything"
+              detail="your account"
+              active={selected("all", undefined, undefined)}
+              onClick={() => setStatsScope("all", undefined, undefined)}
+            />
+
             {/* The heading is conditional on there BEING organisations
                 (#825's "if any"): a solo user gets a sidebar of their own
                 repositories rather than an empty "Organizations" heading

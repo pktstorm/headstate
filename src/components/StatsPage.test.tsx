@@ -13,6 +13,17 @@ vi.mock("../api/hooks", async () => {
     useScopedCounts: vi.fn(),
     useStatsSeries: vi.fn(),
     useStatsBoard: vi.fn(),
+    // The reviews-GIVEN board and the roster it reads (#826's reopening).
+    useStatsReviewers: vi.fn(),
+    useStatsTree: vi.fn(),
+    // The four account-wide hooks #829 removed and #826's reopening restored.
+    // Mocked here because `StatsPage` now routes to the unscoped page when
+    // nothing is selected, so every test in this file mounts a component that
+    // can reach them.
+    usePeriods: vi.fn(),
+    useHistory: vi.fn(),
+    useMergedDetail: vi.fn(),
+    useCycleTrend: vi.fn(),
   };
 });
 
@@ -22,7 +33,17 @@ vi.mock("../store/filters", () => ({
   useFilters: () => ({ setFilter: vi.fn(), setPanel: vi.fn() }),
 }));
 
-import { useScopedCounts, useStatsBoard, useStatsSeries } from "../api/hooks";
+import {
+  useCycleTrend,
+  useHistory,
+  useMergedDetail,
+  usePeriods,
+  useScopedCounts,
+  useStatsBoard,
+  useStatsReviewers,
+  useStatsSeries,
+  useStatsTree,
+} from "../api/hooks";
 import { useActiveFilters } from "../store/filters";
 import { StatsPage, describeScope, partialityCaveat } from "./StatsPage";
 
@@ -144,23 +165,59 @@ beforeEach(() => {
   vi.mocked(useScopedCounts).mockReturnValue(noCounts as never);
   vi.mocked(useStatsSeries).mockReturnValue(pendingQ);
   vi.mocked(useStatsBoard).mockReturnValue(pendingQ);
+  vi.mocked(useStatsReviewers).mockReturnValue(pendingQ);
+  vi.mocked(useStatsTree).mockReturnValue(pendingQ);
+  // The unscoped page's four, pending by default. Only the tests that
+  // actually mount it override these.
+  vi.mocked(usePeriods).mockReturnValue(pendingQ);
+  vi.mocked(useHistory).mockReturnValue(pendingQ);
+  vi.mocked(useMergedDetail).mockReturnValue(pendingQ);
+  vi.mocked(useCycleTrend).mockReturnValue(pendingQ);
   selectOrg();
 });
 
 describe("StatsPage scope gating", () => {
-  /// Nothing loads until something is clicked -- #826's explicit-load rule,
-  /// and the reason the page is affordable at all. Asserted on the HOOKS'
-  /// `enabled` argument rather than on what renders, because a page that
-  /// merely hid the numbers while still fetching them would pass a
-  /// render-only check and still spend the rate limit.
-  it("does not enable any query until a scope is selected", () => {
+  /// With NOTHING selected the page answers the account-wide question instead
+  /// of asking for a scope (#826's reopening), and crucially issues no SCOPED
+  /// query at all -- the scoped hooks are not even called, because
+  /// `UnscopedStats` does not mount them.
+  ///
+  /// That is stronger than the `enabled: false` this test used to assert, and
+  /// it is the property that restores what #829 removed: the zero-click
+  /// overview. Asserted on the hooks rather than only on what renders,
+  /// because a page that showed the account-wide numbers while also firing a
+  /// scope-wide load would pass a render-only check and spend the rate limit.
+  it("answers the account-wide question when nothing is selected, with no scoped query", () => {
     vi.mocked(useActiveFilters).mockReturnValue({} as never);
+    vi.mocked(useScopedCounts).mockClear();
+    vi.mocked(useStatsSeries).mockClear();
+    vi.mocked(useStatsBoard).mockClear();
     render(<StatsPage />);
-    expect(screen.getByText(/pick something to measure/i)).toBeTruthy();
+    // The account-wide page's own caveat line, which names its scope.
+    expect(screen.getByText(/across every organization/i)).toBeTruthy();
+    expect(screen.queryByText(/pick something to measure/i)).toBeNull();
     for (const hook of [useScopedCounts, useStatsSeries, useStatsBoard]) {
-      const enabled = vi.mocked(hook).mock.calls.at(-1)?.at(-1);
-      expect(enabled).toBe(false);
+      expect(vi.mocked(hook)).not.toHaveBeenCalled();
     }
+    // And it DOES ask the unscoped commands, which is the page being restored
+    // rather than merely the prompt being removed.
+    expect(vi.mocked(usePeriods)).toHaveBeenCalled();
+    expect(vi.mocked(useMergedDetail)).toHaveBeenCalled();
+  });
+
+  /// The "Everything" sidebar row reaches the same page. Two ways to ask one
+  /// question, and they must not diverge -- a row that rendered a different
+  /// page from the default would be two implementations of one view.
+  it("renders the account-wide page for the Everything scope too", () => {
+    vi.mocked(useActiveFilters).mockReturnValue({
+      statsScopeKind: "all",
+      statsScopeValue: undefined,
+      statsSubject: undefined,
+    } as never);
+    vi.mocked(useStatsBoard).mockClear();
+    render(<StatsPage />);
+    expect(screen.getByText(/across every organization/i)).toBeTruthy();
+    expect(vi.mocked(useStatsBoard)).not.toHaveBeenCalled();
   });
 
   /// A scope KIND with no value is not loadable either. Without this, an

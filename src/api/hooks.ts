@@ -30,6 +30,14 @@ import {
   statsBoard,
   statsSeries,
   statsCount,
+  statsReviewers,
+  // The four unscoped account-wide commands (#826). Their wrappers never
+  // left `tauri.ts` -- #829 deleted only the hooks -- so restoring the page
+  // is these four imports and the hooks below, not a rebuilt feature.
+  getPeriods,
+  getHistory,
+  getMergedDetail,
+  getCycleTrend,
   getPollInterval,
   getRemoteEnabled,
   setRemoteEnabled,
@@ -2108,6 +2116,176 @@ export function useScopedCounts(
       for (const r of results) void r.refetch();
     },
   };
+}
+
+/// The reviews-GIVEN board: who reviewed the most, per scope (#826).
+///
+/// # Why this is a separate query from the board, and not a field on it
+///
+/// `useStatsBoard` reads `reviews { totalCount }` off pull requests the
+/// ROW'S AUTHOR wrote, which counts review their work RECEIVED. Reviews
+/// GIVEN cannot be derived from that document at all, at any cost: a PR node
+/// says how many reviews it attracted, never who wrote them -- so the two
+/// boards are answers to different questions over different searches, and
+/// #829 was right to refuse to print one under the other's title.
+///
+/// MEASURED, and the two genuinely name different people on this account's
+/// own data (live API, 2026-09-11): a `reviewed-by:<viewer>` search over an
+/// org window returned two pull requests, both AUTHORED BY SOMEONE ELSE and
+/// each carrying `reviews { totalCount } == 1`. So those same two pull
+/// requests credit the AUTHOR on the received board and the REVIEWER on the
+/// given one. A single chart could not have been both.
+///
+/// # Cost: one point, and the expense is LATENCY
+///
+/// One `reviewed-by:<login>` search per member, aliased into one document.
+/// MEASURED live 2026-09-11 against `org:FNX-Labs`, 3 runs per cell:
+///
+/// | Reviewer aliases | Cost | Wall clock |
+/// |---|---|---|
+/// | 4 (this account's real org size) | **1** | 0.84-1.04s |
+/// | 10 | **1** | 1.26-1.50s |
+/// | 36 | **1** | 3.62-4.15s |
+///
+/// So alias count is free on rate limit and linear in latency, exactly as
+/// #823 measured for the history document -- and this is the CHEAP document
+/// shape, count-only with no `nodes`, which is why 36 aliases answer in 3.6s
+/// where 10 node-bearing aliases at a 50-node page failed outright at the
+/// ~11s deadline (`board.rs`'s table). That is also why the page size is
+/// never raised: `fetch::SLICE_PAGE_FULL` is 50 and `degrade` sheds pages
+/// before aliases because NODES drive the deadline, and this document
+/// materialises none.
+///
+/// `totalCount` is read UNPAGED and must stay that way. #826's measurement
+/// is that the `first:` ARGUMENT is what GitHub prices, not the connection
+/// -- so adding `first:` to a connection read only for a count would buy
+/// nothing and cost a point per search. There is a partial disagreement on
+/// record in #823 about whether the paged form is actively more expensive;
+/// both measurements agree the unpaged form is free, so this takes the cheap
+/// path that neither disputes.
+///
+/// # Where the logins come from, and why they are not in the key
+///
+/// The caller passes the roster it already holds for this scope, read off
+/// `useStatsTree`'s `org.members` -- so no request is spent re-deriving a
+/// list that is on screen in the sidebar beside the board.
+///
+/// The key carries the scope and the window and deliberately NOT the member
+/// list. That is this file's standing rule, which `useStatsBoard` states as
+/// "a count in a key makes every sibling key change when one item is
+/// removed, refetching everything": a roster that gained a person would
+/// invalidate every window's cached board. The logins are an INPUT to the
+/// request rather than part of its identity -- the question is "who reviewed
+/// most in this scope and window", and that question is the same question
+/// when the roster changes. The consequence, stated because it is a real
+/// trade rather than a free win: a newly-added member does not appear until
+/// the five-minute `staleTime` lapses. Five minutes of a missing row beats
+/// re-spending every board in the cache on a roster edit, and a roster that
+/// changed mid-session is the rarer event by far.
+///
+/// # `enabled`
+///
+/// Threaded from the caller like every other expensive hook here, so nothing
+/// loads until a scope is clicked. Also gated on there BEING logins: a scope
+/// with no roster (a repository, Personal, Everything) has nobody to ask
+/// about, and the Rust command rejects an empty list rather than returning an
+/// empty board that would read as "nobody reviewed anything".
+export function useStatsReviewers(
+  scope: StatsScope | undefined,
+  days: number,
+  logins: string[],
+  enabled: boolean,
+) {
+  const loadable = scopeIsLoadable(scope);
+  return useQuery({
+    queryKey: ["stats-reviewers", loadable ? scopeKey(scope) : "none", days],
+    queryFn: () => statsReviewers(scope!.kind, scope!.value, days, logins),
+    enabled: enabled && loadable && logins.length > 0,
+    staleTime: 5 * 60 * 1000,
+    retry: false,
+  });
+}
+
+/// The period comparisons behind the unscoped page's delta cards.
+///
+/// # Restored by #826's reopening, after #829 removed it as "superseded"
+///
+/// It was not superseded, and the distinction is the whole reason this hook
+/// exists beside the scoped ones above. A scope page answers "how is THIS
+/// organisation / repository / person doing", which requires choosing one
+/// first. This answers "how am I doing, across everything" with NO selection
+/// at all -- and `search` with an `author:@me` qualifier and NO repository
+/// qualifier is the only query shape that spans every organisation the
+/// viewer contributes to, owned or not (`github/query.rs:241-258`).
+///
+/// MEASURED live 2026-09-11, 30-day window ending yesterday, one aliased
+/// document at cost 1: account-wide `author:@me is:merged` returns **893**
+/// merged pull requests. The nearest scoped equivalent, `Personal` /
+/// `All repos` (`user:pktstorm`), returns **317** -- 35% of it. The rest is
+/// `org:FNX-Labs` (494) and `org:Stohic` (82): org repositories the viewer
+/// contributes to without owning, which no single sidebar row covers and
+/// which on this account is most of the activity. So "All repos" is not a
+/// narrower spelling of account-wide; it is a different and much smaller
+/// number, and presenting the scoped page as a replacement lost 576 of 893
+/// pull requests with nothing on screen to say so.
+///
+/// Separate from `useHistory` so the four headline numbers appear in about
+/// a second rather than waiting on the whole daily series. Same staleTime,
+/// so the two stay consistent within a session.
+export function usePeriods() {
+  return useQuery({
+    queryKey: ["periods"],
+    queryFn: getPeriods,
+    staleTime: 5 * 60 * 1000,
+  });
+}
+
+/// The daily series behind the unscoped page's activity chart.
+///
+/// Held for five minutes rather than the list's live cadence: these counts
+/// move on the order of hours, and the query is only mounted while the
+/// Stats view is open, so a shorter window would spend rate limit for no
+/// visible change.
+///
+/// Restored with `usePeriods` above; see its doc for why the unscoped page
+/// was not superseded by the scoped one.
+export function useHistory(days: number) {
+  return useQuery({
+    queryKey: ["history", days],
+    queryFn: () => getHistory(days),
+    staleTime: 5 * 60 * 1000,
+  });
+}
+
+/// The merged-PR sample behind the insight cards and repo table. Kept
+/// separate from `useHistory` so a slow or failed detail fetch leaves the
+/// chart and cards fully rendered.
+///
+/// This one is a SAMPLE -- the most recent 100 merged pull requests
+/// (`github/query.rs:175-195`) -- which is why the unscoped page carries a
+/// page-level "from a sample of recent merged pull requests" caveat that a
+/// scope page does not need. The scope pages measure a whole window and say
+/// so; this measures a fixed recent slice and says THAT. Two honest claims
+/// about two different populations, which is the reason both pages exist.
+export function useMergedDetail() {
+  return useQuery({
+    queryKey: ["merged-detail"],
+    queryFn: getMergedDetail,
+    staleTime: 5 * 60 * 1000,
+  });
+}
+
+/// Median cycle time this week against last, for the unscoped page.
+///
+/// The Stats page could prove throughput but not improvement: cycle time
+/// was a single window with no prior value, which is why its delta card
+/// was hardcoded to null. Same 5-minute staleness as the other stats.
+export function useCycleTrend() {
+  return useQuery({
+    queryKey: ["cycle-trend"],
+    queryFn: getCycleTrend,
+    staleTime: 5 * 60 * 1000,
+  });
 }
 
 /// Build history. Failed builds are kept: a failing build is usually

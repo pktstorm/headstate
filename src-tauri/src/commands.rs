@@ -2784,6 +2784,164 @@ pub async fn stats_series(
     out
 }
 
+/// How many reviewer logins one call will accept.
+///
+/// A ceiling rather than a trusted input, for `clamp_days`' reason
+/// (`commands.rs:37-46`): a Tauri command is a public surface, and the
+/// argument here is a LIST, so an unbounded one builds an arbitrarily wide
+/// fan-out -- the same blast radius `clamp_days` exists for, one axis over.
+///
+/// 100 because that is exactly what the sidebar can hand over: `tree::PAGE`
+/// is 100, so an org's Members list arrives capped at 100 and a caller
+/// sending more is sending something it did not read off a tree. Matching
+/// the roster cap rather than undercutting it means this clamp never fires
+/// on real input -- a clamp that silently truncated a 60-member org would be
+/// a second, invisible truncation on top of the tree's own reported one.
+///
+/// Sized against the measurement as well: 36 reviewer aliases measured
+/// 3.62-4.15s at cost 1 (`query::reviewer_query`), and 100 chunked at
+/// `ALIAS_CHUNK` is ten requests, which fits inside two `READ_CONCURRENCY`
+/// waves and so costs roughly two chunks of wall clock rather than ten --
+/// comfortably inside `LOAD_TIMEOUT`.
+///
+/// The truncation this DOES impose is visible rather than silent: the caller
+/// sees fewer rows than it sent logins, and `Reviewers::unmeasured` names
+/// every login that did not come back for any other reason.
+const MAX_REVIEWER_LOGINS: usize = 100;
+
+/// The reviews-GIVEN leaderboard: who reviewed the most in a scope (#826).
+///
+/// # Why this is its own command rather than a field on `stats_board`
+///
+/// `stats_board` reads `reviews { totalCount }` off pull request nodes,
+/// which counts reviews a PR RECEIVED and attributes them to its AUTHOR. A
+/// node never says who wrote its reviews, so reviews given are not derivable
+/// from that document at any price -- they need `reviewed-by:<login>`, one
+/// search per person. #829 shipped the correctly-titled "most-reviewed"
+/// board rather than print the received measure under "top reviewers", and
+/// that call was right; this is the missing half rather than a correction to
+/// it. Both boards ship, labelled for what each measures.
+///
+/// The two genuinely name DIFFERENT people on this account's own data
+/// (MEASURED live 2026-09-11): a `reviewed-by:<viewer>` search over an org
+/// window returned two pull requests, both AUTHORED BY SOMEONE ELSE and each
+/// carrying `reviews { totalCount } == 1`. So the same two pull requests
+/// credit the AUTHOR on the received board and the REVIEWER on the given one
+/// -- different names, same rows of data.
+///
+/// # Why the LOGINS are an argument
+///
+/// The roster is already on screen. `stats_tree` enumerated it for the
+/// sidebar at 2 points (#825), and the caller holds `org.members` for the
+/// scope the user clicked -- so asking GitHub for it a second time here
+/// would spend a request to re-derive a list the frontend already has, and
+/// could disagree with the Members rows beside the board if the two reads
+/// straddled a roster change.
+///
+/// The honest consequence, which the UI states rather than this command
+/// hiding: this board covers the people in the list, NOT everyone who
+/// reviewed. A reviewer from outside the org -- an outside collaborator, a
+/// bot -- is absent, because nothing enumerated them. That is a bounded and
+/// explainable gap; the alternative, enumerating reviewers from the PR nodes
+/// themselves, cannot be done at all (see above) and enumerating them from
+/// the org roster is exactly what this does.
+///
+/// # Cost
+///
+/// ONE request per `ALIAS_CHUNK` logins, each measured at 1 point: 4
+/// reviewer aliases cost 1 at 0.84-1.04s, 36 cost 1 at 3.62-4.15s (live API,
+/// 2026-09-11, `org:FNX-Labs`; the table is in `query::reviewer_query`). So
+/// the real org size of 4 members is ONE request and one point -- the
+/// cheapest load on this page, cheaper than the daily series. The budget
+/// check is here anyway for `stats_series`' reason: it guards against
+/// something else having already spent the budget to the reserve, which is
+/// independent of how cheap this particular call is.
+#[tauri::command]
+pub async fn stats_reviewers(
+    client: State<'_, GhClient>,
+    scope_kind: String,
+    scope_value: Option<String>,
+    logins: Vec<String>,
+    days: i64,
+) -> Result<crate::github::stats::Reviewers, String> {
+    use crate::github::stats::{Budget, Measure, StatsQuery};
+
+    let client = client.0.clone().ok_or_else(|| AUTH_ERR.to_string())?;
+    let now = chrono::Utc::now();
+    let req = parse_scope_request(&scope_kind, scope_value, days, now)?;
+
+    // Deduplicated and emptied-out before anything is spent. A repeated
+    // login would build two aliases counting the same person and render them
+    // as two rows on one leaderboard -- a ranking with a name in it twice,
+    // which is worse than a missing row because it looks like data. An empty
+    // or blank entry would build `reviewed-by: ` and match everything in
+    // scope, attributing the whole window to a nameless row.
+    let mut seen = std::collections::HashSet::new();
+    let logins: Vec<String> = logins
+        .into_iter()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty() && seen.insert(l.clone()))
+        .take(MAX_REVIEWER_LOGINS)
+        .collect();
+    if logins.is_empty() {
+        return Err("no reviewer logins to count".into());
+    }
+
+    let budget = Budget::new();
+    // One request per `ALIAS_CHUNK` logins at 1 point each, plus slack.
+    let projected =
+        (logins.len() as u64).div_ceil(crate::github::stats::query::ALIAS_CHUNK as u64) + 1;
+    if !budget.permits(projected) {
+        return Err(format!(
+            "GitHub budget too low for this leaderboard (needs about {projected} points, \
+             keeping {} in reserve for background refresh)",
+            crate::github::stats::budget::RESERVE
+        ));
+    }
+
+    // No SUBJECT at all, which is the same rule `stats_board` follows and
+    // for the same reason: a leaderboard asks "who, among everyone here",
+    // and an author qualifier would narrow it to one person's pull requests
+    // that each reviewer touched -- a third question. `StatsQuery::reviewed_by`
+    // drops the author unconditionally, so this cannot be set wrong here, but
+    // passing `None` keeps the intent visible at the call site.
+    //
+    // `Measure::Merged`, deliberately and not as a default: a review is work
+    // done ON a pull request that landed, and counting reviews on PRs merely
+    // OPENED in the window would count review of work still in flight --
+    // which moves a reviewer up the board for a PR that may never merge.
+    let q = StatsQuery::new(None, req.scope, Measure::Merged);
+
+    crate::diag!(
+        "[diag] cmd stats_reviewers start kind={scope_kind} people={} days={days}",
+        logins.len()
+    );
+    let started = std::time::Instant::now();
+    let out = crate::github::stats::load_reviewers(&client, &q, &logins, &req.window, &budget)
+        .await
+        .map_err(|e| e.to_string());
+    crate::diag!(
+        "[diag] cmd stats_reviewers end {}ms {}",
+        started.elapsed().as_millis(),
+        match &out {
+            // Counts and flags, never a login: this is a public repo and the
+            // privacy rule applies to the diagnostic log too, which is the
+            // same rule `stats_board`'s line above follows. A reviewer board
+            // is the one place this feature could leak a roster.
+            Ok(r) => format!(
+                "ok rows={} unmeasured={} refused={} complete={} points={}",
+                r.rows.len(),
+                r.unmeasured.len(),
+                r.refused_fields,
+                r.is_complete(),
+                r.spend.points
+            ),
+            Err(e) => format!("err: {e}"),
+        }
+    );
+    out
+}
+
 /// Whether we have a usable GitHub client. `state` is computed once at
 /// startup from `auth::read_token` / `auth::build_client` and stored as
 /// managed state; this command just hands it to the frontend.

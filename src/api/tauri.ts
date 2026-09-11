@@ -46,6 +46,7 @@ import type {
   StatsBoard,
   StatsOutcome,
   StatsSeries,
+  StatsReviewers,
   StatsTree,
   Worktree,
   WorktreeRepo,
@@ -295,6 +296,43 @@ export const statsSeries = (
   scopeValue: string | undefined,
   days: number,
 ) => call<StatsSeries>("stats_series", { subject, scopeKind, scopeValue, days });
+
+/// The reviews-GIVEN leaderboard: who reviewed the most in a scope (#826).
+///
+/// One `reviewed-by:<login>` search per person, all aliased into ONE request.
+/// MEASURED live 2026-09-11 against `org:FNX-Labs`: cost **1** at 4, 10 and
+/// 36 aliases, at 0.84-1.04s, 1.26-1.50s and 3.62-4.15s -- so alias count is
+/// free on rate limit and linear in latency, and this account's real 4-member
+/// org is one request and one point. The cheapest query on the page.
+///
+/// # Why `logins` is an argument rather than something Rust derives
+///
+/// The roster is already on screen: `statsTree` enumerated it for the sidebar
+/// at 2 points, and the caller holds `org.members` for the scope the user
+/// clicked. Re-fetching it here would spend a request to re-derive a list the
+/// frontend has, and the two reads could disagree with the Members rows
+/// beside the board if a roster changed between them.
+///
+/// The honest consequence, which the UI states rather than this wrapper
+/// hiding: the board covers the people in the list, not everyone who
+/// reviewed. An outside collaborator or a bot is absent because nothing
+/// enumerated them.
+///
+/// # What this is NOT
+///
+/// Not `statsBoard`'s review figure. That one reads `reviews { totalCount }`
+/// off pull request nodes, which counts reviews a PR RECEIVED and credits its
+/// AUTHOR -- so the two boards name different people on the same data.
+/// MEASURED: a `reviewed-by:<viewer>` search over an org window returned two
+/// pull requests, each authored by SOMEBODY ELSE and each carrying one review.
+/// So the author leads the received board and the reviewer the given one. Both
+/// ship, each labelled for what it measures.
+export const statsReviewers = (
+  scopeKind: string,
+  scopeValue: string | undefined,
+  days: number,
+  logins: string[],
+) => call<StatsReviewers>("stats_reviewers", { scopeKind, scopeValue, days, logins });
 
 /// Repos and their worktrees, WITHOUT safety classification.
 ///

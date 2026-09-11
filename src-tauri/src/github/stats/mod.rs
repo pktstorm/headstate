@@ -68,7 +68,10 @@ pub mod tree;
 
 pub use board::{load_board, AuthorRow, Board, ShortSlice, TOP_N};
 pub use budget::{Budget, Spend};
-pub use fetch::{load_count, load_detail, load_series, Outcome, ScopedPoint, Series};
+pub use fetch::{
+    load_count, load_detail, load_reviewers, load_series, Outcome, ReviewerRow, Reviewers,
+    ScopedPoint, Series,
+};
 pub use query::Slice;
 pub use scope::{Measure, Scope, StatsQuery, Subject};
 pub use tree::{load_tree, MemberRow, OrgTree, RepoRow, Tree};

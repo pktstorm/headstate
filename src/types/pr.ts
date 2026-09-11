@@ -1617,3 +1617,47 @@ export interface StatsSeries {
   refusedFields: number;
   spend: Spend;
 }
+
+/// One person's reviews GIVEN in a scope and window.
+///
+/// The counterpart to `AuthorRow.reviewsReceived`, and deliberately NOT a
+/// field on it: the two come from different searches and name different
+/// people. `reviewsReceived` reads `reviews { totalCount }` off a pull
+/// request the row's author WROTE; this reads `reviewed-by:<login>`, which
+/// finds pull requests by anyone that this person reviewed. MEASURED live
+/// 2026-09-11: the two pull requests crediting the viewer as REVIEWER in an
+/// org window were both authored by somebody else, so the author leads one
+/// board and the reviewer the other on the same two rows of data.
+export interface ReviewerRow {
+  /// The GitHub login, which is the identity the search qualifier uses
+  /// (`reviewed-by:<login>`) and so the one a reader can check against
+  /// GitHub's own UI.
+  login: string;
+  /// Pull requests in scope, merged in the window, that this person
+  /// reviewed.
+  ///
+  /// A MEASURED zero when it is zero. An unmeasured login is absent from
+  /// `rows` and named in `unmeasured` instead -- never a `0` here, because a
+  /// failed query rendered as zero would rank a colleague last on the
+  /// strength of nothing.
+  reviews: number;
+}
+
+/// The reviews-given leaderboard for one scope (#826).
+export interface StatsReviewers {
+  /// One row per login successfully counted, ranked highest first with ties
+  /// broken on login. Includes measured zeroes; the UI is what declines to
+  /// rank them (`Leaderboard.tsx`'s "a zero has no rank" rule).
+  rows: ReviewerRow[];
+  /// Logins whose count did not come back, NAMED rather than counted.
+  ///
+  /// The same rule `StatsSeries.failedDays` follows, and it binds harder on a
+  /// ranking: "2 people could not be measured" does not say whether the
+  /// leader might be one of them.
+  unmeasured: string[];
+  /// Fields GitHub refused. Its own channel rather than folded into
+  /// `unmeasured`, because a refusal suggests a SAML authorization to fix
+  /// while a missing alias suggests a retry.
+  refusedFields: number;
+  spend: Spend;
+}
