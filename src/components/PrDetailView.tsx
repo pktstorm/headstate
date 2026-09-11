@@ -73,7 +73,19 @@ export function PrDetailView({
   number: number;
   onBack: () => void;
 }) {
-  const { data: pr, isLoading, isError, error, refetch } = usePrDetail(repo, number);
+  // `isPlaceholderData` is true while this is the clicked row's own data
+  // standing in for the fetch (#790). `isLoading` is false in that state
+  // -- TanStack reports `success` on placeholder data -- which is exactly
+  // what lets the real view render immediately; the spinner branch below
+  // is now only for a pull request with no cached row to seed from.
+  const {
+    data: pr,
+    isLoading,
+    isPlaceholderData,
+    isError,
+    error,
+    refetch,
+  } = usePrDetail(repo, number);
   const deleteBranch = useDeleteHeadBranch();
   const review = useReviewPr();
   const comment = useCommentOnPr();
@@ -153,6 +165,10 @@ export function PrDetailView({
     </button>
   );
 
+  // Only reachable with NO cached row to seed from: a cold launch
+  // straight into a detail view, or a pull request in neither list.
+  // Every click from a list now skips this entirely and renders the
+  // seeded view below -- see `usePrDetail` (#790).
   if (isLoading) {
     return (
       <div>
@@ -308,11 +324,25 @@ export function PrDetailView({
               <span>draft</span>
             </>
           ) : null}
-          <span aria-hidden="true">·</span>
-          <span className="tabular-nums">
-            +{pr.additions.toLocaleString()} −{pr.deletions.toLocaleString()} across{" "}
-            {pr.changed_files} file{pr.changed_files === 1 ? "" : "s"}
-          </span>
+          {/* The ONE metadata fact the list row does not carry: the list
+              query does not select additions, deletions or changedFiles
+              (see `PRS_QUERY`). So while this is the seeded placeholder
+              the three are zero, and printing "+0 −0 across 0 files" on
+              a real pull request would be a lie the user cannot tell
+              from a genuinely empty diff. Omitted until it arrives; the
+              header reflows by one item rather than showing a wrong
+              number. A real zero-line pull request is possible and also
+              shows nothing here, which is the right way round: silence
+              costs a fact, a zero invents one (#790). */}
+          {isPlaceholderData && pr.changed_files === 0 ? null : (
+            <>
+              <span aria-hidden="true">·</span>
+              <span className="tabular-nums">
+                +{pr.additions.toLocaleString()} −{pr.deletions.toLocaleString()} across{" "}
+                {pr.changed_files} file{pr.changed_files === 1 ? "" : "s"}
+              </span>
+            </>
+          )}
           {pr.unresolved_threads > 0 ? (
             <>
               <span aria-hidden="true">·</span>
@@ -348,6 +378,16 @@ export function PrDetailView({
         <Section title="Description">
           <Markdown>{pr.body}</Markdown>
         </Section>
+      ) : isPlaceholderData ? (
+        // "No description." would be WRONG here, not merely early: the
+        // body is the one thing the seeded row cannot carry, and the
+        // sections below it are hidden while empty -- so a user who
+        // clicked a pull request to read its description would be told
+        // there isn't one, and nothing on the page would correct that
+        // until the fetch landed. This is also the only place the view
+        // says a fetch is still running, which is why it names the two
+        // things the wait is actually for (#790).
+        <p className="text-sm text-[#8b949e]">Loading the description and checks…</p>
       ) : (
         <p className="text-sm text-[#8b949e]">No description.</p>
       )}
@@ -361,7 +401,13 @@ export function PrDetailView({
         <Section
           title="Checks"
           count={pr.checks.length}
-          defaultOpen={pr.checks.some((c) => c.state !== "success")}
+          // Open when anything is not passing -- and open when the list
+          // is CAPPED, because an all-green page of 300 that is missing
+          // 112 contexts is the one case where the collapsed "everything
+          // passed" summary is the least trustworthy (#790).
+          defaultOpen={
+            pr.checks.some((c) => c.state !== "success") || pr.checks_total > pr.checks.length
+          }
           // Offered only when something FAILED and that failure belongs
           // to an Actions workflow run. A status context and a
           // non-Actions check both have no run to re-run, so the button
@@ -399,6 +445,25 @@ export function PrDetailView({
           {pr.checks.map((c) => (
             <CheckRow key={c.name} {...c} />
           ))}
+          {/* HONEST TRUNCATION, the same shape the comments list and the
+              PR list's "showing 100 of 137" use. The Rust side pages the
+              rollup up to a budget (#790 cut it from 20 serial requests
+              to 3), so a pull request with hundreds of contexts arrives
+              capped -- and the reason that budget is a tradeoff and not a
+              free win is precisely that a short check list does not LOOK
+              short: it renders a wall of green on a pull request whose
+              rollup says FAILURE. Saying so is what keeps the cap safe.
+
+              `>` rather than a subtraction against a possibly-larger
+              length: the two numbers come from different pages of a
+              rollup that can grow mid-fetch, so the total can legitimately
+              be the smaller one and that is not a shortfall. */}
+          {pr.checks_total > pr.checks.length ? (
+            <p className="px-2 py-1.5 text-xs text-[#d29922]">
+              Showing {pr.checks.length} of {pr.checks_total} checks. A failure could be among
+              the rest — see them on GitHub.
+            </p>
+          ) : null}
         </Section>
       ) : null}
 
