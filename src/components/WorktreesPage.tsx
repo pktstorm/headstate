@@ -628,6 +628,72 @@ function ConfirmRemove({
   );
 }
 
+/// A clock that ticks ONCE per repository, when its first sizing pass
+/// settles (#817).
+///
+/// The page freezes its row order against the size stream on purpose --
+/// see the long comment on `snapshot` -- but the freeze is there to
+/// protect an order the USER chose, and on arrival the user has chosen
+/// nothing. This is what lets the snapshot be re-taken at the one moment
+/// when re-ordering is free: the initial burst has landed, the rows are
+/// no longer skeletons, and no considered click is in flight.
+///
+/// State adjusted DURING render -- React's documented pattern for
+/// "derive from a prop change" -- rather than `useEffect` + state. The
+/// effect form would paint the pre-settle order first and the settled
+/// order on the following frame, so the list everybody sees on arrival
+/// would visibly re-shuffle once: reintroducing, at exactly the moment
+/// the user is first looking at it, the motion this page goes to such
+/// lengths to avoid. Setting state during render instead makes React
+/// re-run this component before it commits anything, so the settled
+/// order is the FIRST one painted and no intermediate frame exists.
+///
+/// Not a `useRef` either, though that reads more naturally. Mutating a
+/// ref during render is what `react-hooks/refs` forbids, and it is
+/// right to: a ref write does not schedule the re-render that the new
+/// value needs to be reflected, so the value would land one render late
+/// -- which for a memo key means the list paints in the stale order
+/// exactly once, the very flash this is avoiding.
+///
+/// Keyed by repository path and reset when it changes: each repository
+/// runs its own sizing pass, so switching to one whose sizes have never
+/// been measured must get the same one free re-sort rather than
+/// inheriting the previous repo's spent clock.
+///
+/// Returns a counter rather than a boolean only because it feeds a memo
+/// key built by string concatenation; one tick is all it ever takes.
+function useFirstSizingSettled(repoPath: string | undefined, sizing: boolean): number {
+  const [seen, setSeen] = useState<{
+    repo: string | undefined;
+    started: boolean;
+    ticks: number;
+  }>({ repo: repoPath, started: false, ticks: 0 });
+
+  // The pass has to be observed STARTING before its finish counts.
+  // Without this, the very first render -- where the query has not begun
+  // fetching yet and `sizing` is still false -- would read as "already
+  // settled" and spend the tick before a single measurement existed,
+  // which is the bug it is meant to fix with extra steps.
+  //
+  // EVERY branch must return `seen` ITSELF when it has nothing to
+  // change. Returning a fresh object with equal fields instead -- a
+  // `{ ...seen, started: true }` on a `seen` already started -- fails
+  // the identity check below, sets state, re-renders, and builds another
+  // equal-but-new object: React's "Too many re-renders", reached on the
+  // ordinary path rather than an edge case. Hence the field comparisons
+  // in each guard rather than just the state transitions.
+  const next =
+    seen.repo !== repoPath
+      ? { repo: repoPath, started: sizing, ticks: 0 }
+      : sizing && !seen.started
+        ? { ...seen, started: true }
+        : !sizing && seen.started && seen.ticks === 0
+          ? { ...seen, ticks: 1 }
+          : seen;
+  if (next !== seen) setSeen(next);
+  return next.ticks;
+}
+
 export function WorktreesPage() {
   const { data: repos, isLoading, isError, error, refetch } = useWorktrees();
   const filters = useActiveFilters();
@@ -851,7 +917,32 @@ export function WorktreesPage() {
   // and listing it would restore exactly the live re-ordering this
   // exists to prevent. `length` rides along so a worktree appearing or
   // disappearing is not silently dropped from the list.
-  const orderKey = `${sort}:${sortedAt}`;
+  //
+  // THE FIRST BURST IS NOT A GESTURE TO PROTECT (#817).
+  //
+  // `settledAt` joins the clock, and the distinction it draws is the
+  // whole of that issue's second complaint. Everything above is about
+  // not moving a row out from under a user who CHOSE an order. On
+  // arrival nobody has chosen anything: the default is "largest first",
+  // and the first measurements necessarily land after the mount, so the
+  // page used to greet a user who had touched nothing with "re-sort --
+  // 94 newly measured". That is not honesty about a frozen order, it is
+  // the page confessing that data arrived.
+  //
+  // There is also nothing to protect at that moment. The hazard is a
+  // button sliding out from under a cursor that is already reaching for
+  // it; during the initial burst the rows are still filling in their
+  // skeletons and there is no considered click in flight to spoil.
+  //
+  // So the snapshot is re-taken ONCE, when the first sizing pass for
+  // this repository settles, and the button thereafter means "things
+  // changed since YOU chose" rather than "data arrived". Crucially this
+  // is one bump, not a subscription to `sizing`: a clock that moved on
+  // every pass would re-sort the list on each background refetch, which
+  // is exactly the live re-ordering the paragraphs above call the one
+  // genuinely unsafe option.
+  const settledAt = useFirstSizingSettled(selected?.path, sizing);
+  const orderKey = `${sort}:${sortedAt}:${settledAt}`;
   const snapshot = useMemo(
     () => ({
       order: sortWorktrees(withSizes, sort, assessed).map((w) => w.path),
@@ -861,6 +952,19 @@ export function WorktreesPage() {
       // live rows would compare them with themselves.
       measured: new Set(
         withSizes.filter((w) => w.size_bytes !== null && w.size_bytes !== undefined).map((w) => w.path),
+      ),
+      // Which paths were assessed when this order was fixed, for the
+      // same reason and read the same way (#817).
+      //
+      // `sortWorktrees` ranks assessed rows above unassessed ones on
+      // EVERY sort, size or not, so an assessment landing changes what
+      // the correct order would be just as a measurement does. The
+      // staleness count used to look only at sizes, which left that
+      // half of the data silently stale: the order was wrong and the
+      // page did not say so -- precisely the dishonesty the re-sort
+      // button exists to prevent.
+      assessedThen: new Set(
+        withSizes.filter((w) => assessed.has(w.path)).map((w) => w.path),
       ),
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1200,23 +1304,40 @@ export function WorktreesPage() {
     );
   }
 
-  // How many rows have gained a size since the current order was fixed.
+  // How many rows would sort differently than they do, because
+  // something they sort ON has landed since the order was fixed.
   //
   // This is what makes the frozen order HONEST rather than merely
   // stable: without it the user reads a "Largest first" list that is
   // quietly out of date and has no way to know. With it, the page says
-  // so and offers the one click that fixes it. Only meaningful on a
-  // size sort -- name never goes stale, and `last_commit` arrives with
-  // the row rather than streaming in afterwards.
+  // so and offers the one click that fixes it.
+  //
+  // TWO sources, not one (#817). It used to count sizes alone, on the
+  // reasonable-sounding grounds that sizes are the thing that streams.
+  // But `sortWorktrees` ranks assessed rows above unassessed ones
+  // before it looks at any axis, so marking a worktree assessed ALSO
+  // invalidates the displayed order -- and on a name sort, where sizes
+  // are irrelevant, it was the only thing that could. The page
+  // therefore went quiet in exactly the case where it had nothing else
+  // to notice.
+  //
+  // Size staleness stays gated on a size sort: a name sort does not
+  // read `size_bytes` at all, so a measurement landing under it changes
+  // nothing and a button offering to re-apply it would be noise.
+  // Assessment staleness is NOT gated, because the assessed-first rule
+  // applies to every sort.
+  //
+  // `last_commit` needs no clause here: it arrives with the row rather
+  // than streaming in afterwards, so it cannot land after a snapshot.
   const sizeSorted = sort === "size-asc" || sort === "size-desc";
-  const restaleCount = sizeSorted
-    ? withSizes.filter(
-        (w) =>
-          w.size_bytes !== null &&
-          w.size_bytes !== undefined &&
-          !snapshot.measured.has(w.path),
-      ).length
-    : 0;
+  const restaleCount = withSizes.filter(
+    (w) =>
+      (sizeSorted &&
+        w.size_bytes !== null &&
+        w.size_bytes !== undefined &&
+        !snapshot.measured.has(w.path)) ||
+      (assessed.has(w.path) && !snapshot.assessedThen.has(w.path)),
+  ).length;
 
   // Withheld unless classification actually SUCCEEDED. A failed pass
   // used to resolve as an empty success, so rows sat on "checking..."
@@ -1414,41 +1535,79 @@ export function WorktreesPage() {
             there are no headers to click. `ArtifactsPage` reached the
             same shape for the same reason, so this matches it rather
             than inventing a third pattern. */}
-        <label className="flex items-center gap-1 text-xs text-[#8b949e]">
-          Sort
-          <select
-            value={sort}
-            onChange={(e) => chooseSort(e.target.value as WorktreeSort)}
-            aria-label="Sort worktrees"
-            className="rounded border border-[#30363d] bg-[#0d1117] px-1 py-0.5 text-xs text-[#e6edf3]"
-          >
-            {(Object.keys(WORKTREE_SORT_LABELS) as WorktreeSort[]).map((k) => (
-              <option key={k} value={k}>
-                {WORKTREE_SORT_LABELS[k]}
-              </option>
-            ))}
-          </select>
-        </label>
+        {/* ONE GROUP, and it is the fix for #817's first complaint.
 
-        {/* The explicit gesture that makes the frozen order honest.
+            The re-sort button used to sit directly before the bulk
+            "Remove N safe worktrees" button in this `flex flex-wrap`
+            row. So an ADVISORY control appearing -- which it does on its
+            own schedule, as measurements land -- pushed a DESTRUCTIVE
+            control sideways or onto a second line. That is the same
+            hazard the frozen row order exists to prevent, reproduced one
+            level up in the toolbar: a thing that deletes directories
+            must not move because something else arrived.
 
-            Rows are ordered on the sizes known when the sort was
-            chosen, so a measurement landing afterwards does not move
-            anything under the cursor -- but it would leave a "Largest
-            first" list quietly out of date with no way to tell. This
-            says how many rows have been measured since, and one click
-            applies them. Silent when there is nothing to apply, so it
-            is not a permanent piece of furniture. */}
-        {restaleCount > 0 ? (
-          <button
-            type="button"
-            onClick={() => setSortedAt((n) => n + 1)}
-            aria-live="polite"
-            className="rounded border border-[#30363d] px-2 py-0.5 text-xs text-[#58a6ff] hover:bg-[#161b22]"
-          >
-            re-sort — {restaleCount} newly measured
-          </button>
-        ) : null}
+            Grouping them is better than reserving a fixed slot for the
+            button, which was the other option the issue offered. A
+            reserved slot would hold a permanent gap on a toolbar that is
+            usually complete without it -- and it would still sit beside
+            Remove, so the two would merely stop moving rather than stop
+            being neighbours. Here the appearing button displaces nothing
+            but the group's own right edge.
+
+            `shrink-0` so the group is not what the toolbar compresses,
+            and no `flex-wrap` inside it: the button belongs to the
+            select, and a wrap between them would read as two unrelated
+            controls. */}
+        <span className="flex shrink-0 items-center gap-2">
+          <label className="flex items-center gap-1 text-xs text-[#8b949e]">
+            Sort
+            <select
+              value={sort}
+              onChange={(e) => chooseSort(e.target.value as WorktreeSort)}
+              aria-label="Sort worktrees"
+              className="rounded border border-[#30363d] bg-[#0d1117] px-1 py-0.5 text-xs text-[#e6edf3]"
+            >
+              {(Object.keys(WORKTREE_SORT_LABELS) as WorktreeSort[]).map((k) => (
+                <option key={k} value={k}>
+                  {WORKTREE_SORT_LABELS[k]}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          {/* The explicit gesture that makes the frozen order honest.
+
+              Rows are ordered on what was known when the sort was
+              chosen, so a measurement or an assessment landing
+              afterwards does not move anything under the cursor -- but
+              it would leave a "Largest first" list quietly out of date
+              with no way to tell. This says how many rows have changed
+              since, and one click applies them. Silent when there is
+              nothing to apply, so it is not a permanent piece of
+              furniture.
+
+              Beside the Sort select rather than beside Remove, because
+              this is the control it modifies -- the button does nothing
+              but re-run what the select chose. That it also keeps an
+              appearing advisory control away from a destructive one is
+              the half of it #817 was actually reporting.
+
+              "out of date" rather than the old "newly measured": the
+              count now includes assessments, which are not
+              measurements, and a label naming only one of its two
+              causes would misreport the other. */}
+          {restaleCount > 0 ? (
+            <button
+              type="button"
+              onClick={() => setSortedAt((n) => n + 1)}
+              aria-live="polite"
+              title="Re-apply the chosen sort, using the sizes and assessments that have landed since"
+              className="rounded border border-[#30363d] px-2 py-0.5 text-xs text-[#58a6ff] hover:bg-[#161b22]"
+            >
+              re-sort — {restaleCount} out of date
+            </button>
+          ) : null}
+        </span>
 
         {/* The count is in the label, so the scope is legible before
             clicking rather than only in the dialog. 106 of 268 worktrees

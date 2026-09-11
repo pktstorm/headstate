@@ -2334,7 +2334,13 @@ describe("WorktreesPage", () => {
       rerender(<WorktreesPage />);
 
       const resort = screen.getByRole("button", { name: /re-sort/i });
-      expect(resort.textContent).toMatch(/1 newly measured/);
+      // "out of date" rather than the original "newly measured": the
+      // count grew a second source in #817 -- an assessment landing
+      // re-ranks rows just as a measurement does -- so the label can no
+      // longer name measurement as the only cause. The CONTRACT this
+      // test exists for is unchanged and asserted either side of here:
+      // the count is surfaced, and only an explicit click applies it.
+      expect(resort.textContent).toMatch(/1 out of date/);
       fireEvent.click(resort);
 
       // The gesture applies the measurements that had landed since.
@@ -2381,6 +2387,141 @@ describe("WorktreesPage", () => {
       state.partialSizes = new Map([["/code/pending", 9_000_000]]);
       rerender(<WorktreesPage />);
       expect(screen.queryByRole("button", { name: /re-sort/i })).toBeNull();
+    });
+
+    /// Arriving at the page is not a choice to protect (#817).
+    ///
+    /// The freeze above exists so a row cannot slide out from under a
+    /// cursor reaching for an order the USER picked. On first paint
+    /// nobody has picked anything -- the default is "largest first" and
+    /// the first measurements land after the mount -- so the page used
+    /// to greet an untouched arrival with "re-sort — N out of date",
+    /// which reports that data arrived rather than that anything is
+    /// wrong. The snapshot is re-taken once when the first pass settles,
+    /// so the list is correctly ordered AND silent.
+    it("does not prompt on first arrival, and is already correctly sorted", () => {
+      state.classified = [
+        wt({ path: "/code/small", size_bytes: 500 }),
+        wt({ path: "/code/big", size_bytes: null }),
+      ];
+      // The initial burst, mid-flight: nothing has settled yet.
+      state.sizing = true;
+      const { container, rerender } = render(<WorktreesPage />);
+
+      // `big` turns out to be the larger, arriving after the mount --
+      // the ordinary case, not an edge one.
+      state.partialSizes = new Map([["/code/big", 9_000_000]]);
+      rerender(<WorktreesPage />);
+
+      // ...and the burst settles.
+      state.sizing = false;
+      state.sizes = new Map([
+        ["/code/small", 500],
+        ["/code/big", 9_000_000],
+      ]);
+      rerender(<WorktreesPage />);
+
+      // The order is right, without the user having done anything...
+      expect(shownNames(container)[0]).toMatch(/^big/);
+      // ...so there is nothing to prompt about.
+      expect(screen.queryByRole("button", { name: /re-sort/i })).toBeNull();
+    });
+
+    /// The one free re-sort is spent ONCE, not on every pass (#817).
+    ///
+    /// The guard that matters: a clock that bumped whenever sizing went
+    /// idle would re-order the list on each background refetch, which is
+    /// the live re-ordering this whole design calls the one genuinely
+    /// unsafe option. After the first settle the freeze is back in full
+    /// force.
+    it("re-freezes after the first pass settles", () => {
+      state.classified = [
+        wt({ path: "/code/small", size_bytes: 500 }),
+        wt({ path: "/code/big", size_bytes: null }),
+      ];
+      state.sizing = true;
+      const { container, rerender } = render(<WorktreesPage />);
+      state.sizing = false;
+      state.sizes = new Map([["/code/small", 500]]);
+      rerender(<WorktreesPage />);
+
+      // A later pass finds `big` is enormous. It must NOT move on its
+      // own, however idle the query goes.
+      state.sizing = true;
+      rerender(<WorktreesPage />);
+      state.sizing = false;
+      state.sizes = new Map([
+        ["/code/small", 500],
+        ["/code/big", 9_000_000],
+      ]);
+      rerender(<WorktreesPage />);
+
+      expect(shownNames(container)[0]).toMatch(/^small/);
+      // The honest part: frozen, and saying so.
+      expect(screen.getByRole("button", { name: /re-sort/i })).toBeTruthy();
+    });
+
+    /// Assessments re-rank rows too, and used to do it silently (#817).
+    ///
+    /// `sortWorktrees` puts assessed rows above unassessed ones before
+    /// it looks at any axis, so marking one assessed invalidates the
+    /// displayed order exactly as a measurement does. The count read
+    /// only sizes, so this half of the data went stale with the page
+    /// saying nothing -- and on a name sort, where sizes are ignored, it
+    /// was the only thing that could go stale at all.
+    it("counts an assessment landing, even on a name sort", () => {
+      state.classified = [
+        wt({ path: "/code/aaa", size_bytes: 500 }),
+        wt({ path: "/code/zzz", size_bytes: 500 }),
+      ];
+      state.assessed = [];
+      const { container, rerender } = render(<WorktreesPage />);
+      fireEvent.change(screen.getByRole("combobox", { name: /sort worktrees/i }), {
+        target: { value: "name-asc" },
+      });
+      expect(shownNames(container)[0]).toMatch(/^aaa/);
+      expect(screen.queryByRole("button", { name: /re-sort/i })).toBeNull();
+
+      // `zzz` is assessed, so it now outranks `aaa` -- but not under the
+      // cursor.
+      state.assessed = ["/code/zzz"];
+      rerender(<WorktreesPage />);
+      expect(shownNames(container)[0]).toMatch(/^aaa/);
+
+      const resort = screen.getByRole("button", { name: /re-sort/i });
+      expect(resort.textContent).toMatch(/1 out of date/);
+      fireEvent.click(resort);
+      expect(shownNames(container)[0]).toMatch(/^zzz/);
+    });
+
+    /// An appearing advisory control must not move a destructive one
+    /// (#817).
+    ///
+    /// The re-sort button used to render immediately before the bulk
+    /// "Remove N safe worktrees" button in one `flex flex-wrap` toolbar,
+    /// so its arrival shoved a directory-deleting button sideways or
+    /// onto a second line. It now lives in a group with the Sort select
+    /// it modifies, which is both where it belongs and out of Remove's
+    /// way. Asserted structurally, since jsdom lays nothing out: the two
+    /// buttons have no common ancestor below the toolbar, so neither can
+    /// be a sibling the other displaces.
+    it("keeps the re-sort button out of the bulk Remove button's group", () => {
+      state.classified = [
+        wt({ path: "/code/measured", size_bytes: 500, safety: { kind: "safe" } }),
+        wt({ path: "/code/pending", size_bytes: null, safety: { kind: "safe" } }),
+      ];
+      state.sizing = true;
+      const { rerender } = render(<WorktreesPage />);
+      state.partialSizes = new Map([["/code/pending", 9_000_000]]);
+      rerender(<WorktreesPage />);
+
+      const resort = screen.getByRole("button", { name: /re-sort/i });
+      const remove = screen.getByRole("button", { name: /remove 2 safe worktrees/i });
+      // The re-sort button is grouped with the Sort select...
+      const group = resort.parentElement as HTMLElement;
+      expect(group.querySelector("select[aria-label='Sort worktrees']")).toBeTruthy();
+      // ...and the destructive button is outside that group entirely.
+      expect(group.contains(remove)).toBe(false);
     });
   });
 });
