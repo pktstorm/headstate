@@ -170,7 +170,20 @@ pub struct AuthorRow {
     /// The GitHub login. The identity the search qualifier uses
     /// (`author:<login>`), so a row is checkable against GitHub's own UI.
     pub login: String,
-    /// Pull requests by this author in the window.
+    /// Pull requests by this author in the window, for the board's MEASURE.
+    ///
+    /// `Measure::Merged` counts merged ones and `Measure::Opened` counts
+    /// opened ones -- they are not interchangeable, and a PR opened in July
+    /// and merged in August belongs to July's opened count and August's merged
+    /// count. The board is loaded with one measure, so this is a count of that
+    /// one rather than of "pull requests" in general.
+    ///
+    /// Worth stating because it bounds what [`AuthorRow::cycle_time_hours`]
+    /// can be. On the merged measure every counted pull request HAS merged, so
+    /// the two differ only when a timestamp could not be parsed -- not because
+    /// some are still open. A first version of the UI labelled that gap "still
+    /// open, not counted", which described a mixed population this field never
+    /// holds.
     pub prs: u64,
     /// Lines ADDED, summed. Raw `additions`, including generated files --
     /// see [`AuthorRow::lines_changed`] for why the label matters more
@@ -203,11 +216,25 @@ pub struct AuthorRow {
     /// UI's `percentile()` can index it directly, which is the contract
     /// `MergedDetail::cycle_time_hours` already has.
     ///
-    /// EMPTY for an author whose pull requests in this window are all
-    /// unmerged -- `mergedAt` is null on those, and a cycle time computed
-    /// against "now" would report an open pull request as slow rather than
-    /// as unfinished. So the length of this is not the same as `prs`, and
-    /// the UI must not divide one by the other.
+    /// SHORTER than `prs` whenever a pull request has no usable merge time,
+    /// which the mapper drops rather than guessing at:
+    ///
+    /// - `mergedAt` is null -- an open pull request. A cycle time computed
+    ///   against "now" would report it as slow rather than as unfinished, and
+    ///   it gets slower every second it stays open.
+    /// - the timestamps do not parse, or the merge precedes the creation. A
+    ///   negative duration sorts to the TOP of an ascending distribution and
+    ///   drags a median below zero, and clamping it to 0 would be a
+    ///   measurement claim about a value nobody can explain.
+    ///
+    /// On the **merged** measure only the second case is reachable, because
+    /// `is:merged` means every node has a `mergedAt`. That bounds what a UI
+    /// may say about the gap: it is a timestamp problem, not unfinished work.
+    /// A first version of `CycleTime` labelled it "still open, not counted",
+    /// which on a merged-only board called a merged pull request unfinished.
+    ///
+    /// Either way the length is NOT `prs`, and nothing may divide one by the
+    /// other.
     pub cycle_time_hours: Vec<f64>,
 }
 
@@ -667,6 +694,34 @@ pub const GHOST: &str = "(deleted user)";
 /// narrower query, which is also why Mine and Others cost ONE load
 /// between them rather than two.
 pub async fn load_board(
+    client: &GitHubClient,
+    scope: &Scope,
+    measure: super::scope::Measure,
+    window: Slice,
+    budget: &Budget,
+) -> Result<Board, ClientError> {
+    // ONE ceiling around the WHOLE load, which is the rule
+    // `fetch::LOAD_TIMEOUT`'s own doc states: "only a wall-clock ceiling
+    // around the whole thing bounds what the user is actually waiting on".
+    //
+    // Without this the board had TWO sequential 60-second bounds -- the
+    // planner's and the detail fetch's -- so it could legitimately run 120s
+    // where `load_count` bounds itself at 60. Found in review. The inner
+    // bounds are left in place: they are what the other callers of those
+    // functions get, and the outer one is what makes this caller obey the same
+    // contract as the count path.
+    match tokio::time::timeout(
+        super::fetch::LOAD_TIMEOUT,
+        board_inner(client, scope, measure, window, budget),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => Err(ClientError::Timeout(super::fetch::LOAD_TIMEOUT.as_secs())),
+    }
+}
+
+async fn board_inner(
     client: &GitHubClient,
     scope: &Scope,
     measure: super::scope::Measure,
@@ -1383,6 +1438,47 @@ mod tests {
         // cheap -- the 30-alias probe document measured 1 point and 3.5s --
         // and it is why the cap is not raised here.
         assert!(n <= super::super::query::ALIAS_CHUNK as u32);
+    }
+
+    /// A board load has ONE wall-clock ceiling, not two in series.
+    ///
+    /// `load_board` calls `plan_to` and then `load_detail_chunked`, each of
+    /// which carries its own `LOAD_TIMEOUT`. Without an outer bound the board
+    /// could run twice the ceiling -- 120s against the 60 `load_count` holds
+    /// itself to -- which breaks the rule `LOAD_TIMEOUT`'s own doc states.
+    /// Found in review.
+    ///
+    /// Asserted on the source, because the property is structural: it is about
+    /// WHERE the timeout sits, and no value a function returns reveals that.
+    /// The alternative -- an integration test that waits two minutes for a
+    /// hung request -- is a test nobody would run.
+    #[test]
+    fn a_board_load_is_bounded_once_around_the_whole_thing() {
+        let src = include_str!("board.rs");
+        let body = src
+            .split_once("pub async fn load_board(")
+            .expect("load_board")
+            .1;
+        let head = body
+            .split_once("async fn board_inner")
+            .expect("the split")
+            .0;
+        assert!(
+            head.contains("tokio::time::timeout"),
+            "load_board must bound the whole load, not leave it to the two \
+             inner ceilings running in series"
+        );
+        assert!(
+            head.contains("board_inner"),
+            "the bounded thing must be the WHOLE load, which is what \
+             `board_inner` is for"
+        );
+        // And the work itself must not also be inline in `load_board`, which
+        // would mean the timeout wraps only part of it.
+        assert!(
+            !head.contains("load_detail_chunked"),
+            "the detail fetch belongs inside the bounded inner function"
+        );
     }
 
     /// The threshold is a PARAMETER, and the two callers pass different

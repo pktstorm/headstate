@@ -130,12 +130,35 @@ export function PersonFigures({
   partial: boolean;
 }) {
   if (!row) {
+    // An ABSENT row means two completely different things, and which one it
+    // means depends on `partial` rather than on anything visible in the row
+    // itself. Either the person genuinely merged nothing, or the slice that
+    // held their pull requests came back short or refused and their row was
+    // never built.
+    //
+    // So "that is a measured result, not a missing one" is only sayable on a
+    // COMPLETE board. Said over a partial one it is the #802/#790 confusion
+    // inverted -- not a zero that might be a failure, but an explicit denial
+    // that it could be one, which is worse because it is the sentence a
+    // reader would rely on.
     return (
       <div className="rounded-md border border-[#30363d] px-4 py-10 text-center">
-        <p className="text-sm font-semibold text-[#e6edf3]">No activity</p>
+        <p className="text-sm font-semibold text-[#e6edf3]">
+          {partial ? "No activity found" : "No activity"}
+        </p>
         <p className="mx-auto mt-2 max-w-md text-sm text-[#8b949e]">
-          {who} opened or merged no pull requests in this window and this
-          scope. That is a measured result, not a missing one.
+          {partial ? (
+            <>
+              Nothing was found for {who} in this window and scope -- but this
+              board is incomplete, so a missing row may be missing data rather
+              than absent work. See the note above.
+            </>
+          ) : (
+            <>
+              {who} opened or merged no pull requests in this window and this
+              scope. That is a measured result, not a missing one.
+            </>
+          )}
         </p>
       </div>
     );
@@ -186,15 +209,30 @@ export function GroupFigures({
   partial: boolean;
 }) {
   if (rows.length === 0) {
+    // The same two-meanings problem `PersonFigures` has, one level up: an
+    // empty population is a measured fact on a complete board and an open
+    // question on a partial one. "That is an absence of pull requests, not an
+    // absence of people" is a claim, and it must not be made over data that
+    // came back short.
     return (
       <div className="rounded-md border border-[#30363d] px-4 py-10 text-center">
         <p className="text-sm font-semibold text-[#e6edf3]">
-          Nobody else in this window
+          {partial ? "Nobody else found" : "Nobody else in this window"}
         </p>
         <p className="mx-auto mt-2 max-w-md text-sm text-[#8b949e]">
-          No other author opened or merged a pull request in this scope and
-          window. A member with no activity has no row here -- that is an
-          absence of pull requests, not an absence of people.
+          {partial ? (
+            <>
+              No other author was found in this scope and window -- but this
+              board is incomplete, so there may be people whose pull requests
+              were not retrieved. See the note below.
+            </>
+          ) : (
+            <>
+              No other author opened or merged a pull request in this scope and
+              window. A member with no activity has no row here -- that is an
+              absence of pull requests, not an absence of people.
+            </>
+          )}
         </p>
       </div>
     );

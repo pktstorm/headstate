@@ -257,6 +257,20 @@ export function StatsPage() {
 
       {board ? (
         <>
+          {/* The partiality caveat sits ABOVE both views rather than inside
+              the leaderboards, because it qualifies every figure drawn from
+              the board -- Mine's four cards, the cycle-time distribution, the
+              outliers and the repo shares included, not just the rankings.
+
+              It was inside `Leaderboards` first, which left the Mine tab
+              saying "at least 12" with nothing anywhere on screen to say WHY
+              it was a floor. A reader cannot act on a prefix alone. */}
+          {!board.complete && caveat ? (
+            <div className="rounded-md border border-[#d29922]/40 bg-[#d29922]/10 px-3 py-2 text-xs text-[#d29922]">
+              This board is incomplete, so every figure below is a floor rather
+              than a total. {caveat}
+            </div>
+          ) : null}
           {half === "mine" ? (
             <>
               <PersonFigures
@@ -319,11 +333,13 @@ export function StatsPage() {
                   reader would put whoever is second in first place, which
                   is a wrong ranking rather than a filtered one -- and the
                   reader is the one person who can tell it is wrong. */}
-              <Leaderboards
-                rows={board.rows}
-                complete={board.complete}
-                caveat={caveat}
-              />
+              {/* No `caveat` here: the page-level banner above already
+                  carries it, and two copies of the same warning reads as two
+                  different problems. `complete` is still passed, because the
+                  component's own short reminder on the rankings is where a
+                  reader's eye actually is when they read a name off a
+                  board. */}
+              <Leaderboards rows={board.rows} complete={board.complete} />
             </>
           )}
         </>

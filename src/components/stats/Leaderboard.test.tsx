@@ -119,4 +119,18 @@ describe("Leaderboards", () => {
     render(<Leaderboards complete rows={[row("a")]} />);
     expect(screen.queryByText(/incomplete/i)).toBeNull();
   });
+
+  /// The warning renders on `!complete` ALONE, with or without a reason.
+  ///
+  /// `StatsPage` carries the detailed reason in a page-level banner that also
+  /// covers the Mine view, so it omits `caveat` here to avoid two copies of
+  /// one warning reading as two problems. An unexplained warning is still
+  /// worth far more than a silent confident top-five, so the absence of a
+  /// reason must not suppress it -- which is exactly what an earlier
+  /// `!complete && caveat` condition did.
+  it("warns even when no reason is supplied", () => {
+    render(<Leaderboards complete={false} rows={[row("a")]} />);
+    expect(screen.getByText(/rankings are incomplete/i)).toBeTruthy();
+    expect(screen.getByText(/the order may be wrong/i)).toBeTruthy();
+  });
 });

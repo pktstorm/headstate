@@ -346,6 +346,59 @@ describe("StatsPage honesty", () => {
     expect(screen.queryByText(/files touched/i)).toBeNull();
   });
 
+  /// ...but ONLY on a complete board. An absent row means two different
+  /// things -- the person merged nothing, or the slice holding their pull
+  /// requests came back short -- and "that is a measured result, not a missing
+  /// one" is a claim that can only be made when nothing was missed.
+  ///
+  /// Said over a partial board it is the #802/#790 confusion inverted: not a
+  /// zero that might be a failure, but an explicit denial that it could be
+  /// one, which is worse because it is the sentence a reader would rely on.
+  /// Found in review; the test above covered only the complete case.
+  it("does not call an absent row a measured result on a partial board", () => {
+    vi.mocked(useStatsBoard).mockReturnValue(
+      settled(board({ rows: [], complete: false, total: 500, retrieved: 0 })),
+    );
+    render(<StatsPage />);
+    expect(screen.queryByText(/measured result, not a missing one/i)).toBeNull();
+    expect(screen.getByText(/may be missing data rather than absent work/i)).toBeTruthy();
+  });
+
+  /// The same hole one level up: "an absence of pull requests, not an absence
+  /// of people" is also a claim, and also unsayable over data that came back
+  /// short.
+  it("does not deny missing people on a partial board", () => {
+    vi.mocked(useStatsBoard).mockReturnValue(
+      settled(
+        board({
+          rows: [row({ login: "octocat" })],
+          complete: false,
+          total: 500,
+          retrieved: 12,
+        }),
+      ),
+    );
+    render(<StatsPage />);
+    fireEvent.click(screen.getByRole("tab", { name: /others/i }));
+    expect(screen.queryByText(/absence of pull requests, not an absence of people/i)).toBeNull();
+    expect(screen.getByText(/may be people whose pull requests were not retrieved/i)).toBeTruthy();
+  });
+
+  /// The partiality banner covers the MINE view too, not only the rankings.
+  ///
+  /// It was inside `Leaderboards` first, which left Mine saying "at least 12"
+  /// with nothing anywhere on screen to say why it was a floor. A reader
+  /// cannot act on a prefix alone.
+  it("explains the floor on the Mine view, not only on the rankings", () => {
+    vi.mocked(useStatsBoard).mockReturnValue(
+      settled(board({ complete: false, total: 500, retrieved: 120 })),
+    );
+    render(<StatsPage />);
+    // Still on Mine -- no tab click.
+    expect(screen.getByText(/every figure below is a floor/i)).toBeTruthy();
+    expect(screen.getByText(/380 of 500/)).toBeTruthy();
+  });
+
   /// A partial board never renders a confident top-five.
   it("labels an incomplete leaderboard and says why", () => {
     vi.mocked(useStatsBoard).mockReturnValue(

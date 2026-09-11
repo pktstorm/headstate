@@ -155,9 +155,15 @@ export function Leaderboards({
   /// with the most lines.
   rows: AuthorRow[];
   complete: boolean;
-  /// Why the board is partial, in the caller's words. Required when
-  /// `complete` is false; the caller knows which of the three partiality
-  /// channels applied and this component does not.
+  /// Why the board is partial, in the caller's words -- the caller knows
+  /// which of the three partiality channels applied and this component does
+  /// not.
+  ///
+  /// OPTIONAL, because `StatsPage` carries the detail in a page-level banner
+  /// that also covers the Mine view's figures, and two copies of one warning
+  /// read as two different problems. Omitted, the short reminder below still
+  /// renders: a reader taking a name off a ranking needs the caveat where
+  /// their eye is, not only at the top of the page.
   caveat?: string;
 }) {
   const top = (value: (r: AuthorRow) => number) =>
@@ -176,12 +182,17 @@ export function Leaderboards({
 
   return (
     <div className="flex flex-col gap-3">
-      {!complete && caveat ? (
+      {!complete ? (
         <div className="rounded-md border border-[#d29922]/40 bg-[#d29922]/10 px-3 py-2 text-xs text-[#d29922]">
           {/* Above the boards, not inside one: the partiality applies to
               every ranking below it, and a note attached to one board would
-              read as though the others were complete. */}
-          These rankings are incomplete. {caveat}
+              read as though the others were complete.
+
+              Rendered on `!complete` ALONE, with or without a reason. An
+              unexplained warning is worth far more than a silent confident
+              top-five, and the reason is optional precisely because the page
+              may be carrying it elsewhere. */}
+          These rankings are incomplete{caveat ? `. ${caveat}` : ", so the order may be wrong."}
         </div>
       ) : null}
       <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">

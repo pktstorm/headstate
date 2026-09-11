@@ -655,6 +655,7 @@ async fn detail_round(
     page: u32,
 ) -> Result<serde_json::Value, ClientError> {
     let mut merged = serde_json::Map::new();
+    let mut refused = 0usize;
     let per_wave = chunk * READ_CONCURRENCY;
     for (w, wave) in slices.chunks(per_wave).enumerate() {
         let base = w * per_wave;
@@ -680,7 +681,32 @@ async fn detail_round(
                     merged.insert(k.clone(), val.clone());
                 }
             }
+            // `__refused` is a TOP-LEVEL key on each response, not an alias,
+            // so the blanket insert above makes the last refusing chunk's
+            // count win instead of accumulating. Summed explicitly.
+            //
+            // Found in review, and it understated rather than hid: any
+            // non-zero count still trips `complete`, and `graphql_partial_ok`
+            // inserts the key only when there ARE refusals
+            // (`client.rs:1204-1213`), so a clean chunk could not zero a
+            // dirty one. But the FIGURE drives the SAML remediation message,
+            // and "GitHub refused 4 fields" when it refused 7 is the kind of
+            // wrong number that makes a reader distrust the advice attached
+            // to it.
+            //
+            // `series_inner` below already accumulates per chunk, which is
+            // what the two paths now have in common.
+            refused += crate::github::client::refused_fields_of(&v);
         }
+    }
+    // Written back as the merged map's own key, so `Board::from_alias_map`
+    // keeps reading the count through `client::refused_fields_of` -- one
+    // reader for this value rather than a second convention for the merged
+    // shape. Inserted only when non-zero, matching `graphql_partial_ok`'s own
+    // rule: the key's ABSENCE means no refusal, and a written 0 would be a
+    // second way of saying that.
+    if refused > 0 {
+        merged.insert("__refused".into(), refused.into());
     }
     Ok(serde_json::Value::Object(merged))
 }
@@ -913,6 +939,82 @@ mod tests {
         let (chunk, page) = degrade(ALIAS_CHUNK, SLICE_PAGE_FULL).expect("first rung");
         assert_eq!(page, SLICE_PAGE_REDUCED);
         assert_eq!(chunk, ALIAS_CHUNK, "parallelism is kept on rung one");
+    }
+
+    /// Refusals ACROSS chunks are summed, not overwritten.
+    ///
+    /// `__refused` is a top-level key on every response rather than an alias,
+    /// so the alias-merge loop made the last refusing chunk's count win. Three
+    /// refusals in one chunk plus four in another reported **4**, and that
+    /// figure is what `partialityCaveat` quotes beside the SAML remediation
+    /// advice -- a wrong number makes a reader distrust the advice attached to
+    /// it.
+    ///
+    /// Found in review. The shape is reproduced directly rather than through a
+    /// mocked two-chunk fetch, because the bug is in the MERGE and a test that
+    /// needed a network to reach it would not have been written.
+    #[test]
+    fn refusals_across_chunks_are_summed_not_overwritten() {
+        // Two chunk responses, each carrying its own top-level count.
+        let chunks = [
+            serde_json::json!({ "s0": { "issueCount": 1, "nodes": [] }, "__refused": 3 }),
+            serde_json::json!({ "s1": { "issueCount": 1, "nodes": [] }, "__refused": 4 }),
+        ];
+        // The merge this module performs, in the order it performs it.
+        let mut merged = serde_json::Map::new();
+        let mut refused = 0usize;
+        for v in &chunks {
+            if let Some(obj) = v.as_object() {
+                for (k, val) in obj {
+                    merged.insert(k.clone(), val.clone());
+                }
+            }
+            refused += crate::github::client::refused_fields_of(v);
+        }
+        // The blanket insert alone loses the sum -- this is the bug, asserted
+        // so a future edit that drops the explicit accumulation fails here
+        // rather than understating a figure in the UI.
+        assert_eq!(
+            merged["__refused"].as_u64(),
+            Some(4),
+            "the alias merge alone keeps only the LAST count; if this ever \
+             reads 7, the merge has started summing and the explicit \
+             accumulation below is redundant"
+        );
+        assert_eq!(refused, 7, "the accumulator is what carries the total");
+        if refused > 0 {
+            merged.insert("__refused".into(), refused.into());
+        }
+        assert_eq!(
+            crate::github::client::refused_fields_of(&serde_json::Value::Object(merged)),
+            7,
+            "the merged map must report the TOTAL, which is what the board reads"
+        );
+    }
+
+    /// No refusals means the key is ABSENT, not zero.
+    ///
+    /// `graphql_partial_ok` inserts `__refused` only when there are refusals
+    /// (`client.rs:1204-1213`), and the merge keeps that convention: a written
+    /// 0 would be a second way of saying "none", and two spellings of one fact
+    /// is how a reader ends up checking the wrong one.
+    #[test]
+    fn a_clean_load_writes_no_refusal_key() {
+        let mut merged = serde_json::Map::new();
+        merged.insert(
+            "s0".into(),
+            serde_json::json!({ "issueCount": 1, "nodes": [] }),
+        );
+        let refused = 0usize;
+        if refused > 0 {
+            merged.insert("__refused".into(), refused.into());
+        }
+        assert!(!merged.contains_key("__refused"));
+        assert_eq!(
+            crate::github::client::refused_fields_of(&serde_json::Value::Object(merged)),
+            0,
+            "an absent key reads as zero, which is why it need not be written"
+        );
     }
 
     /// The DEFAULT page is already the reduced one, because 3 node-heavy
