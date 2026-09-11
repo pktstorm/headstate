@@ -120,6 +120,9 @@ pub fn map_detail(v: &Value, repo: &str) -> PrDetail {
     let empty = vec![];
 
     let checks = map_detail_checks(pr);
+    // Bound ahead of the struct literal like `checks`, so the total below
+    // can be defaulted to this length without mapping the threads twice.
+    let review_threads = map_review_threads(pr);
 
     let comments = pr["comments"]["nodes"]
         .as_array()
@@ -173,7 +176,16 @@ pub fn map_detail(v: &Value, repo: &str) -> PrDetail {
         unresolved_threads: unresolved_threads(pr),
         comment_count: pr["comments"]["totalCount"].as_u64().unwrap_or(0),
         comments,
-        review_threads: map_review_threads(pr),
+        // Read BEFORE `review_threads` is moved, and defaulted to the
+        // number of threads that arrived rather than to 0, for the reason
+        // `checks_total` below gives: absent `totalCount` (a payload
+        // cached before #802 added the field, a partial response that
+        // dropped it) must read as "nothing missing", where a 0 against a
+        // non-empty list would render a nonsense "Showing 7 of 0".
+        review_threads_total: pr["reviewThreads"]["totalCount"]
+            .as_u64()
+            .unwrap_or(review_threads.len() as u64),
+        review_threads,
         // Read BEFORE `checks` is moved, and defaulted to the number of
         // checks we actually have rather than to 0: absent `totalCount`
         // (an old cached payload, a partial response that dropped the
@@ -257,6 +269,15 @@ fn in_merge_queue(node: &Value) -> bool {
 /// Both filters matter: a resolved thread needs no action, and an outdated
 /// one hangs off a line that has since changed, so counting either would
 /// nag the author about work already finished.
+///
+/// Counted over the threads that ARRIVED, so on a pull request past the
+/// query's page this is a floor rather than the true number (#802). Left
+/// that way on purpose: the alternative is inferring a count from
+/// `reviewThreads.totalCount`, which counts resolved and outdated threads
+/// too and would therefore OVERSTATE the open ones -- a header nagging
+/// about conversations that are already settled. A floor plus a visible
+/// "showing N of M" on the list beneath it is honest; a guessed total is
+/// not.
 fn unresolved_threads(node: &Value) -> u64 {
     node["reviewThreads"]["nodes"]
         .as_array()
@@ -278,6 +299,41 @@ fn unresolved_threads(node: &Value) -> u64 {
 /// the NUMBER. This maps the threads themselves, resolved and outdated
 /// included: the detail view shows resolved ones collapsed so they remain
 /// findable, and an outdated thread can still hold an unanswered question.
+///
+/// NOT PAGINATED, deliberately -- and this is the one decision in #802
+/// worth justifying, because the issue asks for a cursor loop and the
+/// checks one next door is the obvious precedent.
+///
+/// The query asks for `first: 100`, the connection maximum, and MEASURED
+/// against the live API that is free: the whole detail query still costs
+/// 1 point, the latency is unchanged (557ms at 100 vs 574ms at 20, inside
+/// the noise), and 100 threads x 10 comments is 1,000 nodes against
+/// GitHub's 500,000 node ceiling. So the honest count from `totalCount`
+/// plus the largest free page is the entire fix for every pull request
+/// that exists, and a cursor loop would buy the 101st thread only.
+///
+/// REJECTED: a bounded cursor loop like `append_remaining_checks`. The
+/// reason is the reason #790 CUT that loop's budget from 20 pages to 3 --
+/// serial cursor pages are a latency budget, not a completeness budget.
+/// Every page is another POST on the one strictly-serial chain in the
+/// app, behind a blocked user gesture, inside a 30s command ceiling that
+/// the checks loop is already spending up to 4 POSTs of. Adding more
+/// serial pages to that chain needs to buy something, and here it buys
+/// nothing measurable: sampled live across rust-lang/rust,
+/// kubernetes/kubernetes and facebook/react, the busiest recently-merged
+/// pull requests carry 0-10 review threads, an order of magnitude under
+/// the page. Checks are different in kind and that is why they get a loop
+/// -- a rollup legitimately runs to the hundreds (412 contexts in the
+/// reports behind #790), so for checks the first page genuinely is not
+/// enough.
+///
+/// What makes declining safe is that it is no longer SILENT: above 100
+/// threads `review_threads_total` exceeds what arrived and the view says
+/// so, which is the property the 20-thread window lacked and the actual
+/// defect in #802. A pull request with 150 threads shows 100 and admits
+/// it, rather than showing 20 and looking complete. If such a pull
+/// request is ever actually observed, the loop is a small change on top
+/// of this one and `review_threads_total` is what it would need anyway.
 fn map_review_threads(node: &Value) -> Vec<ReviewThread> {
     let empty = vec![];
     node["reviewThreads"]["nodes"]
@@ -920,6 +976,54 @@ mod tests {
         assert!(!t.viewer_can_reply);
         assert!(!t.viewer_can_resolve);
         assert!(!t.viewer_can_unresolve);
+    }
+
+    /// GitHub's own thread count must reach the view, so a truncated list
+    /// can say what it is missing rather than rendering a subset that
+    /// looks like the whole conversation (#802). The shape this guards is
+    /// the one `append_remaining_checks` documents for checks: 20 of 25
+    /// threads reads as finished, and the missing five can hold the
+    /// unresolved blocking comment.
+    #[test]
+    fn carries_the_real_thread_total_so_truncation_can_be_shown() {
+        let v = json!({"repository": {"pullRequest": {
+            "reviewThreads": {"totalCount": 137, "nodes": [
+                {"id": "a", "isResolved": false, "isOutdated": false,
+                 "comments": {"totalCount": 0, "nodes": []}}
+            ]}
+        }}});
+        let d = map_detail(&v, "o/r");
+        assert_eq!(d.review_threads.len(), 1);
+        assert_eq!(
+            d.review_threads_total, 137,
+            "the view cannot announce a shortfall it was never told about"
+        );
+    }
+
+    /// Absent `totalCount` reads as "nothing missing", not as zero.
+    ///
+    /// A payload cached before #802 added the field, or a partial response
+    /// that dropped it, would otherwise make the section claim
+    /// "Showing 3 of 0" -- a subtraction against a count smaller than the
+    /// list, the same failure `checks_total` and `poll::truncation_payload`
+    /// both take care over.
+    #[test]
+    fn without_a_thread_total_reports_no_shortfall() {
+        let v = json!({"repository": {"pullRequest": {
+            "reviewThreads": {"nodes": [
+                {"id": "a", "isResolved": false, "isOutdated": false,
+                 "comments": {"totalCount": 0, "nodes": []}},
+                {"id": "b", "isResolved": false, "isOutdated": false,
+                 "comments": {"totalCount": 0, "nodes": []}},
+                {"id": "c", "isResolved": false, "isOutdated": false,
+                 "comments": {"totalCount": 0, "nodes": []}}
+            ]}
+        }}});
+        let d = map_detail(&v, "o/r");
+        assert_eq!(
+            d.review_threads_total, 3,
+            "no total must mean complete, never a zero the UI subtracts from"
+        );
     }
 
     /// The header count and the thread list are two renderings of one

@@ -470,7 +470,16 @@ export function PrDetailView({
       {/* ABOVE the comments: a conversation waiting on an answer is
           more urgent than the discussion thread, and the header's
           unresolved count points at this section. */}
-      <ReviewThreads threads={pr.review_threads} repo={pr.repo} number={pr.number} />
+      {/* `total` so a truncated list can say so (#802). Passed down rather
+          than annotated here, because this section's header and its rows
+          both live inside `ReviewThreads` -- the notice belongs next to
+          the rows it qualifies. */}
+      <ReviewThreads
+        threads={pr.review_threads}
+        total={pr.review_threads_total}
+        repo={pr.repo}
+        number={pr.number}
+      />
 
       {pr.comments.length > 0 ? (
         // COLLAPSED past a handful. Fifty comments is the longest block
