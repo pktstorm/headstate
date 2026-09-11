@@ -1,62 +1,63 @@
-//! What Headstate itself is costing, live (#665).
+//! What is using this machine, as the CPU and Memory detail pages ask
+//! it (#687, #721).
 //!
-//! The rest of the System Health view is diagnostic: it says the machine
-//! is busy. This says whether *we* are why. So the question here is
-//! narrower than "what is running" -- it is "which of the running
-//! processes are ours, or are ours by proxy".
+//! The rest of the System Health view says the machine is busy. This
+//! says *what* is making it busy: one bounded top-N of processes by CPU
+//! and another by resident set, plus the same two summed by process
+//! name, plus how many processes were running in total so the view can
+//! say what it is not showing.
 //!
-//! Since #687 this file also carries the machine's own top processes,
-//! for the CPU and Memory detail pages. Those are a SEPARATE pair of
-//! fields, not a widening of the three groups below: "are we why" and
-//! "what is why" are different questions, and one list answering both
-//! would answer neither. See "The machine's own top processes" below.
+//! Everything here is a kernel read of an already-open process table.
+//! No subprocess, no filesystem walk, no `du`. That is what makes it
+//! safe to call as often as a view refreshes -- and it is guarded by a
+//! test, because the cheapness is the property the whole design rests on.
 //!
-//! # Three groups, and why those three
+//! # What this file USED to be, and why that matters to a reader
 //!
-//! 1. **This process.** The Tauri host: the webview, the poller, the
-//!    SQLite writes. Usually the smallest of the three.
-//! 2. **Its children.** `git`, `gh`, and the Docker CLI. This is where
-//!    the cost actually is -- `worktrees::scan` fans out 52 distinct
-//!    `git` call sites and a refresh runs many of them at once, so a
-//!    machine that feels slow *because of Headstate* is nearly always
-//!    slow in this group rather than in group 1.
-//! 3. **The Docker daemon, if running.** Not our process and not our
-//!    child, but Headstate is the reason a user opened the Docker view
-//!    and started it, and a daemon holding 4 GB is a cost the user will
-//!    reasonably attribute to this app. Reported separately from the two
-//!    groups we own so the attribution stays honest.
+//! It was written for #665 as "are *we* why the machine is slow": three
+//! groups -- our own process, the `git`/`gh`/`docker` subprocesses we
+//! spawn, and the Docker daemon -- rendered in a "What Headstate is
+//! costing" panel on the System Health overview.
 //!
-//! # This is the LIVE half only
+//! That panel was removed in #795, and the three fields with it. The
+//! reason is worth recording here because the data was *correct* and
+//! the panel was still wrong: it sampled once a second, while our real
+//! cost is bursty and elsewhere. `worktrees::scan` fans out 52 distinct
+//! `git` call sites and a refresh runs many at once, so a point-in-time
+//! sample almost never catches the burst that made the machine feel
+//! slow. A user reading a calm 2% row concluded Headstate was cheap --
+//! a wrong conclusion drawn confidently, which is worse than no panel.
 //!
-//! The disk half of the same panel -- worktrees, artifacts, virtualenvs,
-//! Docker's own reclaimable space -- comes from `size_worktrees`,
-//! `size_artifacts`, `size_venvs` and `docker_disk_usage`, which already
-//! exist, are already tested, and are already what the Worktrees,
-//! Artifacts and Docker views show. There is deliberately no sizing code
-//! here and no command that combines the two halves: those four are slow
-//! (`size_worktrees` is ~13s on a real 147-worktree machine, the #661
-//! timeout), they belong behind a "Measure" affordance, and folding them
-//! into anything that shares a call site with this would put a 13-second
-//! walk one mistake away from the once-a-minute sampler.
+//! The rejected alternative was keeping the three groups and sampling
+//! harder (a high-frequency poll, or a peak-since-last-read). That buys
+//! accuracy by putting a process-table walk on a tight timer to answer
+//! a developer diagnostic question, on a page whose job is "is the
+//! machine OK". If the question is ever worth asking again it wants
+//! instrumentation inside `worktrees::scan`, where the fan-out is, not
+//! a sampler outside it.
 //!
-//! Everything in this file is a kernel read of an already-open process
-//! table. No subprocess, no filesystem walk, no `du`. That is what makes
-//! it safe on the sampler's cadence.
+//! So the `WATCHED` and `DAEMONS` name lists, the `matches` helper that
+//! folded Windows' `.exe` out of them, and the classification pass that
+//! used all three are gone with the fields. None of them had another
+//! caller: the top-N selection below ranks every process by a number
+//! and never asks what a process IS, which is exactly why it answers a
+//! machine question and the removed half answered ours.
 //!
-//! # The machine's own top processes (#687)
+//! # Two questions, not one asked twice
 //!
-//! The three groups above are Headstate's cost. [`Footprint::top_cpu`]
-//! and [`Footprint::top_memory`] are the OTHER question -- "what is
-//! using this machine" -- which the CPU and Memory detail pages ask and
-//! no panel could previously answer.
+//! [`Footprint::top_cpu`] and [`Footprint::top_memory`] are separate
+//! lists rather than one list re-sorted, because the process pinning a
+//! core is rarely the one holding 8 GB: a caller that re-sorted one by
+//! the other metric would show the top of a set chosen by the wrong
+//! measure -- the eighth-hungriest process missing simply because it was
+//! not also busy. Grouping, below, is the same pair asked of processes
+//! summed by name, and it is two more fields for the same reason.
 //!
-//! That is an addition to this file rather than a new module or a new
-//! command because **the data was already here and being thrown away**.
-//! The refresh below is `ProcessesToUpdate::All`: it walks every process
-//! on the machine and then keeps three of them. So the only thing
-//! missing was returning more of what had already been read.
+//! # Cheap enough for a timer
 //!
-//! Measured before it was written, on a 1436-process machine, warm:
+//! The refresh below is `ProcessesToUpdate::All`: it walks every
+//! process on the machine. Measured before the top-N selection was
+//! written, on a 1436-process machine, warm:
 //!
 //! ```text
 //! run 0: 1435 processes refreshed in 33.5ms   (cold)
@@ -88,52 +89,49 @@
 //!
 //! Why NAME and not process ancestry is argued at [`ProcessGroup`].
 //!
-//! # Absent is not zero
+//! # Absent is not zero, which here means a failed READING
 //!
-//! A tool that is not running is `None`, never a zero. `git` at 0% and
-//! `git` not running at all are opposite facts, and a panel that renders
-//! the second as the first tells the user their fan-out is idle when it
-//! never started -- the same failure `packages::run::missing_tool`
-//! exists to avoid on the other side of the app. Group 2 therefore
-//! reports only the tools it actually found, and an empty list means
-//! "none of them were running at this instant", which is the normal
-//! state between refreshes.
+//! The convention came in with #665's three groups, where it was about a
+//! tool that was not running: `git` at 0% and `git` not running at all
+//! are opposite facts, and rendering the second as the first tells a
+//! user their fan-out is idle when it never started. Those groups are
+//! gone, but the rule is not -- it simply moved to the only shape the
+//! absence can still take here.
+//!
+//! Every process on a top-N list by definition exists, so nothing below
+//! can be missing. What CAN be missing is a MEASUREMENT: `sysinfo`
+//! yields a NaN CPU figure where a platform's accounting failed. That
+//! NaN is never folded in as a zero. In the comparator it sorts to the
+//! bottom rather than panicking or (worse) to the top, which `total_cmp`
+//! would do -- see `ordered`. In a summed group it is left out of the
+//! total and counted in [`ProcessGroup::cpu_unmeasured`], so a sum over
+//! 25 of 26 processes is never presented as a sum over 26. Same failure
+//! `packages::run::missing_tool` exists to avoid on the other side of the
+//! app: a fabricated number is worse than a stated gap.
 
 use serde::{Deserialize, Serialize};
 
-/// The live cost of Headstate at one instant.
+/// What is using this machine at one instant.
+///
+/// The name is historical: this carried Headstate's OWN cost until #795
+/// removed the panel that showed it, and the command, the state type and
+/// the remote-surface row are all still spelled `footprint`. Renaming
+/// them would be a breaking change to the remote surface (the phone's
+/// allowlist names the command as a literal string, in two copies) for a
+/// word, so the name stayed and this sentence explains it instead.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Footprint {
     /// RFC 3339, matching [`super::Sample::sampled_at`] and every other
     /// timestamp this app stores.
     pub sampled_at: String,
-    /// The Tauri host process.
-    ///
-    /// `None` only if the platform will not tell us our own PID, which
-    /// should not happen anywhere this ships -- but a fabricated zero
-    /// for "we could not find ourselves" would read as an idle app.
-    pub app: Option<Process>,
-    /// The tool subprocesses we spawn, one entry per LIVE process.
-    ///
-    /// Empty when none of them are running, which is the ordinary state
-    /// between refreshes -- NOT a row of zeroes. Several entries may
-    /// share a `name`: a worktree scan runs many `git` at once, and
-    /// collapsing them would hide exactly the fan-out this panel exists
-    /// to show.
-    pub children: Vec<Process>,
-    /// The Docker daemon, or `None` when Docker is not running.
-    ///
-    /// `None` here is a real and common answer -- most users do not have
-    /// Docker up -- which is precisely why it must not be a zero.
-    pub docker_daemon: Option<Process>,
     /// The [`TOP_N`] biggest CPU consumers on the WHOLE machine (#687).
     ///
-    /// Not ours, and deliberately so: this is the half that answers
-    /// "what is using my CPU" rather than "are we why". The three
-    /// fields above are Headstate's own cost and stay exactly as they
-    /// were -- this is an addition beside them, not a widening of them,
-    /// because the CPU detail page needs the machine's answer and the
-    /// footprint panel needs ours, and one list cannot be both.
+    /// The machine's processes, not Headstate's: "CPU is at 80%" is a
+    /// symptom and this is the answer. Our own processes are in here on
+    /// the same terms as everything else -- a CPU page that hid
+    /// Headstate from its own top eight would be the one view in the app
+    /// that lies about the app, and if we ARE why a core is pinned that
+    /// is exactly the row the user came to find.
     pub top_cpu: Vec<Process>,
     /// The [`TOP_N`] biggest resident sets on the whole machine.
     ///
@@ -179,18 +177,20 @@ pub struct Footprint {
     pub process_count: usize,
 }
 
-/// One process, as the panel renders it.
+/// One process, as the CPU and Memory detail pages render it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Process {
     pub pid: u32,
     /// The executable's own name, as the OS reports it. On Linux this is
-    /// the kernel's `comm`, capped at 15 characters -- none of the names
-    /// we match are near that, but a caller must not assume it is a full
-    /// path.
+    /// the kernel's `comm`, capped at 15 characters, and on Windows it
+    /// carries the `.exe` -- a caller must not assume it is a full path
+    /// or a stable spelling across platforms. It is also what
+    /// `group_by_name` groups on, which is why the caveat is here and
+    /// not only in the grouping code.
     pub name: String,
     /// CPU use, as a percentage of ONE core. Above 100 on a process
-    /// using more than one core, which `git` legitimately does, so the
-    /// UI must not clamp this to 100 the way it can for
+    /// using more than one core, which a parallel build legitimately
+    /// does, so the UI must not clamp this to 100 the way it can for
     /// [`super::Sample::cpu_percent`].
     ///
     /// Like every CPU figure from `sysinfo`, this is a delta since the
@@ -273,41 +273,6 @@ pub struct ProcessGroup {
     pub cpu_unmeasured: usize,
 }
 
-/// The subprocesses whose cost we attribute to ourselves.
-///
-/// Matched by NAME rather than by walking the process tree from our own
-/// PID. Cheaper -- the tree walk needs every process's parent and a
-/// transitive closure, this needs one string compare -- and it is also
-/// more correct for the question being asked: a `git` that Headstate
-/// started but that has since been reparented (its spawning thread gone,
-/// or a `gh` that forked) is still Headstate's cost, and a parent walk
-/// would lose it.
-///
-/// The trade is that a `git` the user is running in their own terminal
-/// is counted here too. That is the right way to be wrong for a panel
-/// whose job is "is this app why the machine is busy": over-attributing
-/// a process the user can see for themselves is a smaller error than
-/// under-reporting the fan-out we caused.
-///
-/// `du` is on the list because the issue lists it, not because we spawn
-/// it: `worktrees::scan::dir_size` walks in-process precisely to avoid
-/// one subprocess per worktree across 296 of them. If that ever changes
-/// back, this already covers it; until then it is simply never present,
-/// which is a `None` and not a zero.
-///
-/// Written WITHOUT the executable suffix; [`matches`] adds it. See there
-/// for why that is not cosmetic.
-const WATCHED: &[&str] = &["git", "gh", "du", "docker"];
-
-/// Process names for the Docker daemon.
-///
-/// Docker Desktop (macOS and Windows) runs the engine behind
-/// `com.docker.backend`; a native Linux install runs `dockerd`. The
-/// user-facing Electron app ("Docker Desktop") is deliberately NOT here:
-/// it is a GUI the user chose to open, not the daemon whose memory
-/// Headstate's `docker` calls are keeping resident.
-const DAEMONS: &[&str] = &["com.docker.backend", "dockerd"];
-
 /// How many machine-wide processes each detail page names.
 ///
 /// Eight, and the number is a judgement about the QUESTION rather than
@@ -334,31 +299,6 @@ const DAEMONS: &[&str] = &["com.docker.backend", "dockerd"];
 /// what is NOT shown (the count of the rest, in the UI) costs nothing
 /// and cannot be got wrong.
 pub const TOP_N: usize = 8;
-
-/// Whether an OS-reported process name is one of `list`.
-///
-/// Exists because a plain equality check is silently wrong on Windows,
-/// which is one of the three platforms this ships to. `sysinfo` reports
-/// the name the OS gives it, and on Windows that carries the extension:
-/// the process is `git.exe`, not `git`. An exact match against `"git"`
-/// would therefore find nothing on Windows and report an empty
-/// `children` -- an absence that looks exactly like "no tools running"
-/// and would never be investigated, because an empty list is this
-/// panel's normal state between refreshes.
-///
-/// So the suffix is stripped rather than baked into the lists, using
-/// `EXE_SUFFIX` for the same reason `docker::cli` does: it is empty on
-/// Unix, so the comparison is unchanged there.
-///
-/// Case-insensitive on the stem as well, because Windows paths are, and
-/// a `GIT.EXE` is the same cost as a `git.exe`.
-fn matches(name: &str, list: &[&str]) -> bool {
-    let stem = name
-        .strip_suffix(std::env::consts::EXE_SUFFIX)
-        .filter(|_| !std::env::consts::EXE_SUFFIX.is_empty())
-        .unwrap_or(name);
-    list.iter().any(|w| stem.eq_ignore_ascii_case(w))
-}
 
 /// The live reader for [`Footprint`].
 ///
@@ -392,25 +332,30 @@ impl Footprints {
     /// Blocking -- it reads the kernel's process table -- so callers put
     /// it on a blocking worker like every other read in `commands.rs`.
     ///
-    /// Cheap enough for the once-a-minute sampler: the refresh asks for
-    /// CPU and memory only, and explicitly not for tasks (threads),
-    /// command lines, environments or user IDs. On Linux `with_tasks` in
-    /// particular means a `readdir` of `/proc/<pid>/task` for every
-    /// process on the machine, which is the one part of a process
-    /// refresh that is genuinely expensive.
+    /// Cheap enough for the five-second poll the detail pages run it on:
+    /// the refresh asks for CPU and memory only, and explicitly not for
+    /// tasks (threads), command lines, environments or user IDs. On
+    /// Linux `with_tasks` in particular means a `readdir` of
+    /// `/proc/<pid>/task` for every process on the machine, which is the
+    /// one part of a process refresh that is genuinely expensive.
+    ///
+    /// Nothing below walks a filesystem or spawns anything, and
+    /// `a_sample_is_cheap_enough_for_a_timer` is the guard that keeps it
+    /// that way.
     pub fn sample(&self, now: &str) -> Footprint {
         let mut sys = self.system.lock().unwrap_or_else(|e| e.into_inner());
 
-        // ProcessesToUpdate::All rather than a PID list: we cannot know
-        // which PIDs the `git` fan-out is using without first listing
-        // them, so a targeted refresh would need this same pass anyway.
+        // ProcessesToUpdate::All, which is not a choice so much as the
+        // question: the answer is "the biggest of everything running",
+        // so there is no PID list to narrow to.
         //
-        // `remove_dead_processes: true` matters more than it looks. The
-        // subprocesses here are short-lived by design, so without it the
-        // map would accumulate every `git` the app has ever run and this
-        // would report hundreds of dead processes at 0% -- zeroes that
-        // read as "running and idle", which is the exact failure the
-        // module docs are about.
+        // `remove_dead_processes: true` matters more than it looks. A
+        // `sysinfo` map that is never pruned accumulates every process
+        // the machine has ever run and reports them at 0% -- and a dead
+        // process at 0% is indistinguishable from a live idle one, so
+        // `process_count` would climb forever and the "the other N are
+        // not listed" sentence in the UI would become a lie about a
+        // machine that had not changed.
         sys.refresh_processes_specifics(
             sysinfo::ProcessesToUpdate::All,
             true,
@@ -419,74 +364,31 @@ impl Footprints {
                 .with_memory(),
         );
 
-        // `Err` means the platform would not tell us our own PID. Absent
-        // rather than defaulted: reporting some other process as "us"
-        // would be worse than reporting nothing.
-        let own = sysinfo::get_current_pid().ok();
-
-        let mut app = None;
-        let mut children = Vec::new();
-        let mut docker_daemon = None;
-        // Every process, for the top-N selection below. Built in the
-        // same pass that classifies ours rather than a second traversal
-        // of the map: the classification already visits all of them.
+        // Every process, for the top-N selections below. One traversal
+        // of the map: the selections are partial passes over this Vec
+        // and never touch `sys` again, which is also what lets the lock
+        // be dropped before any of the sorting work.
         let mut all: Vec<Process> = Vec::with_capacity(sys.processes().len());
 
         for (pid, proc) in sys.processes() {
-            let name = proc.name().to_string_lossy();
-            let out = || Process {
+            // Our OWN processes are in here on the same terms as
+            // everything else, deliberately -- see `Footprint::top_cpu`.
+            // Nothing is classified, matched by name or excluded: that
+            // was the removed half of this module (#795), and its
+            // absence is why this loop is four lines.
+            all.push(Process {
                 pid: pid.as_u32(),
-                name: name.to_string(),
+                name: proc.name().to_string_lossy().to_string(),
                 cpu_percent: f64::from(proc.cpu_usage()),
                 memory: proc.memory(),
-            };
-
-            // Every process is a candidate for the machine-wide lists,
-            // including our own and the ones classified below. A CPU
-            // page that hid Headstate from its own top-eight would be
-            // the one view in the app that lies about the app -- and if
-            // we ARE the reason a core is pinned, that is exactly the
-            // row the user came to find.
-            all.push(out());
-
-            if Some(*pid) == own {
-                app = Some(out());
-            } else if matches(&name, WATCHED) {
-                children.push(out());
-            } else if matches(&name, DAEMONS) {
-                // The LARGEST match wins, not the first. Docker Desktop
-                // runs several `com.docker.backend` processes (three on
-                // the machine this was written on) and they are not
-                // equal shares of one daemon -- one holds the engine and
-                // the rest are small. Taking whichever the process map
-                // happened to yield first would report a number that
-                // changed between samples for no reason the user did.
-                //
-                // A single figure rather than a sum, because the sum is
-                // the wrong answer to a different question: the panel
-                // asks "what is the daemon costing", and adding three
-                // helpers to the engine inflates it.
-                let candidate = out();
-                if docker_daemon
-                    .as_ref()
-                    .is_none_or(|d: &Process| d.memory < candidate.memory)
-                {
-                    docker_daemon = Some(candidate);
-                }
-            }
+            });
         }
         drop(sys);
 
-        // Biggest first: the panel's job is to name the expensive one,
-        // and on a busy refresh this list can be dozens of `git` long.
-        // Ties broken by PID so the order is stable between samples
-        // rather than shuffling with the process map's hash order.
-        children.sort_by(|a, b| b.memory.cmp(&a.memory).then_with(|| a.pid.cmp(&b.pid)));
-
-        // Sorted here rather than in the UI, for the same reason
-        // `children` is: the order is what makes the list an answer, and
-        // a client that sorted its own copy could disagree with the
-        // count of what was left out -- which only this side knows.
+        // Sorted here rather than in the UI, because the order is what
+        // makes the list an answer, and a client that sorted its own
+        // copy could disagree with the count of what was left out --
+        // which only this side knows.
         //
         // `select_nth_unstable_by` rather than a full sort: the answer
         // is eight rows out of 1436, so ordering the other 1428 relative
@@ -518,9 +420,6 @@ impl Footprints {
 
         Footprint {
             sampled_at: now.to_string(),
-            app,
-            children,
-            docker_daemon,
             top_cpu,
             top_memory,
             top_cpu_grouped,
@@ -680,75 +579,80 @@ fn top_groups<K: Ord>(
 mod tests {
     use super::*;
 
-    /// A real reading from the machine running the tests.
+    /// A real reading from the machine running the tests, and it does
+    /// NOT exclude us.
     ///
-    /// Asserting SHAPE, not values, for the same reason
-    /// `collect::tests` does: what `git` is doing on a CI runner is
-    /// whatever it is. What must hold anywhere is that a running process
-    /// finds itself and has real memory behind it.
+    /// This was `a_footprint_finds_the_process_it_ran_in`, asserting the
+    /// removed `app` field (#795). The reworked property is the one the
+    /// machine-wide lists actually promise: our own process is a
+    /// candidate on the same terms as everything else. The rejected
+    /// alternative is an `all`-level filter that hides Headstate from the
+    /// CPU page -- which would make this the one view in the app that
+    /// lies about the app, and hide exactly the row a user came to find
+    /// when we ARE why a core is pinned.
+    ///
+    /// Asserting SHAPE, not values, for the same reason `collect::tests`
+    /// does: what is hottest on a CI runner is whatever it is. Asserted
+    /// through `process_count` rather than by finding our PID in
+    /// `top_cpu`, because an idle test binary is legitimately not in the
+    /// top eight of a busy machine -- a PID search would be flaky for
+    /// the wrong reason.
+    ///
+    /// Two claims, and no more than two: the traversal saw more than
+    /// itself, and every figure it reported is a usable number. Anything
+    /// stronger about the CONTENT of a machine-wide list is a statement
+    /// about the machine rather than about this code -- see the note on
+    /// PID 0 below, which is what a third claim cost.
     #[test]
-    fn a_footprint_finds_the_process_it_ran_in() {
+    fn a_sample_counts_every_process_including_our_own() {
         let f = Footprints::new();
         let fp = f.sample("2026-01-01T00:00:00Z");
 
         assert_eq!(fp.sampled_at, "2026-01-01T00:00:00Z");
-        let app = fp
-            .app
-            .expect("the test binary is a process and can see itself");
-        assert!(app.memory > 0, "a running process has a resident set");
-        assert!(app.cpu_percent >= 0.0, "cpu {}", app.cpu_percent);
-        assert_eq!(
-            app.pid,
-            std::process::id(),
-            "the app entry must be THIS process, not some other one"
-        );
-    }
-
-    /// Absent is not zero.
-    ///
-    /// The whole point of #665's convention: a tool that is not running
-    /// must be missing from `children`, never present at 0%. Checked
-    /// with a name nothing can be running under, because asserting the
-    /// same thing about `git` would be flaky -- a real `git` may well be
-    /// running while the suite does.
-    #[test]
-    fn a_process_that_is_not_running_is_absent_rather_than_zero() {
-        let f = Footprints::new();
-        let fp = f.sample("2026-01-01T00:00:00Z");
-
+        // At least this process and the one that spawned it. A count of
+        // one would mean the traversal found only itself, which no
+        // machine running a test harness can be.
         assert!(
-            !fp.children
-                .iter()
-                .any(|c| c.name == "headstate-not-a-real-tool"),
-            "a tool nobody is running must not appear at all"
+            fp.process_count > 1,
+            "counted {} processes on a machine running a test suite",
+            fp.process_count
         );
-        // And nothing we DID report is a placeholder: every child is a
-        // process that exists, so it has a PID and a resident set.
-        for c in &fp.children {
-            assert!(c.pid > 0, "{} has no pid", c.name);
+        // Every reported CPU figure is a usable number rather than a
+        // fabricated one. This is the "absent is not zero" rule in the
+        // only shape it can still take here: a NaN from a platform whose
+        // accounting failed must not reach a caller that will format it.
+        //
+        // Deliberately NOT asserting `pid > 0`, and the reason is a fact
+        // about Windows worth recording here: PID 0 is a REAL process
+        // there. The kernel idle/system container is reported as
+        // `Process { pid: 0, name: "[System Process]", .. }`, where macOS
+        // and Linux never report a PID below 1.
+        //
+        // The assertion held of the removed `children` field, which
+        // contained only processes matched against a name list, so PID 0
+        // could never enter it. These lists are drawn from EVERY process
+        // on the machine -- that widening is the whole point of the
+        // reworked test -- so "no row has pid 0" stopped being a property
+        // of this data and became a claim about PID numbering on one
+        // platform.
+        //
+        // Not filtered out of `sample` either: that would invent a policy
+        // to satisfy a test, and the row is genuinely in a Windows user's
+        // process table. It sorts harmlessly -- it reports 0.0% and zero
+        // bytes, so it only reaches a top-N list on a machine with fewer
+        // than TOP_N processes doing anything at all.
+        //
+        // Observed on `platform (windows-latest)` and reproducible on no
+        // other runner, which is exactly why it is written down rather
+        // than left for the next person to rediscover.
+        for p in fp.top_cpu.iter().chain(&fp.top_memory) {
             assert!(
-                matches(&c.name, WATCHED),
-                "{} is not a tool we spawn",
-                c.name
+                p.cpu_percent.is_finite(),
+                "cpu {} for {:?} (pid {})",
+                p.cpu_percent,
+                p.name,
+                p.pid
             );
-        }
-    }
-
-    /// Docker's daemon is `None` when it is not running, and a real
-    /// process when it is. Both are valid on a developer machine, so the
-    /// assertion is on the shape of whichever answer came back.
-    #[test]
-    fn the_docker_daemon_is_absent_or_real_but_never_a_zero() {
-        let f = Footprints::new();
-        let fp = f.sample("2026-01-01T00:00:00Z");
-
-        if let Some(d) = fp.docker_daemon {
-            assert!(
-                matches(&d.name, DAEMONS),
-                "reported {} as the daemon",
-                d.name
-            );
-            assert!(d.memory > 0, "a running daemon has a resident set");
         }
     }
 
@@ -757,9 +661,20 @@ mod tests {
     /// Same delta problem as `collect::Collector`, and the same reason
     /// [`Footprints`] holds its `System`: a fresh one per call has no
     /// interval to measure and would report every process idle forever.
+    ///
+    /// Asserted on `top_cpu` rather than on the removed `app` field
+    /// (#795). Not "greater than zero" as a hard floor either way: a
+    /// scheduler can give a busy loop no measurable slice on a loaded
+    /// runner, and an assertion on the VALUE would be flaky for a reason
+    /// that has nothing to do with the reader being reused. What the
+    /// reuse actually buys is a figure that is real rather than
+    /// structurally absent, so that is what is checked.
     #[test]
     fn the_reader_is_reused_so_cpu_is_a_real_delta() {
         let f = Footprints::new();
+        // Discarded: it exists only to give the second read an interval
+        // to measure. A fresh `System` per call has no previous refresh
+        // to difference against and reports every process at 0% forever.
         let _first = f.sample("2026-01-01T00:00:00Z");
         std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
         // Burn a little CPU so there is something for the second read to
@@ -772,72 +687,26 @@ mod tests {
         assert!(spin > 0);
 
         let second = f.sample("2026-01-01T00:01:00Z");
-        let app = second.app.expect("still running");
-        // Not "greater than zero" as a hard floor on the value: a
-        // scheduler can give a busy loop no measurable slice on a loaded
-        // runner. What matters is that the field is populated and sane.
         assert!(
-            app.cpu_percent >= 0.0 && app.cpu_percent.is_finite(),
-            "cpu {}",
-            app.cpu_percent
+            !second.top_cpu.is_empty(),
+            "a machine running this test has processes"
         );
-    }
-
-    /// Children come back biggest-first, so the panel can name the
-    /// expensive one without sorting client-side -- and the order is
-    /// stable rather than following the process map's hash order.
-    #[test]
-    fn children_are_ordered_by_cost() {
-        let f = Footprints::new();
-        let fp = f.sample("2026-01-01T00:00:00Z");
-        for pair in fp.children.windows(2) {
+        for p in &second.top_cpu {
             assert!(
-                pair[0].memory > pair[1].memory
-                    || (pair[0].memory == pair[1].memory && pair[0].pid < pair[1].pid),
-                "{:?} before {:?}",
-                pair[0],
-                pair[1]
+                p.cpu_percent >= 0.0 && p.cpu_percent.is_finite(),
+                "cpu {} for {}",
+                p.cpu_percent,
+                p.name
             );
         }
-    }
-
-    /// The name match must survive Windows' `.exe`.
-    ///
-    /// The failure this guards is silent, which is why it is worth a
-    /// test of its own: an exact match against `"git"` finds nothing on
-    /// Windows, where the process is `git.exe`, and the result is an
-    /// empty `children` -- indistinguishable from the ordinary "no tools
-    /// running right now", so nobody would ever look.
-    ///
-    /// Written to run on every platform rather than only Windows: the
-    /// suffixed spellings are asserted only where the suffix exists,
-    /// but the unsuffixed ones and the non-matches must hold everywhere.
-    #[test]
-    fn the_name_match_survives_the_platform_executable_suffix() {
-        assert!(matches("git", WATCHED));
-        assert!(matches("gh", WATCHED));
-        assert!(matches("dockerd", DAEMONS));
-
-        // Near misses are misses. `github-desktop` is not our `gh`, and
-        // partial matching here would attribute a whole other app's
-        // memory to Headstate.
-        assert!(!matches("github-desktop", WATCHED));
-        assert!(!matches("digit", WATCHED));
-        assert!(!matches("", WATCHED));
-        assert!(!matches("git", DAEMONS));
-
-        if !std::env::consts::EXE_SUFFIX.is_empty() {
-            let exe = |n: &str| format!("{n}{}", std::env::consts::EXE_SUFFIX);
-            assert!(matches(&exe("git"), WATCHED));
-            assert!(matches(&exe("docker"), WATCHED));
-            assert!(matches(&exe("GIT"), WATCHED), "windows paths fold case");
-            assert!(matches(&exe("dockerd"), DAEMONS));
-            assert!(!matches(&exe("github-desktop"), WATCHED));
-        } else {
-            // On Unix the suffix is empty, so a literal ".exe" is just
-            // part of the name and must NOT be stripped into a match.
-            assert!(!matches("git.exe", WATCHED));
-        }
+        // Deliberately NOT asserting that some process was busy. That
+        // would be the direct statement of what reuse buys, and it is
+        // also flaky in exactly the situation CI runs in: on a quiet
+        // runner every process can legitimately read 0.0% across a
+        // tenth-of-a-second interval, so the test would fail for a
+        // reason unrelated to the reader. The structural claim -- a
+        // populated, finite figure on every row of a second read -- is
+        // what is checked instead.
     }
 
     /// The machine-wide lists are bounded, ordered, and honest about
