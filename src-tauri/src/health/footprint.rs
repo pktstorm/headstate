@@ -103,7 +103,7 @@
 //! yields a NaN CPU figure where a platform's accounting failed. That
 //! NaN is never folded in as a zero. In the comparator it sorts to the
 //! bottom rather than panicking or (worse) to the top, which `total_cmp`
-//! would do -- see [`ordered`]. In a summed group it is left out of the
+//! would do -- see `ordered`. In a summed group it is left out of the
 //! total and counted in [`ProcessGroup::cpu_unmeasured`], so a sum over
 //! 25 of 26 processes is never presented as a sum over 26. Same failure
 //! `packages::run::missing_tool` exists to avoid on the other side of the
@@ -185,7 +185,7 @@ pub struct Process {
     /// the kernel's `comm`, capped at 15 characters, and on Windows it
     /// carries the `.exe` -- a caller must not assume it is a full path
     /// or a stable spelling across platforms. It is also what
-    /// [`group_by_name`] groups on, which is why the caveat is here and
+    /// `group_by_name` groups on, which is why the caveat is here and
     /// not only in the grouping code.
     pub name: String,
     /// CPU use, as a percentage of ONE core. Above 100 on a process
