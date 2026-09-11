@@ -60,6 +60,39 @@ export function lockAge(lock: Lock): string | null {
 /// The merge state comes last because it is about the worktree rather
 /// than about the lock -- and it is why the sentence is worth reading
 /// before unlocking at all.
+///
+/// DELIBERATELY STILL LONG, and #818 asked whether it had to be.
+///
+/// That issue's row -- "locked today by claude agent agent-a0cc… (pid
+/// 14779 start Fri Sep 11 09:43:48 2026) — merged, would be safe once
+/// unlocked" -- broke the desktop layout, and it proposed keeping the
+/// pid and start time for a tooltip so the row could read "locked today
+/// by a claude agent". Tempting, and not done, for two reasons that are
+/// about correctness rather than effort:
+///
+/// - The parenthesis is INSIDE `lock.reason`, which is git's free text
+///   written by whoever took the lock (`git worktree lock --reason`).
+///   Shortening it means pattern-matching a format this app does not
+///   own and did not define. Our own agents happen to write
+///   `(pid N start …)` today; a lock taken by a human, another tool, or
+///   a future version of ours does not, and a regex that misfires would
+///   either leave the string untouched (no fix) or eat a clause that
+///   mattered (worse than the bug). The comments below and on
+///   `Lock::reason` in the Rust model both turn on not rewriting the
+///   locker's words; a trim is a rewrite with a friendlier name.
+/// - The pid and start time are the EVIDENCE for the clause appended
+///   right after them. "Holder process is gone" is a claim about a
+///   specific process, and `holder_running` is computed by checking
+///   exactly that pid against exactly that start time. Hiding the
+///   identifiers behind a hover would leave the row asserting a
+///   conclusion while its grounds needed a mouse.
+///
+/// So #818 is fixed in the LAYOUT instead -- the cell truncates and
+/// carries the full sentence in its `title` -- which also fixes every
+/// other unbounded verdict rather than just this one phrasing. The
+/// length here is a real cost, paid knowingly: a row shows as much of
+/// the sentence as it has room for, and the decisive part leads because
+/// of the ordering argued above, so what gets clipped is the tail.
 export function lockReason(lock: Lock): string {
   const age = lockAge(lock);
   let s = age === null ? "locked" : `locked ${age}`;
