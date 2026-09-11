@@ -8,9 +8,10 @@ import { IS_MOBILE_BUILD } from "../lib/target";
 ///
 /// Exported because `SettingsDialog` offers these as hide/show
 /// checkboxes and previously kept its OWN hand-written list. That list
-/// carried four of the nine, so five views could not be hidden at all
-/// and nothing said so -- the section simply looked complete (#675).
-/// One array, one order, one set of labels.
+/// carried four of the nine views there were then, so five could not be
+/// hidden at all and nothing said so -- the section simply looked
+/// complete (#675). One array, one order, one set of labels, which is why
+/// #794's tenth view needed no edit there.
 export const VIEWS: { id: View; label: string; Icon: typeof GitPullRequest }[] = [
   { id: "my-prs", label: "My pull requests", Icon: GitPullRequest },
   { id: "to-review", label: "To review", Icon: Eye },
@@ -88,7 +89,19 @@ export const ALWAYS_OFFERED: ReadonlySet<View> = new Set<View>(["my-prs"]);
 /// empty frame. Worth revisiting if PR Stats is ever scoped per repo, at
 /// which point these rows stop being decoration.
 export function ViewSwitcher({ counts }: { counts?: Partial<Record<View, number>> }) {
-  const { view, setView } = useFilters();
+  const { view: storedView, setView } = useFilters();
+  // The SAME fallback `App.tsx` applies, and it has to be the same or the
+  // collapsed control names a page that is not on screen: the companion
+  // renders My PRs for a stored `pr-stats` (the view is declined, not
+  // rewritten, so the desktop sharing the store keeps it), and a button
+  // reading "PR Stats" above the PR list is worse than either.
+  //
+  // Derived here rather than passed in as a prop: five sidebars render
+  // this component, and a prop would be five call sites that have to
+  // remember. One rule, read from the store, in both places that route on
+  // it.
+  const view =
+    IS_MOBILE_BUILD && MOBILE_HIDDEN_VIEWS.has(storedView) ? "my-prs" : storedView;
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const current = VIEWS.find((v) => v.id === view) ?? VIEWS[0];

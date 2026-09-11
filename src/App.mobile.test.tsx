@@ -281,6 +281,22 @@ describe("Stats on the companion build", () => {
     expect(useFilters.getState().view).toBe("pr-stats");
   });
 
+  /// The consequence of declining rather than correcting: two components
+  /// route on `view`, and both must apply the same fallback. `App` renders
+  /// the PR list; if `ViewSwitcher` read the raw stored value its collapsed
+  /// button would say "PR Stats" above that list, naming a page not on
+  /// screen.
+  it("names the page it is actually showing in the switcher", async () => {
+    useFilters.setState({ view: "pr-stats" } as never);
+    stubViewport(390);
+    await renderMobileApp();
+    fireEvent.click(screen.getByRole("button", { name: /open navigation/i }));
+    await waitFor(() => expect(screen.getByRole("navigation")).toBeTruthy());
+    const nav = within(screen.getByRole("navigation"));
+    expect(nav.getByRole("button", { name: /my pull requests/i })).toBeTruthy();
+    expect(nav.queryByText("PR Stats")).toBeNull();
+  });
+
   it("keeps PR Stats on a narrow DESKTOP window", async () => {
     // The case the viewport guard got wrong (#598): a desktop dragged
     // under 768px still has every page a desktop has.
