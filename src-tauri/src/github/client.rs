@@ -885,10 +885,53 @@ impl GitHubClient {
     /// the login never changes for a session, so the UI asks once and
     /// caches it forever, and threading a rarely-changing string through
     /// every poll and the SQLite snapshot would cost more than it saves.
+    ///
+    /// Costs ONE rate-limit point and now SAYS SO: the document is
+    /// `query::VIEWER_QUERY`, which selects `rateLimit`. Its doc carries the
+    /// measurement and why the field is free (#844). Callers outside the
+    /// stats layer -- `get_viewer`, the remote gate, startup -- have no
+    /// accumulator to report into and use this; everything in a stats load
+    /// uses [`Self::fetch_viewer_metered`] instead.
     pub async fn fetch_viewer(&self) -> Result<String, ClientError> {
         let v = self
-            .graphql_partial_ok(&json!({ "query": "query { viewer { login } }" }))
+            .graphql_partial_ok(&json!({ "query": crate::github::query::VIEWER_QUERY }))
             .await?;
+        // Fed to the stats GATE even from the unmetered callers: this is a
+        // real reading of the hour's remaining budget, and startup is exactly
+        // when the gate has nothing else to go on (#843).
+        if let Some((remaining, _)) = map_rate_limit(&v) {
+            crate::github::stats::budget::note_remaining(remaining);
+        }
+        map_viewer(&v).ok_or_else(|| ClientError::Graphql("no viewer login in response".into()))
+    }
+
+    /// [`Self::fetch_viewer`], reported into a load's accumulator.
+    ///
+    /// # Why a second method rather than an `Option<&Budget>` parameter
+    ///
+    /// The defect this fixes (#844) is that a request was unmetered, and
+    /// `Option<&Budget>` makes "unmetered" the thing a caller gets by passing
+    /// `None` -- an easier path than the correct one, at the exact call sites
+    /// that got it wrong. Two named methods make the choice visible in the
+    /// call and greppable afterwards: a stats command calling plain
+    /// `fetch_viewer` is a defect you can find.
+    ///
+    /// The three non-stats callers genuinely have no accumulator -- `get_viewer`
+    /// answers the UI, the remote gate authenticates, startup probes the token
+    /// -- so there is nothing for them to report into, and inventing a
+    /// throwaway `Budget` to discard would be accounting theatre. They still
+    /// feed the process-wide figure, which is the part that matters outside a
+    /// load.
+    pub async fn fetch_viewer_metered(
+        &self,
+        budget: &crate::github::stats::Budget,
+    ) -> Result<String, ClientError> {
+        let v = self
+            .graphql_partial_ok(&json!({ "query": crate::github::query::VIEWER_QUERY }))
+            .await?;
+        // Recorded BEFORE the login is extracted, so a response that answered
+        // but carried no login still counts the point it spent.
+        budget.record(&v);
         map_viewer(&v).ok_or_else(|| ClientError::Graphql("no viewer login in response".into()))
     }
 

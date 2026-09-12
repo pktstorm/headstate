@@ -2294,17 +2294,35 @@ pub async fn stats_count(
 
     let q = StatsQuery::new(Some(subject), scope, measure);
 
+    // Constructed BEFORE the viewer lookup, which is a change of order and
+    // the point of it (#844): that lookup spends a rate-limit point, and
+    // constructing the accumulator afterwards meant the point was spent
+    // outside anything that could count it -- so `Spend.points` understated
+    // by one per call while `is_exact()` returned true.
+    let budget = Budget::new();
     // The cache key needs `@me` RESOLVED, because two accounts on one
     // machine share this database and a row keyed on the literal would be
-    // served to whichever asked second. `fetch_viewer` is one cheap
+    // served to whichever asked second. `fetch_viewer_metered` is one cheap
     // request and its result never changes for a session.
-    let viewer = client.fetch_viewer().await.map_err(|e| e.to_string())?;
+    let viewer = client
+        .fetch_viewer_metered(&budget)
+        .await
+        .map_err(|e| e.to_string())?;
     let key = q.cache_key(&viewer);
 
     let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
     if let Ok(Some(hit)) = crate::store::stats::get(&conn, &key, &window.from, &window.to, now) {
-        if let Ok(cached) = serde_json::from_str::<crate::github::stats::Outcome>(&hit.payload) {
+        if let Ok(mut cached) = serde_json::from_str::<crate::github::stats::Outcome>(&hit.payload)
+        {
             crate::diag!("[diag] cmd stats_count cache hit total={}", hit.total);
+            // A cache HIT still cost the viewer lookup, so it reports that
+            // rather than the spend of the load that originally filled the
+            // row. Stating a stale figure would be worse than either: a user
+            // reading "9 points" on a request that spent 1 cannot tell
+            // caching is working, and the number is not about this call at
+            // all. Overwritten rather than added to, because the cached
+            // value's requests happened in a different hour.
+            cached.spend = budget.snapshot();
             return Ok(cached);
         }
         // A payload that will not parse is a shape change across an
@@ -2314,12 +2332,15 @@ pub async fn stats_count(
         log::warn!("discarding an unreadable stats cache row");
     }
 
-    let budget = Budget::new();
     // REFUSE before spending, so a load cannot be the thing that starves
     // the poll loop. The projection is the probe rounds plus one request
     // per chunk of slices, all at the measured 1 point each -- small, but
     // the point of the check is the one case where `remaining` is already
     // near the floor because something else spent it.
+    //
+    // The viewer lookup above has ALREADY landed by now, so `budget` carries
+    // a real `remaining` here and `permits` is gating on this session's own
+    // most recent reading rather than on the process-wide one alone (#843).
     let projected = u64::try_from(days).unwrap_or(u64::MAX) / 5 + 8;
     if !budget.permits(projected) {
         return Err(format!(
@@ -2629,15 +2650,22 @@ pub async fn stats_board(
     let now = chrono::Utc::now();
     let req = parse_scope_request(&scope_kind, scope_value, days, now)?;
 
+    // Constructed BEFORE the viewer lookup, which spends a point that used to
+    // land outside any accumulator (#844) -- `board_projection` already
+    // budgeted for it (`// +1 for fetch_viewer.`), so the projection knew
+    // about a request the accounting did not.
+    let budget = Budget::new();
     // Resolved so the UI can split the board into Mine and Others. One
     // cheap request whose answer never changes for a session, and the same
     // call `stats_count` makes for its cache key -- the viewer's login is
     // genuinely needed here rather than avoidable, because `@me` is a
     // qualifier GitHub resolves and not a login the UI can compare a row
     // against.
-    let viewer = client.fetch_viewer().await.map_err(|e| e.to_string())?;
+    let viewer = client
+        .fetch_viewer_metered(&budget)
+        .await
+        .map_err(|e| e.to_string())?;
 
-    let budget = Budget::new();
     let projected = board_projection(clamp_days(days));
     if !budget.permits(projected) {
         return Err(format!(

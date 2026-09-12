@@ -66,7 +66,91 @@ use serde_json::json;
 /// applied and has to be reasoned about, where a refused read is just a
 /// read to do again. The asymmetry is the justification for the two
 /// numbers differing rather than being unified.
+///
+/// # It is enforced PER PROCESS, not per call (#844)
+///
+/// The waves below enforce it correctly WITHIN one command: each drains its
+/// `JoinSet` before the next, so at most six are in flight per call. But six
+/// per call is not six, because a Stats page render fires FIVE independent
+/// commands with no gating between them (`StatsPage.tsx:126-151`:
+/// `useScopedCounts` is 2x `stats_count`, plus `useStatsSeries`,
+/// `useStatsBoard`, `useStatsReviewers`). 5 x 6 is ~30 concurrent POSTs.
+///
+/// That exceeds this module's own safety argument. The evidence above is
+/// "`fetch_history_values` has shipped at 18 without a reported
+/// secondary-limit failure, so the real threshold is above 18" -- which
+/// covers 18, and says nothing about 30. And the penalty it names is severe:
+/// octocrab is `min_wait_seconds: 60` against a `LOAD_TIMEOUT` of 60s, so one
+/// secondary limit becomes a TIMEOUT rather than a retry.
+///
+/// So the cap is a process-wide [`READ_PERMITS`] acquired per request, which
+/// is what makes the number above true of the app rather than of one command.
 pub const READ_CONCURRENCY: usize = 6;
+
+/// The process-wide permits that make [`READ_CONCURRENCY`] real.
+///
+/// # Why a static semaphore and not a parameter
+///
+/// The cap has to hold across COMMANDS, and commands have no shared object to
+/// hang it on: each `#[tauri::command]` is entered independently with a
+/// cloned client. A permit threaded in as an argument would be a permit a new
+/// call site could decline to take -- and "the cap is a local variable" is
+/// precisely the defect (#844). A static cannot be forgotten.
+///
+/// Acquired INSIDE each spawned task rather than around a wave, so a wave
+/// that is wider than the cap simply queues rather than deadlocking, and so
+/// the permit is held for exactly the duration of the POST. `tokio`'s
+/// semaphore is fair (FIFO), so one command cannot starve another
+/// indefinitely: five commands contending for six permits interleave instead
+/// of the first to arrive holding them until it finishes.
+///
+/// # Why this does not make the page slower than it was
+///
+/// It changes the page from ~30 concurrent requests to 6, which sounds like
+/// a 5x serialisation and is not: the five commands were never independent in
+/// wall-clock terms, because they contend for one connection pool and for
+/// GitHub's own serial evaluation of search aliases. `client.rs:564`'s
+/// diagnostic comment records the same effect for two concurrent searches
+/// ("a total far above the slower of the two means they are NOT actually
+/// overlapping"), and #844 measured the poll loop's two searches at 3.5s
+/// sequential against 5.6s concurrent -- GitHub contends on simultaneous
+/// node-heavy queries. Bounded concurrency is what the latency figures in
+/// this module were measured under in the first place.
+///
+/// `const_new` so there is no lazy initialisation and no `OnceLock` to reason
+/// about: the permits exist for the life of the process.
+static READ_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(READ_CONCURRENCY);
+
+/// Run one stats read, holding a process-wide permit for its duration.
+///
+/// Every POST this module issues goes through here, which is what makes
+/// [`READ_CONCURRENCY`] a property of the app rather than of one command.
+///
+/// The permit is released when the future completes, including on error: it
+/// is held in a local that drops at the end of this function. `acquire` fails
+/// only if the semaphore has been CLOSED, which nothing closes -- mapped to an
+/// error rather than unwrapped, because a panic inside a Tauri command aborts
+/// the whole app (`board.rs`'s `total_cmp` comment makes the same call).
+/// `pub(super)` so `tree.rs`'s two reads go through it too. Every stats POST
+/// in the module has to, or the cap is a property of this file rather than of
+/// the feature -- and the sidebar tree is one of the things a Stats page
+/// render has in flight (`StatsPage.tsx` reads `useStatsTree`).
+pub(super) async fn metered_read(
+    client: &GitHubClient,
+    budget: &Budget,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, ClientError> {
+    let _permit = READ_PERMITS
+        .acquire()
+        .await
+        .map_err(|_| ClientError::Graphql("the stats read semaphore is closed".into()))?;
+    let v = client.stats_graphql(&body).await?;
+    // Recorded HERE rather than at each call site, so a new read cannot be
+    // added that takes a permit and then forgets to meter itself -- which is
+    // the `fetch_viewer` defect in #844, one layer up.
+    budget.record(&v);
+    Ok(v)
+}
 
 /// Wall-clock ceiling on one whole scope load.
 ///
@@ -575,8 +659,7 @@ async fn probe_round(
             let budget = budget.clone();
             let len = chunk.len();
             set.spawn(async move {
-                let v = client.stats_graphql(&json!({ "query": doc })).await?;
-                budget.record(&v);
+                let v = metered_read(&client, &budget, json!({ "query": doc })).await?;
                 let mut out = Vec::with_capacity(len);
                 for i in 0..len {
                     let alias = super::query::slice_alias(first_index + i);
@@ -622,17 +705,19 @@ async fn connection_count(
     name: &str,
     budget: &Budget,
 ) -> Result<Outcome, ClientError> {
-    let v = client
-        .stats_graphql(&json!({
+    let v = metered_read(
+        client,
+        budget,
+        json!({
             "query": REPO_CONNECTION_QUERY,
             // `first: 1` because only `totalCount` is wanted here. The
             // page is not the cost -- `query.rs:480-484` records that
             // GitHub charges the connection, not the page -- so this is
             // about bytes on the wire, not points.
             "variables": { "owner": owner, "name": name, "first": 1, "after": null },
-        }))
-        .await?;
-    budget.record(&v);
+        }),
+    )
+    .await?;
     let total = v["repository"]["pullRequests"]["totalCount"]
         .as_u64()
         .ok_or_else(|| {
@@ -833,11 +918,7 @@ async fn detail_round(
             let doc = slice_detail_query(q, part, first_index, page);
             let client = client.clone();
             let budget = budget.clone();
-            set.spawn(async move {
-                let v = client.stats_graphql(&json!({ "query": doc })).await?;
-                budget.record(&v);
-                Ok::<serde_json::Value, ClientError>(v)
-            });
+            set.spawn(async move { metered_read(&client, &budget, json!({ "query": doc })).await });
         }
         while let Some(joined) = set.join_next().await {
             let v = joined.map_err(|e| ClientError::Join(e.to_string()))??;
@@ -992,8 +1073,7 @@ async fn series_inner(
             let budget = budget.clone();
             let len = chunk.len();
             set.spawn(async move {
-                let v = client.stats_graphql(&json!({ "query": doc })).await?;
-                budget.record(&v);
+                let v = metered_read(&client, &budget, json!({ "query": doc })).await?;
                 let refused = crate::github::client::refused_fields_of(&v);
                 let mut out = Vec::with_capacity(len);
                 for i in 0..len {
@@ -1200,8 +1280,7 @@ async fn reviewers_inner(
             let budget = budget.clone();
             let len = chunk.len();
             set.spawn(async move {
-                let v = client.stats_graphql(&json!({ "query": doc })).await?;
-                budget.record(&v);
+                let v = metered_read(&client, &budget, json!({ "query": doc })).await?;
                 let refused = crate::github::client::refused_fields_of(&v);
                 let mut out = Vec::with_capacity(len);
                 for i in 0..len {
@@ -1305,6 +1384,61 @@ mod tests {
             src.contains("const BATCH_CONCURRENCY: usize = 4"),
             "the mutation cap moved; re-read why reads differ from it"
         );
+    }
+
+    /// The cap is enforced PER PROCESS, not per call (#844).
+    ///
+    /// # Why this is a source scan rather than a concurrency test
+    ///
+    /// The property is "no stats POST bypasses the permit", which is a
+    /// statement about every call site rather than about observable behaviour
+    /// at one of them. A test that spawned 30 futures and counted peak
+    /// concurrency would prove the semaphore works -- which is tokio's job,
+    /// not this module's -- while saying nothing about a SEVENTH call site
+    /// added later that calls `stats_graphql` directly. That seventh call site
+    /// is the defect: the cap was real within each command and meaningless
+    /// across the five a Stats page fires (`StatsPage.tsx:126-151`).
+    ///
+    /// So the scan asserts the chokepoint is the only door. `metered_read` is
+    /// the one function that may call `stats_graphql`, and it holds a permit
+    /// and records the spend -- which also means a new read cannot take a
+    /// permit and then forget to meter itself, the `fetch_viewer` half of
+    /// #844.
+    #[test]
+    fn every_stats_read_goes_through_the_process_wide_permit() {
+        for (file, src) in [
+            ("fetch.rs", include_str!("fetch.rs")),
+            ("tree.rs", include_str!("tree.rs")),
+            ("board.rs", include_str!("board.rs")),
+            ("slice.rs", include_str!("slice.rs")),
+        ] {
+            // Production half only: a doc comment may legitimately name the
+            // method it is explaining, and the test module below discusses it.
+            let prod = src.split_once("\n#[cfg(test)]").map_or(src, |(p, _)| p);
+            for (i, line) in prod.lines().enumerate() {
+                if !line.contains("stats_graphql(") {
+                    continue;
+                }
+                // The one permitted caller, and only inside `metered_read`.
+                let inside_chokepoint =
+                    file == "fetch.rs" && line.contains("client.stats_graphql(&body)");
+                // A doc comment or ordinary comment mentioning the name.
+                let t = line.trim_start();
+                let is_comment = t.starts_with("//");
+                assert!(
+                    inside_chokepoint || is_comment,
+                    "{file}:{} calls `stats_graphql` directly, bypassing the \
+                     process-wide READ_PERMITS. A Stats page fires five \
+                     independent commands, so a per-call cap is not a cap \
+                     (#844) -- route it through `metered_read`, which holds a \
+                     permit and records the spend.\n    {line}",
+                    i + 1
+                );
+            }
+        }
+        // And the permit count IS the documented cap, rather than a second
+        // number that could drift from it.
+        assert_eq!(READ_PERMITS.available_permits(), READ_CONCURRENCY);
     }
 
     /// A whole-load ceiling exists, and it is NOT `poll::FETCH_TIMEOUT`
@@ -1696,6 +1830,13 @@ mod tests {
     #[test]
     fn a_wave_is_refused_once_the_budget_is_under_the_reserve() {
         use crate::github::stats::budget::RESERVE;
+
+        // `record` feeds the PROCESS-WIDE figure as well as this accumulator
+        // (#843), so this test mutates state shared with `budget.rs`'s tests.
+        // Serialised and restored, or it races them -- an intermittent failure
+        // in another file caused by a test in this one.
+        let _g = crate::github::stats::budget::observed_test_lock();
+        let _restore = crate::github::stats::budget::RestoreObserved::capture();
 
         // A fresh `Budget` with a seeded process figure, which is exactly
         // the state a wave loop is in: the accumulator belongs to this load,

@@ -368,8 +368,17 @@ pub fn cycle_trend_query(now: DateTime<Utc>) -> String {
 /// Deliberately no file diff and no commit history. Headstate is for
 /// deciding and acting; reviewing code belongs in GitHub or an editor,
 /// and fetching a diff here would cost far more than a point.
+///
+/// `rateLimit` added for #844. It was one of two documents the
+/// hand-written list in `budget::tests::every_stats_query_meters_itself`
+/// never covered, and the derived replacement found it immediately -- which
+/// is the whole argument for deriving the list. RE-MEASURED live 2026-09-11
+/// on this document extracted verbatim (`gh api graphql`, `pktstorm/headstate`
+/// PR 786, 3 runs): **cost 1** in 1.25-1.52s, confirming the figure this
+/// comment already claimed and that the field is free.
 pub const PR_DETAIL_QUERY: &str = r#"
 query($owner: String!, $repo: String!, $number: Int!) {
+  rateLimit { cost remaining resetAt }
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
       id number title url state isDraft body
@@ -533,8 +542,20 @@ query($owner: String!, $repo: String!, $number: Int!) {
 /// threads and labels, none of which change between check pages, so
 /// paging with it would pay for all of that again per page. Named
 /// `ChecksPage` so the follow-up is identifiable in a request log.
+///
+/// `rateLimit` added for #844, alongside `PR_DETAIL_QUERY` and for the same
+/// reason: the derived metering guard found both, where the hand-written
+/// six-name list it replaced covered neither. It matters more here than on
+/// most documents, because this one runs in a LOOP bounded by `MAX_PAGES =
+/// 10` -- so a per-page cost that nothing reads is a spend of up to ten
+/// points per detail view that no total could account for.
+///
+/// MEASURED live 2026-09-11 on this document extracted verbatim (`gh api
+/// graphql`, 3 runs): **cost 1 per page** in 1.08-1.17s, so the field is
+/// free and the loop's worst case is 10 points.
 pub const PR_CHECKS_PAGE_QUERY: &str = r#"
 query ChecksPage($owner: String!, $repo: String!, $number: Int!, $after: String!) {
+  rateLimit { cost remaining resetAt }
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
       commits(last: 1) {
@@ -561,6 +582,44 @@ query ChecksPage($owner: String!, $repo: String!, $number: Int!, $after: String!
     }
   }
 }"#;
+
+/// The authenticated user's login, and what asking cost.
+///
+/// # Why this is a named const and not an inline literal (#844)
+///
+/// It used to be `json!({ "query": "query { viewer { login } }" })` written
+/// inline at `client.rs:889`, and it selected no `rateLimit`. MEASURED live
+/// 2026-09-11 via the `X-Ratelimit-Used` response header, which advances
+/// whether or not the document asks: three consecutive `viewer { login }`
+/// requests moved it 86 -> 87 -> 88, and the same document WITH
+/// `rateLimit { cost }` moved it 88 -> 89. **One point either way** -- so the
+/// request was always costing a point and simply not reporting it, and adding
+/// the field is free.
+///
+/// The consequence was worse than an undercount. `Budget::record` counts a
+/// response with no `rateLimit` as `unmetered`, which is what makes
+/// `Spend::is_exact()` false and a total honest about being a floor -- but
+/// `fetch_viewer` was called BEFORE `Budget::new()` (`commands.rs:2301`,
+/// `:2638`), so it was not recorded at all. `points` and `requests`
+/// understated by one per call while `is_exact()` returned **true**: exactly
+/// what `budget.rs:252-255` forbids -- "the accumulated spend UNDERSTATES the
+/// truth ... A reported total must say so rather than look exact."
+///
+/// Notably `board_projection` already budgeted for it (`commands.rs:2557`,
+/// `// +1 for fetch_viewer.`), so the PROJECTION knew about a request the
+/// ACCOUNTING did not.
+///
+/// Named rather than left inline so
+/// `budget::tests::every_stats_query_meters_itself` can find it: that guard
+/// enumerated six query names by hand and omitted this one, which is the same
+/// list-based blind spot as #842's poll guard. It now derives its list from
+/// this file, and an inline literal would be invisible to that.
+pub const VIEWER_QUERY: &str = r#"
+query {
+  rateLimit { cost remaining resetAt }
+  viewer { login }
+}
+"#;
 
 /// How many pull requests a search matches, and nothing else.
 ///

@@ -768,6 +768,80 @@ fn spawn_recheck(app: AppHandle, client: Arc<GitHubClient>, last_known: Vec<Pull
 /// so the loop's job is to fail fast and retry rather than to hang.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The ceiling on a whole TICK, which is what must clear the next one.
+///
+/// # The gap this closes (#844)
+///
+/// `FETCH_TIMEOUT` bounds ONE fetch, and
+/// `the_fetch_ceiling_is_under_the_shortest_poll_interval` asserted
+/// `30s < 60s` on the premise that a tick IS one fetch. It is not: a tick
+/// awaits two sequential 30-second timeouts (`:868` and `:884`), so the
+/// worst case is 60s -- **exactly equal** to `MIN_FOCUSED_SECS`, which
+/// reintroduces the overlapping-fetch regression that test was written to
+/// prevent. Two hung fetches, both spending budget, for requests that had
+/// already been useless for a full interval.
+///
+/// # Why a shared deadline rather than halving `FETCH_TIMEOUT`
+///
+/// #844 offers both. Halving does not survive the OTHER guard:
+/// `the_fetch_ceiling_still_clears_the_measured_p90` requires
+/// `FETCH_TIMEOUT >= 3 x p90`, and p90 is 8,814ms per POST over 3,806
+/// requests in a reported six-day session -- so 15s would leave 1.7x
+/// headroom and cut off polls on accounts that are merely large, which is
+/// the failure that guard exists to prevent. The two requirements are only
+/// jointly satisfiable by bounding the TICK rather than shrinking each
+/// fetch, so the deadline is shared: the second fetch gets whatever the
+/// first left of it.
+///
+/// # And NOT by parallelising the two fetches
+///
+/// The obvious alternative is `tokio::join!`, and it is measurably worse.
+/// MEASURED (#844, and reproduced by this issue's own figures): sequential
+/// 3.5s against concurrent 5.6s -- GitHub contends on simultaneous
+/// node-heavy queries, so issuing both at once makes the slow one slower
+/// by more than the overlap saves. `fetch_prs_and_reviewing`
+/// (`client.rs:564`) does run two searches concurrently, and its own
+/// diagnostic comment is about exactly this: a total far above the slower
+/// of the two means they are not actually overlapping.
+///
+/// # Why 45s
+///
+/// It must be under `MIN_FOCUSED_SECS` (60) with enough margin that a tick
+/// finishing at the ceiling still lands before its successor starts, and
+/// it must leave the FIRST fetch its full `FETCH_TIMEOUT` -- the authored
+/// list is what the UI renders, and the review queue is a notification
+/// whose loss costs nothing (`:880`). 45s gives the first fetch all 30s
+/// and the second up to 15s, and 45 < 60 holds with 15s of slack.
+///
+/// The budget is generous on purpose for `fetch::LOAD_TIMEOUT`'s reason:
+/// "the budget exists to convert an unbounded hang into an actionable
+/// error, not to tighten a latency target". Measured tick latency is
+/// 3.37s + 0.78s = ~4.2s, so this ceiling is an order of magnitude above
+/// what a real tick needs.
+pub const TICK_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// What is left of [`TICK_TIMEOUT`] after `spent`, capped at
+/// [`FETCH_TIMEOUT`].
+///
+/// Extracted rather than inlined in the loop for the reason
+/// `clamp_interval` is: the loop needs a live `AppHandle` and a network, so
+/// the arithmetic is only testable if it lives apart from them. The
+/// property that matters -- the two fetches together cannot outlast a tick
+/// -- is then asserted directly instead of inferred from two constants.
+///
+/// Capped at `FETCH_TIMEOUT` so the second fetch never gets a LONGER
+/// ceiling than the first: a fast authored fetch leaves 40+ seconds, and
+/// handing all of it to the review queue would make a hung notification
+/// fetch the thing that overruns the tick.
+///
+/// Saturating, so a first fetch that somehow outran the whole budget
+/// yields zero rather than wrapping into a near-infinite ceiling. The
+/// caller treats zero as "skip": a request with no time to answer still
+/// spends a rate-limit point.
+pub fn remaining_tick_budget(spent: Duration) -> Duration {
+    TICK_TIMEOUT.saturating_sub(spent).min(FETCH_TIMEOUT)
+}
+
 /// Wakes the poll loop out of its sleep.
 ///
 /// Managed in Tauri state so the tray and the window-focus handler can
@@ -864,6 +938,14 @@ pub fn spawn(
             // visible against the `cmd get_reviewing` bracket.
             crate::diag!("[diag] poll tick start");
             let tick_started = std::time::Instant::now();
+            // ONE deadline across BOTH fetches, not one per fetch (#844).
+            // Two independent 30s ceilings make the worst-case tick 60s,
+            // exactly `MIN_FOCUSED_SECS` -- so a hung tick overlaps its own
+            // successor, which is the regression
+            // `the_fetch_ceiling_is_under_the_shortest_poll_interval` exists
+            // to prevent. See `TICK_TIMEOUT` for why the fix is a shared
+            // deadline rather than a smaller `FETCH_TIMEOUT` or a
+            // `tokio::join!`.
             let fetched =
                 match tokio::time::timeout(FETCH_TIMEOUT, client.fetch_prs_with_total()).await {
                     Ok(res) => res,
@@ -879,17 +961,32 @@ pub fn spawn(
             //
             // A failure here is NOT a tick failure: the authored list
             // above is what the UI renders, and losing one notification
-            // must not cost the poll.
+            // must not cost the poll. That is also what makes it the right
+            // half to squeeze when the shared deadline is nearly spent.
+            let remaining = remaining_tick_budget(tick_started.elapsed());
             let reviewing_now = if read_notify_prefs(&app).ready_to_review {
-                match tokio::time::timeout(FETCH_TIMEOUT, client.fetch_reviewing()).await {
-                    Ok(Ok(list)) => Some(list),
-                    Ok(Err(e)) => {
-                        crate::diag!("[diag] poll reviewing failed: {e}");
-                        None
-                    }
-                    Err(_) => {
-                        crate::diag!("[diag] poll reviewing timed out");
-                        None
+                if remaining.is_zero() {
+                    // The authored fetch used the whole tick. Skipped rather
+                    // than issued with no time to answer: a request that
+                    // cannot finish still SPENDS a rate-limit point, and the
+                    // next tick is about to ask the same question with a
+                    // full budget.
+                    crate::diag!("[diag] poll reviewing skipped: tick budget spent");
+                    None
+                } else {
+                    match tokio::time::timeout(remaining, client.fetch_reviewing()).await {
+                        Ok(Ok(list)) => Some(list),
+                        Ok(Err(e)) => {
+                            crate::diag!("[diag] poll reviewing failed: {e}");
+                            None
+                        }
+                        Err(_) => {
+                            crate::diag!(
+                                "[diag] poll reviewing timed out after {}ms of tick budget",
+                                remaining.as_millis()
+                            );
+                            None
+                        }
                     }
                 }
             } else {
@@ -1304,7 +1401,8 @@ mod tests {
         assert!(ClientError::Timeout(90).is_transient());
     }
 
-    /// A poll must give up before its successor starts.
+    /// A poll must give up before its successor starts -- the whole TICK,
+    /// not one fetch of it.
     ///
     /// The regression this guards: `FETCH_TIMEOUT` was 90s while
     /// `MIN_FOCUSED_SECS` is 60, so a user on the fastest allowed
@@ -1313,15 +1411,85 @@ mod tests {
     /// budget, for a request that had already been useless for a full
     /// interval.
     ///
-    /// Asserted against the CONSTANT rather than a literal, so raising
-    /// the ceiling past the floor fails here instead of in the field.
+    /// # What this test MISSED, and why it is rewritten (#844)
+    ///
+    /// It asserted `FETCH_TIMEOUT < MIN_FOCUSED_SECS` -- `30s < 60s`, true
+    /// -- on the premise that a tick is one fetch. A tick awaits TWO
+    /// sequential 30s timeouts (`:868` and `:884`), so the worst case was
+    /// 60s: exactly equal to the floor, which reintroduces the very overlap
+    /// the test was written to prevent. The assertion passed while the
+    /// property failed, which is the shape of every defect in #842 and #847
+    /// as well.
+    ///
+    /// Asserted against `TICK_TIMEOUT` and against the arithmetic that
+    /// enforces it, rather than against a pair of constants plus a belief
+    /// about how many fetches there are. `remaining_tick_budget` is the
+    /// thing the loop actually calls, so this measures the shipped
+    /// behaviour -- the property `a_tick_cannot_outlast_its_own_cadence`
+    /// below pins end to end.
     #[test]
     fn the_fetch_ceiling_is_under_the_shortest_poll_interval() {
+        // The TICK is what must clear the next tick.
         assert!(
-            FETCH_TIMEOUT < Duration::from_secs(MIN_FOCUSED_SECS),
-            "a fetch may not outlive the gap to the next poll: \
-             FETCH_TIMEOUT={FETCH_TIMEOUT:?} MIN_FOCUSED_SECS={MIN_FOCUSED_SECS}"
+            TICK_TIMEOUT < Duration::from_secs(MIN_FOCUSED_SECS),
+            "a tick may not outlive the gap to the next poll: \
+             TICK_TIMEOUT={TICK_TIMEOUT:?} MIN_FOCUSED_SECS={MIN_FOCUSED_SECS}"
         );
+        // And one fetch must still fit inside a tick, or the first fetch
+        // alone could exhaust the budget and the second would always skip.
+        assert!(
+            FETCH_TIMEOUT < TICK_TIMEOUT,
+            "the first fetch must leave the second some budget: \
+             FETCH_TIMEOUT={FETCH_TIMEOUT:?} TICK_TIMEOUT={TICK_TIMEOUT:?}"
+        );
+    }
+
+    /// The two sequential fetches, together, cannot outlast a tick.
+    ///
+    /// This is the property the old single-constant assertion could not
+    /// state. Driven through `remaining_tick_budget`, which is what the loop
+    /// calls, so it holds for the code that ships rather than for a
+    /// restatement of it.
+    ///
+    /// Includes the pathological case the loop has to handle: a first fetch
+    /// that ran to its own ceiling leaves 15s, not 30, so the pair is 45s
+    /// and not the 60s two independent ceilings allowed.
+    #[test]
+    fn a_tick_cannot_outlast_its_own_cadence() {
+        let floor = Duration::from_secs(MIN_FOCUSED_SECS);
+        // Every point at which the first fetch could finish, including
+        // running to its own ceiling and past the whole tick budget.
+        for spent_secs in [0, 1, 10, 29, 30, 44, 45, 60, 600] {
+            let spent = Duration::from_secs(spent_secs);
+            let first = spent.min(FETCH_TIMEOUT);
+            let worst = first + remaining_tick_budget(spent);
+            assert!(
+                worst <= TICK_TIMEOUT,
+                "a tick whose first fetch took {spent:?} could run {worst:?}, \
+                 past TICK_TIMEOUT={TICK_TIMEOUT:?}"
+            );
+            assert!(
+                worst < floor,
+                "a tick whose first fetch took {spent:?} could run {worst:?} and \
+                 overlap the next tick at {floor:?}"
+            );
+        }
+        // A first fetch at its full ceiling does NOT hand the second
+        // another full one. Pinned as a number because it is the case the
+        // old guard got wrong: 30 + 30 = 60, not 30 + 15 = 45.
+        assert_eq!(
+            remaining_tick_budget(FETCH_TIMEOUT),
+            Duration::from_secs(15),
+            "a hung first fetch must shrink the second's ceiling, not reset it"
+        );
+        // Overrunning the budget yields zero rather than wrapping, which the
+        // loop reads as "skip": a request with no time to answer still
+        // spends a rate-limit point.
+        assert!(remaining_tick_budget(Duration::from_secs(600)).is_zero());
+        // A fast first fetch does not hand the second a LONGER ceiling than
+        // the first had, or a hung notification fetch becomes the thing that
+        // overruns the tick.
+        assert_eq!(remaining_tick_budget(Duration::ZERO), FETCH_TIMEOUT);
     }
 
     /// The ceiling must still clear the measured p90, or ordinary slow

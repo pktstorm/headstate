@@ -522,10 +522,13 @@ pub async fn load_tree(client: &GitHubClient) -> Result<Tree, ClientError> {
 async fn load_tree_inner(client: &GitHubClient) -> Result<Tree, ClientError> {
     let budget = super::budget::Budget::new();
 
-    let orgs_v = client
-        .stats_graphql(&json!({ "query": orgs_query() }))
-        .await?;
-    budget.record(&orgs_v);
+    // Through `fetch::metered_read`, which holds a process-wide permit and
+    // records the spend -- so the sidebar tree counts against the same
+    // `READ_CONCURRENCY` as everything else a Stats page render has in flight
+    // (#844). It used to call `stats_graphql` directly and be invisible to
+    // the cap.
+    let orgs_v =
+        super::fetch::metered_read(client, &budget, json!({ "query": orgs_query() })).await?;
     let mut refused = refused_fields_of(&orgs_v);
 
     // An ERROR, not a default. The viewer's login is the Personal section's
@@ -571,10 +574,9 @@ async fn load_tree_inner(client: &GitHubClient) -> Result<Tree, ClientError> {
     // second request entirely would be a micro-optimisation that adds a
     // branch and a second code path for the empty case to be wrong in.
     let logins: Vec<String> = listed.iter().map(|(l, ..)| l.clone()).collect();
-    let tree_v = client
-        .stats_graphql(&json!({ "query": tree_query(&logins) }))
-        .await?;
-    budget.record(&tree_v);
+    let tree_v =
+        super::fetch::metered_read(client, &budget, json!({ "query": tree_query(&logins) }))
+            .await?;
     refused += refused_fields_of(&tree_v);
 
     let personal_conn = &tree_v["viewer"]["repositories"];
