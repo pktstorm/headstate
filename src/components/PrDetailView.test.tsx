@@ -686,6 +686,26 @@ describe("PrDetailView", () => {
       expect(agent.className).not.toContain("#f85149");
     });
 
+    /// #845's third acceptance criterion: reachable and legible ON TOUCH.
+    ///
+    /// This view has a phone layout (the footer wraps), and the only thing
+    /// distinguishing the old button from the two harmless ones beside it
+    /// would have had to be a tooltip -- which does not exist on touch. Both
+    /// halves of the fix are therefore asserted at a phone width: the
+    /// confirmation, and the colour that is not a hover affordance.
+    it("confirms and reads as destructive at a phone width", () => {
+      stubViewport(390);
+      state.data = { ...detail(), state: "MERGED", head_ref_id: "REF_1" };
+      render(<PrDetailView repo="o/r" number={1} onBack={() => {}} />);
+      const del = screen.getByRole("button", { name: /delete branch/i });
+      expect(del.className).toContain("#f85149");
+      fireEvent.click(del);
+      expect(deleteBranch).not.toHaveBeenCalled();
+      expect(
+        within(screen.getByRole("dialog")).getByText(scopeEffect("remote")),
+      ).toBeTruthy();
+    });
+
     it("passes merged=true so the backend gate can agree", async () => {
       state.data = { ...detail(), state: "MERGED", head_ref_id: "REF_1" };
       render(<PrDetailView repo="o/r" number={1} onBack={() => {}} />);

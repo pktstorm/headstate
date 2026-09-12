@@ -167,11 +167,16 @@ describe("CleanupLog", () => {
   /// model -- `min-w-0 flex-auto truncate` on the advisory, the full text in
   /// `title`, and `overflow-hidden` on the container.
   describe("a row whose reason is long", () => {
+    /// `acme/` is one of the synthetic owners `scripts/check-privacy.sh`
+    /// allows. A plausible-looking local checkout path is exactly what that
+    /// guard exists to keep out of the repository, and a long target is all
+    /// this fixture actually needs -- the length is the point, not the name.
+    const TARGET = "/Users/runner/code/acme/a-long-enough-project-to-clip/target";
     const refused = () =>
       entry({
         action: "refused",
-        target: "/Users/someone/code/a-rather-long-project-name/target",
-        error: "could not remove /Users/someone/code/a-rather-long-project-name/target: Device or resource busy",
+        target: TARGET,
+        error: `could not remove ${TARGET}: Device or resource busy`,
       });
 
     it("lets the reason yield width instead of squeezing the target out", () => {

@@ -1566,6 +1566,29 @@ describe("WorktreesPage", () => {
       });
     });
 
+    /// #845's third acceptance criterion: reachable and legible ON TOUCH,
+    /// where `title` is unavailable.
+    ///
+    /// The whole justification for shipping no dialog rested on the button's
+    /// `title`, which is hover-only -- on a page that has a mobile layout.
+    /// So the confirmation has to exist at a phone width, and it has to
+    /// carry the warning in TEXT rather than in a tooltip, because on touch
+    /// a tooltip is not a surface at all.
+    it("confirms at a phone width, with the warning in text rather than a tooltip", () => {
+      stubViewport(390);
+      state.classified = [orphan()];
+      render(<WorktreesPage />);
+      const btn = screen.getByRole("button", { name: /^delete…$/i });
+      fireEvent.click(btn);
+      const dialog = screen.getByRole("dialog");
+      // The warning is READABLE, not hidden in a `title`.
+      expect(within(dialog).getByText(/nothing inside could be checked/i)).toBeTruthy();
+      expect(within(dialog).getByText(/copy the directory somewhere first/i)).toBeTruthy();
+      // And the row's own button no longer carries the warning it used to
+      // smuggle into a hover-only attribute.
+      expect(btn.getAttribute("title")).not.toMatch(/copy the directory/i);
+    });
+
     /// The dialog has to exist on BOTH paths an orphan row renders on
     /// (#845): the Orphaned section and a repository page that happens to
     /// contain one. Mounting it inside one branch would leave the other
