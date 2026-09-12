@@ -240,6 +240,7 @@ const ROWS: Row[] = [
   }),
   row(api.systemHealth, [], "system_health"),
   row(api.systemHealthHistory, [], "system_health_history"),
+  row(api.healthAlerts, [], "health_alerts"),
   row(api.systemFootprint, [], "system_footprint"),
   // Also argument-free, and for the same reason: it reads THIS machine
   // (or, over the wire, the paired desktop). The ~5s it costs is a

@@ -5,6 +5,7 @@ import {
   useNetworkProcesses,
   useSystemFootprint,
   useSystemHealth,
+  useHealthAlerts,
   useSystemHealthHistory,
 } from "@/api/hooks";
 import { QueryError, errorMessage } from "./QueryError";
@@ -39,6 +40,7 @@ import type {
   FootprintProcessGroup,
   HealthGpu,
   HealthPowerFlow,
+  AlertReport,
   HealthSample,
 } from "@/types/pr";
 import { IS_MOBILE_BUILD } from "@/lib/target";
@@ -354,6 +356,101 @@ function ProcessRow({ p, hint }: { p: FootprintProcess; hint?: string }) {
 /// figure, and this renders "Not measured" with no bar at all. The
 /// alternative -- a confident green 0% -- would be the page's own rule
 /// broken in the place people look first.
+/// The conditions that are true right now, above the numbers (#864).
+///
+/// # Why this panel exists
+///
+/// Twelve orphaned busy-loops ran 8.5 hours at ~50% of a core each, load
+/// average 53, and System Health showed nothing. The rules had evaluated
+/// them correctly the whole time: `health_alerts` returns every current
+/// condition, and no TypeScript called it. The page's own comment further
+/// down assumed the other half of the design existed -- "alert fires, the
+/// user opens this page, and the number that answers why should be
+/// [there]" -- so the page was built to EXPLAIN an alert it could never
+/// show.
+///
+/// # Silence and not-watching are different answers
+///
+/// `lastSampleAgoMs` is the point of the second branch. A health tool
+/// only samples while it is running, so "no conditions are true" and "we
+/// have not looked since yesterday" are opposite claims that would
+/// otherwise render identically as an empty panel. The overnight runaway
+/// is exactly the case where the app may have been closed, so the gap is
+/// the MORE likely of the two and must not be reported as good news.
+/// That is the rule the rest of this codebase states as absent-is-not-zero
+/// (#769, #841): a reading we could not take is never evidence of health.
+///
+/// The staleness bar is deliberately generous. The sampler runs at 60s,
+/// and a missed poll or two is normal; ten minutes means something
+/// stopped.
+const SAMPLE_STALE_MS = 10 * 60 * 1000;
+
+function HealthConditions({
+  alerts,
+  failed,
+  sampledAt,
+  now,
+}: {
+  alerts: AlertReport[] | undefined;
+  failed: boolean;
+  /// The live sample's own timestamp, epoch ms.
+  sampledAt: number;
+  /// The right-hand edge of "recent", epoch ms.
+  ///
+  /// Passed in rather than read from `Date.now()` here, for exactly the
+  /// reason `Sparkline` above states: it keeps this a pure function of
+  /// its props, which the impure-render lint rule is right to insist on.
+  /// The caller resolves it once per poll.
+  now: number;
+}) {
+  // A failed read is not "nothing is wrong". Same rule as the panel
+  // below it, and the reason this is a branch rather than `?? []`.
+  if (failed) {
+    return (
+      <div
+        className="rounded-md border border-[#f85149]/40 bg-[#f85149]/5 px-3 py-2 text-xs text-[#f85149]"
+        role="status"
+      >
+        Could not check for health conditions. This is not a clean result — the rules did not
+        run.
+      </div>
+    );
+  }
+
+  const lastSampleAgoMs = now - sampledAt;
+  const stale = lastSampleAgoMs > SAMPLE_STALE_MS;
+
+  if (alerts && alerts.length === 0 && stale) {
+    return (
+      <div
+        className="rounded-md border border-[#d29922]/40 bg-[#d29922]/5 px-3 py-2 text-xs text-[#d29922]"
+        role="status"
+      >
+        No conditions found, but the last reading is{" "}
+        {Math.round(lastSampleAgoMs / 60_000)} minutes old — the app was not watching for
+        most of that time, so a problem in the gap would not have been seen.
+      </div>
+    );
+  }
+
+  if (!alerts || alerts.length === 0) return null;
+
+  return (
+    <div className="flex flex-col gap-2" role="group" aria-label="Active health conditions">
+      {alerts.map((a) => (
+        <div
+          key={a.key}
+          className="rounded-md border border-[#d29922]/40 bg-[#d29922]/5 px-3 py-2"
+          role="status"
+        >
+          <p className="text-sm font-semibold text-[#d29922]">{a.title}</p>
+          <p className="mt-0.5 text-xs text-[#8b949e]">{a.body}</p>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function PressureCard({
   label,
   percent,
@@ -475,6 +572,7 @@ export function SystemHealthPage() {
   // leave the timer running whenever the caller forgot to pass false.
   const live = useSystemHealth(true);
   const history = useSystemHealthHistory(true);
+  const alerts = useHealthAlerts(true);
   // Which page of the view is open. Read HERE rather than in each
   // detail component so the live sample, the history and the error and
   // loading states are fetched once and shared: a drill-down that
@@ -573,6 +671,18 @@ export function SystemHealthPage() {
   // every few seconds, this advances on its own anyway.
   const sampledAt = Date.parse(s.sampled_at);
 
+  // "Now", without reading the clock during render (the rule `Sparkline`
+  // above states). React Query stamps this when the live sample resolved,
+  // so it advances once per poll rather than on every repaint -- which is
+  // also the honest edge for "how old is the newest reading": the last
+  // moment we actually heard from the sampler.
+  //
+  // When the query has never resolved, `dataUpdatedAt` is 0, and `s` is a
+  // placeholder; falling back to `sampledAt` makes the age zero rather
+  // than 56 years, so a cold start does not accuse the app of not
+  // watching.
+  const renderedAt = live.dataUpdatedAt || sampledAt;
+
   // The root volume for the pressure card. The Disk panel below still
   // lists every mount -- this row answers "is the machine about to run
   // out", and on every platform we support that question is about the
@@ -611,6 +721,9 @@ export function SystemHealthPage() {
         samples={samples}
         sampledAt={sampledAt}
         historyFailed={history.isError}
+        alerts={alerts.data}
+        alertsFailed={alerts.isError}
+        renderedAt={renderedAt}
       />
     );
   }
@@ -623,6 +736,14 @@ export function SystemHealthPage() {
           it is navigation: what the page can show, before what it is
           showing. Desktop renders nothing here; the sidebar has it. */}
       <HealthPageNav gpuCount={s.gpus.length} />
+      {/* Above the pressure cards and the nav: a condition that is
+          already true outranks the numbers it was derived from. #864. */}
+      <HealthConditions
+        alerts={alerts.data}
+        failed={alerts.isError}
+        sampledAt={sampledAt}
+        now={renderedAt}
+      />
       {/* Whose machine, said once, at the top, on the phone only.
           `ConnectionBanner` already names the paired desktop, but it
           is chrome that sits above every view alike -- it says which
@@ -1156,8 +1277,21 @@ function DetailPage({
   samples,
   sampledAt,
   historyFailed,
+  alerts,
+  alertsFailed,
+  renderedAt,
 }: {
   page: Exclude<HealthPage, "overview">;
+  /// The current conditions, for the CPU page (#864). Passed down from
+  /// the parent's single observer rather than re-queried: someone who
+  /// drilled into CPU because the machine is slow should see the runaway
+  /// alert on the page that explains it, not only on the overview they
+  /// navigated away from.
+  alerts: AlertReport[] | undefined;
+  alertsFailed: boolean;
+  /// "Now" for the staleness check, resolved once by the parent rather
+  /// than read from the clock here -- same rule as `Sparkline`'s `now`.
+  renderedAt: number;
   sample: HealthSample;
   /// The 24-hour series, already fetched by the parent. Passed down
   /// rather than re-queried so a drill-down does not open a second
@@ -1194,6 +1328,20 @@ function DetailPage({
       {/* An h1 rather than an h2: on a detail page this class IS the
           subject, and the panels below it are its sections. */}
       <h1 className="text-base font-semibold text-[#e6edf3]">{meta?.label ?? page}</h1>
+
+      {/* The CPU page only (#864). Someone arrives here because the
+          machine is slow, and the runaway rules are the one thing on
+          this page that can NAME the cause rather than plot it. The
+          other drill-downs have no rule that fires on them, so an
+          empty panel there would be furniture. */}
+      {page === "cpu" ? (
+        <HealthConditions
+          alerts={alerts}
+          failed={alertsFailed}
+          sampledAt={sampledAt}
+          now={renderedAt}
+        />
+      ) : null}
 
       {page === "cpu" ? (
         <CpuDetail sample={sample} samples={samples} sampledAt={sampledAt} />

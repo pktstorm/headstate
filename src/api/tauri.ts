@@ -13,6 +13,7 @@
 
 import { call } from "./transport";
 import type {
+  AlertReport,
   CachedSnapshot,
   Artifact,
   Branch,
@@ -854,6 +855,20 @@ export const systemHealth = () => call<HealthSample>("system_health");
 /// `SystemHealthPage`.
 export const systemHealthHistory = () =>
   call<HealthSample[]>("system_health_history");
+
+/// Every health condition that is true right now (#864).
+///
+/// Not transitions: the Rust side returns the full current set so two
+/// clients cannot each see half the alerts. Deduplicate on `key`, which
+/// is stable across changing figures.
+///
+/// This is the CPU runaway rules' only path to a screen. They were
+/// evaluated on every poll and by this command, and until #864 nothing
+/// in the frontend called it -- so an 8.5-hour, 12-process runaway
+/// produced no visible output anywhere. Bounded like
+/// `systemHealthHistory` by being a fixed small set of conditions rather
+/// than a series, so it is safe to read over the LAN from the phone.
+export const healthAlerts = () => call<AlertReport[]>("health_alerts");
 
 /// What is using this machine, right now (#687, #721).
 ///

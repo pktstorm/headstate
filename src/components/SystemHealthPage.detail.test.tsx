@@ -54,6 +54,17 @@ const footprintFn = vi.hoisted(() => vi.fn<() => Promise<Footprint>>());
 vi.mock("../api/hooks", () => ({
   useSystemHealth: (enabled: boolean) =>
     useQuery({ queryKey: ["system-health"], queryFn: liveFn, enabled, retry: false }),
+  // The current conditions (#864). The CPU page renders them, so the
+  // hook has to exist here; resolved empty because these tests are about
+  // the detail panels rather than the alert panel, which
+  // `SystemHealthPage.test.tsx` covers.
+  useHealthAlerts: (enabled: boolean) =>
+    useQuery({
+      queryKey: ["health-alerts"],
+      queryFn: () => Promise.resolve([]),
+      enabled,
+      retry: false,
+    }),
   useSystemHealthHistory: (enabled: boolean) =>
     useQuery({
       queryKey: ["system-health-history"],

@@ -1,12 +1,13 @@
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { Footprint, HealthSample } from "@/types/pr";
+import type { AlertReport, Footprint, HealthSample } from "@/types/pr";
 import { stubViewport } from "@/test-utils";
 
 const liveFn = vi.hoisted(() => vi.fn<() => Promise<HealthSample>>());
 const historyFn = vi.hoisted(() => vi.fn<() => Promise<HealthSample[]>>());
 const footprintFn = vi.hoisted(() => vi.fn<() => Promise<Footprint>>());
+const alertsFn = vi.hoisted(() => vi.fn<() => Promise<AlertReport[]>>());
 
 // The hooks this page uses, not the whole `api/hooks` module's
 // transitive world: that file imports every command the app has, and
@@ -46,6 +47,8 @@ vi.mock("../api/hooks", () => ({
       enabled,
       retry: false,
     }),
+  useHealthAlerts: (enabled: boolean) =>
+    useQuery({ queryKey: ["health-alerts"], queryFn: alertsFn, enabled, retry: false }),
 }));
 
 // The build target, as a mock: `IS_MOBILE_BUILD` is read at module
@@ -281,10 +284,60 @@ describe("SystemHealthPage", () => {
     vi.clearAllMocks();
     liveFn.mockResolvedValue(sample());
     historyFn.mockResolvedValue([]);
+    // No conditions by default; a test that cares primes its own.
+    alertsFn.mockResolvedValue([]);
     // Back to the desktop build on a local machine, so a mobile test
     // that flips these cannot leak into the one after it.
     mobileBuild.current = false;
     connection.current = { kind: "local" };
+  });
+
+  /// #864: the rules ran for 8.5 hours over a 12-process runaway and the
+  /// page showed nothing, because `health_alerts` had no frontend caller
+  /// at all. These four cover the panel that closes that gap, and the
+  /// third is the one that matters most.
+  it("names an active health condition on the overview", async () => {
+    alertsFn.mockResolvedValue([
+      {
+        key: "diffuse_cpu",
+        title: "Several processes are using the CPU",
+        body: "About 72% of the CPU has been in use for 31 minutes, and no single process accounts for it.",
+      },
+    ]);
+    show();
+    expect(await screen.findByText("Several processes are using the CPU")).toBeTruthy();
+    expect(screen.getByText(/no single process accounts for it/)).toBeTruthy();
+  });
+
+  it("says nothing when no condition is true and the reading is current", async () => {
+    show();
+    // The live sample must have arrived, or an empty panel would prove
+    // only that the query had not resolved yet.
+    expect(await screen.findByText("1.25")).toBeTruthy();
+    expect(screen.queryByRole("group", { name: "Active health conditions" })).toBeNull();
+    expect(screen.queryByText(/was not watching/)).toBeNull();
+  });
+
+  /// The distinction the incident turned on. An overnight runaway is
+  /// exactly the case where the app may have been closed, so "no
+  /// conditions found" over a stale sample is not good news and must not
+  /// render as the silence above.
+  it("does not call a stale reading clean", async () => {
+    liveFn.mockResolvedValue(
+      sample({ sampled_at: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString() }),
+    );
+    show();
+    expect(await screen.findByText(/was not watching/)).toBeTruthy();
+    expect(screen.getByText(/180 minutes old/)).toBeTruthy();
+  });
+
+  /// A failed read is not a clean result either -- the same rule the rest
+  /// of this page follows for a failed scan (#858).
+  it("says the check failed rather than showing nothing", async () => {
+    alertsFn.mockRejectedValue(new Error("no"));
+    show();
+    expect(await screen.findByText(/Could not check for health conditions/)).toBeTruthy();
+    expect(screen.getByText(/the rules did not run/)).toBeTruthy();
   });
 
   it("shows the live readings once they arrive", async () => {
@@ -770,6 +823,8 @@ describe("the at-a-glance pressure cards", () => {
     vi.clearAllMocks();
     liveFn.mockResolvedValue(sample());
     historyFn.mockResolvedValue([]);
+    // No conditions by default; a test that cares primes its own.
+    alertsFn.mockResolvedValue([]);
     mobileBuild.current = false;
     connection.current = { kind: "local" };
   });

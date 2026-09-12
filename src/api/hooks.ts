@@ -6,6 +6,7 @@ import { safeUnlisten } from "./unlisten";
 import { timeCall, timed } from "./diag";
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import type {
+  AlertReport,
   Artifact,
   Branch,
   BranchDeleteFrame,
@@ -53,6 +54,7 @@ import {
   classifyWorktrees,
   listBranches,
   systemHealth,
+  healthAlerts,
   systemHealthHistory,
   systemFootprint,
   systemNetworkProcesses,
@@ -3456,6 +3458,30 @@ export function useSystemHealthHistory(enabled: boolean) {
   return useQuery<HealthSample[]>({
     queryKey: ["system-health-history"],
     queryFn: systemHealthHistory,
+    enabled,
+    refetchInterval: enabled ? 60_000 : false,
+    staleTime: 30_000,
+  });
+}
+
+/// Every health condition true right now, for the page to show (#864).
+///
+/// The CPU runaway rules had no path to a screen before this hook: they
+/// were evaluated on every poll and by `health_alerts`, and nothing in
+/// the frontend called that command, so a 12-process runaway that ran
+/// 8.5 hours produced no visible output. A rule that evaluates into
+/// nothing is indistinguishable from no rule.
+///
+/// Cadenced with `useSystemHealthHistory` rather than the live sample
+/// because it is DERIVED from that same stored series: the rules read
+/// history, so asking faster than the series grows re-derives an
+/// identical answer. The one exception is the aggregate CPU rule's
+/// process-table read, which is why this is a command rather than
+/// client-side arithmetic over the samples the charts already have.
+export function useHealthAlerts(enabled: boolean) {
+  return useQuery<AlertReport[]>({
+    queryKey: ["health-alerts"],
+    queryFn: healthAlerts,
     enabled,
     refetchInterval: enabled ? 60_000 : false,
     staleTime: 30_000,
