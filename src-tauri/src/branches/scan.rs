@@ -102,6 +102,41 @@ pub fn default_branch(dir: &Path) -> Result<String, DefaultBranchError> {
             let head = head.trim();
             if head.is_empty() {
                 Err(DefaultBranchError::NotSet)
+            } else if !crate::worktrees::scan::is_safe_ref(
+                head.strip_prefix("origin/").unwrap_or(head),
+            ) {
+                // `origin/HEAD` is written by the REMOTE, so the name it
+                // yields is remote-controlled and must clear the
+                // flag-shape check before it reaches an argv (#854). It
+                // goes on to `rev-list <default>` (`mainline_patch_ids`)
+                // and `merge-base <branch> <default>` (`branch_patch_id`)
+                // as a bare argument with no `--`, where `--output=/path`
+                // is an arbitrary file write with the app's privileges.
+                //
+                // `worktrees::scan::default_branch` has validated exactly
+                // this since it was written, with the reasoning in its own
+                // comment; this sibling did not, because `is_safe_ref` was
+                // `pub(super)` and unreachable from here.
+                //
+                // The BARE name is what is checked, after the `origin/`
+                // prefix is stripped -- and this is not a refinement, it
+                // is the whole check. `symbolic-ref --short` returns
+                // `origin/<name>`, so a hostile `origin/--output=/tmp/x`
+                // starts with `o` and passes `is_safe_ref` unchanged. The
+                // first version of this fix validated the prefixed string
+                // and was therefore worthless; the test below caught it.
+                // `worktrees::scan::default_branch`'s comment warns about
+                // exactly this -- "Prefixing first would hide
+                // `--output=EVIL` behind a name that no longer starts with
+                // `-`" -- and the trap is the same whether the prefix is
+                // re-added or never removed.
+                //
+                // Reported as `NotSet` rather than `Unavailable`: git
+                // ANSWERED, and the answer is a name this code will not
+                // use -- which is a fact about the repository, the
+                // distinction #481 turned on.
+                log::warn!("ignoring a default branch that reads as a flag: {head:?}");
+                Err(DefaultBranchError::NotSet)
             } else {
                 Ok(head.to_string())
             }
@@ -726,6 +761,46 @@ mod tests {
         run(&repo, &["push", "-q", "-u", "origin", "main"]);
         run(&repo, &["remote", "set-head", "origin", "main"]);
         (tmp, repo)
+    }
+
+    /// A flag-shaped `origin/HEAD` is refused rather than passed to git.
+    ///
+    /// `origin/HEAD` is written by the REMOTE, so the name it yields is
+    /// remote-controlled -- and it goes on to `rev-list <default>` and
+    /// `merge-base <branch> <default>` as a bare argv element with no
+    /// `--`, where `--output=/path` is an arbitrary file write with this
+    /// app's privileges.
+    ///
+    /// `worktrees::scan` has guarded its own `default_branch` since it was
+    /// written; this sibling did not, because `is_safe_ref` was
+    /// `pub(super)` (#854). The symref is planted with `git symbolic-ref`
+    /// directly rather than through `set-head`, which validates the name
+    /// -- a hostile remote is under no such obligation.
+    #[test]
+    fn a_flag_shaped_remote_head_is_refused() {
+        let (_t, repo) = fixture();
+        run(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/--output=/tmp/pwned",
+            ],
+        );
+        assert_eq!(
+            default_branch(&repo),
+            Err(DefaultBranchError::NotSet),
+            "a name git would read as an option must not be returned as a branch"
+        );
+    }
+
+    /// And the ordinary case still works, so the guard above is not
+    /// refusing everything -- which would read as "this repository has no
+    /// origin/HEAD" on every repository.
+    #[test]
+    fn an_ordinary_remote_head_is_still_returned() {
+        let (_t, repo) = fixture();
+        assert_eq!(default_branch(&repo).as_deref(), Ok("origin/main"));
     }
 
     fn find<'a>(bs: &'a [Branch], name: &str) -> &'a Branch {

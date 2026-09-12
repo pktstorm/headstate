@@ -92,7 +92,39 @@ fn default_branch(repo: &Path) -> String {
             .filter(|s| !s.is_empty())
     };
 
-    if let Some(head) = git(&["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]) {
+    // `origin/HEAD` is written by the REMOTE, so this name is
+    // remote-controlled and must clear the flag-shape check before it
+    // reaches an argv (#854). It goes on to
+    // `merge-base --is-ancestor <tag> <default_branch>` in `origin.rs`,
+    // as a bare argument with no `--`, where `--output=/path` is an
+    // arbitrary file write with the app's privileges.
+    //
+    // Falling THROUGH to the candidate loop below on a flag-shaped name
+    // rather than returning an error: this function has no error channel,
+    // and the loop's two candidates are literals that cannot be
+    // flag-shaped. That is the same fallback shape
+    // `worktrees::scan::default_branch` uses -- a rejected name yields
+    // the default rather than a failure.
+    //
+    // The BARE name is what is checked, after the `origin/` prefix is
+    // stripped -- and that is the whole check, not a refinement.
+    // `symbolic-ref --short` returns `origin/<name>`, so a hostile
+    // `origin/--output=/tmp/x` starts with `o` and passes `is_safe_ref`
+    // unchanged. `worktrees::scan::default_branch`'s comment warns about
+    // exactly this: "Prefixing first would hide `--output=EVIL` behind a
+    // name that no longer starts with `-`."
+    //
+    // The value RETURNED keeps its prefix, because that is what
+    // `origin.rs`' `merge-base --is-ancestor` wants; only the validation
+    // looks at the bare half.
+    if let Some(head) = git(&["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).filter(|h| {
+        let bare = h.strip_prefix("origin/").unwrap_or(h);
+        let ok = crate::worktrees::scan::is_safe_ref(bare);
+        if !ok {
+            log::warn!("ignoring a default branch that reads as a flag: {h:?}");
+        }
+        ok
+    }) {
         return head;
     }
 

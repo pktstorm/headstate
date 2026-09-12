@@ -742,7 +742,11 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         "prune_worktrees" => res(commands::prune_worktrees(a.get("repoPath")?).await),
         "remove_artifacts" => res(commands::remove_artifacts(app.clone(), a.get("paths")?).await),
         "remove_venvs" => res(commands::remove_venvs(app.clone(), a.get("paths")?).await),
-        "remove_orphan" => res(commands::remove_orphan(a.get("path")?).await),
+        // `app.clone()` like the two rows above, since #854: the scan
+        // roots it checks containment against come from settings rather
+        // than from this request, which is what makes the path a paired
+        // peer sends unable to name a directory outside them.
+        "remove_orphan" => res(commands::remove_orphan(app.clone(), a.get("path")?).await),
         "docker_remove_images" => {
             let ids: Vec<String> = a.get("ids")?;
             ok(blocking(move || commands::docker_remove_images(ids)).await?)

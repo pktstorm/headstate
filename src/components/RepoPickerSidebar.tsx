@@ -14,7 +14,14 @@ export function RepoPickerSidebar({ reviewingCount }: { reviewingCount: number }
   const { setFilter } = useFilters();
   // The SAME repository list the worktree view uses -- one scan, one
   // source of truth for what exists in the monitored directories.
-  const { data: repos = [], isLoading } = useWorktrees();
+  //
+  // `isError` and `refetch` since #854. #846 fixed this exact defect on
+  // four surfaces, `WorktreeSidebar` among them -- which consumes THIS
+  // hook -- and this second consumer of it was missed. The copy below
+  // makes it the sharpest instance of the four: it is a diagnosis naming
+  // the user's settings, so a failed scan sent someone to fix a
+  // configuration that was never wrong.
+  const { data: repos = [], isLoading, isError, refetch } = useWorktrees();
 
   const rowClass = (active: boolean) =>
     `flex w-full items-center justify-between rounded px-3 py-2 text-sm ${
@@ -44,8 +51,30 @@ export function RepoPickerSidebar({ reviewingCount }: { reviewingCount: number }
             
             "We have not looked yet" and "we looked and there is
             nothing" are opposite answers, which is the same rule this
-            codebase applies to a failed check anywhere else. */}
-        {isLoading ? (
+            codebase applies to a failed check anywhere else.
+
+            And so is the THIRD answer, "we looked and could not tell",
+            which this had no arm for until #854 -- the sharpest omission
+            of the six that issue found, because the copy above is a
+            diagnosis naming the user's settings. The failure arm comes
+            FIRST, for the reason `ClaudeMdPage` states: `data` keeps its
+            `[]` default on a rejection, so an arm placed after the empty
+            one is unreachable in exactly the case it exists for. And
+            before `isLoading`, because a retry leaves both true and
+            flipping back to "Looking…" reads as the error resolving
+            itself. */}
+        {isError ? (
+          <div className="px-3 py-2">
+            <p className="text-xs text-[#f85149]">Could not scan for repositories.</p>
+            <button
+              type="button"
+              onClick={() => void refetch()}
+              className="mt-1 text-xs text-[#58a6ff] hover:underline"
+            >
+              Try again
+            </button>
+          </div>
+        ) : isLoading ? (
           <p className="px-3 py-2 text-xs text-[#8b949e]">Looking for repositories…</p>
         ) : repos.length === 0 ? (
           <p className="px-3 py-2 text-xs text-[#8b949e]">

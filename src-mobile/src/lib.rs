@@ -43,6 +43,10 @@ mod connection;
 pub mod discovery;
 mod events;
 mod keys;
+/// The constants this crate shares with the desktop, asserted against the
+/// desktop's own source (#854). Test-only.
+#[cfg(test)]
+mod mirrored;
 pub mod notify;
 mod pairing;
 mod stepup;

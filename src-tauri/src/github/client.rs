@@ -457,6 +457,49 @@ impl GitHubClient {
         Ok(prs)
     }
 
+    /// Fails rather than reporting a COUNT that GitHub refused to supply.
+    ///
+    /// `reject_empty_after_refusals` above is the same rule for a list,
+    /// and it has been right since #317. This is the half that was
+    /// missing for five years of count paths (#854): every one of them
+    /// read its number through `as_u64().unwrap_or(0)`, so a refused
+    /// `search` alias became a confident zero rather than a failure.
+    ///
+    /// Why zero is the worst possible default for these specific numbers:
+    /// they are all "how much happened", so a refusal renders as a
+    /// truthful-looking quiet period. `count_reviewing` feeds the sidebar
+    /// badge, where it reads as "you are all caught up" on a query that
+    /// never answered -- the user then does not look, which is precisely
+    /// the outcome the badge exists to prevent. `fetch_periods` and
+    /// `fetch_history` feed the delta cards and the chart, where a zeroed
+    /// bucket draws a trough: `stats/fetch.rs:1087` refuses to default
+    /// exactly there, saying "defaulting here would draw a trough that
+    /// reads as a quiet day", and these paths are its untreated siblings.
+    ///
+    /// An error is honest and, unlike a zero, retries. The wording
+    /// matches its list-shaped sibling because the cause and the remedy
+    /// are the same.
+    ///
+    /// Applied when the count is ABSENT and fields were refused, not
+    /// whenever anything was refused: a response missing one of six
+    /// aliases should still show the five that arrived, which is the
+    /// "half a list beats none" rule the whole module is built on.
+    fn reject_missing_count_after_refusals(
+        value: Option<u64>,
+        refused: usize,
+        what: &str,
+    ) -> Result<u64, ClientError> {
+        match value {
+            Some(n) => Ok(n),
+            None if refused > 0 => Err(ClientError::Graphql(format!(
+                "GitHub refused {refused} field(s) and returned no {what}. \
+                 This usually clears on the next refresh."
+            ))),
+            // No refusal: a missing alias is an ordinary empty result.
+            None => Ok(0),
+        }
+    }
+
     pub async fn fetch_reviewing(&self) -> Result<Vec<PullRequest>, ClientError> {
         self.fetch_reviewing_with_shortfall()
             .await
@@ -558,7 +601,13 @@ impl GitHubClient {
                 "variables": { "q": REVIEW_REQUESTED },
             }))
             .await?;
-        Ok(v["matching"]["issueCount"].as_u64().unwrap_or(0))
+        // A refused `matching` alias used to render as 0, which the
+        // sidebar badge shows as "nothing awaits your review" (#854).
+        Self::reject_missing_count_after_refusals(
+            v["matching"]["issueCount"].as_u64(),
+            refused_fields(&v),
+            "review count",
+        )
     }
 
     /// Both lists, as two CONCURRENT requests.
@@ -597,6 +646,22 @@ impl GitHubClient {
         let v = self
             .graphql_partial_ok(&json!({ "query": cycle_trend_query(now) }))
             .await?;
+        // Both window totals, before mapping (#854). `map_cycle_trend`
+        // reads each `issueCount` through `unwrap_or(0)` and derives
+        // `sampled` from it, so a refused count does not merely zero a
+        // number: `0 > 100` is false, `sampled` flips to FALSE, and a
+        // 100-PR sample of a busy week is presented as the complete week.
+        // That is exactly the silent-census failure #847's shape guard
+        // exists to stop a missing FIELD causing, arriving here through a
+        // refused one instead.
+        let refused = refused_fields(&v);
+        for window in ["current", "previous"] {
+            Self::reject_missing_count_after_refusals(
+                v[window]["issueCount"].as_u64(),
+                refused,
+                "cycle-time window total",
+            )?;
+        }
         Ok(map_cycle_trend(&v))
     }
 
@@ -718,6 +783,32 @@ impl GitHubClient {
                 "variables": { "owner": owner, "repo": name, "number": number }
             }))
             .await?;
+        // A refusal on THIS document is not survivable by defaulting, and
+        // this is the one path where that is counter-intuitive enough to
+        // spell out (#854).
+        //
+        // `map_detail` defaults an absent `totalCount` to the number of
+        // items that ARRIVED, deliberately, so that an old cached payload
+        // predating #802 reads as "nothing missing" rather than rendering
+        // a nonsense "showing 37 of 0". That default is right for a stale
+        // payload and actively wrong for a refused one: a response whose
+        // `totalCount` GitHub declined then claims the truncated list is
+        // complete -- a blocking review thread or a failing check outside
+        // the window, on a panel that looks finished. #802 and #790 are
+        // both that exact shape, and defaulting turns a refusal into it.
+        //
+        // So a refusal here is an error rather than a partial render. The
+        // detail view is opened deliberately and retries on its own, which
+        // is what makes an error affordable here where it would not be on
+        // the poll path.
+        let refused = refused_fields(&v);
+        if refused > 0 {
+            return Err(ClientError::Graphql(format!(
+                "GitHub refused {refused} field(s) on this pull request, so its checks \
+                 and review threads cannot be shown as complete. \
+                 This usually clears on the next refresh."
+            )));
+        }
         self.append_remaining_checks(&mut v, owner, name, number)
             .await?;
         Ok(map_detail(&v, repo))
@@ -984,9 +1075,20 @@ impl GitHubClient {
                 }
             }))
             .await?;
+        // Both counts, or an error: a refused alias reported as 0 merged
+        // pull requests is a confident claim about a quiet week (#854).
+        let refused = refused_fields(&v);
         Ok(Stats {
-            merged_week: v["merged_week"]["issueCount"].as_u64().unwrap_or(0),
-            merged_month: v["merged_month"]["issueCount"].as_u64().unwrap_or(0),
+            merged_week: Self::reject_missing_count_after_refusals(
+                v["merged_week"]["issueCount"].as_u64(),
+                refused,
+                "weekly merged count",
+            )?,
+            merged_month: Self::reject_missing_count_after_refusals(
+                v["merged_month"]["issueCount"].as_u64(),
+                refused,
+                "monthly merged count",
+            )?,
             ..Stats::default()
         })
     }
@@ -1021,10 +1123,22 @@ impl GitHubClient {
         }
 
         let mut merged = serde_json::Map::new();
+        // Refusals are SUMMED across chunks rather than overwritten.
+        //
+        // `__refused` is a TOP-LEVEL key, not an alias, so the blanket
+        // insert below made the last refusing chunk win -- in
+        // `join_next` completion order, which is non-deterministic, so a
+        // complete chunk finishing last erased every refusal before it
+        // (#854). The stats layer found and fixed this exact bug in its
+        // own chunked merge (`stats/fetch.rs:948`, pinned by
+        // `refusals_across_chunks_are_summed_not_overwritten`); this is
+        // the legacy history path that never received it.
+        let mut refused = 0usize;
         while let Some(joined) = set.join_next().await {
             // A panicked task would otherwise be swallowed and show up as a
             // silently short series, so it is surfaced as an error.
             let chunk = joined.map_err(|e| ClientError::Join(e.to_string()))??;
+            refused += refused_fields(&chunk);
             if let Some(obj) = chunk.as_object() {
                 // Alias indices are absolute, so chunks merge in any
                 // completion order without renumbering or clobbering.
@@ -1032,6 +1146,13 @@ impl GitHubClient {
                     merged.insert(k.clone(), val.clone());
                 }
             }
+        }
+        // Re-stated under the key the readers use, so the merged value
+        // carries the TOTAL. Inserted only when non-zero, matching
+        // `graphql_partial_ok`'s own shape -- an absent key means no
+        // refusal, and a present zero would be a different claim.
+        if refused > 0 {
+            merged.insert("__refused".into(), refused.into());
         }
         Ok(serde_json::Value::Object(merged))
     }
@@ -1042,14 +1163,20 @@ impl GitHubClient {
         let v = self
             .graphql_partial_ok(&json!({ "query": periods_query(now) }))
             .await?;
-        let count = |k: &str| v[k]["issueCount"].as_u64().unwrap_or(0);
+        // Each alias consults the refusal count rather than defaulting to
+        // zero (#854): a zeroed period is a delta card claiming a change
+        // that did not happen, against a figure GitHub never supplied.
+        let refused = refused_fields(&v);
+        let count = |k: &str| {
+            Self::reject_missing_count_after_refusals(v[k]["issueCount"].as_u64(), refused, k)
+        };
         Ok(Periods {
-            week_current: count("week_current"),
-            week_previous: count("week_previous"),
-            opened_week_current: count("opened_week_current"),
-            opened_week_previous: count("opened_week_previous"),
-            month_current: count("month_current"),
-            month_previous: count("month_previous"),
+            week_current: count("week_current")?,
+            week_previous: count("week_previous")?,
+            opened_week_current: count("opened_week_current")?,
+            opened_week_previous: count("opened_week_previous")?,
+            month_current: count("month_current")?,
+            month_previous: count("month_previous")?,
         })
     }
 
@@ -1063,15 +1190,22 @@ impl GitHubClient {
         // carries the six period aliases, so a 30-day fetch is six requests
         // and two rate-limit points rather than one request that fails.
         let v = self.fetch_history_values(now, days, true).await?;
-        let count = |k: &str| v[k]["issueCount"].as_u64().unwrap_or(0);
+        // The period aliases consult the refusal count, as `fetch_periods`
+        // does, and for the same reason (#854). `points` is left to
+        // `map_history`, which already reports a missing day as a gap
+        // rather than as a zero.
+        let refused = refused_fields(&v);
+        let count = |k: &str| {
+            Self::reject_missing_count_after_refusals(v[k]["issueCount"].as_u64(), refused, k)
+        };
         Ok(History {
             points: map_history(&v, days, now),
-            week_current: count("week_current"),
-            week_previous: count("week_previous"),
-            opened_week_current: count("opened_week_current"),
-            opened_week_previous: count("opened_week_previous"),
-            month_current: count("month_current"),
-            month_previous: count("month_previous"),
+            week_current: count("week_current")?,
+            week_previous: count("week_previous")?,
+            opened_week_current: count("opened_week_current")?,
+            opened_week_previous: count("opened_week_previous")?,
+            month_current: count("month_current")?,
+            month_previous: count("month_previous")?,
         })
     }
 
@@ -2719,5 +2853,220 @@ mod tests {
         );
         // Repo counts descend, so the table's first row is the busiest.
         assert!(d.repo_counts.windows(2).all(|w| w[0].merged >= w[1].merged));
+    }
+
+    /// Every `graphql_partial_ok` call site consults the refusal count.
+    ///
+    /// # What it enforces
+    ///
+    /// A production function that runs a GraphQL document through
+    /// `graphql_partial_ok` must also read `refused_fields` from the
+    /// response -- directly, or by handing it to one of the two rejecters
+    /// -- or appear in `NO_REFUSAL_READ` below with a recorded reason.
+    ///
+    /// # The findings it would have caught (#854)
+    ///
+    /// `graphql_partial_ok` exists to keep `data` when `errors`
+    /// accompanies it, which is right: 26 good PR nodes beat none. The
+    /// corollary is that every caller inherits a response that may be
+    /// PARTIAL and has to decide what to do about it. One caller did:
+    /// `fetch_reviewing_with_shortfall` has called
+    /// `reject_empty_after_refusals` since #317, whose doc spells the cost
+    /// out -- a refused page cached as "No open pull requests", shown
+    /// indefinitely because the query stays fresh for a minute.
+    ///
+    /// Five count paths did not, and each read its number through
+    /// `as_u64().unwrap_or(0)`:
+    ///
+    /// - `count_reviewing` -- the sidebar badge, which then reads "you
+    ///   are all caught up" on a query that never answered.
+    /// - `fetch_periods` and `fetch_history` -- the delta cards and the
+    ///   chart, where a zeroed bucket draws a trough.
+    /// - `fetch_stats` -- a confident zero merged pull requests.
+    /// - `fetch_cycle_trend` -- the sharpest: `map_cycle_trend` derives
+    ///   `sampled` from the count, so a refused total flips `sampled` to
+    ///   FALSE and a 100-PR sample of a busy week is presented as the
+    ///   complete week.
+    ///
+    /// The rule was written down the whole time, twice.
+    /// `reject_empty_after_refusals` sits thirty lines above
+    /// `count_reviewing`, and `stats/fetch.rs:1087` refuses to default a
+    /// missing bucket in so many words -- "defaulting here would draw a
+    /// trough that reads as a quiet day". Neither reached these five.
+    ///
+    /// # What it cannot see
+    ///
+    /// - **Whether the consultation is CORRECT.** It checks that
+    ///   `refused_fields` is read in the same function, not that the
+    ///   answer changes anything. A caller that reads the count and
+    ///   discards it passes. The behavioural tests beside each path are
+    ///   what cover that.
+    /// - **A call it cannot follow.** `search_page` runs the document and
+    ///   its CALLER consults refusals; a text scan cannot see across that
+    ///   boundary, so both halves of such a split need an entry below.
+    /// - **`stats_graphql`'s callers**, which are in another module
+    ///   entirely. `stats/fetch.rs`' seven readers all call
+    ///   `refused_fields_of`, and
+    ///   `every_stats_read_goes_through_the_process_wide_permit` is what
+    ///   keeps that the only door.
+    #[test]
+    fn every_partial_ok_call_site_consults_the_refusal_count() {
+        /// Call sites that legitimately do not read the count, each with
+        /// its reason. An explicit, reviewed list rather than a looser
+        /// pattern, for the reason `check-privacy.sh:120` gives: a guard
+        /// that cries wolf is a guard somebody disables.
+        const NO_REFUSAL_READ: &[(&str, &str)] = &[
+            // Runs the document; its callers consult the count on the
+            // response it returns. `fetch_reviewing_with_shortfall` does
+            // so through `reject_empty_after_refusals`.
+            (
+                "search_page",
+                "returns the raw response; its callers read the count",
+            ),
+            // The viewer login. A refusal here cannot become a confident
+            // wrong answer: an absent login is already treated as the
+            // failure it is rather than as a user named "".
+            (
+                "fetch_viewer",
+                "an absent login is already handled as a failure, not defaulted",
+            ),
+            (
+                "fetch_viewer_metered",
+                "as `fetch_viewer`; this one also records the spend",
+            ),
+            // The cursor loop that appends extra pages into a response the
+            // CALLER then maps, so `fetch_pr_detail` owns the verdict for
+            // the whole chain -- and it refuses outright on a refusal,
+            // because `map_detail` defaults a missing total to "nothing
+            // missing".
+            //
+            // Named `checks_pages` rather than its delegating wrapper
+            // `append_remaining_checks`: the guard reports the function the
+            // call is IN, and the first version of this list named the
+            // wrapper, which the guard correctly would not accept.
+            (
+                "checks_pages",
+                "merges into the caller's response; `fetch_pr_detail` judges the whole chain",
+            ),
+            (
+                "merged_detail_page",
+                "one page for `fetch_merged_detail`, which maps the result",
+            ),
+            // The stats layer's door. Its readers each call
+            // `refused_fields_of`, which a scan of this file cannot see.
+            (
+                "stats_graphql",
+                "the stats layer reads the count at each of its own readers",
+            ),
+            // The machinery itself, not a caller of it.
+            ("graphql_partial_ok", "the helper itself"),
+        ];
+
+        let src = include_str!("client.rs");
+        let prod = src.split_once("\n#[cfg(test)]").map_or(src, |(p, _)| p);
+        // `fn` openers at both indentations: free functions at column 0
+        // and methods inside the `impl` block.
+        const FN: &[&str] = &[
+            "\n    fn ",
+            "\n    pub fn ",
+            "\n    pub async fn ",
+            "\n    async fn ",
+            "\nfn ",
+            "\npub fn ",
+            "\npub async fn ",
+            "\nasync fn ",
+        ];
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut at = 0usize;
+        while let Some(i) = prod[at..].find("graphql_partial_ok(") {
+            let hit = at + i;
+            at = hit + 1;
+            let line_start = prod[..hit].rfind('\n').map_or(0, |j| j + 1);
+            let line_end = prod[hit..].find('\n').map_or(prod.len(), |j| hit + j);
+            let line = &prod[line_start..line_end];
+            // A comment naming the helper. This file discusses it at
+            // length, so without the skip the guard would fire on the
+            // very prose that states the rule it enforces.
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+
+            // The enclosing function: back to the nearest `fn`, forward to
+            // the next one, so the read has to be in THIS function.
+            let before = &prod[..hit];
+            let start = FN.iter().filter_map(|m| before.rfind(m)).max().unwrap_or(0);
+            let body = &prod[start..];
+            let rel = hit - start;
+            // Searched FROM the hit, not from the start of the body.
+            // `body.find(m)` finds each pattern's FIRST occurrence, which
+            // may already be behind `rel` -- so filtering those out
+            // discards the pattern entirely rather than looking for its
+            // next occurrence, and the body then ran to the next pattern
+            // that happened to appear later. That gave `count_reviewing` a
+            // 5,797-byte body spanning six functions, so it "consulted"
+            // refusals that a neighbour consulted, and the guard passed
+            // over the very defect it was written for. Caught only by
+            // reverting the fix and watching it NOT fail.
+            let end = FN
+                .iter()
+                .filter_map(|m| body[rel..].find(m).map(|e| rel + e))
+                .min()
+                .unwrap_or(body.len());
+            let body = &body[..end];
+            let name = body
+                .split_once("fn ")
+                .and_then(|(_, r)| r.split(['(', '<']).next())
+                .unwrap_or("<unknown>")
+                .trim()
+                .to_string();
+
+            seen.push(name.clone());
+            if NO_REFUSAL_READ.iter().any(|(n, _)| *n == name) {
+                continue;
+            }
+            // Reading the count, in any of the three spellings: the reader
+            // itself, or either rejecter -- which takes the count as an
+            // argument, so calling one means having read it.
+            let consults = body.contains("refused_fields(")
+                || body.contains("reject_empty_after_refusals")
+                || body.contains("reject_missing_count_after_refusals");
+            assert!(
+                consults,
+                "`{name}` runs a document through `graphql_partial_ok` and never reads \
+                 `refused_fields` from the response. `graphql_partial_ok` keeps `data` \
+                 when GitHub refuses fields -- deliberately -- so every caller inherits \
+                 a response that may be PARTIAL and has to say so rather than render it \
+                 as an answer. A refused count read through `unwrap_or(0)` is the worst \
+                 shape this takes: zero is indistinguishable from a quiet week, and \
+                 `count_reviewing` showed exactly that on the sidebar badge as \
+                 \"nothing awaits your review\" (#854). Use \
+                 `reject_empty_after_refusals` for a list or \
+                 `reject_missing_count_after_refusals` for a count, or record here why \
+                 this one cannot.\n    {}",
+                line.trim()
+            );
+        }
+
+        // Guards the guard. A renamed helper or a moved file would
+        // otherwise leave this passing over an empty list --
+        // `every_stats_query_meters_itself` asserts the same way and for
+        // the same reason.
+        assert!(
+            seen.len() >= 10,
+            "only {} `graphql_partial_ok` call site(s) found; the scan is broken, not \
+             the code",
+            seen.len()
+        );
+        // And every exemption must still correspond to a real call site,
+        // so the list cannot quietly outlive what it excuses. A stale
+        // entry is how an allowlist stops describing the code.
+        for (name, why) in NO_REFUSAL_READ {
+            assert!(
+                seen.iter().any(|s| s == name),
+                "NO_REFUSAL_READ excuses `{name}` ({why}), which no longer calls \
+                 `graphql_partial_ok`. Remove the entry."
+            );
+        }
     }
 }

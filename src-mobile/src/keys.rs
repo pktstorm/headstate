@@ -72,7 +72,9 @@ pub const MLDSA_SIG_LEN: usize = 3309;
 /// Session certificate validity. Long, like the desktop's, because the
 /// desktop pins the fingerprint and checks no dates; an expiry would
 /// silently unpair the phone.
-const VALIDITY_YEARS: i32 = 10;
+/// `pub(crate)` so `mirrored.rs` can assert it against the desktop's
+/// copy (#854); nothing outside this crate reads it.
+pub(crate) const VALIDITY_YEARS: i32 = 10;
 
 const SESSION_KEY: &str = "keys/session";
 const STEPUP_KEY: &str = "keys/stepup";

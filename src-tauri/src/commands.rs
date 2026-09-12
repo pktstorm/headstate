@@ -1413,12 +1413,22 @@ pub async fn pull_checkout(path: String) -> Result<String, String> {
 /// run `git worktree remove` against. That makes it a plain recursive
 /// delete, and `remove_orphan` re-derives orphan status itself rather
 /// than trusting this call.
+///
+/// The scan roots are passed to the backend rather than trusted from the
+/// caller, the same rule `remove_artifacts` above states: containment is
+/// one of the two things between a bad path and `remove_dir_all` on an
+/// arbitrary directory, so the boundary it checks against must come from
+/// settings, not from the request. This call used to pass the path alone
+/// (#854) -- the one recursive delete in the app with neither a symlink
+/// check nor a containment check, reachable from a paired peer.
 #[tauri::command]
-pub async fn remove_orphan(path: String) -> Result<(), String> {
+pub async fn remove_orphan(app: AppHandle, path: String) -> Result<(), String> {
+    let roots = get_worktree_dirs(app);
     let p = path.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || crate::worktrees::remove_orphan(&p))
-        .await
-        .map_err(|e| e.to_string())?;
+    let result =
+        tauri::async_runtime::spawn_blocking(move || crate::worktrees::remove_orphan(&p, &roots))
+            .await
+            .map_err(|e| e.to_string())?;
 
     match &result {
         Ok(()) => log::info!("removed orphaned worktree {path}"),

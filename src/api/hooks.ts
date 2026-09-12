@@ -983,15 +983,28 @@ export function useCleanupPrefs() {
 /// have never seen applied.
 export function useCleanupLog(enabled: boolean) {
   const qc = useQueryClient();
-  const { data = [], isLoading } = useQuery({
+  const { data = [], isLoading, isError, refetch } = useQuery({
     queryKey: ["cleanup-log"],
     queryFn: cleanupLog,
     enabled,
     staleTime: 30_000,
+    // Paired with the explicit retry the component now renders, the way
+    // #846 paired them on `useArtifacts`, `useVenvs` and `useClaudeMd`:
+    // a silent background retry makes a failure look like a slow load.
+    retry: false,
   });
   return {
     entries: data,
     isLoading,
+    // `isError` and `refetch` are RETURNED since #854. Without them the
+    // component could not comply however it was written -- the hook is
+    // the whole reason this surface was not fixable by #846, which
+    // changed four components and no hooks' return shapes. An audit
+    // ledger that reads "No reports yet" because the read FAILED is the
+    // sharpest form of this bug: the component's own purpose is turning
+    // "trust this predicate" into "I have read this list".
+    isError,
+    refetch,
     run: async () => {
       const out = await previewCleanup();
       await qc.invalidateQueries({ queryKey: ["cleanup-log"] });

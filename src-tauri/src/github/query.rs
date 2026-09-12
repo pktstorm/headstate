@@ -1037,4 +1037,263 @@ mod tests {
              to avoid"
         );
     }
+
+    /// `VIEWER_QUERY` selects the one field its mapper reads.
+    ///
+    /// The shortest document in the app and the one with the most leverage:
+    /// `map_viewer` reads `["viewer"]["login"]`, and the login is what
+    /// every `author:@me`-shaped search is built from. #769 records what a
+    /// defaulted login costs -- `unwrap_or_default()` would have sent
+    /// `user:` to GitHub, "which returns no results rather than an error".
+    /// So the document losing `login` does not fail; it empties every list
+    /// in the app, quietly.
+    ///
+    /// Derived from the mapper rather than listed, the same way
+    /// `the_cycle_trend_query_asks_for_every_field_its_mapper_reads` is.
+    /// #844 promoted this document out of an inline literal in `client.rs`
+    /// specifically so guards could see it; this is the shape half of
+    /// that, where the metering guard was the cost half (#854).
+    #[test]
+    fn the_viewer_query_asks_for_every_field_its_mapper_reads() {
+        for f in fields_read_by(&["map_viewer"]) {
+            assert!(
+                VIEWER_QUERY.contains(&f),
+                "map_viewer reads `{f}` and VIEWER_QUERY does not select it; an absent \
+                 login defaults to empty, and `author:@me` built from an empty login \
+                 returns NO RESULTS rather than an error (#769)"
+            );
+        }
+        // The nesting, which a read-set derivation cannot express: `login`
+        // has to be inside `viewer`, not merely somewhere in the document.
+        let viewer = VIEWER_QUERY
+            .split_once("viewer {")
+            .expect("the viewer selection")
+            .1;
+        assert!(
+            viewer
+                .split_once('}')
+                .expect("viewer closes")
+                .0
+                .contains("login"),
+            "login must be selected INSIDE viewer"
+        );
+    }
+
+    /// `STATS_QUERY` carries both aliases its reader reads, count-only.
+    ///
+    /// `fetch_stats` reads `merged_week` and `merged_month` by name, so a
+    /// renamed alias reads as a zero rather than as a failure -- the same
+    /// property `the_count_query_alias_matches_its_reader` pins for
+    /// `COUNT_QUERY`, which is its sibling and was guarded while this was
+    /// not (#854).
+    #[test]
+    fn the_stats_query_aliases_match_their_reader() {
+        for alias in ["merged_week: search", "merged_month: search"] {
+            assert!(
+                STATS_QUERY.contains(alias),
+                "fetch_stats reads the `{alias}` alias by name; renaming it here makes \
+                 the dashboard read 0 merged pull requests rather than fail"
+            );
+        }
+        assert!(STATS_QUERY.contains("issueCount"));
+        // COUNT-only, which is the whole reason this document is separate
+        // from `PRS_QUERY`. `nodes` here would resolve the per-PR fields
+        // that make the list query cost 6 points instead of 1.
+        assert!(
+            !STATS_QUERY.contains("nodes"),
+            "nodes here would resolve the per-PR fields this document exists to avoid"
+        );
+    }
+
+    /// `periods_query` carries all six aliases `fetch_periods` reads.
+    ///
+    /// Six, derived from the READER rather than listed here, so an alias
+    /// added to `Periods` demands its place in the document on the next
+    /// `cargo test`. `fetch_periods` reads each one by a string literal, so
+    /// the read set is extractable exactly the way `fields_read_by` does it
+    /// for a mapper -- and a missing alias renders as a zeroed period,
+    /// which is a delta card claiming a change that did not happen.
+    ///
+    /// `combined_query_is_balanced_and_complete` already checks two of
+    /// these names on `history_query_with_periods`, the document that
+    /// appends them. It never checked `periods_query`, which is the
+    /// standalone request the delta cards fire on their own (#854).
+    #[test]
+    fn the_periods_query_carries_every_alias_its_reader_reads() {
+        let q = periods_query(at("2026-08-20T14:00:00Z"));
+        // The reader's own source, scoped to `fetch_periods`.
+        let client = include_str!("client.rs");
+        let from = client
+            .find("pub async fn fetch_periods(")
+            .expect("fetch_periods not found in client.rs");
+        let body = &client[from..];
+        let end = body[1..]
+            .find("\n    pub async fn ")
+            .map_or(body.len(), |j| j + 1);
+        let body = &body[..end];
+
+        let mut found = 0usize;
+        for line in body.lines() {
+            // `count("week_current")?` -- the alias as a quoted literal.
+            let Some((_, rest)) = line.split_once("count(\"") else {
+                continue;
+            };
+            let Some((alias, _)) = rest.split_once('"') else {
+                continue;
+            };
+            found += 1;
+            assert!(
+                q.contains(&format!("{alias}: search")),
+                "fetch_periods reads the `{alias}` alias and periods_query does not \
+                 emit it; the delta card would render a zero as a real period"
+            );
+        }
+        assert_eq!(
+            found, 6,
+            "six period aliases are expected; found {found} -- the scan is broken, \
+             not the document"
+        );
+        // And count-only: these are six searches in one request precisely
+        // because none of them resolves a node.
+        assert!(
+            !q.contains("nodes"),
+            "nodes would make six aliased searches resolve per-PR fields"
+        );
+    }
+
+    /// Every GraphQL document has a shape guard naming it.
+    ///
+    /// # What it enforces
+    ///
+    /// The document list is DERIVED -- it reuses
+    /// `stats::budget::tests::every_query_document`, the same scan #857's
+    /// metering guard runs on -- and every document it finds must be named
+    /// by at least one test in a guard file, or appear in `NO_SHAPE_GUARD`
+    /// below with a reason.
+    ///
+    /// # The finding it would have caught (#847, #854)
+    ///
+    /// #847 is the canonical statement of why a shape guard is needed at
+    /// all: a mapper's tests feed it `json!` literals, so they supply the
+    /// fields themselves and pass just as happily against a document that
+    /// stopped asking for one. `cycle_trend_query`'s own guard spells the
+    /// cost out -- drop `issueCount` and `map_cycle_trend` computes
+    /// `sampled` from a zero, `0 > 100` is false, and a 100-PR sample of a
+    /// busy week is presented as the complete week.
+    ///
+    /// #847 then fixed TWO documents by hand and #857 built
+    /// `fields_read_by` to derive the field list from the mapper. Both are
+    /// good. Neither asked the general question: IS every document
+    /// guarded? It was still a set of individually-written tests, so a new
+    /// document arrives unguarded by default and nothing says so -- which
+    /// is the same list-shaped blind spot #842, #844 and #847 each were.
+    ///
+    /// # What it cannot see, stated rather than glossed
+    ///
+    /// - **Whether the guard is any GOOD.** It checks that a test NAMES
+    ///   the document, not that the test asserts anything useful about it.
+    ///   A test mentioning `PRS_QUERY` in a comment would satisfy this.
+    ///   That is a real weakness and the reason `NO_SHAPE_GUARD`'s entries
+    ///   carry reasons rather than being waved through: this guard raises
+    ///   the floor from "nobody checked" to "somebody wrote a test naming
+    ///   it", which is where a text scan's reach ends.
+    /// - **Which mapper belongs to which document.** That binding is not
+    ///   derivable from source: only four of the eleven documents are
+    ///   built in the same function as the `map_*` call that reads them,
+    ///   and three read their fields inline with no mapper at all. It was
+    ///   attempted and abandoned rather than approximated -- a guess at
+    ///   that pairing would assert the wrong mapper's read set against a
+    ///   document and report a defect at a location that does not have
+    ///   one, which is the mistake `every_stats_query_meters_itself`
+    ///   records an earlier version of itself making.
+    /// - **`mutate.rs`' nine documents**, which are named `*_DOC` and so
+    ///   match no `query`/`QUERY` pattern. They are mutations: a dropped
+    ///   field makes a write fail loudly rather than return a confident
+    ///   partial answer, which is the property this whole family of guards
+    ///   is about. Out of scope deliberately, not overlooked.
+    #[test]
+    fn every_graphql_document_has_a_shape_guard() {
+        /// Documents with no shape guard, and why.
+        ///
+        /// An explicit, reviewed list with a reason each -- the form this
+        /// codebase insists on over a looser pattern
+        /// (`check-privacy.sh:120`, ~40 false positives from one
+        /// unanchored regex).
+        const NO_SHAPE_GUARD: &[(&str, &str)] = &[
+            // Delegators: their body forwards to another builder, so the
+            // document -- and its guard -- live one level down.
+            (
+                "history_query",
+                "delegates to history_query_range, which is guarded",
+            ),
+            (
+                "history_query_with_periods",
+                "delegates to history_query_range_with_periods",
+            ),
+        ];
+
+        let docs = crate::github::stats::budget::tests::every_query_document();
+        // Every test source that could hold a guard. The guards live beside
+        // the documents they check, which is where this codebase puts them.
+        let guards = [
+            include_str!("query.rs"),
+            include_str!("stats/query.rs"),
+            include_str!("stats/tree.rs"),
+            include_str!("stats/board.rs"),
+            include_str!("../poll.rs"),
+        ];
+
+        let mut unguarded = Vec::new();
+        for (file, name, _) in &docs {
+            if NO_SHAPE_GUARD.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            // A guard is a `fn` in a test module whose BODY names this
+            // document. Scoped to a function body rather than searched
+            // file-wide, because every one of these files defines its own
+            // documents and would therefore "name" all of them.
+            let guarded = guards.iter().any(|src| {
+                let Some((_, tests)) = src.split_once("\n#[cfg(test)]") else {
+                    return false;
+                };
+                tests.split("    fn ").skip(1).any(|body| {
+                    // Only the portion before the next test attribute, so a
+                    // mention in the NEXT test's doc comment does not count
+                    // for this one.
+                    let body = body.split("\n    #[").next().unwrap_or(body);
+                    let uses = body
+                        .lines()
+                        .filter(|l| !l.trim_start().starts_with("//"))
+                        .any(|l| l.contains(name.as_str()));
+                    uses && (body.contains("contains(") || body.contains("split_once("))
+                })
+            });
+            if !guarded {
+                unguarded.push(format!("{file}'s {name}"));
+            }
+        }
+
+        // Guards the guard: a broken derivation would report nothing to
+        // check, and a broken guard-detector would report everything.
+        assert!(
+            docs.len() >= 10,
+            "only {} document(s) derived; the scan is broken, not the documents",
+            docs.len()
+        );
+        assert!(
+            unguarded.is_empty(),
+            "these GraphQL documents have no test asserting their shape:\n  {}\n\n\
+             No mapper test can see a missing field: they feed `json!` literals that \
+             supply the field themselves, so the document can stop asking for it and \
+             the suite stays green (#847). What that costs is a PARTIAL answer \
+             presented as a complete one -- drop `issueCount` from a window and \
+             `map_cycle_trend` reports a 100-PR sample of a busy week as the whole \
+             week. Add a test asserting the fields its reader reads, deriving them \
+             with `fields_read_by` where the reader is a `map_*` function, plus a \
+             nesting assertion where a count has to sit beside the nodes it \
+             qualifies. If the document genuinely needs none, add it to \
+             NO_SHAPE_GUARD with a reason (#854).",
+            unguarded.join("\n  ")
+        );
+    }
 }
