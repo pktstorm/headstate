@@ -408,7 +408,17 @@ mod removal_tests {
     /// permissions because a permissions test cannot run as root and
     /// would be skipped in exactly the CI that needs it. Both reach the
     /// same `None`.
+    ///
+    /// `#[cfg(unix)]` because setting an mtime needs `touch -t`: `std::fs`
+    /// cannot set one, and `filetime` would be a new crate in the supply
+    /// chain for one call -- the trade `make_old` above already made and
+    /// documents. This test ASSERTS `touch` succeeded rather than
+    /// ignoring the status as `make_old` does, since a silently-unset
+    /// mtime would leave it passing for the wrong reason; that assert is
+    /// what makes the gate necessary rather than merely tidy. The guard
+    /// it covers is platform-independent, so unix coverage establishes it.
     #[test]
+    #[cfg(unix)]
     fn refuses_a_directory_whose_age_it_could_not_read() {
         let (_t, target, roots) = root_with_target();
         // Far enough ahead to survive any clock skew between the `touch`

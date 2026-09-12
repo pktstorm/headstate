@@ -526,7 +526,14 @@ mod tests {
     /// This is the rule `an_unfinished_scan_proposes_nothing` already
     /// states for venvs, asserted for artifacts: the unattended pass is
     /// the worst place to guess (#747).
+    ///
+    /// `#[cfg(unix)]` because setting an mtime needs `touch -t` -- the
+    /// trade `artifacts::removal_tests::make_old` already documents, and
+    /// the status is asserted here rather than ignored so a silently-unset
+    /// mtime cannot leave this passing for the wrong reason. The guard it
+    /// covers is platform-independent.
     #[test]
+    #[cfg(unix)]
     fn a_directory_of_unreadable_age_is_skipped_not_proposed() {
         let t = tempfile::TempDir::new().unwrap();
         std::fs::write(t.path().join("Cargo.toml"), "[package]").unwrap();
