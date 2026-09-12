@@ -609,13 +609,30 @@ mod tests {
         let fp = f.sample("2026-01-01T00:00:00Z");
 
         assert_eq!(fp.sampled_at, "2026-01-01T00:00:00Z");
-        // At least this process and the one that spawned it. A count of
-        // one would mean the traversal found only itself, which no
-        // machine running a test harness can be.
+        // The traversal saw at least this process.
+        //
+        // Was `> 1` -- "this process and the one that spawned it" -- on
+        // the reasoning that no machine running a test harness has only
+        // one process. That is true of a machine and false of a PID
+        // NAMESPACE: a test running as PID 1 in a minimal container sees
+        // exactly itself, and the assertion fails for a reason that has
+        // nothing to do with this code (#853). The `platform
+        // (ubuntu-latest)` job makes that a reachable configuration
+        // rather than a hypothetical one.
+        //
+        // Weakened to `>= 1` rather than gated, because the claim worth
+        // keeping survives the weakening: a count of ZERO means the
+        // traversal returned nothing at all, which is the real failure,
+        // and it is true on every host including a namespace of one. The
+        // "more than itself" reading that `> 1` was reaching for is not
+        // available on a host where it is legitimately false, so it is
+        // dropped rather than gated -- `process_count` is re-checked
+        // against the grouped totals in
+        // `a_real_grouped_reading_is_consistent_with_its_own_process_count`,
+        // which is where the count's INTERNAL consistency belongs.
         assert!(
-            fp.process_count > 1,
-            "counted {} processes on a machine running a test suite",
-            fp.process_count
+            fp.process_count >= 1,
+            "the traversal returned no processes at all, not even our own"
         );
         // Every reported CPU figure is a usable number rather than a
         // fabricated one. This is the "absent is not zero" rule in the
@@ -669,6 +686,24 @@ mod tests {
     /// that has nothing to do with the reader being reused. What the
     /// reuse actually buys is a figure that is real rather than
     /// structurally absent, so that is what is checked.
+    ///
+    /// # Deliberately NOT gated, but the spin is gone (#853)
+    ///
+    /// The paragraph above had already made the right call once -- it
+    /// refuses to assert a CPU VALUE, for exactly the reason #834's
+    /// rewrite gives -- so the assertions here (`!is_empty()`,
+    /// `>= 0.0 && is_finite()`) are host-independent and keep their place
+    /// on CI.
+    ///
+    /// What did not survive review is the 120ms busy loop. It existed to
+    /// "burn a little CPU so there is something for the second read to
+    /// find", which nothing then asserts on: the test deliberately
+    /// accepts a zero. So it burned a core on every CI run, three times
+    /// over in the race check, to make no assertion more likely to pass.
+    /// Removed. The `MINIMUM_CPU_UPDATE_INTERVAL` sleep stays, because
+    /// that one is load-bearing -- it is the interval sysinfo requires
+    /// before it will compute a delta at all, which is the structural
+    /// property being tested.
     #[test]
     fn the_reader_is_reused_so_cpu_is_a_real_delta() {
         let f = Footprints::new();
@@ -677,15 +712,6 @@ mod tests {
         // to difference against and reports every process at 0% forever.
         let _first = f.sample("2026-01-01T00:00:00Z");
         std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
-        // Burn a little CPU so there is something for the second read to
-        // find, rather than asserting against an idle test thread.
-        let mut spin = 0u64;
-        let until = std::time::Instant::now() + std::time::Duration::from_millis(120);
-        while std::time::Instant::now() < until {
-            spin = spin.wrapping_add(1);
-        }
-        assert!(spin > 0);
-
         let second = f.sample("2026-01-01T00:01:00Z");
         assert!(
             !second.top_cpu.is_empty(),
@@ -1063,6 +1089,25 @@ mod tests {
     /// happens to be doing -- but the invariants that must hold on any
     /// machine: the counts add up to the process total, and no group
     /// claims more members than there are processes.
+    ///
+    /// # Deliberately NOT gated (#853)
+    ///
+    /// #853 lists this among the host-dependent tests; on inspection it
+    /// is not one, and gating it would have cost real coverage for
+    /// nothing. It reads a live table, but every assertion is an
+    /// INTERNAL invariant of whatever came back -- `count >= 1`,
+    /// `count <= process_count`, `cpu_unmeasured <= count`, not NaN,
+    /// `len() <= TOP_N`. None is a claim about machine speed, load, or
+    /// what is running.
+    ///
+    /// The one assertion that could depend on the host -- that eight
+    /// grouped rows cover more than eight processes, which is the whole
+    /// point of the field -- is already guarded on
+    /// `process_count > TOP_N`, so it goes vacuous rather than failing on
+    /// a machine too small to exercise it. That guard is what makes the
+    /// PID-namespace case handled here and not in
+    /// `a_sample_counts_every_process_including_our_own`, where the
+    /// unguarded `> 1` had to be weakened.
     #[test]
     fn a_real_grouped_reading_is_consistent_with_its_own_process_count() {
         let f = Footprints::new();
@@ -1124,8 +1169,31 @@ mod tests {
     /// catch someone adding a `du`, a directory walk, or a subprocess to
     /// this path, all of which are seconds rather than milliseconds. It
     /// is not a benchmark.
+    ///
+    /// # Gated (#853)
+    ///
+    /// The comment above already concedes the problem -- "CI runners of
+    /// unknown speed", "alongside seven other test threads" -- which is
+    /// the definition of a wall-clock budget that describes the host
+    /// rather than the code. A 2s bound is roomy enough that it rarely
+    /// fires, but "rarely" is what a flake is, and the race check runs
+    /// the suite three times over at eight threads.
+    ///
+    /// Gated rather than fixed because the thing it guards is genuinely a
+    /// duration: "nobody added a subprocess to this path" has no
+    /// observable form here the way it did in `packages/tools.rs`, where
+    /// the login-shell cache could be inspected. A process-table
+    /// traversal is a real traversal, so the only honest assertion about
+    /// its cost is a measured one.
+    ///
+    /// Run with: `HEADSTATE_LIVE_MEASUREMENT=1 cargo test -- --ignored`
     #[test]
+    #[ignore]
     fn a_sample_is_cheap_enough_for_a_timer() {
+        if std::env::var("HEADSTATE_LIVE_MEASUREMENT").is_err() {
+            println!("set HEADSTATE_LIVE_MEASUREMENT=1 to run this timing measurement");
+            return;
+        }
         let f = Footprints::new();
         let _warm = f.sample("2026-01-01T00:00:00Z");
         let started = std::time::Instant::now();

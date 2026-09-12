@@ -251,8 +251,36 @@ describe("the desktop build", () => {
     // snapshot to fall back on, so a second attempt is worth making.
     // Turning retries off for BOTH builds would have been the easy fix
     // and the wrong one.
-    await renderGate("desktop");
-    await waitFor(() => expect(authCalls.count).toBeGreaterThan(1), { timeout: 4000 });
+    //
+    // # Fake timers, scoped to this one case (#853)
+    //
+    // This waited on React Query's REAL exponential backoff with
+    // `{ timeout: 4000 }` -- the slowest assertion in the file, and a
+    // race between two unrelated clocks: TanStack's first retry delay
+    // (~1s, and it doubles) against a 4s deadline. Nothing in the test
+    // controlled either, so a slow runner could miss the retry and report
+    // a regression in the retry POLICY, which is what the file exists to
+    // pin.
+    //
+    // Driven rather than awaited: advancing the fake clock past the first
+    // backoff makes the retry happen because the scheduler ran, not
+    // because 4s of wall time elapsed. Deterministic, and it removes ~1s
+    // from every run of this suite.
+    //
+    // Scoped here rather than in the file's `beforeEach` on purpose --
+    // the cases above assert that the mobile build shows the app WITHOUT
+    // waiting for retries, and a file-wide fake clock would change what
+    // those are testing.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await renderGate("desktop");
+      // Past TanStack's first retry delay (~1s), so the second attempt is
+      // scheduled and run inside this window.
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(authCalls.count).toBeGreaterThan(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not show the app to an unauthenticated desktop just because a query rejected", async () => {

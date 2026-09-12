@@ -1618,8 +1618,41 @@ pub(crate) mod tests {
     /// once in 30 local runs of the suite, this desktop having seven
     /// such listeners). A refused connect is not retried: that is the
     /// bug this test exists to catch.
+    ///
+    /// # Gated (#853)
+    ///
+    /// The retry above is a mitigation, not a fix, and the doc already
+    /// records the failure rate that proves it: one in 30 local runs on a
+    /// desktop with seven loopback listeners. Five retries lower the odds,
+    /// they do not bound them -- all five can lose on a host that has many
+    /// -- and CI runs eight test threads each binding ports, so the suite
+    /// is itself a source of the contention. #853 calls this the strongest
+    /// candidate after #834 for that reason.
+    ///
+    /// Gated rather than fixed because the collision is not in this
+    /// code's gift to avoid. It is a kernel behaviour: with
+    /// `SO_REUSEADDR`, a wildcard `bind(0)` may be handed a port that a
+    /// more-specific `127.0.0.1` socket already holds, and which process
+    /// wins the IPv4 connect is then decided by the host's listener set.
+    /// No assertion this test could make about its own sockets changes
+    /// that, and an in-test retry is already present and already
+    /// insufficient -- adding more would be the #811 mistake (a retry
+    /// that hides a real breakage is worse than the flake).
+    ///
+    /// The property is still worth checking on demand: the IPv4
+    /// reachability of the IPv6 wildcard is what lets a phone reach the
+    /// desktop from the QR, and `loopback_tests.rs` exercises the
+    /// pairing path over loopback on every run, so the handshake itself
+    /// is not left uncovered.
+    ///
+    /// Run with: `HEADSTATE_LIVE_MEASUREMENT=1 cargo test -- --ignored`
     #[tokio::test]
+    #[ignore]
     async fn the_ipv6_wildcard_answers_on_ipv4_too() {
+        if std::env::var("HEADSTATE_LIVE_MEASUREMENT").is_err() {
+            println!("set HEADSTATE_LIVE_MEASUREMENT=1 to run this host-dependent port test");
+            return;
+        }
         let phone = Identity::generate().unwrap();
         let mut last = String::new();
         for _ in 0..5 {

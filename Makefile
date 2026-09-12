@@ -1,6 +1,7 @@
 .PHONY: dev build test test-rust test-ui lint lint-rust lint-ui lint-deps fmt icons \
 	mobile-frontend lint-mobile test-mobile check-mobile-ios check-mobile-android \
-	deny-mobile ios-init android-init icons-mobile ios-device android-device
+	deny-mobile ios-init android-init icons-mobile ios-device android-device \
+	deny test-race check-intel
 
 # ---- Mobile companion (src-mobile) ---------------------------------------
 #
@@ -124,6 +125,51 @@ test-rust:
 test-ui:
 	yarn vitest run
 
+# ---- Parity with CI (#853) -----------------------------------------------
+#
+# Three things CI ran that no `make` target could, so a developer could
+# not reproduce a CI failure locally even knowing which check had failed.
+# Deliberately NOT added to `lint` or `test`: each is slow or installs a
+# toolchain, and the cheap-guards rule the `lint-deps` comment states
+# ("answer a question in a second") is what keeps those targets worth
+# running. These are the ones you run when CI is red, or before a release.
+#
+# `deny-mobile` already existed for the phone crate; the desktop's
+# `src-tauri/deny.toml` had no target at all, which is why a supply-chain
+# failure was only ever reachable by pushing.
+deny:
+	cd src-tauri && cargo deny check
+
+# The race check, matching CI's `Race check` step exactly (ci.yml):
+# three runs of the library tests at eight threads.
+#
+# THE COSTLY OMISSION of the three. CI repeats the suite three times
+# precisely because one green run does not prove a race is absent, and
+# before this there was no local way to ask -- so a state-touching change
+# looked fine locally and failed from a job that had run the same tests
+# twice more. #834's flake was found exactly this way.
+#
+# `--lib` and the iteration count are CI's, not a guess: matching them is
+# the point, since a local run that differed would not reproduce what CI
+# saw.
+test-race:
+	cd src-tauri && for i in 1 2 3; do \
+		cargo test --lib -- --test-threads=8 || { echo "FAILED ON ITERATION $$i"; exit 1; }; \
+	done
+
+# The Intel target the release also builds.
+#
+# The release ships a UNIVERSAL binary while every test job builds native
+# arm64, so an arch-gated link failure (plausible with bundled SQLite or
+# octocrab's crypto backends) would first appear at TAG time, after
+# version stamping, mid-release. `cargo check` rather than a second build,
+# for the reason ci.yml gives: it catches the compile and
+# link-configuration failures that differ by target without doubling the
+# time.
+check-intel:
+	rustup target add x86_64-apple-darwin
+	cd src-tauri && cargo check --target x86_64-apple-darwin --all-targets
+
 lint: lint-rust lint-ui lint-deps
 
 # Guards that answer a question in a second which would otherwise be
@@ -148,6 +194,34 @@ lint-deps:
 	# cheapest place to ask is here, before anything installs.
 	python3 scripts/check-symlinks.test.py
 	python3 scripts/check-symlinks.py
+	# The gate guard's own self-test, added with the guard's `GATED_JOBS`
+	# derivation (#853). It was the one guard in this target with none,
+	# which is an uncomfortable gap for a guard whose failure mode is a
+	# silent pass.
+	python3 scripts/check-mobile-gate.test.py
+	# A `run:` step with no `shell:` runs under PowerShell on Windows,
+	# where bash syntax (a heredoc, `$(...)`) is a parse error. CI-only
+	# until now (ci.yml), so the author of such a step ran `make lint`
+	# green and learned about it from a Windows job -- the v2.0.1-rc.1
+	# rehearsal failure this script's docstring says it exists to
+	# prevent. No dependencies, so there is no reason it was not here
+	# (#848, #853).
+	python3 scripts/check-workflow-shells.py
+	# The leak guard, LAST in this target: it is the only check here that
+	# scans commit messages, so it is the only one whose failure means an
+	# amend or an interactive rebase rather than an edit. Running it
+	# locally at all is the point of #833 -- it was CI-only, so the
+	# feedback arrived after the content was already pushed to a public
+	# remote, which is one step too late for a guard whose whole purpose
+	# is to stop sensitive strings reaching one.
+	#
+	# Runnable locally only since #848 gitignored the vendored Tauri iOS
+	# API; before that this line would have exited 2 for every developer
+	# who had ever built for iOS.
+	#
+	# Local checks are advisory, CI remains the gate (ci.yml) -- this
+	# closes the feedback gap, it does not move the gate.
+	./scripts/check-privacy.sh
 
 # The shared step-up crate again: a path dependency is compiled by the
 # desktop's clippy but its own tests are not, and `cargo fmt --check`

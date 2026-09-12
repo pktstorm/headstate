@@ -86,19 +86,36 @@ mod tests {
         assert!(!crate::poll::UiPrefs::default().diagnostic_logging);
     }
 
-    /// The macro must actually consult the switch.
+    /// The counting logger, installed at most once for this whole test
+    /// binary.
     ///
-    /// Asserted by installing a REAL logger and counting records.
-    /// Counting argument evaluation instead does not work: `log::info!`
-    /// has its own level check and skips formatting when no logger is
-    /// installed, so an ungated macro and a gated one both evaluate
-    /// nothing in a bare unit test -- a version of this test that
-    /// counted arguments passed even with the gate deleted.
-    #[test]
-    fn the_macro_writes_nothing_while_off() {
+    /// # Why a shared static rather than a per-test install (#853)
+    ///
+    /// `log::set_boxed_logger` is process-global and ONE-SHOT. The test
+    /// below used to call it and `return` early when it lost the race --
+    /// reporting PASS while asserting nothing at all, so the test
+    /// guarding the `[diag]` switch could silently check nothing. That is
+    /// the failure mode this repo rejects everywhere else
+    /// (`check-privacy.sh`: "Abort loudly instead"), and it is worse than
+    /// an ordinary skip because the switch it guards is a privacy-adjacent
+    /// one: `[diag]` lines are what the user opted out of.
+    ///
+    /// The race is avoidable rather than merely detectable, which is why
+    /// this is a fix and not a loud skip. There is only ever ONE logger
+    /// per process, so the test does not need to own the installation --
+    /// it needs the installed logger to be a counting one. Installing it
+    /// from a `OnceLock` does that: whichever test arrives first installs
+    /// it, every later caller gets the same counter back, and no call
+    /// ever fails. `set_max_level` is set here too, since a logger that
+    /// is installed but filtered out counts nothing.
+    ///
+    /// Returns the counter so the caller reads deltas off the same
+    /// instance it installed.
+    fn counting_logger() -> &'static std::sync::atomic::AtomicUsize {
         use std::sync::atomic::AtomicUsize;
-
         static RECORDS: AtomicUsize = AtomicUsize::new(0);
+        static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
         struct Counting;
         impl log::Log for Counting {
             fn enabled(&self, _: &log::Metadata) -> bool {
@@ -110,14 +127,33 @@ mod tests {
             fn flush(&self) {}
         }
 
-        // `set_boxed_logger` is process-global and one-shot. If another
-        // test already installed one this returns Err, and counting
-        // would then measure nothing -- so skip rather than assert
-        // against a logger we do not own.
-        if log::set_boxed_logger(Box::new(Counting)).is_err() {
-            return;
-        }
-        log::set_max_level(log::LevelFilter::Info);
+        INSTALLED.get_or_init(|| {
+            // An Err here means something OUTSIDE these tests installed a
+            // logger first (a harness, a dependency). That cannot be
+            // counted against, and silently passing is the bug being
+            // fixed -- so it fails loudly instead of returning a counter
+            // that will never move.
+            log::set_boxed_logger(Box::new(Counting))
+                .expect("a foreign logger is already installed; this test cannot count records");
+            log::set_max_level(log::LevelFilter::Info);
+        });
+        &RECORDS
+    }
+
+    /// The macro must actually consult the switch.
+    ///
+    /// Asserted by installing a REAL logger and counting records.
+    /// Counting argument evaluation instead does not work: `log::info!`
+    /// has its own level check and skips formatting when no logger is
+    /// installed, so an ungated macro and a gated one both evaluate
+    /// nothing in a bare unit test -- a version of this test that
+    /// counted arguments passed even with the gate deleted.
+    ///
+    /// No longer returns early when it loses the logger race: see
+    /// `counting_logger`, which removes the race instead (#853).
+    #[test]
+    fn the_macro_writes_nothing_while_off() {
+        let records = counting_logger();
 
         // DELTAS, not absolutes. The logger is process-global and this
         // whole binary shares it, so other tests logging concurrently
@@ -127,15 +163,15 @@ mod tests {
         // THIS macro call produced a record.
         let _guard = switch_lock();
         set_enabled(false);
-        let before = RECORDS.load(Ordering::Relaxed);
+        let before = records.load(Ordering::Relaxed);
         crate::diag!("[diag] must not be written");
         // The gate is synchronous, so any record from this call has
         // already landed by the time the next line runs.
-        let after_off = RECORDS.load(Ordering::Relaxed);
+        let after_off = records.load(Ordering::Relaxed);
 
         set_enabled(true);
         crate::diag!("[diag] must be written");
-        let after_on = RECORDS.load(Ordering::Relaxed);
+        let after_on = records.load(Ordering::Relaxed);
         set_enabled(false);
 
         // Other tests may have logged in between, so the delta is a

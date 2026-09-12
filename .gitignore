@@ -50,6 +50,36 @@ src-tauri/gen
 # ignored, as it is for the desktop.
 src-mobile/target
 src-mobile/gen/schemas/
+
+# Tauri's iOS API, vendored into each mobile plugin by its own build
+# script. `tauri_plugin::Builder::new(COMMANDS).ios_path("ios")` (e.g.
+# src-mobile/plugins/headstate-notify/build.rs:26) copies the Swift
+# `tauri-api` package into `<plugin>/.tauri/` so the plugin's Swift
+# sources have something to compile against. Generated, never authored:
+# upstream's sources, re-copied whenever the build script runs.
+#
+# Un-ignored, it broke `scripts/check-privacy.sh` permanently on any
+# machine that had built for iOS, which is the whole of #848. The guard
+# refuses to scan while untracked files exist -- correctly, since `git
+# grep` cannot see them and "clean" would be a scan that never looked
+# (check-privacy.sh:57-63). So the leak guard went from "runs" to
+# "exits 2 forever" after one `make check-mobile-ios`, and #833 would
+# have wired that exit 2 into `make lint` for everyone.
+#
+# Measured here rather than taken from #848, which understates it twice:
+# it is the IOS-TARGET check that vendors these, not every `cargo
+# check` (a host `cargo check -p tauri-plugin-headstate-notify`, with
+# build.rs forced to re-run, generates nothing), and THREE plugins
+# generate one, not one -- headstate-notify, headstate-keys and
+# headstate-refresh, 11 untracked files from the notify plugin alone.
+#
+# Matched by name without a trailing slash, per the #813 argument at the
+# top of this file: nothing of this name is ever meant to be tracked as
+# any type. Ignoring it is the entire fix -- the guard's refusal reads
+# `git ls-files --others --exclude-standard`, which already excludes
+# ignored files, so no change to the guard is needed or wanted.
+.tauri
+
 coverage
 .DS_Store
 
