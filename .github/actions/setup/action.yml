@@ -39,13 +39,13 @@ inputs:
     # single crate is 21s of the 28s. Only its DEPENDENCIES were ever
     # cacheable, and they were the cheap part.
     #
-    # Net on the critical path this is break-even: two warm runs restored
-    # BOTH roots in 103s and 95s, against a 95s baseline for one root, so
-    # the second entry costs about nothing to restore. It is kept because
-    # it is correct and removes
-    # 52 redundant compiles per job across three jobs -- which is real
-    # billed runner time and a much better no-cache worst case -- not
-    # because it shortens the wall clock. Do not cite #889's ~35s.
+    # Net on the critical path this is break-even: three warm runs restored
+    # BOTH roots in 103s, 95s and 93s, against a 95s baseline for one root,
+    # so the second entry costs about nothing to restore. It is kept
+    # because it is correct and removes 52 redundant compiles per job
+    # across three jobs -- which is real billed runner time, and a much
+    # better no-cache worst case -- not because it shortens the wall clock.
+    # Do not cite #889's ~35s.
     #
     # AND THE COST, which is the part to watch. A second root makes each
     # job's cache entry bigger, and the Windows `platform` entries are

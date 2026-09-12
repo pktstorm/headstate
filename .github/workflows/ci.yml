@@ -352,13 +352,19 @@ jobs:
   # run 34708843018 every other job finished inside its shadow, so only
   # changes to this job shorten CI at all. That makes duplicated work
   # here uniquely expensive, and two steps were pure duplication.
-  # Removing them measured 619s -> 562s and 566s across two warm runs
-  # (34712365398, 34714662969), all nine required checks green both
-  # times: -42s for the vitest step and -7s for the clippy narrowing,
-  # which is #890's prediction essentially exactly. The clippy figure
-  # reproduced at 23s on both runs; treat `Rust tests` movements as noise
-  # unless they exceed ~20s, since the same 1202 tests have measured
-  # 75.65s and 97.45s on different runners with identical code.
+  # Removing them measured 619s -> 562s, 566s and 524s across three warm
+  # runs (34712365398, 34714662969, 34715265386), all nine required checks
+  # green every time: -42s for the vitest step and -7s for the clippy
+  # narrowing, which is #890's prediction essentially exactly. Clippy came
+  # in at 23s, 23s and 21s against the 30s baseline, so that figure is the
+  # firm one.
+  #
+  # TREAT `Rust tests` MOVEMENTS UNDER ~20s AS NOISE. The same 1202 tests
+  # have measured 75.65s and 97.45s on different runners with identical
+  # code, and the step itself came in at 232s, 238s and then 198s -- the
+  # last of those BELOW the 221s baseline. Anyone reading a single run's
+  # step timing as a regression here will be reading the runner, not the
+  # change.
   #
   # The job keeps exactly what is target-DEPENDENT: `Rust tests`, because
   # ~11 of the suite is platform-gated (1213 tests on Ubuntu vs 1202 on
