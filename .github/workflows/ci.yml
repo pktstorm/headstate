@@ -45,6 +45,10 @@ permissions:
 
 jobs:
   lint:
+    # 2m measured. Generous on purpose: this must never fire on a slow but
+    # healthy run, only on a hang. Without it the job inherits
+    # GitHub's 360-minute default (#885).
+    timeout-minutes: 30
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -74,6 +78,26 @@ jobs:
       # review. See the `mobile-changes` job.
       - name: Mobile path gate
         run: python3 scripts/check-mobile-gate.py
+      # `.github/mobile-build-high-water-mark` records the highest build
+      # number that reached a store, and it went stale before six
+      # consecutive releases (#714, #731, #740, #768, #786, #867) without
+      # one of them failing. The reason nothing caught it: the only thing
+      # that reads the file is mobile-release.yml's Preflight, which
+      # compares `BUILD_NUMBER > HIGH` -- and BUILD_NUMBER is
+      # github.run_number, so it climbs past a stale mark as easily as a
+      # current one. Drift was invisible to its only reader.
+      #
+      # Asked here because `lint` always runs and is a required check, so
+      # the gap surfaces on the next PR after a release rather than at
+      # the next release attempt (#787). --require because a token exists
+      # here: an unreachable Releases API is a real failure in CI, where
+      # locally it is just a laptop offline.
+      - name: Mobile build high-water mark
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/check-mobile-build-mark.test.py
+          python3 scripts/check-mobile-build-mark.py --require
       # Asserted against the SOURCE css, unlike the toast check below which
       # needs a built bundle. This rule is hand-written and survives the
       # build unchanged, and the test suite structurally cannot see it:
@@ -112,6 +136,10 @@ jobs:
           (cd src-tauri && cargo clippy --all-targets -- -D warnings)
 
   test-rust:
+    # 4m measured, incl. the 3x race check. Generous on purpose: this must never fire on a slow but
+    # healthy run, only on a hang. Without it the job inherits
+    # GitHub's 360-minute default (#885).
+    timeout-minutes: 30
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -141,6 +169,10 @@ jobs:
           done
 
   test-frontend:
+    # under 1m measured. Generous on purpose: this must never fire on a slow but
+    # healthy run, only on a hang. Without it the job inherits
+    # GitHub's 360-minute default (#885).
+    timeout-minutes: 20
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -150,6 +182,10 @@ jobs:
         run: yarn vitest run
 
   build:
+    # 4m measured. Generous on purpose: this must never fire on a slow but
+    # healthy run, only on a hang. Without it the job inherits
+    # GitHub's 360-minute default (#885).
+    timeout-minutes: 30
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -231,6 +267,10 @@ jobs:
           cd src-tauri && cargo check --target x86_64-apple-darwin --all-targets
 
   supply-chain:
+    # 51s measured. Generous on purpose: this must never fire on a slow but
+    # healthy run, only on a hang. Without it the job inherits
+    # GitHub's 360-minute default (#885).
+    timeout-minutes: 20
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -306,6 +346,12 @@ jobs:
   # (see `mobile-changes`, and `scripts/check-mobile-gate.py`, which is
   # the guard that keeps that wiring honest).
   platform:
+    # 10m measured on windows-latest, 5m on ubuntu -- this matrix is the
+    # critical path, so its ceiling is the highest here. Generous on
+    # purpose: it must never fire on a slow but healthy run, only on a
+    # hang. Without it the job inherits GitHub's 360-minute default
+    # (#885).
+    timeout-minutes: 45
     name: platform (${{ matrix.os }})
     strategy:
       # One platform failing must not cancel the other: when both are
@@ -410,6 +456,10 @@ jobs:
   # a `git diff --name-only` and a `grep`; buying that with another
   # supply-chain entry to audit is the wrong trade.
   mobile-changes:
+    # 8s measured; it is one diff and a grep. Generous on purpose: this must never fire on a slow but
+    # healthy run, only on a hang. Without it the job inherits
+    # GitHub's 360-minute default (#885).
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     outputs:
       # "true" when the mobile jobs must do their real work.
@@ -555,6 +605,10 @@ jobs:
   # make this job skippable -- `mobile-changes` has no condition of its
   # own, so it always succeeds and this always runs.
   mobile-android:
+    # 7m measured. Generous on purpose: this must never fire on a slow but
+    # healthy run, only on a hang. Without it the job inherits
+    # GitHub's 360-minute default (#885).
+    timeout-minutes: 45
     needs: mobile-changes
     runs-on: ubuntu-latest
     env:
@@ -718,6 +772,10 @@ jobs:
   # forever. That is the precise false negative this whole change has to
   # avoid, so it is worth naming where it would happen.
   mobile-ios:
+    # 1.5m measured. Generous on purpose: this must never fire on a slow but
+    # healthy run, only on a hang. Without it the job inherits
+    # GitHub's 360-minute default (#885).
+    timeout-minutes: 30
     needs: mobile-changes
     runs-on: macos-latest
     steps:

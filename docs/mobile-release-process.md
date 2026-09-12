@@ -275,9 +275,30 @@ Preflight compares against `.github/mobile-build-high-water-mark` and fails
 in the first job with the cause named. **Raise that file whenever a build
 reaches TestFlight or Play.**
 
+You no longer have to remember to. CI's `lint` job runs
+`scripts/check-mobile-build-mark.py`, which fails when the file is below the
+`build<N>` of the newest published mobile asset and names the value to
+write — so a missed bump surfaces on the next PR instead of at the next
+release.
+
+That guard exists because Preflight could never catch this. Preflight tests
+`BUILD_NUMBER > HIGH`, and `run_number` climbs every run, so a mark lagging
+by three still passes — run 29 cleared a mark of 25 as easily as 28.
+Staleness was invisible to the file's only reader, which is how it drifted
+before six consecutive releases without one of them failing (#787). The cost
+was never a blocked release; it was this file naming the wrong number to
+whoever is debugging a genuine duplicate rejection.
+
 Numbers being non-contiguous per version (0.1.7 → 9, 0.1.12 → 14) is this
 system working, not drift: a rejected upload still consumes its number, and
 re-tagging the same version is routine. Only a decrease is a fault (#635).
+
+A mark *ahead* of the newest published asset is also fine, and the guard
+says so rather than failing: the file is written before the upload, so it
+records a number consumed by a run whose `publish` never finished. That is
+why the guard compares against the assets instead of being replaced by
+them — an asset exists only if `publish` succeeded, so assets can
+under-report what a store has seen, and this file cannot.
 
 ## Secrets
 
