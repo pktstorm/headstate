@@ -1294,56 +1294,77 @@ mod tests {
     /// report every process at 0%. A zero `top_cpu_percent` makes
     /// `one_process_explains_it` answer `Some(false)` -- the clause that
     /// lets `evaluate` fire -- so a caller without the interval would
-    /// report "no single process explains it" during a build.
+    /// report "no single process explains it" during a build (#807).
     ///
     /// That is `a_legitimate_build_does_not_fire` reintroduced one layer
-    /// down, where that test cannot see it, so it is asserted here:
-    /// `read_twice` must find a busy process that a back-to-back pair
-    /// does not.
+    /// down, where that test cannot see it, so it is asserted here.
     ///
-    /// Asserted as "strictly more than the zero-interval pair" rather
-    /// than against an absolute figure, because the only number a test
-    /// can rely on is the one it burned itself.
+    /// # What is asserted, and why it changed (#834)
+    ///
+    /// The promise `read_twice` makes is an INTERVAL: it leaves at least
+    /// `MINIMUM_CPU_UPDATE_INTERVAL` between its two reads, which is the
+    /// precondition `sysinfo` imposes for a delta to exist at all. That
+    /// is what #807 violated, and it is deterministic -- so it is what is
+    /// measured here, on elapsed time.
+    ///
+    /// This test used to compare two live CPU readings instead: a busy
+    /// loop, a no-interval `read` pair, and an assertion that
+    /// `read_twice`'s `top_cpu_percent` came out strictly higher. That
+    /// was a PROXY, and a load-sensitive one, because
+    /// `top_cpu_percent` is the whole machine's busiest process and not
+    /// this test's own spin loop. Under CI's `--test-threads=8`
+    /// (ci.yml, the race check) the comparison is therefore between two
+    /// readings of a shared, contended process table, so the assertion
+    /// was really a claim about runner load: the spin can be
+    /// descheduled, or the eager read can pick up another tenant's
+    /// burst, and it inverts. It took down `test-rust` on #831 -- a
+    /// stats-only PR with zero files under `health/` -- where it read
+    /// exactly like a real regression at a glance.
+    ///
+    /// Rejected alternatives, both considered:
+    ///   * **Retry in-test.** Cheapest and the worst. #811 shipped an
+    ///     install retry for a transient that was not the cause, and the
+    ///     lesson stuck: a retry that can mask a real regression is
+    ///     worse than the flake it hides.
+    ///   * **`#[ignore]` behind the env convention** used by the live
+    ///     tests in this repo. That would have kept the proxy and lost
+    ///     the regression protection on CI -- the #807 bug is precisely
+    ///     the kind that must fail a PR.
+    ///
+    /// The CPU delta is not left untested, it is tested where it is
+    /// deterministic: `a_legitimate_build_does_not_fire` and the
+    /// `one_process_explains_it` cases above drive synthetic aggregates,
+    /// so the zero-delta inversion that made #807 dangerous is asserted
+    /// on fixtures rather than on whatever the runner happened to be
+    /// doing. `a_real_process_table_reads` keeps the live reader covered.
     #[test]
     fn read_twice_waits_long_enough_for_a_cpu_delta_to_exist() {
-        let spin = || {
-            let mut n = 0u64;
-            let until = std::time::Instant::now() + std::time::Duration::from_millis(150);
-            while std::time::Instant::now() < until {
-                n = n.wrapping_add(1);
-            }
-            assert!(n > 0);
-        };
+        let table = Table::new();
+        let started = std::time::Instant::now();
+        let (observations, _) = table.read_twice();
+        let elapsed = started.elapsed();
 
-        // Two reads with no interval between them: sysinfo has nothing
-        // to divide by, so nothing is busy.
-        let eager = Table::new();
-        let _ = eager.read();
-        spin();
-        let (_, no_interval) = eager.read();
-
-        // And the same thing done properly.
-        let patient = Table::new();
-        spin();
-        let (_, with_interval) = patient.read_twice();
-
+        // The property, asserted directly. `>=` because that is the
+        // contract -- at LEAST the interval -- and a scheduler may
+        // always hand back more; only less would be the #807 bug.
         assert!(
-            with_interval.top_cpu_percent > no_interval.top_cpu_percent,
-            "read_twice must leave an interval for a delta to exist: \
-             with={} without={}",
-            with_interval.top_cpu_percent,
-            no_interval.top_cpu_percent
+            elapsed >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL,
+            "read_twice must leave at least MINIMUM_CPU_UPDATE_INTERVAL \
+             ({:?}) between its two reads, or sysinfo reports every \
+             process at 0% and one_process_explains_it inverts (#807); \
+             took {:?}",
+            sysinfo::MINIMUM_CPU_UPDATE_INTERVAL,
+            elapsed
         );
+
+        // And it really did read a table across that interval, rather
+        // than sleeping and returning nothing -- which would satisfy the
+        // timing assertion above while being useless. No claim about the
+        // VALUES: that is the machine's business, and asserting on it is
+        // what made this test flaky.
         assert!(
-            with_interval.top_cpu_percent > 0.0,
-            "this test burned a core for 150ms; something must be busy"
-        );
-        // And that figure is what keeps a busy machine from firing: a
-        // zero would have read as "nothing explains the load".
-        assert_eq!(
-            no_interval.one_process_explains_it(),
-            Some(false),
-            "which is exactly the false positive read_twice prevents"
+            !observations.is_empty(),
+            "a machine running this test has processes"
         );
     }
 
