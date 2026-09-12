@@ -6772,7 +6772,6 @@ prunable gitdir file points to non-existent location
         };
         use std::path::Path;
         use std::process::Command;
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Mutex;
 
         /// A repository with `n` worktrees on unmerged branches.
@@ -7020,26 +7019,56 @@ prunable gitdir file points to non-existent location
             classify_within(&mut one.clone(), &repo, "main", CLASSIFY_TIMEOUT);
             let solo = solo.elapsed();
 
-            let whole = std::time::Instant::now();
-            let n = AtomicUsize::new(0);
+            // WHEN each report arrives, not how long the run took. The
+            // distinction is the whole fix for #861: the assertion below
+            // used to be `whole * 2 < serial_floor`, a wall-clock
+            // threshold, under this test's own doc comment claiming it
+            // "asserts overlap rather than wall-clock time: a timing
+            // threshold on CI hardware is a flake generator". The doc was
+            // right and the code did not implement it -- it failed twice
+            // in the #835 batch on branches touching nothing near here,
+            // once having MEASURED 1.8x overlap, so concurrency was
+            // working and the test rejected it anyway.
+            //
+            // Arrival instants are taken inside the callback, which the
+            // doc above notes is serialised behind the sink mutex. That
+            // serialisation is exactly why a COUNT of in-flight callbacks
+            // cannot work here -- but the instants still cannot cluster
+            // tighter than the work that produced them unless that work
+            // overlapped. With `CLASSIFY_WORKERS + 1` equal-cost
+            // worktrees, a serial run spaces every arrival by one
+            // classification; a concurrent one lands a whole batch within
+            // one. So: the span covering all arrivals must be shorter
+            // than the serial spacing would make it, measured against THIS
+            // machine's own solo cost rather than a constant.
+            let start = std::time::Instant::now();
+            let arrivals = Mutex::new(Vec::new());
             classify_repo_streaming(repo.to_str().unwrap(), &mut |_| {
-                n.fetch_add(1, Ordering::SeqCst);
+                arrivals.lock().unwrap().push(start.elapsed());
             })
             .unwrap();
-            let whole = whole.elapsed();
 
-            let count = n.load(Ordering::SeqCst);
+            let mut arrivals = arrivals.into_inner().unwrap();
+            arrivals.sort();
+            let count = arrivals.len();
             assert_eq!(count, CLASSIFY_WORKERS + 1, "every worktree reported");
-            // Serial would be at least `count * solo`. Half of that is a
-            // generous line that still cannot be crossed by a serial
-            // implementation, and leaves room for process-spawn noise on
-            // a loaded machine.
-            let serial_floor = solo * count as u32;
+            // The tightest window holding at least two arrivals. Under a
+            // serial classifier the closest any two can fall is one solo
+            // cost apart; under a concurrent one they land together. The
+            // comparison is against `solo` measured moments ago on this
+            // same machine, so a slow runner moves both sides equally --
+            // which is the property the old wall-clock form lacked.
+            let closest = arrivals
+                .windows(2)
+                .map(|w| w[1] - w[0])
+                .min()
+                .expect("more than one worktree was classified");
             assert!(
-                whole * 2 < serial_floor,
-                "classification must run worktrees concurrently: {count} \
-                 worktrees took {whole:?} against a {solo:?} solo cost, so \
-                 a serial floor of {serial_floor:?}. No overlap is the \
+                closest * 2 < solo,
+                "classification must run worktrees concurrently: the two \
+                 closest of {count} arrivals were {closest:?} apart, which a \
+                 serial classifier could not beat -- it spaces every arrival \
+                 by one {solo:?} classification. No overlap is the \
                  3.6x-slower shape the fixed chunks had."
             );
         }
