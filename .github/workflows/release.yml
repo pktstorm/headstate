@@ -81,8 +81,14 @@ jobs:
   # waited for nothing.
   #
   # `true` also sets the API's `filter` to `all` rather than `latest`
-  # (`options[:filter] = 'all' if wait_for_duplicates`), so BOTH suites
-  # are fetched and every run must conclude `success`.
+  # (`options[:filter] = 'all' if wait_for_duplicates`), but that part is
+  # belt-and-braces rather than the fix: `filter=latest` deduplicates only
+  # WITHIN one check suite, as the action's own comment above
+  # `keep_latest_per_name` says, so our cross-suite duplicates survive it
+  # either way. Measured on 097a1af, which returns the same 25 runs under
+  # `filter=latest` and `filter=all`. The load-bearing half is skipping
+  # `keep_latest_per_name`, which is what actually collapsed the two
+  # suites to one run per name.
   #
   # Zero false positives: the two suites are the same jobs on the same
   # commit, so requiring both green adds no new way to fail -- it only
