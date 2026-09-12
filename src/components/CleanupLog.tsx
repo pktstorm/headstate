@@ -39,7 +39,7 @@ export function CleanupLog() {
   // before the scan finishes it says the scan directories are wrong when
   // they are fine, and sends someone to fix something that is not
   // broken."
-  const { entries, isLoading, run } = useCleanupLog(true);
+  const { entries, isLoading, isError, refetch, run } = useCleanupLog(true);
   const [busy, setBusy] = useState(false);
 
   const proposed = entries.filter((e) => e.action === "proposed");
@@ -102,8 +102,27 @@ export function CleanupLog() {
           The two are opposite answers -- "we have not read the ledger
           yet" and "we read it and it is empty" -- and the diagnosis is
           the one that sends someone into Settings. Rendering it during
-          the initial load pointed at a setting that is already on. */}
-      {isLoading ? (
+          the initial load pointed at a setting that is already on.
+
+          And the THIRD answer, which #852 left out when it added the
+          second: "we tried to read the ledger and could not" (#854). It
+          could not be written at all until `useCleanupLog` returned
+          `isError` -- the hook destructured it and kept it. First of the
+          three arms, because `entries` keeps its `[]` default on a
+          rejection so an arm after the empty one never renders, and
+          before `isLoading`, because a retry leaves both true. */}
+      {isError ? (
+        <div>
+          <p className="text-sm text-[#f85149]">Could not read the cleanup ledger.</p>
+          <button
+            type="button"
+            onClick={() => void refetch()}
+            className="mt-1 text-sm text-[#58a6ff] hover:underline"
+          >
+            Try again
+          </button>
+        </div>
+      ) : isLoading ? (
         <p className="text-sm text-[#8b949e]">Reading the cleanup ledger…</p>
       ) : entries.length === 0 ? (
         <p className="text-sm text-[#8b949e]">

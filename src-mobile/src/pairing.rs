@@ -39,12 +39,14 @@ use crate::store::{get_json, put_json, Store, StoreError};
 /// Store key for the pairing records.
 pub const DESKTOPS_KEY: &str = "desktops";
 
-const TOKEN_LEN: usize = 32;
+/// `pub(crate)` so `mirrored.rs` can assert it against the desktop's
+/// copy (#854); nothing outside this crate reads it.
+pub(crate) const TOKEN_LEN: usize = 32;
 /// The one `v` this build pairs with: the desktop's `PROTOCOL_VERSION`,
 /// as the spec says ("the same integer is the QR's `v`"). Exactly, not
 /// at-least: a QR from a newer desktop describes a pairing this phone
 /// does not know how to complete.
-const QR_VERSION: u8 = 2;
+pub(crate) const QR_VERSION: u8 = 2;
 
 /// One paired desktop, as persisted. Newest first in the list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

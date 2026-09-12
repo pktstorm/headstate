@@ -157,11 +157,20 @@ pub fn repo_identity(repo_path: &str) -> Option<String> {
 /// write to an arbitrary file, which is an arbitrary file write with the
 /// app's privileges.
 ///
-/// Rejected at the two BOUNDARIES where remote-controlled refs enter
-/// (`parse_porcelain` and `default_branch`) rather than at each of the
-/// ten call sites, because a boundary cannot be forgotten. The `--`
+/// Rejected at the BOUNDARIES where remote-controlled refs enter
+/// (`parse_porcelain` and every `default_branch`) rather than at each of
+/// the ten call sites, because a boundary cannot be forgotten. The `--`
 /// separators at the sinks are the second layer, not the only one.
-pub(super) fn is_safe_ref(r: &str) -> bool {
+///
+/// `pub(crate)` since #854. It was `pub(super)`, reachable only inside
+/// `worktrees` -- and THREE other modules read
+/// `refs/remotes/origin/HEAD`, the remote-controlled value this exists to
+/// guard, and returned it unvalidated because they could not call this.
+/// `branches::scan`, `packages::apply` and `docker::classify` each grew
+/// their own `default_branch`, and the validator's reach was the reason
+/// the rule did not travel with the pattern. A shared validator that only
+/// one module can see is a rule with one user.
+pub(crate) fn is_safe_ref(r: &str) -> bool {
     !r.is_empty() && !r.starts_with('-')
 }
 
@@ -1713,22 +1722,82 @@ fn patch_id(dir: &Path, from: &str, to: &str) -> Option<String> {
 /// the caller: the scan is a snapshot, and a path that has since become
 /// a real checkout must not be deleted by a stale click. Same rule
 /// `remove_inner` applies for the same reason.
-pub fn remove_orphan(path: &str) -> Result<(), String> {
+///
+/// # The two checks that were missing (#854)
+///
+/// Orphan status is a property of the DIRECTORY, not of the path, and
+/// for a long time it was the only thing asked here. That left this the
+/// one `remove_dir_all` in the app with neither of the two checks
+/// `remove_artifact` and `remove_venv` both document at length:
+///
+///  1. **Never a symlink**, checked with `symlink_metadata` BEFORE
+///     canonicalising. `dir.is_dir()` follows links, so the old gate
+///     saw the target's type and `remove_dir_all` then deleted the
+///     TARGET's contents -- which may be anywhere at all. A link whose
+///     target holds a `.git` file with a dead `gitdir:` pointer passed
+///     `orphan_gitdir` without trouble.
+///  2. **Inside a configured scan root**, against the canonical path so
+///     `../` cannot walk out of one. `roots` comes from settings rather
+///     than from the request, which is the rule
+///     `commands::remove_artifacts` states in so many words -- "the
+///     boundary it checks against must come from settings, not from the
+///     request". Orphans are only ever FOUND by walking those roots
+///     (`collect_inner`), so a path outside them was never a row the
+///     user could have clicked.
+///
+/// Why this mattered more here than anywhere else: `orphan_gitdir` is
+/// not a containment boundary and was never meant as one. It asks for a
+/// readable `<dir>/.git` whose `gitdir:` target does not exist -- a
+/// two-line file any caller can write. And `remove_orphan` is exposed
+/// on the remote surface as `Class::Destructive`
+/// (`remote/surface.rs:298`), so the path can arrive from a paired peer
+/// rather than from this machine's own UI.
+///
+/// The checks are ordered as `remove_artifact` orders them, and for the
+/// reason its comment gives: a later symlink check would still reject
+/// most links by accident (the resolved path usually falls outside the
+/// roots), but "rejected for another reason" is not "rejected because it
+/// is a symlink", and the day someone reorders them the accident stops
+/// happening.
+pub fn remove_orphan(path: &str, roots: &[String]) -> Result<(), String> {
     let dir = Path::new(path);
-    if !dir.is_dir() {
+
+    // 1. Never a symlink. FIRST, before `canonicalize` -- which resolves
+    //    through links, so afterwards there is nothing left to detect.
+    let link_meta =
+        std::fs::symlink_metadata(dir).map_err(|_| "that directory is missing".to_string())?;
+    if link_meta.is_symlink() {
+        return Err("that path is a symlink, not a directory".into());
+    }
+    if !link_meta.is_dir() {
         return Err("that directory is missing".into());
     }
 
-    // Re-checked RIGHT NOW. Without this the command is "delete any
-    // directory the frontend names", which is not a gate at all.
-    if orphan_gitdir(dir).is_none() {
+    // 2. Inside a configured scan root, against the CANONICAL path so
+    //    `../` cannot walk out of one.
+    let canon = dir
+        .canonicalize()
+        .map_err(|e| format!("could not resolve the path: {e}"))?;
+    let inside = roots.iter().any(|r| {
+        Path::new(r)
+            .canonicalize()
+            .is_ok_and(|root| canon.starts_with(&root))
+    });
+    if !inside {
+        return Err("that directory is outside the scanned folders".into());
+    }
+
+    // 3. Still an orphan, re-checked RIGHT NOW. Without this the command
+    //    is "delete any directory under a scan root that the frontend
+    //    names", which is not much of a gate.
+    if orphan_gitdir(&canon).is_none() {
         return Err(
             "this is no longer an orphaned worktree -- its repository may have been restored"
                 .into(),
         );
     }
 
-    std::fs::remove_dir_all(dir).map_err(|e| format!("could not remove: {e}"))
+    std::fs::remove_dir_all(&canon).map_err(|e| format!("could not remove: {e}"))
 }
 
 /// The dead `gitdir` a worktree points at, when its parent is gone.
@@ -8083,6 +8152,13 @@ mod live {
             }
         }
 
+        /// Every scan root for a `remove_orphan` test: the temp dir the
+        /// fixture was built in, which is where `collect_inner` would
+        /// have found the orphan.
+        fn roots(base: &Path) -> Vec<String> {
+            vec![base.to_string_lossy().into_owned()]
+        }
+
         /// `remove_orphan` is a plain recursive delete -- git cannot
         /// help, since the repository that owned the worktree is gone.
         /// That makes the gate the ONLY protection, so these test it
@@ -8092,8 +8168,96 @@ mod live {
             let tmp = tempfile::TempDir::new().unwrap();
             let wt = orphaned_worktree(tmp.path());
             assert!(wt.is_dir());
-            remove_orphan(&wt.to_string_lossy()).expect("an orphan must be removable");
+            remove_orphan(&wt.to_string_lossy(), &roots(tmp.path()))
+                .expect("an orphan must be removable");
             assert!(!wt.exists(), "the directory must be gone");
+        }
+
+        /// The containment half of #854's invariant: the only thing
+        /// between a bad path and `remove_dir_all` on an arbitrary
+        /// directory. `remove_artifact`'s
+        /// `refuses_a_path_outside_every_scan_root` is the sibling this
+        /// copies -- this path had no equivalent at all.
+        #[test]
+        fn refuses_an_orphan_outside_every_scan_root() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let wt = orphaned_worktree(tmp.path());
+            let elsewhere = tempfile::TempDir::new().unwrap();
+            let err = remove_orphan(&wt.to_string_lossy(), &roots(elsewhere.path()))
+                .expect_err("a path outside the scanned folders must be refused");
+            assert!(err.contains("outside the scanned folders"), "{err}");
+            assert!(wt.is_dir(), "and it must still be there");
+        }
+
+        /// `..` must not walk out of a scan root. Checked against the
+        /// CANONICAL path for exactly this.
+        #[test]
+        fn refuses_a_traversal_out_of_the_root() {
+            let inside = tempfile::TempDir::new().unwrap();
+            let outside = tempfile::TempDir::new().unwrap();
+            let victim = orphaned_worktree(outside.path());
+
+            // A path that LOOKS like it is under the root but resolves
+            // out of it.
+            let sneaky = format!(
+                "{}/../{}/{}",
+                inside.path().to_string_lossy(),
+                outside.path().file_name().unwrap().to_string_lossy(),
+                victim.file_name().unwrap().to_string_lossy()
+            );
+            let _ = remove_orphan(&sneaky, &roots(inside.path()));
+            assert!(
+                victim.exists(),
+                "a path resolving outside the root must not be removed"
+            );
+        }
+
+        /// The symlink half. `remove_dir_all` on a symlink deletes the
+        /// TARGET's contents, which may be anywhere at all -- and
+        /// `orphan_gitdir` reads through the link perfectly happily, so
+        /// a link whose target is an orphan passed the old gate.
+        ///
+        /// Both rejecting paths are exercised for the reason
+        /// `artifacts/mod.rs` gives: `canonicalize` resolves through the
+        /// link, so a link out of the roots is caught by containment and
+        /// only a link that stays inside reaches the symlink check
+        /// itself. Testing one would leave the other unprotected the day
+        /// someone reorders them.
+        #[test]
+        #[cfg(unix)]
+        fn refuses_a_symlink_pointing_out_of_the_root() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let real = tempfile::TempDir::new().unwrap();
+            let victim = orphaned_worktree(real.path());
+            std::fs::write(victim.join("keep.txt"), "important").unwrap();
+
+            let link = tmp.path().join("looks-orphaned");
+            std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+            assert!(remove_orphan(&link.to_string_lossy(), &roots(tmp.path())).is_err());
+            assert!(
+                victim.join("keep.txt").exists(),
+                "the link target must be untouched"
+            );
+        }
+
+        #[test]
+        #[cfg(unix)]
+        fn refuses_a_symlink_pointing_inside_the_root() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let victim = orphaned_worktree(tmp.path());
+            std::fs::write(victim.join("keep.txt"), "important").unwrap();
+
+            let link = tmp.path().join("looks-orphaned");
+            std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+            let err = remove_orphan(&link.to_string_lossy(), &roots(tmp.path()))
+                .expect_err("a symlink must be refused as one");
+            assert!(err.contains("symlink"), "{err}");
+            assert!(
+                victim.join("keep.txt").exists(),
+                "the link target must be untouched"
+            );
         }
 
         /// The gate that matters: a LIVE worktree must never be
@@ -8119,8 +8283,8 @@ mod live {
                 ]
             ));
 
-            let err =
-                remove_orphan(&wt.to_string_lossy()).expect_err("a live worktree must be refused");
+            let err = remove_orphan(&wt.to_string_lossy(), &roots(tmp.path()))
+                .expect_err("a live worktree must be refused");
             assert!(err.contains("no longer an orphaned worktree"), "{err}");
             assert!(wt.is_dir(), "and it must still be there");
         }
@@ -8135,7 +8299,7 @@ mod live {
             std::fs::create_dir_all(&plain).unwrap();
             std::fs::write(plain.join("important.txt"), "data").unwrap();
 
-            assert!(remove_orphan(&plain.to_string_lossy()).is_err());
+            assert!(remove_orphan(&plain.to_string_lossy(), &roots(tmp.path())).is_err());
             assert!(
                 plain.join("important.txt").exists(),
                 "nothing may be deleted"

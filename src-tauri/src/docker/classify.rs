@@ -92,7 +92,39 @@ fn default_branch(repo: &Path) -> String {
             .filter(|s| !s.is_empty())
     };
 
-    if let Some(head) = git(&["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]) {
+    // `origin/HEAD` is written by the REMOTE, so this name is
+    // remote-controlled and must clear the flag-shape check before it
+    // reaches an argv (#854). It goes on to
+    // `merge-base --is-ancestor <tag> <default_branch>` in `origin.rs`,
+    // as a bare argument with no `--`, where `--output=/path` is an
+    // arbitrary file write with the app's privileges.
+    //
+    // Falling THROUGH to the candidate loop below on a flag-shaped name
+    // rather than returning an error: this function has no error channel,
+    // and the loop's two candidates are literals that cannot be
+    // flag-shaped. That is the same fallback shape
+    // `worktrees::scan::default_branch` uses -- a rejected name yields
+    // the default rather than a failure.
+    //
+    // The BARE name is what is checked, after the `origin/` prefix is
+    // stripped -- and that is the whole check, not a refinement.
+    // `symbolic-ref --short` returns `origin/<name>`, so a hostile
+    // `origin/--output=/tmp/x` starts with `o` and passes `is_safe_ref`
+    // unchanged. `worktrees::scan::default_branch`'s comment warns about
+    // exactly this: "Prefixing first would hide `--output=EVIL` behind a
+    // name that no longer starts with `-`."
+    //
+    // The value RETURNED keeps its prefix, because that is what
+    // `origin.rs`' `merge-base --is-ancestor` wants; only the validation
+    // looks at the bare half.
+    if let Some(head) = git(&["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).filter(|h| {
+        let bare = h.strip_prefix("origin/").unwrap_or(h);
+        let ok = crate::worktrees::scan::is_safe_ref(bare);
+        if !ok {
+            log::warn!("ignoring a default branch that reads as a flag: {h:?}");
+        }
+        ok
+    }) {
         return head;
     }
 
@@ -244,6 +276,95 @@ pub fn remove_images(ids: &[String]) -> Vec<RemovalOutcome> {
             error: remove_image(id).err(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod default_branch_tests {
+    use super::*;
+
+    /// Synthetic identity: these fixtures must never carry a real one.
+    const IDENT: [(&str, &str); 4] = [
+        ("GIT_AUTHOR_NAME", "octocat"),
+        ("GIT_COMMITTER_NAME", "octocat"),
+        ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+        ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+    ];
+
+    fn run(dir: &Path, args: &[&str]) -> bool {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .envs(IDENT)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// A repository with a commit, an `origin`, and a fetched `main`.
+    fn repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        assert!(run(&remote, &["init", "-q", "--bare", "-b", "main"]));
+
+        let dir = tmp.path().join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(run(&dir, &["init", "-q", "-b", "main"]));
+        assert!(run(&dir, &["commit", "-q", "--allow-empty", "-m", "base"]));
+        assert!(run(
+            &dir,
+            &["remote", "add", "origin", remote.to_str().unwrap()]
+        ));
+        assert!(run(&dir, &["push", "-q", "-u", "origin", "main"]));
+        assert!(run(&dir, &["remote", "set-head", "origin", "main"]));
+        (tmp, dir)
+    }
+
+    /// A flag-shaped `origin/HEAD` is not returned (#854).
+    ///
+    /// The value goes on to `merge-base --is-ancestor <tag> <default>` in
+    /// `origin.rs`, as a bare argv element with no `--`, so
+    /// `--output=/path` there is an arbitrary file write with this app's
+    /// privileges -- and `merged` drives image DELETION, so a refused
+    /// check is not merely cosmetic.
+    ///
+    /// The BARE name is what must be validated: `symbolic-ref --short`
+    /// returns `origin/<name>`, so a check against the whole string passes
+    /// anything at all. `worktrees::scan::default_branch`'s comment warns
+    /// about exactly this, and my first two attempts at this fix got it
+    /// wrong -- which is why it is tested rather than reviewed.
+    ///
+    /// Planted with `symbolic-ref` directly rather than `set-head`, which
+    /// validates the name. A hostile remote is under no such obligation.
+    #[test]
+    fn a_flag_shaped_remote_head_is_not_used() {
+        let (_t, dir) = repo();
+        assert!(run(
+            &dir,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/--output=/tmp/pwned",
+            ]
+        ));
+        let got = default_branch(&dir);
+        assert!(
+            !got.contains("--output"),
+            "a name git would read as an option must not be returned: {got}"
+        );
+        // It falls through to the literal candidates, which cannot be
+        // flag-shaped -- `origin/main` exists in this fixture.
+        assert_eq!(got, "origin/main");
+    }
+
+    /// And the ordinary case still works, so the guard above is not
+    /// rejecting every repository into the fallback.
+    #[test]
+    fn an_ordinary_remote_head_is_returned() {
+        let (_t, dir) = repo();
+        assert_eq!(default_branch(&dir), "origin/main");
+    }
 }
 
 #[cfg(test)]

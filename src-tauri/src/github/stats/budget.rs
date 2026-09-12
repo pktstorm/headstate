@@ -502,8 +502,12 @@ impl Spend {
     }
 }
 
+/// `pub(crate)`: `github::query`'s shape-guard coverage check reads this
+/// module's `every_query_document` rather than keeping a second copy of
+/// the derivation (#854). `remote::events` does the same for the same
+/// reason.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
@@ -879,10 +883,23 @@ mod tests {
     /// version of this test got wrong by anchoring on the first mention of a
     /// name rather than on its definition, then reading the wrong region and
     /// reporting a defect at a location that did not have one.
-    fn every_query_document() -> Vec<(&'static str, String, String)> {
+    /// `pub(crate)` since #854: `github::query`'s shape-guard coverage
+    /// check derives the same document list, and a second copy of this
+    /// scan would drift from it silently -- which is the whole defect
+    /// class this guard was written for.
+    ///
+    /// `stats/tree.rs` is in the list since #854 as well. It was NOT
+    /// before, and that is this derivation's own instance of the bug it
+    /// exists to prevent: the file list was two `include_str!` paths, so
+    /// `orgs_query` and `tree_query` -- two real documents, one of them
+    /// the most expensive read on the scope sidebar -- sat outside the
+    /// metering guard for exactly the reason `VIEWER_QUERY` did. Derived
+    /// SUBJECTS with an enumerated FILE list is only half a derivation.
+    pub(crate) fn every_query_document() -> Vec<(&'static str, String, String)> {
         let files = [
             ("query.rs", include_str!("../query.rs")),
             ("stats/query.rs", include_str!("query.rs")),
+            ("stats/tree.rs", include_str!("tree.rs")),
         ];
         let mut out = Vec::new();
         for (file, src) in files {

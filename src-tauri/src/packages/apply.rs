@@ -467,6 +467,19 @@ pub fn default_branch(dir: &Path) -> Option<String> {
         .strip_prefix("origin/")
         .map(str::to_string)
         .filter(|s| !s.is_empty())
+        // `origin/HEAD` is written by the REMOTE, so this name is
+        // remote-controlled and must clear the flag-shape check before it
+        // reaches an argv (#854). It becomes the `--base` of a pull
+        // request and, one caller up, is pushed -- and
+        // `valid_branch_name` guards the branch this app CREATES, never
+        // the base it reads.
+        //
+        // Filtered AFTER `strip_prefix("origin/")`, which is the ordering
+        // `worktrees::scan::default_branch` documents: "Prefixing first
+        // would hide `--output=EVIL` behind a name that no longer starts
+        // with `-`." The same applies to stripping -- the bare name is
+        // what reaches the argv, so the bare name is what is checked.
+        .filter(|s| crate::worktrees::scan::is_safe_ref(s))
 }
 
 /// Create a worktree for an update run.
