@@ -54,13 +54,25 @@ export type View = (typeof ALL_VIEWS)[number];
 /// leaves the other two offering a page the phone cannot show. One set,
 /// read everywhere a view is offered or routed.
 ///
-/// `pr-stats` is the only member, and the classification is deliberate
-/// rather than inherited: Stats has never been offered on the phone, the
-/// companion's first release scoped it out, and #794 moves it between
-/// desktop surfaces without changing that. The local-machine views stay
-/// on mobile (that is the companion's whole purpose) -- this is not a
-/// precedent for hiding them.
-export const MOBILE_HIDDEN_VIEWS: ReadonlySet<View> = new Set<View>(["pr-stats"]);
+/// EMPTY as of #863: the companion now offers every view the desktop
+/// does. `pr-stats` was the only member, hidden because the companion's
+/// first release scoped it out and #794 moved it between desktop surfaces
+/// without revisiting that.
+///
+/// Kept as a mechanism rather than deleted, and that is the deliberate
+/// choice here. The set is what makes the three-call-site bug described
+/// above impossible: `App.tsx`, and `ViewSwitcher`'s collapsed button and
+/// its menu all consult it, so hiding a future view is one line here
+/// instead of three patches that can disagree. Deleting it would return
+/// the next such decision to the shape #794 had to fix. An empty set
+/// costs one allocation and `has()` returning false.
+///
+/// If you are adding a member: it must be a statement about what the
+/// COMPANION cannot do, not about screen width -- see `lib/target.ts`.
+/// And note the local-machine views (worktrees, docker, artifacts,
+/// packages, claude-md) are the companion's whole purpose and are not
+/// candidates.
+export const MOBILE_HIDDEN_VIEWS: ReadonlySet<View> = new Set<View>();
 
 /// The System Health sub-pages, in sidebar order (#687).
 ///
