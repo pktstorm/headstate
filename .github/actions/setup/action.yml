@@ -12,7 +12,34 @@ inputs:
     # on the desktop's lock would never hit for it.
     description: Cargo workspace roots for the Rust cache, one per line
     required: false
-    default: src-tauri
+    # TWO roots, because this repo has two desktop-side lockfiles and a
+    # cache root covers exactly one. `crates/headstate-stepup` is a PATH
+    # DEPENDENCY of src-tauri rather than a workspace member and it has
+    # its OWN Cargo.lock with no root manifest uniting them (#695 put the
+    # step-up canonical bytes, header grammar and verifier there) -- so
+    # `cd crates/headstate-stepup && cargo test`, which `test-rust`, both
+    # `platform` legs and `lint` all run, compiled into a target/ that
+    # rust-cache never saved or restored. It recompiled its whole tree on
+    # every job of every run: ~51 crates from cold, measured locally with
+    # `rm -rf target && cargo build`, for ~35s of the 221s Windows
+    # `Rust tests` step (#889).
+    #
+    # The src-tauri cache was never broken -- it reports `full match:
+    # true`. This was a SCOPE bug: the second lockfile was simply never
+    # named, which is why it cost the same 35s on a warm cache as on a
+    # cold one.
+    #
+    # The mobile jobs override this with `src-mobile` alone and must NOT
+    # add the stepup line. Verified rather than assumed: stepup is a path
+    # dependency INSIDE src-mobile's own workspace, so it appears in
+    # src-mobile/Cargo.lock (one of its 679 packages) and compiles into
+    # src-mobile/target, which that root already saves. Every mobile step
+    # is a `make` target that runs `cd src-mobile && cargo ...`; none
+    # ever enters crates/headstate-stepup, so a second root there would
+    # cache a target/ directory nothing in those jobs writes.
+    default: |
+      src-tauri
+      crates/headstate-stepup
 runs:
   using: composite
   steps:
