@@ -16,7 +16,6 @@ describe("useFilters", () => {
     useFilters.setState({
       filtersByView: { ...EMPTY },
       view: "my-prs",
-      panel: "list",
       density: "comfortable",
     }),
   );
@@ -32,13 +31,16 @@ describe("useFilters", () => {
     expect(active()).toEqual({ needsAttentionOnly: true });
   });
 
-  // On "builds" rather than the old "stats": since #794 that value is
-  // gone from the union, and Docker's is the only other sub-page left.
-  it("a preset returns to the list panel", () => {
-    useFilters.getState().setPanel("builds");
-    useFilters.getState().applyPreset({ staleOnly: true });
-    expect(useFilters.getState().panel).toBe("list");
-  });
+  /// "a preset returns to the list panel" is GONE with the axis (#852).
+  ///
+  /// It asserted `applyPreset` resets `panel` to `"list"`, which existed to
+  /// drop a preset user out of the stats sub-page -- a destination that
+  /// became a view in #794. After that, the only value anything read was
+  /// `"list"`, so the test was pinning a write that could not be observed,
+  /// and `setPanel("builds")` was reaching the one union member no
+  /// component ever set. Deleted rather than rewritten: there is no
+  /// remaining behaviour to assert, and a test kept alive by changing what
+  /// it checks stops describing why it was written.
 
   // A preset is about WHICH PRs you are looking at; density is about the
   // user's eyes and screen. `applyPreset` used to carry
@@ -89,13 +91,9 @@ describe("useFilters", () => {
     expect(active()).toEqual({ repo: "octocat/hello-world" });
   });
 
-  // Switching views must not change which panel a view shows.
-  it("panel is independent of view", () => {
-    useFilters.getState().setPanel("builds");
-    useFilters.getState().setView("to-review");
-    useFilters.getState().setView("my-prs");
-    expect(useFilters.getState().panel).toBe("builds");
-  });
+  /// "panel is independent of view" is GONE with the axis (#852). With one
+  /// reachable value there is no independence to test: the assertion would
+  /// hold for a constant.
 
   // #794: PR Stats is reached by `setView`, which clears the selection
   // and the cursor like any other view change. Pinned because the route
@@ -130,30 +128,36 @@ describe("persisted state migration", () => {
   // `filtersByView` undefined and crashed on first render -- invisible to
   // tests, which always start from empty, and hit immediately on a real
   // machine with saved state.
+  // `panel` is typed OPTIONAL here, and every assertion below expects it
+  // absent (#852). The axis is gone and the v4 arm drops the key, so the
+  // migration's output no longer carries it -- which is the contract worth
+  // pinning: `merge` spreads the persisted object over the live store, so
+  // a surviving `panel` would be written back onto a shape that has no such
+  // field and `partialize` would re-persist it forever.
   const migrate = (useFilters.persist.getOptions().migrate ??
     ((s: unknown) => s)) as (s: unknown, v: number) => {
     filtersByView: Record<string, unknown>;
     view: string;
-    panel: string;
+    panel?: string;
   };
 
   it("lifts a v1 filter set into the active view", () => {
     const out = migrate({ filters: { repo: "octocat/hello-world" }, view: "list" }, 1);
     expect(out.view).toBe("my-prs");
-    expect(out.panel).toBe("list");
+    expect(out.panel).toBeUndefined();
     expect(out.filtersByView["my-prs"]).toEqual({ repo: "octocat/hello-world" });
   });
 
   // Was "maps the old dashboard enum to the stats panel". v2 sent it to
   // `panel: "stats"` because that was where the page lived; #794 moved
-  // the page to a view, so the destination moved with it. Asserting the
-  // panel as well is the point: "stats" is no longer a value `panel`
-  // can hold, and a migration that still wrote it would leave a
-  // persisted store the union says is impossible.
+  // the page to a view, so the destination moved with it -- and #852
+  // removed the axis, so the assertion is now that NO panel survives. A
+  // v1 store has to cross three migrations to get here, and the one thing
+  // it must not arrive carrying is a field the store no longer has.
   it("maps the old dashboard enum to the PR Stats view", () => {
     const out = migrate({ filters: {}, view: "dashboard" }, 1);
     expect(out.view).toBe("pr-stats");
-    expect(out.panel).toBe("list");
+    expect(out.panel).toBeUndefined();
   });
 
   it("maps the old reviewing enum to the to-review view", () => {
@@ -197,7 +201,7 @@ describe("v2 -> v3: the stats panel becomes the PR Stats view", () => {
       2,
     );
     expect(out.view).toBe("pr-stats");
-    expect(out.panel).toBe("list");
+    expect(out.panel).toBeUndefined();
   });
 
   // The filters are left exactly where they were. PR Stats keeps the
@@ -212,19 +216,60 @@ describe("v2 -> v3: the stats panel becomes the PR Stats view", () => {
     expect(out.filtersByView).toEqual({ "my-prs": { repo: "octocat/hello-world" } });
   });
 
-  // `panel` is shared with Docker. A Docker user could not reach
+  // `panel` was shared with Docker. A Docker user could not reach
   // "stats" through the UI, but a store that somehow holds both must not
   // teleport them off the view they were on -- dropping an unreachable
   // panel value is the smaller correction.
   it("does not move a non-My-PRs view, only clears the dead panel", () => {
     const out = migrate({ filtersByView: {}, view: "docker", panel: "stats" }, 2);
     expect(out.view).toBe("docker");
-    expect(out.panel).toBe("list");
+    expect(out.panel).toBeUndefined();
   });
 
-  it("leaves a v2 store that was not on stats alone", () => {
+  /// Was "leaves a v2 store that was not on stats alone", asserting the
+  /// object came back byte-identical. It cannot any more (#852): a v2 store
+  /// carries `panel: "list"` and the v4 arm drops it, so "untouched" is now
+  /// "untouched except for the axis that no longer exists".
+  ///
+  /// Split into the two claims that matter rather than loosened, because
+  /// `toEqual(before)` was doing real work -- it is what catches a
+  /// migration arm that rewrites a view it should not have.
+  it("leaves a v2 store that was not on stats where it was, minus the dead panel", () => {
     const before = { filtersByView: {}, view: "worktrees", panel: "list" };
-    expect(migrate(before, 2)).toEqual(before);
+    const out = migrate(before, 2);
+    expect(out.view).toBe("worktrees");
+    expect(out.filtersByView).toEqual({});
+    expect(out.panel).toBeUndefined();
+    // And nothing ELSE was added: the arms must not invent keys.
+    expect(Object.keys(out).sort()).toEqual(["filtersByView", "view"]);
+  });
+
+  /// The v4 arm on its own (#852), from a v3 store -- the version most
+  /// installs are actually on, and the one the other tests here reach only
+  /// by falling through from v1 or v2.
+  it("drops a v3 store's panel and changes nothing else", () => {
+    const out = migrate(
+      { filtersByView: { docker: {} }, view: "docker", panel: "list", density: "dense" },
+      3,
+    );
+    expect(out.panel).toBeUndefined();
+    expect("panel" in out).toBe(false);
+    expect(out.view).toBe("docker");
+    expect(out.filtersByView).toEqual({ docker: {} });
+    // Unrelated persisted preferences survive: the arm removes one key, it
+    // does not rebuild the object from a known list.
+    expect((out as { density?: string }).density).toBe("dense");
+  });
+
+  /// `"panel" in out` is the assertion that matters, not just
+  /// `toBeUndefined()`. An explicit `panel: undefined` is still an own
+  /// property, and `merge` spreads the persisted object over the live store
+  /// -- so that form would write `undefined` over the default and leave the
+  /// key alive with a worse value than before. The arm destructures for
+  /// exactly this reason.
+  it("removes the key rather than setting it undefined", () => {
+    const out = migrate({ filtersByView: {}, view: "docker", panel: "builds" }, 3);
+    expect(Object.prototype.hasOwnProperty.call(out, "panel")).toBe(false);
   });
 
   // The hazard this whole migration exists for. `filtersByView` is
@@ -249,7 +294,7 @@ describe("v2 -> v3: the stats panel becomes the PR Stats view", () => {
   it("carries a v1 store all the way to v3", () => {
     const out = migrate({ filters: { staleOnly: true }, view: "dashboard" }, 1);
     expect(out.view).toBe("pr-stats");
-    expect(out.panel).toBe("list");
+    expect(out.panel).toBeUndefined();
     expect(Object.keys(out.filtersByView as object).sort()).toEqual([...ALL_VIEWS].sort());
   });
 });

@@ -602,3 +602,155 @@ describe("ArtifactsPage when the scan fails", () => {
     expect(screen.queryByRole("combobox", { name: /sort artifacts/i })).toBeNull();
   });
 });
+
+/// #817's advisory-displacement bug, which survived here (#852).
+///
+/// The rule (`WorktreesPage:1696`): "Ordering is what actually settles it.
+/// With the group after Remove, nothing upstream of Remove changes width
+/// when the button appears… by construction rather than by tuning." A
+/// self-scheduling, variable-width advisory sat UPSTREAM of both Remove
+/// buttons here, which relied on `ml-auto` -- the remedy #817 explicitly
+/// rejected -- and the desktop container has no `flex-wrap` and no
+/// `overflow`, so when the advisory appeared mid-scan Remove was pushed off
+/// the right edge.
+///
+/// Asserted with `compareDocumentPosition` rather than on the parent alone.
+/// A parent-only assertion is exactly what let #817 ship green: the two
+/// elements were correctly not siblings and the button still moved.
+describe("ArtifactsPage toolbar ordering", () => {
+  beforeEach(() => {
+    state.artifacts = [];
+    state.venvs = [];
+    state.failed = false;
+    state.venvsFailed = false;
+    state.loading = false;
+    state.sizes = new Map();
+    state.ages = new Map();
+    state.pending = 0;
+    state.total = 0;
+  });
+  afterEach(() => stubViewport(null));
+
+  const threeRemovable = () => {
+    state.artifacts = [
+      art({ path: "/code/a/target" }),
+      art({ path: "/code/b/target" }),
+      art({ path: "/code/c/target" }),
+    ];
+    state.sizes = new Map([
+      ["/code/a/target", 1_000],
+      ["/code/b/target", 2_000],
+      ["/code/c/target", 3_000],
+    ]);
+  };
+
+  it("puts the measuring advisory AFTER the remove button, not before it", () => {
+    threeRemovable();
+    state.pending = 2;
+    state.total = 5;
+    render(<ArtifactsPage />);
+    const remove = screen.getByRole("button", { name: /remove all 3/i });
+    const advisory = screen.getByText(/measuring — 3 of 5 repositories/i);
+    expect(
+      remove.compareDocumentPosition(advisory) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  /// The structural claim, stated as the thing that can actually go wrong:
+  /// NO element whose presence depends on the scan may sit upstream of
+  /// Remove.
+  ///
+  /// Counted by POSITION, not compared by text. The total beside the count
+  /// legitimately rewords with `pending` ("5.9 KB" becomes "at least 5.9
+  /// KB") and so does the button's own label; neither is displacement, and a
+  /// text comparison would fail on both while missing the real defect.
+  ///
+  /// Both directions are checked in one test because #817's remedy is
+  /// ORDERING, and ordering is only demonstrated by a pair: an assertion
+  /// that the advisory follows Remove while the scan runs, AND that nothing
+  /// new appeared ahead of Remove between the two states. Either alone
+  /// passes against an arrangement that still moves the button -- which is
+  /// how #817's own structural test shipped green.
+  it("never puts a scan-dependent element upstream of remove", () => {
+    const around = (label: RegExp) => {
+      const remove = screen.getByRole("button", { name: label });
+      const bar = remove.closest("div") as HTMLElement;
+      const upstream = [...bar.children].filter(
+        (el) => el.compareDocumentPosition(remove) & Node.DOCUMENT_POSITION_FOLLOWING,
+      );
+      return { remove, upstream: upstream.length };
+    };
+
+    threeRemovable();
+    state.pending = 0;
+    state.total = 5;
+    const { unmount } = render(<ArtifactsPage />);
+    const quiet = around(/remove all 3/i).upstream;
+    unmount();
+
+    state.pending = 2;
+    render(<ArtifactsPage />);
+    const advisory = screen.getByText(/measuring — 3 of 5/i);
+    const { remove, upstream } = around(/remove all 3/i);
+    // The advisory is on screen, and DOWNSTREAM of the button.
+    expect(
+      remove.compareDocumentPosition(advisory) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    // And nothing arrived ahead of it between the two states.
+    expect(upstream).toBe(quiet);
+  });
+
+  /// `ml-auto` is GONE, which is the mechanism #817 rejected: it made each
+  /// button's position a function of everything upstream of it, so an
+  /// advisory consuming the free space pushed the button left.
+  it("does not position the remove button with an auto margin", () => {
+    threeRemovable();
+    render(<ArtifactsPage />);
+    const remove = screen.getByRole("button", { name: /remove all 3/i });
+    expect(remove.className).not.toContain("ml-auto");
+  });
+
+  /// The two buttons differ in width a lot -- "Remove all 47 · 112 GB"
+  /// against "Remove 3 · 8 GB" -- and they swap on the first checkbox tick,
+  /// so ticking a row moved the button the user was about to aim at. A
+  /// fixed-width cell holds the position: `WorktreesPage`'s row reached the
+  /// same shape for the same reason ("A row's layout should not depend on
+  /// which action it currently offers").
+  it("keeps the action in one fixed cell across the button swap", () => {
+    threeRemovable();
+    stubViewport(1400);
+    render(<ArtifactsPage />);
+    const before = screen.getByRole("button", { name: /remove all 3/i });
+    const cell = before.parentElement as HTMLElement;
+    expect(cell.className).toMatch(/\bw-48\b/);
+
+    fireEvent.click(screen.getByLabelText("Select /code/a/target"));
+    const after = screen.getByRole("button", { name: /remove 1 ·/i });
+    // The SAME cell, so the button cannot move sideways when it changes.
+    expect(after.parentElement).toBe(cell);
+  });
+
+  /// #852's live-region half, on this page. `StatusBar`: "A live region has
+  /// to exist before the text appears or the first announcement is missed --
+  /// the one that matters most, since it is the one saying work started."
+  /// The `<span>` carrying `aria-live` was created by the render that first
+  /// gave it text, so the "measuring" announcement was never heard.
+  it("mounts the measuring live region before there is anything to announce", () => {
+    threeRemovable();
+    state.pending = 0;
+    state.total = 5;
+    const { container } = render(<ArtifactsPage />);
+    const region = container.querySelector('[aria-live="polite"]');
+    expect(region).toBeTruthy();
+    expect(region?.textContent).toBe("");
+  });
+
+  it("announces through that same region once measuring starts", () => {
+    threeRemovable();
+    state.pending = 2;
+    state.total = 5;
+    const { container } = render(<ArtifactsPage />);
+    const regions = [...container.querySelectorAll('[aria-live="polite"]')];
+    expect(regions.some((r) => /measuring — 3 of 5/.test(r.textContent ?? ""))).toBe(true);
+  });
+});

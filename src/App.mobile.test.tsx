@@ -116,7 +116,7 @@ const EMPTY = {
 };
 
 beforeEach(() => {
-  useFilters.setState({ filtersByView: EMPTY, view: "my-prs", panel: "list" } as never);
+  useFilters.setState({ filtersByView: EMPTY, view: "my-prs" } as never);
 });
 
 afterEach(() => {

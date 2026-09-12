@@ -386,7 +386,6 @@ describe("WorktreesPage", () => {
     useFilters.setState({
       filtersByView: { ...EMPTY, worktrees: { repo: "/code/proj" } },
       view: "worktrees",
-      panel: "list",
     });
     // Calls leak between tests otherwise, which makes "was not called"
     // assertions pass or fail depending on ordering.
@@ -1887,7 +1886,6 @@ describe("WorktreesPage", () => {
         filtersByView: { ...EMPTY, worktrees: {},
   branches: {} },
         view: "worktrees",
-        panel: "list",
       });
       return render(<WorktreesPage />);
     };
@@ -1928,7 +1926,6 @@ describe("WorktreesPage", () => {
         filtersByView: { ...EMPTY, worktrees: {},
   branches: {} },
         view: "worktrees",
-        panel: "list",
       });
       render(<WorktreesPage />);
       expect(screen.getByText(/at least/i)).toBeTruthy();
@@ -1953,7 +1950,6 @@ describe("WorktreesPage", () => {
       useFilters.setState({
         filtersByView: { ...EMPTY, worktrees: { repo: "/code/proj" } },
         view: "worktrees",
-        panel: "list",
       });
       return render(<WorktreesPage />);
     };

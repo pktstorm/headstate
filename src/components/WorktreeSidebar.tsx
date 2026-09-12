@@ -34,6 +34,21 @@ export function WorktreeSidebar({
       active ? "bg-[#1f6feb] text-white" : "text-[#e6edf3] hover:bg-[#161b22]"
     }`;
 
+  /// `aria-current` for the selected row (#852). The blue was carrying the
+  /// selection alone, against the rule `StatsSidebar` states: "the
+  /// selection is navigation state, and a screen reader reading a list of
+  /// repository names has no other way to know which one is open."
+  ///
+  /// `"true"` rather than `"page"`: these rows SCOPE the worktree view
+  /// rather than navigating to a different one. `undefined` on the
+  /// inactive rows, because absence is how "not current" is spelled and
+  /// `aria-current="false"` is announced by some readers.
+  ///
+  /// It covers the Orphaned row too, which is the one that most needs it:
+  /// its only other distinguishing mark is its amber text, so a reader who
+  /// cannot see colour had nothing at all.
+  const current = (active: boolean) => (active ? ("true" as const) : undefined);
+
   // Worktree count EXCLUDING the main checkout: it is not a worktree you
   // would ever remove, and counting it inflates every repo by one.
   // Counted by EXCLUDING the main checkout, not by subtracting one.
@@ -117,6 +132,7 @@ export function WorktreeSidebar({
         <button
           type="button"
           onClick={() => setFilter("repo", undefined)}
+          aria-current={current(!filters.repo)}
           className={rowClass(!filters.repo)}
         >
           <span>All repositories</span>
@@ -138,6 +154,7 @@ export function WorktreeSidebar({
             type="button"
             key={r.path}
             onClick={() => setFilter("repo", r.path)}
+            aria-current={current(filters.repo === r.path)}
             className={rowClass(filters.repo === r.path)}
           >
             <span className="truncate">{r.name}</span>
@@ -162,6 +179,7 @@ export function WorktreeSidebar({
             <button
               type="button"
               onClick={() => setFilter("repo", ORPHAN_FILTER)}
+              aria-current={current(filters.repo === ORPHAN_FILTER)}
               className={rowClass(filters.repo === ORPHAN_FILTER)}
             >
               <span className="truncate text-[#d29922]">Orphaned</span>

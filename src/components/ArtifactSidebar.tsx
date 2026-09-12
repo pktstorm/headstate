@@ -92,6 +92,17 @@ export function ArtifactSidebar({ reviewingCount }: { reviewingCount: number }) 
       active ? "bg-[#1f6feb] text-white" : "text-[#e6edf3] hover:bg-[#161b22]"
     }`;
 
+  /// `aria-current` for the selected row (#852). The blue was carrying the
+  /// selection alone, against the rule `StatsSidebar` states: "the
+  /// selection is navigation state, and a screen reader reading a list of
+  /// repository names has no other way to know which one is open."
+  ///
+  /// `"true"` rather than `"page"`: these rows SCOPE the artifacts view
+  /// rather than navigating to a different one. `undefined` on the
+  /// inactive rows, because absence is how "not current" is spelled and
+  /// `aria-current="false"` is announced by some readers.
+  const current = (active: boolean) => (active ? ("true" as const) : undefined);
+
   return (
     <nav className="flex w-64 shrink-0 flex-col border-r border-[#30363d] p-3">
       <ViewSwitcher counts={{ "to-review": reviewingCount }} />
@@ -99,6 +110,7 @@ export function ArtifactSidebar({ reviewingCount }: { reviewingCount: number }) 
         <button
           type="button"
           onClick={() => setFilter("repo", undefined)}
+          aria-current={current(!filters.repo)}
           className={rowClass(!filters.repo)}
         >
           <span className="flex items-center gap-2">
@@ -153,6 +165,7 @@ export function ArtifactSidebar({ reviewingCount }: { reviewingCount: number }) 
             type="button"
             key={kind}
             onClick={() => setFilter("repo", kind)}
+            aria-current={current(filters.repo === kind)}
             className={rowClass(filters.repo === kind)}
           >
             <span className="truncate">{GROUP_LABEL[kind]}</span>

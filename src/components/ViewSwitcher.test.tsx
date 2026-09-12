@@ -10,7 +10,7 @@ const EMPTY = { "my-prs": {}, "to-review": {}, worktrees: {},
 
 describe("ViewSwitcher", () => {
   beforeEach(() =>
-    useFilters.setState({ filtersByView: { ...EMPTY }, view: "my-prs", panel: "list" }),
+    useFilters.setState({ filtersByView: { ...EMPTY }, view: "my-prs" }),
   );
 
   it("names the current view when collapsed", () => {
@@ -39,7 +39,7 @@ describe("ViewSwitcher", () => {
   });
 
   it("marks the current view so the menu is not ambiguous", () => {
-    useFilters.setState({ filtersByView: { ...EMPTY }, view: "to-review", panel: "list" });
+    useFilters.setState({ filtersByView: { ...EMPTY }, view: "to-review" });
     render(<ViewSwitcher />);
     fireEvent.click(screen.getByRole("button", { name: /to review/i }));
     const current = screen.getByRole("menuitem", { name: /to review/i });
@@ -75,7 +75,6 @@ describe("ViewSwitcher", () => {
       filtersByView: { "my-prs": { repo: "octocat/hello-world" }, "to-review": {}, worktrees: {},
   branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} },
       view: "my-prs",
-      panel: "list",
     });
     render(<ViewSwitcher />);
     fireEvent.click(screen.getByRole("button", { name: /my pull requests/i }));

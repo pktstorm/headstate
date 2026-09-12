@@ -28,7 +28,9 @@ export function RepoTable({
   /// the caller knows why it is partial, which this component does not.
   hint?: string;
 }) {
-  const { setFilter, setPanel } = useFilters();
+  // `setView`, which this did not call -- the whole of the dead click
+  // (#852). See the `onClick` below.
+  const { setFilter, setView } = useFilters();
   const total = repos.reduce((sum, r) => sum + r.merged, 0);
 
   return (
@@ -56,9 +58,33 @@ export function RepoTable({
               <button
                 key={r.repo}
                 type="button"
+                // A DEAD CLICK before this (#852). It called `setFilter`
+                // and `setPanel("list")` and never `setView`, so nothing
+                // navigated: the user stayed on PR Stats, and since
+                // `setFilter` writes into `filtersByView[s.view]` the repo
+                // landed in `pr-stats`' own filter set -- which `StatsPage`
+                // does not read. Clicking the "Merged by repository" bars
+                // did nothing at all, while the doc comment above promised
+                // "Clicking a row scopes the app to that repo and switches
+                // to the list… it has to be a way in, not just a readout."
+                //
+                // `setView` FIRST, then `setFilter`, and the order is
+                // load-bearing: `setFilter` writes to whichever view is
+                // active when it runs, so the reverse order would put the
+                // repo in `pr-stats`' slot again -- the same bug with an
+                // extra call. `setView` also clears the selection and the
+                // working set, which is correct here: a set assembled on
+                // one view means nothing on another.
+                //
+                // `setPanel` is GONE rather than reordered. It was setting
+                // `"list"`, already the only value My PRs reads, so the
+                // call was a no-op dressed as navigation -- and `panel` has
+                // been removed from the store (see `store/filters.ts`),
+                // since "a `panel` nobody routes on would be a silent
+                // no-op" was the rule it was already breaking.
                 onClick={() => {
+                  setView("my-prs");
                   setFilter("repo", r.repo);
-                  setPanel("list");
                 }}
                 className="flex items-center gap-3 rounded px-2 py-1.5 text-sm hover:bg-[#161b22]"
               >

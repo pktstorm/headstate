@@ -41,8 +41,11 @@ vi.mock("../api/hooks", () => ({
   useVenvSizes: () => ({ sizes: new Map(), idle: new Map(), measuring: false, pending: 0, total: 0 }),
 }));
 vi.mock("./ViewSwitcher", () => ({ ViewSwitcher: () => null }));
+// Which group the sidebar believes is selected, so the `aria-current` tests
+// below can exercise a row that is current and a row that is not (#852).
+const selected = vi.hoisted(() => ({ repo: undefined as string | undefined }));
 vi.mock("@/store/filters", () => ({
-  useActiveFilters: () => ({ repo: undefined }),
+  useActiveFilters: () => ({ repo: selected.repo }),
   useFilters: () => ({ setFilter: vi.fn() }),
 }));
 
@@ -68,6 +71,7 @@ const venv = (over: Partial<Venv> = {}): Venv =>
   }) as Venv;
 
 beforeEach(() => {
+  selected.repo = undefined;
   refetchArtifacts.mockClear();
   refetchVenvs.mockClear();
   state.artifacts = [];
@@ -169,6 +173,42 @@ describe("ArtifactSidebar", () => {
       state.artifacts = [art()];
       render(<ArtifactSidebar reviewingCount={0} />);
       expect(screen.getByText("Rust targets")).toBeTruthy();
+    });
+  });
+
+  /// #852: selection was conveyed by BACKGROUND COLOUR ALONE, with zero
+  /// `aria-current`. `StatsSidebar` states the rule: "the selection is
+  /// navigation state, and a screen reader reading a list of repository
+  /// names has no other way to know which one is open."
+  describe("selection is not conveyed by colour alone", () => {
+    it("marks the selected group as current", () => {
+      state.artifacts = [art(), art({ path: "/code/x/node_modules", kind: "node_modules" })];
+      selected.repo = "cargo_target";
+      render(<ArtifactSidebar reviewingCount={0} />);
+      expect(
+        screen.getByText("Rust targets").closest("button")?.getAttribute("aria-current"),
+      ).toBe("true");
+      expect(
+        screen.getByText("Node modules").closest("button")?.getAttribute("aria-current"),
+      ).toBeNull();
+    });
+
+    it("marks Everything as current when no group is scoped", () => {
+      state.artifacts = [art()];
+      render(<ArtifactSidebar reviewingCount={0} />);
+      expect(
+        screen.getByText("Everything").closest("button")?.getAttribute("aria-current"),
+      ).toBe("true");
+    });
+
+    /// `undefined`, never `"false"`: absence is how "not current" is
+    /// spelled, and `aria-current="false"` is announced by some readers.
+    it("omits the attribute on unselected rows rather than setting it false", () => {
+      state.artifacts = [art()];
+      selected.repo = "cargo_target";
+      render(<ArtifactSidebar reviewingCount={0} />);
+      const rows = screen.getAllByRole("button");
+      expect(rows.some((r) => r.getAttribute("aria-current") === "false")).toBe(false);
     });
   });
 

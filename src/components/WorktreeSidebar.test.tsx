@@ -22,6 +22,25 @@ vi.mock("./ViewSwitcher", () => ({ ViewSwitcher: () => null }));
 
 import { WorktreeSidebar } from "./WorktreeSidebar";
 import { useFilters } from "../store/filters";
+import { ORPHAN_FILTER } from "../lib/worktrees";
+
+/// The complete per-view filter map, which `setState` REPLACES rather than
+/// merges -- so a partial object here leaves views without a key and every
+/// consumer reads `.repo` off undefined. Declared once rather than inlined at
+/// each call, which is what the `beforeEach` below was already doing
+/// by hand.
+const EMPTY = {
+  "my-prs": {},
+  "to-review": {},
+  worktrees: {},
+  branches: {},
+  docker: {},
+  artifacts: {},
+  packages: {},
+  "claude-md": {},
+  "pr-stats": {},
+  "system-health": {},
+} as const;
 
 afterEach(() => stubViewport(null));
 
@@ -223,6 +242,64 @@ describe("WorktreeSidebar", () => {
       repos.mockReturnValue(undefined);
       render(<WorktreeSidebar />);
       expect(screen.queryByText(/check the scanned directories/i)).toBeNull();
+    });
+  });
+
+  /// #852: four of seven sidebars conveyed selection by BACKGROUND COLOUR
+  /// ALONE, with zero `aria-current`.
+  ///
+  /// `StatsSidebar` already states the rule: "`aria-current` rather than
+  /// only a colour: the selection is navigation state, and a screen reader
+  /// reading a list of repository names has no other way to know which one
+  /// is open."
+  describe("selection is not conveyed by colour alone", () => {
+    it("marks the selected repository as current", () => {
+      repos.mockReturnValue([repo("busy", 3), repo("other", 2)]);
+      useFilters.setState({
+        filtersByView: { ...EMPTY, worktrees: { repo: "/code/busy" } },
+        view: "worktrees",
+      } as never);
+      render(<WorktreeSidebar />);
+      expect(
+        screen.getByText("busy").closest("button")?.getAttribute("aria-current"),
+      ).toBe("true");
+      // And only that one. A second `aria-current` would announce two
+      // locations at once.
+      expect(
+        screen.getByText("other").closest("button")?.getAttribute("aria-current"),
+      ).toBeNull();
+    });
+
+    it("marks All repositories as current when nothing is scoped", () => {
+      repos.mockReturnValue([repo("busy", 3)]);
+      render(<WorktreeSidebar />);
+      expect(
+        screen.getByText("All repositories").closest("button")?.getAttribute("aria-current"),
+      ).toBe("true");
+    });
+
+    /// The Orphaned row most of all: its only other distinguishing mark is
+    /// amber TEXT, so a reader who cannot see colour had nothing at all.
+    it("marks the Orphaned row as current when it is selected", () => {
+      repos.mockReturnValue([repo("busy", 3), orphanRepo("veil-coh")]);
+      useFilters.setState({
+        filtersByView: { ...EMPTY, worktrees: { repo: ORPHAN_FILTER } },
+        view: "worktrees",
+      } as never);
+      render(<WorktreeSidebar />);
+      expect(
+        screen.getByText("Orphaned").closest("button")?.getAttribute("aria-current"),
+      ).toBe("true");
+    });
+
+    /// `undefined`, never `"false"`. Absence is how "not current" is
+    /// spelled, and `aria-current="false"` is announced by some readers --
+    /// so a row that is merely not selected would say so out loud.
+    it("omits the attribute on unselected rows rather than setting it false", () => {
+      repos.mockReturnValue([repo("busy", 3)]);
+      render(<WorktreeSidebar />);
+      const rows = screen.getAllByRole("button");
+      expect(rows.some((r) => r.getAttribute("aria-current") === "false")).toBe(false);
     });
   });
 

@@ -40,6 +40,26 @@ export function RepoSidebar({
       active ? "bg-[#1f6feb] text-white" : "text-[#e6edf3] hover:bg-[#161b22]"
     }`;
 
+  /// `aria-current` for the selected row (#852).
+  ///
+  /// The blue was carrying the selection on its own, so a screen reader
+  /// reading a list of repository names had no way to know which one was
+  /// open. `StatsSidebar` already states the rule: "`aria-current` rather
+  /// than only a colour: the selection is navigation state, and a screen
+  /// reader reading a list of repository names has no other way to know
+  /// which one is open."
+  ///
+  /// `"true"` rather than `"page"`, matching `StatsSidebar` rather than
+  /// `SystemHealthSidebar`: these rows SCOPE the current page, they do not
+  /// navigate to a different one, and `aria-current="page"` would claim
+  /// each repository is its own page. `undefined` rather than `"false"` on
+  /// the inactive rows -- the attribute's absence is how "not current" is
+  /// spelled, and `aria-current="false"` is announced by some readers.
+  ///
+  /// A helper rather than an inline ternary at each call site, so the two
+  /// rows here cannot drift and a third cannot be added without it.
+  const current = (active: boolean) => (active ? ("true" as const) : undefined);
+
   // My PRs is the only view whose `filters.repo` this column both writes
   // and has read back. PR Stats was the other until #825 gave it
   // `StatsSidebar`, and it is dropped from this list rather than left in:
@@ -60,6 +80,7 @@ export function RepoSidebar({
         <button
           type="button"
           onClick={() => setFilter("repo", undefined)}
+          aria-current={current(repoActive && !filters.repo)}
           className={rowClass(repoActive && !filters.repo)}
         >
           <span>All repositories</span>
@@ -70,6 +91,7 @@ export function RepoSidebar({
             type="button"
             key={repo}
             onClick={() => setFilter("repo", repo)}
+            aria-current={current(repoActive && filters.repo === repo)}
             className={rowClass(repoActive && filters.repo === repo)}
           >
             <span className="truncate">{repo}</span>

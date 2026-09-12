@@ -592,3 +592,74 @@ describe("VenvSection when the scan fails", () => {
     expect(container.textContent).not.toBe("");
   });
 });
+
+/// #852: the confirmation stated a false reassurance as fact.
+///
+/// It read "Every one of these belongs to a project directory that no longer
+/// exists" -- unconditionally, while `isRemovable` admits `stale` too. And
+/// this component's own doc comment defines the difference: "An orphan is a
+/// FACT -- the path that made it is gone… A stale venv is a JUDGEMENT about
+/// a project that STILL EXISTS."
+///
+/// So for every stale row the dialog asserted the opposite of the truth, at
+/// the exact moment the gate's own justification says the intent is formed:
+/// "Ticking a specific row and confirming in a dialog IS the intent."
+describe("VenvSection's confirmation wording", () => {
+  const STALE_SECS = 90 * 24 * 60 * 60;
+
+  const orphan = () => venv({ path: "/cache/gone-AAAA-py3.13", project: "gone" });
+  const stale = () =>
+    venv({ path: "/cache/here-BBBB-py3.13", project: "here", state: "live", source: "/code/here" });
+
+  /// `stale` is a DISPLAY state derived from the idle time, so the fixture
+  /// has to supply one past the threshold -- a `state: "stale"` venv with no
+  /// idle time renders as `live` and cannot be selected at all.
+  const ageStale = () => {
+    state.idle = new Map([["/cache/here-BBBB-py3.13", STALE_SECS + 1]]);
+  };
+
+  const openWith = (rows: ReturnType<typeof venv>[]) => {
+    state.venvs = rows;
+    render(<VenvSection />);
+    for (const r of rows) {
+      fireEvent.click(screen.getByLabelText(new RegExp(`Select ${r.project} virtualenv`)));
+    }
+    fireEvent.click(screen.getByRole("button", { name: /^Remove \d/ }));
+    return screen.getByRole("dialog");
+  };
+
+  it("does not claim a stale venv's project is gone", () => {
+    ageStale();
+    const dialog = openWith([stale()]);
+    expect(within(dialog).queryByText(/no longer exists/i)).toBeNull();
+    expect(within(dialog).getByText(/still exists/i)).toBeTruthy();
+  });
+
+  /// The judgement has to be REVIEWABLE, not merely flagged: the threshold
+  /// and the cost are what let the user weigh it.
+  it("names the threshold and what removing a stale venv costs", () => {
+    ageStale();
+    const dialog = openWith([stale()]);
+    expect(within(dialog).getByText(/90 days/i)).toBeTruthy();
+    expect(within(dialog).getByText(/poetry install/i)).toBeTruthy();
+  });
+
+  /// The orphan sentence is still made, unchanged, when it is true -- the
+  /// fix is a split, not a retreat into vagueness.
+  it("still says an orphan's project is gone", () => {
+    const dialog = openWith([orphan()]);
+    expect(within(dialog).getByText(/no longer exists/i)).toBeTruthy();
+    expect(within(dialog).queryByText(/still exists/i)).toBeNull();
+  });
+
+  /// A MIXED selection is the case the old copy was most wrong about: it
+  /// said "every one" over a set where only some qualified.
+  it("says both things, each counted, for a mixed selection", () => {
+    ageStale();
+    const dialog = openWith([orphan(), stale()]);
+    expect(within(dialog).getByText(/1 of these belong to a project directory that no longer exists/i)).toBeTruthy();
+    expect(within(dialog).getByText(/1 of these belong to a project that still exists/i)).toBeTruthy();
+    // And never "every one", which is the word that made it a false claim.
+    expect(within(dialog).queryByText(/every one of these/i)).toBeNull();
+  });
+});

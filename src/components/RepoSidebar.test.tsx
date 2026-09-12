@@ -138,5 +138,64 @@ describe("RepoSidebar", () => {
     expect(screen.getByText("All repositories").closest("button")?.className).not.toContain(
       "bg-[#1f6feb]",
     );
+    // And the same in the accessible layer (#852), which is the half a
+    // `className` assertion cannot see: a row that is not serving this view
+    // must not announce itself as the current location either.
+    expect(
+      screen.getByText("All repositories").closest("button")?.getAttribute("aria-current"),
+    ).toBeNull();
+  });
+
+  /// #852: selection was conveyed by BACKGROUND COLOUR ALONE.
+  ///
+  /// Every assertion in this file reached for `className` and
+  /// `bg-[#1f6feb]`, which is precisely the problem restated: the blue WAS
+  /// the selection, so the tests could only check the blue. `StatsSidebar`
+  /// already states the rule: "`aria-current` rather than only a colour: the
+  /// selection is navigation state, and a screen reader reading a list of
+  /// repository names has no other way to know which one is open."
+  describe("selection is not conveyed by colour alone", () => {
+    it("marks the selected repository as current", () => {
+      useFilters.setState({ view: "my-prs" });
+      useFilters.getState().setFilter("repo", "octocat/hello-world");
+      render(<RepoSidebar prs={PR_FIXTURES} />);
+      const row = screen.getByRole("button", { name: /octocat\/hello-world/ });
+      expect(row.getAttribute("aria-current")).toBe("true");
+      expect(
+        screen.getByText("All repositories").closest("button")?.getAttribute("aria-current"),
+      ).toBeNull();
+    });
+
+    it("marks All repositories as current when nothing is scoped", () => {
+      useFilters.setState({ view: "my-prs" });
+      // Cleared explicitly: the file's `afterEach` calls `reset()`, which
+      // deliberately KEEPS the repo (see the store test "reset clears
+      // filters but keeps the repo"), so a repo set by an earlier test
+      // survives into this one and "nothing is scoped" would be untrue.
+      useFilters.getState().setFilter("repo", undefined);
+      render(<RepoSidebar prs={PR_FIXTURES} />);
+      expect(
+        screen.getByText("All repositories").closest("button")?.getAttribute("aria-current"),
+      ).toBe("true");
+    });
+
+    /// `undefined`, never `"false"`: absence is how "not current" is
+    /// spelled, and `aria-current="false"` is announced by some readers.
+    it("omits the attribute on unselected rows rather than setting it false", () => {
+      useFilters.setState({ view: "my-prs" });
+      render(<RepoSidebar prs={PR_FIXTURES} />);
+      const rows = screen.getAllByRole("button");
+      expect(rows.some((r) => r.getAttribute("aria-current") === "false")).toBe(false);
+    });
+
+    /// The `repoActive` guard applies to the accessible layer too: on a view
+    /// this column does not serve, NO row is current. That guard exists
+    /// because PR Stats was in exactly that state for a release.
+    it("marks nothing as current on a view it does not serve", () => {
+      useFilters.setState({ view: "pr-stats" });
+      render(<RepoSidebar prs={PR_FIXTURES} />);
+      const rows = screen.getAllByRole("button");
+      expect(rows.some((r) => r.getAttribute("aria-current") !== null)).toBe(false);
+    });
   });
 });
