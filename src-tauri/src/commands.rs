@@ -2691,13 +2691,30 @@ pub async fn stats_board(
     // against.
     let viewer = client.fetch_viewer().await.map_err(|e| e.to_string())?;
 
-    // A board has no subject, so the query whose key this is is the
-    // whole-scope one -- `Kind::Board` is what keeps it out of the count's
-    // row. The viewer is still part of the key through `cache_key`'s `*`
-    // placeholder resolution path, and the STORED payload carries the
-    // viewer it was split against, so a row written under one identity can
-    // never be re-split under another (see `StatsBoard`'s doc for why that
-    // pairing has to be atomic).
+    // A board has no subject, so `cache_key` fills the subject slot with
+    // `*` and the key reads `board|merged|*|org:X`. `Kind::Board` is what
+    // keeps that out of the whole-scope COUNT's row, which is the same
+    // string bar the prefix.
+    //
+    // Note what this means and why it is safe: unlike `stats_count`'s key,
+    // this one does NOT carry the viewer's login -- there is no subject for
+    // it to be resolved into. Two accounts on one machine share this
+    // database (`Subject::cache_key`'s doc records that as a real case), so
+    // in principle one could read a board row the other wrote, and a
+    // `StatsBoard` payload carries the viewer it was split into Mine and
+    // Others against -- which would put the reader's own work under
+    // "Others" and show "no activity" for Mine.
+    //
+    // `note_stats_viewer` below is what closes it, and it has to run before
+    // the read for exactly this reason: a changed identity drops every row
+    // in the table, so the only rows this read can find were written by the
+    // account now asking. That ordering is load-bearing rather than tidy.
+    //
+    // The alternative -- putting the viewer in the key -- was rejected: it
+    // would give every account its own copy of an answer that is identical
+    // for all of them (a board is about everyone in the scope), so the
+    // second user would pay the full ~45-point load to recompute a
+    // leaderboard already on disk.
     let q = crate::github::stats::StatsQuery::new(None, req.scope.clone(), measure);
     let key = crate::store::stats::key(crate::store::stats::Kind::Board, &q.cache_key(&viewer));
     let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
@@ -3254,6 +3271,53 @@ mod tests {
                 body.contains("note_stats_viewer("),
                 "{name} must note the viewer (#840), or a token swap \
                  leaves the previous user's rows forever"
+            );
+        }
+    }
+
+    /// The identity check must run BEFORE the cache is read.
+    ///
+    /// Not a style preference -- it is what makes `stats_board`'s key safe.
+    /// That key is `board|merged|*|org:X`: a board has no subject, so unlike
+    /// `stats_count`'s key it carries NO viewer login. Two accounts on one
+    /// machine share this database (`Subject::cache_key` records that as a
+    /// real case), so one could otherwise read a board row the other wrote
+    /// -- and a `StatsBoard` payload carries the viewer it was split into
+    /// Mine and Others against, which would put the reader's own work under
+    /// "Others" and show "no activity" for Mine.
+    ///
+    /// `note_stats_viewer` clears the whole table on an identity change, so
+    /// running it first means the only rows the read can find were written
+    /// by the account now asking. Reversed, the stale board is served and
+    /// THEN the table is cleared -- the wrong answer already returned.
+    ///
+    /// Checked by source position for the reason the sibling guards above
+    /// give: these commands need an authenticated client and live requests.
+    /// A position check is weak, but it is the property itself, and the
+    /// alternative was nothing.
+    #[test]
+    fn the_identity_check_precedes_every_cache_read() {
+        let src = include_str!("commands.rs");
+        for name in ["stats_count", "stats_board", "stats_series"] {
+            let start = src.find(&format!("pub async fn {name}(")).unwrap();
+            let rest = &src[start + 1..];
+            let end = rest
+                .find("#[tauri::command]")
+                .map(|i| start + 1 + i)
+                .unwrap_or(src.len());
+            let body = &src[start..end];
+            let note = body
+                .find("note_stats_viewer(")
+                .unwrap_or_else(|| panic!("{name} must call note_stats_viewer"));
+            let read = body
+                .find("store::stats::get(")
+                .unwrap_or_else(|| panic!("{name} must read the cache"));
+            assert!(
+                note < read,
+                "{name} reads the cache before checking whether the token \
+                 still belongs to the same person; on a board -- whose key \
+                 carries no login -- that serves another account's rows and \
+                 splits Mine/Others against the wrong viewer"
             );
         }
     }
