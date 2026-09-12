@@ -139,6 +139,13 @@ pub const SURFACE: &[(&str, Class)] = &[
     // phone to do. They change the desktop but delete nothing, so
     // they do not carry the step-up signature.
     ("pull_checkout", Class::Write),
+    // Refreshing one repository's remote refs (#788). Write, not Read:
+    // `git fetch` mutates nothing on GitHub but it writes `origin/*`,
+    // `FETCH_HEAD` and new objects to disk, and Read here means neither.
+    // Not Destructive -- no `--prune`, so it deletes no ref -- so it
+    // carries no step-up signature. See the desktop table for the full
+    // argument.
+    ("fetch_refs", Class::Write),
     ("docker_start", Class::Write),
     ("docker_restart", Class::Write),
     // Preferences, not machine capabilities: they live in the

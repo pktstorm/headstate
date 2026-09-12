@@ -5,10 +5,19 @@ use std::process::Command;
 /// Run a git command in a directory, returning stdout on success.
 /// Git calls are bounded, like the Docker ones.
 ///
-/// Every subcommand here is local-only -- cherry, log, rev-list,
-/// rev-parse, worktree list -- so this is not about a network call. The
-/// risk is a stalled FILESYSTEM: an unresponsive network mount, a stale
-/// index.lock, a disk that stops answering.
+/// Almost every subcommand here is local-only -- cherry, log, rev-list,
+/// rev-parse, worktree list -- so the bound was never about a network
+/// call. The risk it was added for is a stalled FILESYSTEM: an
+/// unresponsive network mount, a stale index.lock, a disk that stops
+/// answering.
+///
+/// The exceptions are `fetch_refs` and `pull_checkout`, both of which go
+/// to the network and both of which run only on a click. For them the
+/// 30s ceiling is doing a second job -- it is what makes "fetch on
+/// demand" safe against an unreachable remote, which is one of the two
+/// reasons the SCAN still refuses to fetch (#788). Thirty seconds is
+/// generous for a fetch of one repository's refs and short enough that a
+/// dead host reports git's own error instead of holding a pool thread.
 ///
 /// The consequence justified the bound: `output()` blocks forever, and
 /// this runs inside spawn_blocking, so a hung call permanently consumes
@@ -8012,6 +8021,162 @@ mod live {
         }
     }
 
+    /// `fetch_refs` is the half of #788 that closes the loop: the badge
+    /// can say how stale it is, but until now the only way to make it
+    /// fresh again was `git pull`, which also moves the branch.
+    ///
+    /// Against REAL git repositories for the same reason `pull` is: the
+    /// whole property under test is what `git fetch` does and does not
+    /// touch, and a mock would only assert our own idea of it.
+    mod fetch {
+        use super::*;
+        use std::process::Command;
+
+        const IDENT: [(&str, &str); 4] = [
+            ("GIT_AUTHOR_NAME", "octocat"),
+            ("GIT_COMMITTER_NAME", "octocat"),
+            ("GIT_AUTHOR_EMAIL", "octocat@invalid"),
+            ("GIT_COMMITTER_EMAIL", "octocat@invalid"),
+        ];
+
+        fn run(dir: &Path, args: &[&str]) -> bool {
+            Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .envs(IDENT)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+
+        fn origin_and_clone(base: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+            let origin = base.join("origin");
+            std::fs::create_dir_all(&origin).unwrap();
+            assert!(run(&origin, &["init", "-q", "-b", "main"]));
+            assert!(run(
+                &origin,
+                &["commit", "-q", "--allow-empty", "-m", "one"]
+            ));
+
+            let clone = base.join("clone");
+            assert!(Command::new("git")
+                .args(["clone", "-q"])
+                .arg(&origin)
+                .arg(&clone)
+                .envs(IDENT)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false));
+            (origin, clone)
+        }
+
+        /// The WHOLE POINT, as two assertions that have to hold
+        /// together: `origin/main` advances and local `main` does not.
+        ///
+        /// Either one alone passes over a different bug. Only checking
+        /// that `origin/main` moved would be satisfied by `git pull`,
+        /// which is what the user already had and what #788 is asking for
+        /// an alternative to. Only checking that `main` stayed put would
+        /// be satisfied by doing nothing at all.
+        #[test]
+        fn advances_the_remote_ref_and_leaves_the_local_branch_alone() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (origin, clone) = origin_and_clone(tmp.path());
+            assert!(run(
+                &origin,
+                &["commit", "-q", "--allow-empty", "-m", "two"]
+            ));
+
+            let local_before = git(&clone, &["rev-parse", "main"]).unwrap();
+            let remote_before = git(&clone, &["rev-parse", "origin/main"]).unwrap();
+            assert_eq!(
+                local_before, remote_before,
+                "before the fetch the two refs agree -- which is exactly the \
+                 state that renders as a green 'up to date with upstream'"
+            );
+
+            fetch_refs(&clone.to_string_lossy()).expect("a fetch against a reachable origin");
+
+            let remote_after = git(&clone, &["rev-parse", "origin/main"]).unwrap();
+            assert_ne!(
+                remote_before, remote_after,
+                "origin/main must have advanced; otherwise the comparison is \
+                 still as stale as it was and the badge still lies"
+            );
+            let local_after = git(&clone, &["rev-parse", "main"]).unwrap();
+            assert_eq!(
+                local_before, local_after,
+                "main must NOT move -- a Fetch that pulls is a Pull, and the \
+                 separation is the feature"
+            );
+        }
+
+        /// No `--prune`, asserted by outcome rather than by reading the
+        /// argv.
+        ///
+        /// A pruning fetch deletes `origin/*` refs whose remote branch is
+        /// gone, and those refs are the inputs to `MergedUpstreamDeleted`
+        /// (#732) -- the verdict that tells "merged, then the branch was
+        /// tidied up" from "these commits exist nowhere else". So a
+        /// `--prune` slipped into this command would silently rewrite a
+        /// DELETION gate's evidence from a button labelled Fetch.
+        #[test]
+        fn does_not_prune_a_remote_ref_whose_branch_is_gone() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (origin, clone) = origin_and_clone(tmp.path());
+            // A second branch on origin, fetched into the clone, then
+            // deleted upstream -- the exact shape `MergedUpstreamDeleted`
+            // reads.
+            assert!(run(&origin, &["branch", "landed"]));
+            fetch_refs(&clone.to_string_lossy()).expect("the first fetch brings the branch down");
+            assert!(
+                git(&clone, &["rev-parse", "origin/landed"]).is_ok(),
+                "the fixture is broken: origin/landed should exist now"
+            );
+            assert!(run(&origin, &["branch", "-D", "landed"]));
+
+            fetch_refs(&clone.to_string_lossy()).expect("the second fetch, after the deletion");
+
+            assert!(
+                git(&clone, &["rev-parse", "origin/landed"]).is_ok(),
+                "origin/landed must survive: pruning it would change what the \
+                 safety verdicts read, on a button that promises only a refresh"
+            );
+        }
+
+        #[test]
+        fn a_missing_directory_is_a_message_not_a_panic() {
+            let err = fetch_refs("/nonexistent/path/for/a/test")
+                .expect_err("a missing directory must be refused");
+            assert!(err.contains("missing"), "{err}");
+        }
+
+        /// An unreachable remote is the scan's second reason for never
+        /// fetching, and bounding it is what makes this safe on a click:
+        /// it comes back with git's own words instead of hanging.
+        #[test]
+        fn an_unreachable_remote_is_an_error_not_a_hang() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let repo = tmp.path().join("lonely");
+            std::fs::create_dir_all(&repo).unwrap();
+            assert!(run(&repo, &["init", "-q", "-b", "main"]));
+            assert!(run(&repo, &["commit", "-q", "--allow-empty", "-m", "one"]));
+            // A local path that does not exist, rather than a hostname:
+            // an unresolvable host would make this test depend on the
+            // machine's DNS timeout, and CI runners differ. Git's
+            // refusal is what is being asserted, not the transport.
+            assert!(run(
+                &repo,
+                &["remote", "add", "origin", "/nonexistent/origin/for/a/test"]
+            ));
+
+            let err =
+                fetch_refs(&repo.to_string_lossy()).expect_err("an unreachable origin must fail");
+            assert!(!err.is_empty(), "git's own message, not an empty string");
+        }
+    }
+
     /// #356: a worktree whose parent repository was deleted is
     /// invisible to the scan -- it is not a repository, so the walker
     /// skips it, and its own repo can no longer report it.
@@ -8772,6 +8937,70 @@ pub fn pull_checkout(path: &str) -> Result<String, String> {
     // `--ff-only` on the pull itself, so a diverged branch fails here
     // rather than producing a merge nobody asked for.
     git(dir, &["pull", "--ff-only"])
+}
+
+/// Refresh one repository's remote refs, moving no branch (#788).
+///
+/// The ONE network call on this module's own initiative, and it is here
+/// because the scan deliberately has none. `upstream_state` and every
+/// merge verdict read `origin/*` off disk, so the green "up to date with
+/// upstream" on the main checkout's row compares local `main` against
+/// whatever `origin/main` happened to be at the last fetch. When nothing
+/// has fetched recently both refs are behind together, the row honestly
+/// reports that they agree, and the Update button -- which DOES fetch,
+/// via `git pull` -- then discovers everything the badge never saw. That
+/// is the asymmetry #788 reports as "green, then it pulled lots of new
+/// changes".
+///
+/// The no-fetch decision in the scan stays, and nothing here weakens it:
+/// this runs on a CLICK, for ONE repository, never on the scan's path.
+/// That is the whole distinction. The scan's reasons -- a network call
+/// per repository every time the view opens, 40+ repositories here and
+/// ~27,000 directories in one pass, and a hang on an unreachable remote
+/// -- are all about the implicit, fan-out case. A user who has asked for
+/// a live answer for one repository has accepted the wait and is
+/// watching for the result.
+///
+/// Three deliberate constraints, and they are what make this different
+/// from `pull_checkout` rather than a second spelling of it:
+///
+/// - **Moves no ref the user is standing on.** `git fetch` writes only
+///   the remote-tracking refs, so `main` and every worktree's HEAD are
+///   exactly where they were. Today the only way to refresh the
+///   comparison is to perform the merge, which means a user who wants to
+///   KNOW whether they are behind has to first become not-behind. This
+///   separates the question from the answer.
+///
+/// - **Never `--prune`.** Pruning deletes local `origin/*` refs whose
+///   remote branch is gone, and those refs are exactly what
+///   `MergedUpstreamDeleted` (#732) and the cherry checks read to tell
+///   "merged, then the branch was tidied up" from "these commits exist
+///   nowhere else". A refresh that silently rewrote the inputs to the
+///   safety verdicts would be a deletion gate changing under the user on
+///   a button labelled Fetch.
+///
+/// - **Returns git's own message.** Same rule `pull_checkout` states:
+///   "could not fetch" names nothing, while git's refusal usually names
+///   the host, the permission, or the ref. `git fetch` is quiet on
+///   success and writes its progress to stderr, so the Ok string is
+///   routinely EMPTY -- the caller must phrase its own success line
+///   rather than echoing this, which `useFetchRefs` does.
+///
+/// Bounded by `GIT_TIMEOUT` like every other call here, which is the
+/// answer to the scan's second objection: an unreachable remote fails
+/// after 30s with git's message rather than holding a pool thread
+/// forever.
+pub fn fetch_refs(path: &str) -> Result<String, String> {
+    let dir = Path::new(path);
+    if !dir.is_dir() {
+        return Err("that directory is missing".into());
+    }
+
+    // No `--prune`, no `--all`, no refspec: just the default remote's
+    // configured refspec. See the doc above for why pruning is not a
+    // tidy-up this button is allowed to do.
+    let args: &[&str] = &["fetch"];
+    git(dir, args)
 }
 
 pub fn remove_worktrees_with_progress(
