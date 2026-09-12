@@ -312,3 +312,24 @@ libc = "0.2"
 temp-env = "0.3"
 tempfile = "3"
 wiremock = "0.6"
+
+# `float_cmp` is not in clippy's default set; it is a `pedantic` lint that
+# #892's audit measured as the one pedantic lint worth having here. Eight
+# hits across this crate, six of them `assert_eq!` expansions on exact
+# literal round-trips (map.rs, store/health.rs) -- correct code, and the
+# `allow`s below say so in place rather than turning the lint off.
+#
+# The two real hits are fixed: health/alerts.rs compared a sampled
+# percentage against a literal to mean "the first iteration", and
+# health/footprint.rs asserted a sort order with raw `>`/`==` instead of
+# the total order `top_by` actually sorts by -- which also answered FALSE
+# for a NaN, so the assertion misreported the one input `Ordered` exists
+# to handle.
+#
+# Declared HERE rather than as a `-W` flag on a new CI step, for two
+# reasons. `[lints]` travels with the crate, so `make lint-rust`, the
+# `Clippy` step in ci.yml, and anyone's bare `cargo clippy` all ask the
+# same question -- and it costs zero additional CI time, because it runs
+# inside a clippy invocation that already happens.
+[lints.clippy]
+float_cmp = "deny"

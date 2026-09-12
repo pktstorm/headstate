@@ -21,6 +21,13 @@ describe("safeUnlisten", () => {
 
   it("swallows a rejected promise, which is how the dev error actually surfaced", async () => {
     const rejects = () => Promise.reject(new TypeError("handlerId"));
+    // A promise-returning function where `UnlistenFn` declares void is
+    // the SUBJECT of this test, not a slip: `safeUnlisten`'s doc explains
+    // that the observed dev failure arrived as an unhandled rejection, so
+    // a Tauri version whose `unlisten` returns a promise is exactly the
+    // input the catch-on-return-value branch exists for. The only
+    // `no-misused-promises` site #892's audit found that should stay.
+    // eslint-disable-next-line @typescript-eslint/no-misused-promises
     const returned = safeUnlisten(rejects);
     // An unhandled rejection here is the bug -- awaiting must resolve.
     await expect(Promise.resolve(returned)).resolves.toBeUndefined();
