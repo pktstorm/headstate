@@ -1914,7 +1914,11 @@ export function useDockerImages(enabled: boolean) {
 export function useStatsTree(enabled: boolean) {
   return useQuery({
     queryKey: ["stats-tree"],
-    queryFn: statsTree,
+    // `timeCall` rather than `timed` for all five stats queries (#853):
+    // the other four close over per-render scope arguments, so a hoisted
+    // `timed()` wrapper is not available to them, and `stats-tree` uses
+    // the same form to keep the five reading alike in the log.
+    queryFn: () => timeCall("stats-tree", statsTree),
     enabled,
     staleTime: 5 * 60 * 1000,
   });
@@ -2016,7 +2020,10 @@ export function useStatsBoard(
       measure,
       days,
     ],
-    queryFn: () => statsBoard(scope!.kind, scope!.value, measure, days),
+    queryFn: () =>
+      timeCall(`stats-board[${scopeKey(scope!)} ${measure} ${days}d]`, () =>
+        statsBoard(scope!.kind, scope!.value, measure, days),
+      ),
     enabled: enabled && loadable,
     staleTime: 5 * 60 * 1000,
     retry: false,
@@ -2050,7 +2057,11 @@ export function useStatsSeries(
       scope?.subject ?? "*",
       days,
     ],
-    queryFn: () => statsSeries(scope!.subject, scope!.kind, scope!.value, days),
+    queryFn: () =>
+      timeCall(
+        `stats-series[${scopeKey(scope!)} ${scope?.subject ?? "*"} ${days}d]`,
+        () => statsSeries(scope!.subject, scope!.kind, scope!.value, days),
+      ),
     enabled: enabled && loadable,
     staleTime: 5 * 60 * 1000,
     retry: false,
@@ -2094,7 +2105,10 @@ export function useScopedCounts(
         days,
       ],
       queryFn: () =>
-        statsCount(scope!.subject, scope!.kind, scope!.value, measure, days),
+        timeCall(
+          `stats-count[${scopeKey(scope!)} ${scope?.subject ?? "@me"} ${measure} ${days}d]`,
+          () => statsCount(scope!.subject, scope!.kind, scope!.value, measure, days),
+        ),
       enabled: enabled && loadable,
       staleTime: 5 * 60 * 1000,
       retry: false,
@@ -2199,7 +2213,11 @@ export function useStatsReviewers(
   const loadable = scopeIsLoadable(scope);
   return useQuery({
     queryKey: ["stats-reviewers", loadable ? scopeKey(scope) : "none", days],
-    queryFn: () => statsReviewers(scope!.kind, scope!.value, days, logins),
+    queryFn: () =>
+      timeCall(
+        `stats-reviewers[${scopeKey(scope!)} ${days}d n=${logins.length}]`,
+        () => statsReviewers(scope!.kind, scope!.value, days, logins),
+      ),
     enabled: enabled && loadable && logins.length > 0,
     staleTime: 5 * 60 * 1000,
     retry: false,

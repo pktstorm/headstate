@@ -281,6 +281,19 @@ mod tests {
     /// ordering by giving `find` a fallback that WILL match: if the
     /// shell were consulted first the result would be the shell's answer
     /// (or None), not the fallback's.
+    ///
+    /// # Asserted on the cache, not on the clock (#853)
+    ///
+    /// The `< 500ms` bound was standing in for "no subprocess was
+    /// spawned" -- a proxy, and the reason #853 lists this line. A
+    /// 1.3s shell spawn is slow, but 500ms of scheduling delay on a
+    /// contended runner is not evidence of one either way.
+    ///
+    /// `ask_login_shell` memoises into `SHELL_LOOKUPS` before returning,
+    /// so "the shell was never consulted for this name" has a direct
+    /// observable form: no entry. Asserted on that instead -- stronger
+    /// (a fast spawn no longer passes), deterministic, and so needing no
+    /// `#[ignore]` gate.
     #[test]
     fn a_fallback_hit_does_not_reach_the_login_shell() {
         let t = tempfile::TempDir::new().unwrap();
@@ -293,11 +306,20 @@ mod tests {
         std::fs::write(&exe, "#!/bin/sh\n").unwrap();
         let dir = t.path().to_string_lossy().to_string();
 
-        let t0 = std::time::Instant::now();
         assert_eq!(find(name, &[dir.as_str()]), Some(exe));
+
+        // The shell is asked LAST and caches every answer it gives,
+        // including `None`. An entry for this name would mean the
+        // fallback hit did not short-circuit the search -- the ~1.3s
+        // regression this test exists to catch.
+        let consulted = SHELL_LOOKUPS
+            .get()
+            .map(|c| c.lock().unwrap().contains_key(name))
+            .unwrap_or(false);
         assert!(
-            t0.elapsed().as_millis() < 500,
-            "a fallback hit must not spawn a login shell"
+            !consulted,
+            "a fallback hit must not reach the login shell, but {name} \
+             was looked up and cached -- that is a ~1.3s spawn per repository"
         );
     }
 
@@ -306,19 +328,47 @@ mod tests {
     /// Without this, every repository the user clicks pays a ~1.3s shell
     /// spawn to re-learn that a tool they do not have is still not
     /// installed.
+    ///
+    /// # Asserted on the cache, not on the clock (#853)
+    ///
+    /// This compared the two lookups' ELAPSED TIMES, with a 50ms floor,
+    /// which made it a claim about scheduling: the second call is fast
+    /// because it is cached, but a descheduled 51ms on a contended runner
+    /// reads identically to a cache miss. #853 groups it with the
+    /// "wall-clock budget as proxy" tests for that reason.
+    ///
+    /// The cache is observable, so the real property is asserted
+    /// directly: after one lookup the program has an entry in
+    /// `SHELL_LOOKUPS`, and it is `None`. That is strictly STRONGER than
+    /// the timing version -- a second spawn that happened to be fast
+    /// passed before and fails now -- and it is deterministic, so it
+    /// needs no gate. Gating it would have been the wrong trade: this
+    /// guards a 1.3s-per-repository regression, which is exactly the kind
+    /// of thing that must fail a PR rather than wait for someone to run
+    /// the ignored tests.
     #[test]
     fn a_missing_tool_is_not_looked_up_twice() {
         let name = "headstate-definitely-absent-tool";
-        let first = std::time::Instant::now();
         assert!(find(name, &[]).is_none());
-        let first_ms = first.elapsed().as_millis();
 
-        let second = std::time::Instant::now();
-        assert!(find(name, &[]).is_none());
-        assert!(
-            second.elapsed().as_millis() <= first_ms.max(50),
-            "the second lookup must come from the cache"
+        // The negative result is MEMOISED, which is the whole point: an
+        // absent tool must not cost a shell spawn per repository.
+        let cached = SHELL_LOOKUPS
+            .get()
+            .expect("the lookup above initialises the cache")
+            .lock()
+            .unwrap()
+            .get(name)
+            .cloned();
+        assert_eq!(
+            cached,
+            Some(None),
+            "a missing tool must be cached AS missing -- an absent entry \
+             means the next repository pays the ~1.3s shell spawn again"
         );
+
+        // And the cached answer is still the right one.
+        assert!(find(name, &[]).is_none());
     }
 
     /// The regression test for `env: node: No such file or directory`.

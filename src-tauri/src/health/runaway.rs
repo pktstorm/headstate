@@ -1372,6 +1372,22 @@ mod tests {
     /// an assertion about any particular process -- it cannot be -- but
     /// it does prove the reader works, which a pure-arithmetic suite
     /// never would.
+    ///
+    /// # Deliberately NOT gated (#853)
+    ///
+    /// Listed in #853 with the host-dependent group; it does not belong
+    /// there, and gating it would leave the live reader with no coverage
+    /// on CI at all -- which matters more now that #834 removed the CPU
+    /// comparison from the test above.
+    ///
+    /// Every assertion is an invariant of whatever table came back:
+    /// non-empty, `observations.len() == aggregate.process_count`,
+    /// `top_cpu_percent.is_finite()`, and our own PID present with a name
+    /// and a start time. The last is the only one that names a specific
+    /// process, and it is the process doing the asking -- true on every
+    /// host, a PID namespace of one included, which is where
+    /// `footprint.rs`'s `> 1` count assertion failed. Nothing here reads
+    /// a clock or compares two live samples.
     #[test]
     fn a_real_process_table_reads() {
         // `read_twice`, because `sysinfo` reports CPU since the previous

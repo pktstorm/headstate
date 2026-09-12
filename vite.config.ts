@@ -107,6 +107,36 @@ export default defineConfig(({ mode }) => ({
     // also tracks reducing the jsdom cost itself -- the actual wound,
     // of which this timeout is only the bleeding.
     testTimeout: 15_000,
+    // Coverage is available ON DEMAND (`yarn vitest run --coverage`) and
+    // is NOT a gate. Kept deliberately, and the reasoning matters because
+    // #853 proposed removing it outright.
+    //
+    // The argument for removal was a stale `coverage/` directory that
+    // reported 91.81% over 403 lines across 32 files -- against 130
+    // non-test source files totalling 33,394 lines (measured at this
+    // commit; #853 recorded 132/33,390 when it was filed), so it
+    // described about 1.2% of the frontend, from a run three weeks older
+    // than the commit beside it. Anyone opening it to ask "is this area covered?" got a
+    // confident number about almost none of the code.
+    //
+    // But the artifact was the problem, not the config: `coverage` is
+    // already in `.gitignore` and was never tracked, so there is nothing
+    // to delete from the repo -- the misleading directory was local to one
+    // machine and a fresh run overwrites it.
+    //
+    // `thresholds` is deliberately NOT set, and no CI job runs this.
+    // A threshold over the whole frontend would have to be set at
+    // today's real number to pass, which nobody has measured, and a
+    // threshold is a ratchet: it fails PRs that add well-tested code
+    // beside untested code. The project's actual testing rule is the one
+    // the suite already enforces -- 1,199 Rust tests and a frontend suite
+    // that must be green -- not a percentage. Removing the block instead
+    // would mean `--coverage` errors out for someone asking a legitimate
+    // one-off question ("did my new file get exercised?"), which is the
+    // only use this has ever had.
+    //
+    // So: no implied measurement, because nothing is committed and
+    // nothing is gated; and the tool still works when asked.
     coverage: { provider: "v8", reporter: ["text", "json-summary"] },
   },
 }));
