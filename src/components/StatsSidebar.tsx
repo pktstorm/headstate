@@ -532,11 +532,20 @@ function OrgSection({
           // the organisations query, which succeeds even when the detail
           // query is refused, so the row can say how big the org is while
           // admitting it could not be read.
+          // The SCOPE fix leads, SSO follows (#840). Both causes produce
+          // the same null alias and the app cannot tell them apart from
+          // the response body (`tree.rs`'s `readable` doc explains why),
+          // so the message has to name both -- and the order is the whole
+          // point: `gh auth refresh -s read:org` is one command the
+          // reader runs themselves, while SAML authorization may need an
+          // administrator. Leading with SSO sent people to ask for help
+          // with the expensive cause when the cheap one was theirs to fix.
           <Note>
             Could not read this organization ({org.reposTotal} repositories,{" "}
-            {org.membersTotal} members). The token needs organization read
-            access -- if this org uses SAML single sign-on, authorize the token
-            for it.
+            {org.membersTotal} members). Most often the token is missing the{" "}
+            <code>read:org</code> scope -- <code>gh auth refresh -s read:org</code>{" "}
+            adds it. If this org uses SAML single sign-on, the token also has to
+            be authorized for it.
           </Note>
         ))}
     </>

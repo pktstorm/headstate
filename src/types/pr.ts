@@ -144,7 +144,6 @@ export interface MergedDetail {
   additions: number;
   deletions: number;
   changed_files: number;
-  review_count: number;
   comment_count: number;
   sample_size: number;
   repo_counts: RepoCount[];

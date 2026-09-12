@@ -483,6 +483,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         // a leaderboard with one name on it. The viewer's login comes back
         // IN the answer so the caller can split Mine from Others.
         "stats_board" => res(commands::stats_board(
+            app.clone(),
             app.state(),
             a.get("scopeKind")?,
             a.get("scopeValue")?,
@@ -491,6 +492,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         )
         .await),
         "stats_series" => res(commands::stats_series(
+            app.clone(),
             app.state(),
             a.get("subject")?,
             a.get("scopeKind")?,

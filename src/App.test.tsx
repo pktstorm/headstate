@@ -208,7 +208,19 @@ describe("App — priorities strip scoping", () => {
   /// Set through `view` since #794, not `panel`. The page is routed on
   /// one axis now, and a test that still set the old panel value would
   /// render the PR list and pass for the wrong reason.
-  it("shows no priorities strip on the PR Stats view", () => {
+  /// `async` + `findByText` since #838: `StatsPage` is a `React.lazy`
+  /// chunk now, so its content arrives on a microtask rather than in the
+  /// synchronous render. The assertion is unchanged in substance -- the
+  /// strip must be absent while the page's OWN content is present -- but a
+  /// `getByText` would now run against the Suspense fallback and fail for a
+  /// reason that has nothing to do with the strip.
+  ///
+  /// The absence check stays SYNCHRONOUS and stays first: if the strip
+  /// rendered it would render eagerly, so checking for it before the lazy
+  /// content lands is the stronger ordering. It is then repeated after the
+  /// page commits, so the absence cannot pass merely because the page had
+  /// not arrived yet.
+  it("shows no priorities strip on the PR Stats view", async () => {
     const blocked = prWithState("failure", "mergeable", "none", {
       number: 101,
       repo: "octocat/hello-world",
@@ -231,7 +243,10 @@ describe("App — priorities strip scoping", () => {
     // showed between #829 and that reopening -- and the caveat line is
     // StatsPage's own content either way, which is what makes the absence of
     // the strip meaningful.
-    expect(screen.getByText(/across every organization/i)).toBeDefined();
+    expect(await screen.findByText(/across every organization/i)).toBeDefined();
+    // And still absent once the lazy page has actually committed: the check
+    // above could only see the eager tree.
+    expect(screen.queryByText(/Needs your attention/)).toBeNull();
   });
 
   /// A repo selection scopes the strip; a label filter must not. Something

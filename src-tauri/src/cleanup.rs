@@ -159,11 +159,41 @@ pub fn max_per_run(prefs: &CleanupPrefs) -> usize {
     }
 }
 
-/// Append entries to the ledger.
+/// How many ledger rows are kept, newest first.
+///
+/// The ledger is read with a limit of 200 (`commands::cleanup_log`), so
+/// everything past the newest 200 rows is storage nothing can display.
+/// This bound is deliberately 10x that read limit: it leaves room for
+/// the read limit to grow several times over before the trim could ever
+/// remove a row the view would have shown, and it is still a hard
+/// ceiling instead of the unbounded growth #837 found.
+///
+/// Before this, `cleanup_log` was the only table in the store that was
+/// never pruned: `grep 'DELETE FROM cleanup_log'` returned nothing.
+/// Growth is one row per considered entry per run, and `max_per_run`
+/// clamps a run to 500 ([`max_per_run`]) -- so a daily run at the cap
+/// wrote ~180,000 rows a year, of which 200 were ever displayable.
+///
+/// Why a ROW count and not an age window, which is what
+/// `store::health::RETENTION_HOURS` uses: a health sample is written on
+/// a timer, so "the last 24 hours" is a predictable number of rows. A
+/// cleanup run is user-triggered and bursty -- a week of no runs then
+/// one run of 500 -- so an age window would either drop a ledger the
+/// user has not read yet (short window) or bound nothing in practice
+/// (long window). A row count bounds the table regardless of how the
+/// runs are spaced, which is the property #837 asked for.
+pub const MAX_ROWS: i64 = 2_000;
+
+/// Append entries to the ledger, then trim it to [`MAX_ROWS`].
 ///
 /// Failure is logged and swallowed: the ledger is a record of work, and
 /// losing a row must never take down the pass that produced it. Same
 /// reasoning as `notify_breakage` in `poll`.
+///
+/// The trim runs beside the insert rather than on a timer, for the
+/// reason `store::health::record` gives: a timer is a second thing to
+/// schedule and to get wrong, and deleting a handful of rows next to an
+/// insert costs nothing.
 pub fn record(conn: &Connection, entries: &[LedgerEntry]) {
     for e in entries {
         let r = conn.execute(
@@ -182,6 +212,48 @@ pub fn record(conn: &Connection, entries: &[LedgerEntry]) {
         if let Err(err) = r {
             log::warn!("could not record a cleanup entry: {err}");
         }
+    }
+    trim(conn);
+}
+
+/// Drop all but the newest [`MAX_ROWS`] ledger rows.
+///
+/// Ordered by `id`, not by `at`. `at` is supplied by the CALLER --
+/// `propose` stamps every entry in a run with the `now` string it was
+/// handed, and `record` does not check it -- so a clock change, a
+/// timezone-less write, or a caller passing a literal (the tests pass
+/// `"now"`) would make `at` non-monotonic and trim the wrong end.
+/// `id` is `INTEGER PRIMARY KEY`, so it is the rowid and strictly
+/// increasing per insert; newest-by-`id` is exactly newest-by-insert.
+///
+/// Note this means the trim does not use the `cleanup_log_at` index.
+/// It does not need to: the subquery orders by the rowid, which is the
+/// table's own physical order, and a `LIMIT`ed scan from the end of it
+/// needs no index at all.
+///
+/// The two orderings are therefore not identical -- [`recent`] reads
+/// `ORDER BY at DESC, id DESC`, putting `at` first. They agree whenever
+/// `at` is monotonic, which is every normal run. If a clock moved
+/// backwards they could disagree: a row with a later `id` but an earlier
+/// `at` is kept here while sorting late there. That cannot cost a
+/// displayable row at these numbers -- the trim keeps 2,000 and the read
+/// asks for 200, so the disagreement would have to span ten times the
+/// read limit to reach the boundary -- and the alternative, trimming by
+/// `at`, would hand the decision to the same untrusted clock rather than
+/// to insert order. Recorded rather than fixed, because the fix would be
+/// the worse of the two.
+///
+/// Failure is logged and swallowed for the same reason the insert's is:
+/// a ledger that cannot be trimmed is a table that grows, which is
+/// strictly better than a cleanup pass that fails.
+fn trim(conn: &Connection) {
+    let r = conn.execute(
+        "DELETE FROM cleanup_log WHERE id NOT IN
+           (SELECT id FROM cleanup_log ORDER BY id DESC LIMIT ?1)",
+        rusqlite::params![MAX_ROWS],
+    );
+    if let Err(err) = r {
+        log::warn!("could not trim the cleanup ledger: {err}");
     }
 }
 
@@ -650,6 +722,74 @@ mod tests {
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].target, "/code/x/target");
         assert_eq!(back[0].bytes, Some(1234));
+    }
+
+    /// The ledger is bounded, so the table cannot grow without bound.
+    ///
+    /// #837: `cleanup_log` was the only table in the store never pruned.
+    /// The same property `health::samples_older_than_a_day_are_dropped`
+    /// pins for `health_samples`, by row count instead of by age -- see
+    /// [`MAX_ROWS`] for why that axis.
+    ///
+    /// Writes `MAX_ROWS + 50` in ONE `record` call rather than one per
+    /// call: the trim runs at the end of `record`, so a per-call loop
+    /// would only ever test the steady state where the table is already
+    /// at the bound. A single over-cap batch tests the case where the
+    /// trim has to remove more than one row, which is what a user who
+    /// upgrades with an already-large ledger hits.
+    #[test]
+    fn the_ledger_is_trimmed_to_its_bound() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let conn = crate::store::open_db(&dir.path().join("t.db")).unwrap();
+
+        let over = (MAX_ROWS + 50) as usize;
+        let entries: Vec<LedgerEntry> = (0..over)
+            .map(|i| LedgerEntry {
+                // Every row carries the SAME `at`, which is what a real
+                // run does -- `propose` stamps one `now` across the
+                // whole batch. If the trim ordered by `at` it would have
+                // no order to work with here and could keep any 2,000 of
+                // these; ordering by `id` makes "newest" well defined.
+                at: "2026-09-02T00:00:00Z".into(),
+                kind: "artifact".into(),
+                target: format!("/code/p{i}/target"),
+                detail: None,
+                bytes: Some(i as u64),
+                action: "proposed".into(),
+                error: None,
+            })
+            .collect();
+        record(&conn, &entries);
+
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cleanup_log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, MAX_ROWS, "the ledger must be bounded by MAX_ROWS");
+
+        // And the rows kept are the NEWEST ones, not an arbitrary
+        // 2,000: the last entry written must still be readable.
+        let back = recent(&conn, 1).unwrap();
+        assert_eq!(
+            back[0].target,
+            format!("/code/p{}/target", over - 1),
+            "the trim must drop the oldest rows, not the newest"
+        );
+
+        // The bound is comfortably above the 200 rows `cleanup_log`
+        // reads (`commands::cleanup_log`), so nothing displayable is
+        // ever trimmed. Pinned rather than left to the doc: a future
+        // edit that lowers MAX_ROWS below the read limit would start
+        // deleting rows the view was about to show.
+        //
+        // A `const` block, so it fails at COMPILE time rather than when
+        // this test runs -- both operands are constants, and clippy is
+        // right that an assertion over two constants belongs in one.
+        const { assert!(MAX_ROWS >= 200 * 5) };
+        assert_eq!(
+            recent(&conn, 200).unwrap().len(),
+            200,
+            "a full read must still be satisfiable after a trim"
+        );
     }
 }
 

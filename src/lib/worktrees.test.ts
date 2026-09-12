@@ -1,4 +1,10 @@
 import { describe, expect, it } from "vitest";
+// The Rust enum and this file's own text, for the variant-parity test at the
+// end of the `isSafe` block. `?raw` rather than `node:fs` because the project
+// deliberately carries no `@types/node` -- see `vite.config.ts`, which
+// resolves its own paths with `import.meta.url` for the same reason.
+import modelRs from "../../src-tauri/src/worktrees/model.rs?raw";
+import testSource from "./worktrees.test.ts?raw";
 import type { Lock, Safety, Worktree } from "@/types/pr";
 import {
   canClaudify,
@@ -74,6 +80,23 @@ describe("isSafe", () => {
       // hypothetical rather than a licence.
       { kind: "locked", detail: lock({ underlying: { kind: "safe" } }) },
       { kind: "prunable", detail: "gitdir file points to non-existent location" },
+      // #851: the two variants Rust's own refusal list singles out, and
+      // the two this mirror was missing. Rust's `is_safe` test names both
+      // (`worktrees/model.rs:667-668`) and is followed by one whose doc
+      // reads "the default must never be deletable… this is the one place
+      // where getting it wrong deletes someone's work".
+      //
+      // `pending` is the DEFAULT (`Safety::default() == Pending`), which
+      // is what makes the hole matter: `isSafe` is an allowlist, so a
+      // careless widening -- or adding `pending` to it -- would arm Remove
+      // on every row still classifying, and this suite would have passed.
+      // Rust's would not, but Rust is not what greys the button.
+      { kind: "pending" },
+      // `orphaned` means the repository itself is gone, so nothing here
+      // can be checked at all ("its repository is gone -- nothing here
+      // can be checked", `model.rs:521`). An unknowable state is the last
+      // one that should license an unrecoverable action.
+      { kind: "orphaned" },
       { kind: "unknown", detail: "x" },
       // The other half of #819, and the one that keeps it honest. A
       // detached checkout whose HEAD is NOT on the default branch arrives
@@ -86,6 +109,67 @@ describe("isSafe", () => {
     ] as Safety[]) {
       expect(isSafe(s)).toBe(false);
     }
+  });
+
+  /// Every Rust `Safety` variant appears above, and nothing is missing.
+  ///
+  /// #851's finding was that the enumeration above had a HOLE: `pending`
+  /// and `orphaned` -- the two Rust's own refusal list singles out, one of
+  /// them the default -- were absent, so the suite guarding the app's only
+  /// unrecoverable action passed without ever asking about the state most
+  /// rows are in for the first minute of a scan.
+  ///
+  /// Listing them (done) fixes today. This fixes tomorrow: it reads both
+  /// enumerations and fails when they diverge, so a variant added to Rust
+  /// cannot be silently absent from the mirror. Without it the same hole
+  /// reopens the next time `Safety` grows a case, and the next reviewer has
+  /// to notice by eye what a test can notice for them.
+  ///
+  /// # Why it parses the Rust source
+  ///
+  /// The Rust enum is the definition; `types/pr.ts` is a hand-written
+  /// mirror of it. Comparing the mirror against itself would assert
+  /// nothing, and there is no generated artifact to compare against -- so
+  /// the only thing that can catch a divergence is the original. The
+  /// `?raw` import does the same job `App.lazy.test.tsx` uses it for.
+  it("enumerates every Rust Safety variant", () => {
+    // Variant names from the Rust enum's own declaration. Anchored to the
+    // `pub enum Safety {` block so the `match` arms elsewhere in the file,
+    // which repeat every name, cannot pad the set.
+    const block = modelRs.slice(
+      modelRs.indexOf("pub enum Safety {"),
+      modelRs.indexOf("\n}", modelRs.indexOf("pub enum Safety {")),
+    );
+    expect(block.length).toBeGreaterThan(0);
+    const rustVariants = new Set(
+      [...block.matchAll(/^\s{4}([A-Z][A-Za-z]*)(?:\(|,|\s*$)/gm)].map((m) => m[1]),
+    );
+    // A sanity floor: if the regex stops matching, an empty set would make
+    // this test pass while checking nothing.
+    expect(rustVariants.size).toBeGreaterThanOrEqual(12);
+
+    // `MergedUpstreamDeleted` -> `merged_upstream_deleted`, which is what
+    // `#[serde(rename_all = "snake_case")]` produces and what the TS union
+    // spells.
+    const snake = (name: string) =>
+      name.replace(/(?<!^)([A-Z])/g, "_$1").toLowerCase();
+
+    // Every `kind` this file asserts on, across both the safe and the
+    // refused list. Read off the test source rather than maintained as a
+    // second list, so adding a variant to the arrays above is all it takes.
+    const asserted = new Set(
+      [...testSource.matchAll(/\{\s*kind:\s*"([a-z_]+)"/g)].map((m) => m[1]),
+    );
+
+    const expected = [...rustVariants].map(snake).sort();
+    const missing = expected.filter((k) => !asserted.has(k));
+    expect(
+      missing,
+      `isSafe is an ALLOWLIST, so a variant nobody asserts about is a \
+variant a careless widening could arm Remove for. Rust's own refusal test \
+(worktrees/model.rs) names every one of these; add the missing ones to the \
+lists above. Missing: ${missing.join(", ")}`,
+    ).toEqual([]);
   });
 });
 

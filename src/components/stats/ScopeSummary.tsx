@@ -78,6 +78,28 @@ export function ScopeCounts({
     // the number is presented plainly and the caveat is about the per-PR
     // detail, which is a different claim and belongs on the board.
     const parts = [`last ${days} days`];
+    // WHICH guarantee this number carries, which is what `viaConnection`
+    // was added to report and what nothing read until #851.
+    //
+    // The two sources are not equivalent. `repository.pullRequests` is a
+    // connection with no result cap, so a total from it is exact and
+    // complete by construction. A `search` total is assembled from slices
+    // each capped at 1,000 results -- the COUNT is still exact (the cap
+    // limits retrieval, not counting) but the completeness argument is a
+    // different one, resting on the slicing having covered the window
+    // rather than on the source being uncapped.
+    //
+    // Said here rather than left to `slices > 1` below, which is what a
+    // reader had to infer from before. That inference is neither necessary
+    // nor sufficient: a search answered in ONE slice has `slices === 1` and
+    // is still capped, so two totals that looked identical carried
+    // different guarantees with nothing on screen to separate them.
+    //
+    // Phrased as the SOURCE rather than as a verdict ("exact" / "sampled")
+    // because the figure beside it is exact either way; what differs is
+    // what makes it so, and a verdict here would contradict the note above
+    // about the count being exact when retrieval was capped.
+    parts.push(o.viaConnection ? "uncapped connection" : "sliced search");
     if (o.slices > 1) {
       // Said out loud because an assembled total is a different kind of
       // answer from a single measurement, and #824 item 8 requires anything
