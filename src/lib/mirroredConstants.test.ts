@@ -131,13 +131,36 @@ describe("the artifact active-build window", () => {
   /// tests age their fixtures to 2024. A boundary test here is what
   /// makes the number itself -- not merely its agreement -- load-bearing.
   it("treats the 15-to-60-minute band as idle, which is where the drift lived", () => {
-    const twentyMinutes = 20 * 60;
-    const tenMinutes = 10 * 60;
-    expect(twentyMinutes).toBeGreaterThan(ACTIVE_SECS);
-    expect(tenMinutes).toBeLessThan(ACTIVE_SECS);
-    // And the boundary itself, stated as the comparison the page makes:
-    // `age >= ACTIVE_SECS` is removable, so exactly 15:00 is idle.
-    expect(ACTIVE_SECS >= ACTIVE_SECS).toBe(true);
+    // The page's two predicates, as the page spells them: a row is
+    // removable at `age >= ACTIVE_SECS` and counts as active at
+    // `age < ACTIVE_SECS`. Applied to ages rather than asserting on the
+    // constant alone, so this fails if either comparison is ever
+    // inverted as well as if the number moves.
+    const removable = (age: number) => age >= ACTIVE_SECS;
+    const active = (age: number) => age < ACTIVE_SECS;
+
+    // 20 minutes: the drift's own example. The backend removes it, so the
+    // page must offer it and must NOT call it active. Under the old hour
+    // both of these were the other way round.
+    expect(removable(20 * 60)).toBe(true);
+    expect(active(20 * 60)).toBe(false);
+
+    // 10 minutes: genuinely inside the window, on both sides.
+    expect(removable(10 * 60)).toBe(false);
+    expect(active(10 * 60)).toBe(true);
+
+    // The boundary itself. Exactly 15:00 is idle, because the page's test
+    // is `>=` -- and one second under is not.
+    expect(removable(ACTIVE_SECS)).toBe(true);
+    expect(removable(ACTIVE_SECS - 1)).toBe(false);
+
+    // And the whole 15-60 band, not just one point in it: every minute
+    // from 16 to 59 must be removable, which is the range the two sides
+    // disagreed over.
+    for (let min = 16; min < 60; min += 1) {
+      expect(removable(min * 60), `${min} minutes must be removable`).toBe(true);
+    }
+
     expect(ACTIVE_SECS).toBe(900);
   });
 });
