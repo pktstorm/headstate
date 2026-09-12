@@ -6772,7 +6772,6 @@ prunable gitdir file points to non-existent location
         };
         use std::path::Path;
         use std::process::Command;
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Mutex;
 
         /// A repository with `n` worktrees on unmerged branches.
@@ -7043,7 +7042,7 @@ prunable gitdir file points to non-existent location
             // than the serial spacing would make it, measured against THIS
             // machine's own solo cost rather than a constant.
             let start = std::time::Instant::now();
-            let arrivals = std::sync::Mutex::new(Vec::new());
+            let arrivals = Mutex::new(Vec::new());
             classify_repo_streaming(repo.to_str().unwrap(), &mut |_| {
                 arrivals.lock().unwrap().push(start.elapsed());
             })
