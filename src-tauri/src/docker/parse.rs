@@ -143,18 +143,59 @@ pub fn disk_usage(out: &str) -> DiskUsage {
     for line in out.lines() {
         let cols: Vec<&str> = line.split_whitespace().collect();
         // TYPE TOTAL ACTIVE SIZE RECLAIMABLE [(pct)]
-        if cols.len() < 5 {
-            continue;
-        }
-        match cols[0] {
+        //
+        // Bounds are checked PER ARM, not once for the loop, because the
+        // arms do not agree on how many columns they need. The label is
+        // one token for "Images" and TWO for "Local Volumes" and "Build
+        // Cache", which shifts every later column right by one -- so the
+        // highest index read is 4 for "Images", 4 for "Build", and 5 for
+        // "Local".
+        //
+        // The single `cols.len() < 5` gate that used to stand here
+        // therefore admitted a five-token "Local Volumes" row and then
+        // indexed `cols[5]`, panicking the whole command (#849). Five
+        // tokens is not hypothetical: it is a `Local Volumes` row
+        // without the trailing `(pct)` suffix, which is exactly how the
+        // `Build Cache` row already arrives in the captured fixture.
+        // `docker system df` is output this parser does not control,
+        // whose columns Docker has changed across versions, polled by
+        // the Docker page with no user action -- so the panic needed
+        // nothing but a Docker upgrade to reach.
+        //
+        // Per-arm also makes each arm's requirement legible. "Build"
+        // reading `cols[4]` under a two-word label satisfied the old
+        // shared guard by coincidence, not by construction, and a
+        // coincidence is invisible to whoever reorders these next.
+        let Some(kind) = cols.first() else { continue };
+        match *kind {
+            // One-word label: SIZE at 3, RECLAIMABLE at 4. Needs 5.
             "Images" => {
-                du.images_bytes = parse_size(cols[3]);
-                du.images_reclaimable_bytes = parse_size(cols[4]);
+                if let (Some(size), Some(reclaimable)) = (cols.get(3), cols.get(4)) {
+                    du.images_bytes = parse_size(size);
+                    du.images_reclaimable_bytes = parse_size(reclaimable);
+                }
             }
-            "Build" => du.build_cache_bytes = parse_size(cols[4]),
+            // "Build Cache": two words, so SIZE lands at 4. Needs 5.
+            // The reclaimable column is not read here, which is the only
+            // reason five tokens suffices for this arm and not the next.
+            "Build" => {
+                if let Some(size) = cols.get(4) {
+                    du.build_cache_bytes = parse_size(size);
+                }
+            }
+            // "Local Volumes": two words AND both columns, so
+            // RECLAIMABLE lands at 5. Needs 6 -- the only arm that
+            // reaches past what the old guard admitted.
+            //
+            // Both fields are written together or not at all: a size
+            // recorded beside a reclaimable figure that was never read
+            // would understate reclaimable space, which is the one
+            // number this whole view exists to report.
             "Local" => {
-                du.volumes_bytes = parse_size(cols[4]);
-                du.volumes_reclaimable_bytes = parse_size(cols[5]);
+                if let (Some(size), Some(reclaimable)) = (cols.get(4), cols.get(5)) {
+                    du.volumes_bytes = parse_size(size);
+                    du.volumes_reclaimable_bytes = parse_size(reclaimable);
+                }
             }
             _ => {}
         }
@@ -278,6 +319,17 @@ mod tests {
     /// The row labels are not all one word -- "Local Volumes" and "Build
     /// Cache" shift every column right, so positional indexing that works
     /// for "Images" silently reads the wrong field for them.
+    ///
+    /// The short-row cases are the same fact from the other side, and they
+    /// are here because #849 was a PANIC rather than a wrong number. A
+    /// `Local Volumes` row carrying exactly five tokens -- the table
+    /// without its `(pct)` suffix, which is how the `Build Cache` row
+    /// already arrives in the fixture above -- cleared the old
+    /// `cols.len() < 5` guard and then read `cols[5]`, which is not
+    /// there. `docker system df` is output this parser does not control
+    /// and whose shape Docker has changed before, and the Docker page
+    /// polls it with no user action, so the panic needed no more than a
+    /// Docker upgrade to reach.
     #[test]
     fn disk_usage_reads_every_row_despite_two_word_labels() {
         let du = disk_usage(DF);
@@ -291,6 +343,30 @@ mod tests {
         assert_eq!(
             du.volumes_reclaimable_bytes, 4_735_000_000,
             "volumes reclaimable"
+        );
+
+        // Five tokens for a two-word label: every arm's highest index is
+        // one past the end for "Local", and exactly at the end for
+        // "Build". Skipped and parsed respectively -- never a panic.
+        let short = "Local Volumes   1   0   4.735GB\nBuild Cache   94   0   4.654GB\n";
+        let du = disk_usage(short);
+        assert_eq!(
+            du.volumes_bytes, 0,
+            "a Local row with no reclaimable column is not half-read"
+        );
+        assert_eq!(du.volumes_reclaimable_bytes, 0, "and cannot panic");
+        assert_eq!(
+            du.build_cache_bytes, 4_654_000_000,
+            "Build Cache needs only five columns and must still parse"
+        );
+
+        // And the rows around it still land: one unusable row must not
+        // cost the whole table, which is the `a_broken_row_is_skipped`
+        // rule applied to this parser.
+        let mixed = format!("{short}Images   10   0   17.35GB   2.194GB (12%)\n");
+        assert_eq!(
+            disk_usage(&mixed).images_bytes, 17_350_000_000,
+            "a short row must not stop the rows after it"
         );
     }
 
