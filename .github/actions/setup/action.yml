@@ -45,6 +45,22 @@ inputs:
     # billed runner time and a much better no-cache worst case -- not
     # because it shortens the wall clock. Do not cite #889's ~35s.
     #
+    # AND THE COST, which is the part to watch. A second root makes each
+    # job's cache entry bigger, and the Windows `platform` entries are
+    # ~1.5GB APIECE. Measured immediately after this landed: the repo sat
+    # at 8GB of its 10GB cache quota across 11 entries, and run
+    # 34713149169 then reported
+    #   ##[warning]Cache not found for keys: v0-rust-platform-Windows_NT-...
+    # for the SAME key that had reported `full match: true` twenty-five
+    # minutes earlier. GitHub evicts least-recently-used at the quota, so
+    # a run can evict the entry the next run needs -- which turns a 562s
+    # job into a 1716s one.
+    #
+    # So if CI starts missing its cache often, this is the first thing to
+    # suspect, and the fix is to shrink what is cached (or raise the
+    # quota) rather than to add a third root. A cache that does not fit
+    # is slower than no cache at all, because it pays the upload too.
+    #
     # The mobile jobs override this with `src-mobile` alone and must NOT
     # add the stepup line. Verified rather than assumed: stepup is a path
     # dependency INSIDE src-mobile's own workspace, so it appears in
