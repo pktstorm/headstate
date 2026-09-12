@@ -9,7 +9,6 @@ const detail: MergedDetail = {
   additions: 50000,
   deletions: 9139,
   changed_files: 400,
-  review_count: 50,
   comment_count: 120,
   sample_size: 100,
   repo_counts: [],

@@ -248,6 +248,90 @@ describe("Leaderboards", () => {
     expect(screen.getByText(/an outside collaborator, a bot -- are not counted/i)).toBeTruthy();
   });
 
+  /// A truncated roster is STATED, not implied (#851).
+  ///
+  /// The most severe of #851's four findings: the board ranked a roster cut
+  /// at `tree::PAGE` (100) and titled itself "Top 5 reviewers" while the
+  /// sidebar two columns away said "Showing 100 of 224 members". A top-five
+  /// over an arbitrary subset presented as a top-five over the org.
+  ///
+  /// "Arbitrary" is the part that makes it worse than the repository
+  /// truncation the module documents: `tree::PAGE`'s own doc reasons that a
+  /// repository cut at 100 "drops the DEADEST repositories" because the
+  /// order is most-recently-active. `membersWithRole` takes no `orderBy`, so
+  /// there is no such consolation -- the top reviewer can be among the ones
+  /// never asked about.
+  it("says when the roster it ranked was cut short", () => {
+    render(
+      <Leaderboards
+        complete
+        reviewersAvailable
+        reviewersTruncated
+        rows={[row("a")]}
+        reviewers={given([
+          { login: "one", reviews: 2 },
+          { login: "two", reviews: 1 },
+        ])}
+      />,
+    );
+    // The caveat, and specifically the claim that matters: somebody absent
+    // may outrank everybody shown.
+    expect(screen.getByText(/more members than the roster could list/i)).toBeTruthy();
+    expect(
+      screen.getByText(/may have reviewed more than anybody shown/i),
+      "the caveat has to say the LEADER may be missing, not merely that some \
+rows are absent -- that is the difference between a qualified ranking and a \
+wrong one",
+    ).toBeTruthy();
+    // And it says the cut is arbitrary, which is what distinguishes it from
+    // the repo truncation a reader may already know about.
+    expect(screen.getByText(/not ordered by anything/i)).toBeTruthy();
+  });
+
+  /// A COMPLETE roster says nothing, so the caveat means something.
+  ///
+  /// The other half: a warning shown unconditionally is wallpaper. This is
+  /// the assertion that would fail if the flag were ignored and the line
+  /// always rendered -- which would pass the test above perfectly well.
+  it("stays quiet when the roster was complete", () => {
+    render(
+      <Leaderboards
+        complete
+        reviewersAvailable
+        rows={[row("a")]}
+        reviewers={given([{ login: "one", reviews: 2 }])}
+      />,
+    );
+    expect(screen.queryByText(/more members than the roster could list/i)).toBeNull();
+    expect(screen.queryByText(/not ordered by anything/i)).toBeNull();
+    // The who-it-covers line is NOT the same claim and still appears: that
+    // one is about non-members, this one about unlisted members.
+    expect(screen.getByText(/1 listed member/)).toBeTruthy();
+  });
+
+  /// The two roster caveats are independent and both appear together.
+  ///
+  /// A truncated roster AND named unmeasured people is a real combination --
+  /// the board asked 100 of 224 and some of the 100 did not answer -- and
+  /// the two facts are different: one is people never asked, the other
+  /// people asked who failed. Collapsing them would lose a count either way.
+  it("reports a short roster and unmeasured people separately", () => {
+    render(
+      <Leaderboards
+        complete
+        reviewersAvailable
+        reviewersTruncated
+        rows={[row("a")]}
+        reviewers={given([{ login: "counted", reviews: 3 }], {
+          unmeasured: ["asked-but-failed"],
+        })}
+      />,
+    );
+    expect(screen.getByText(/more members than the roster could list/i)).toBeTruthy();
+    expect(screen.getByText(/asked-but-failed/)).toBeTruthy();
+    expect(screen.getByText(/rather than shown as zero/i)).toBeTruthy();
+  });
+
   /// Ties on the reviewer board break on login too, so the two boards order a
   /// tie identically and neither reshuffles between loads.
   it("breaks reviewer ties deterministically", () => {

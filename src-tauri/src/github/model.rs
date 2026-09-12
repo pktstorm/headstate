@@ -206,7 +206,28 @@ pub struct MergedDetail {
     pub additions: u64,
     pub deletions: u64,
     pub changed_files: u64,
-    pub review_count: u64,
+    /// Reviews are NOT here, deliberately (#851).
+    ///
+    /// `review_count` existed, was requested as `reviews { totalCount }`,
+    /// summed, typed and fixtured -- and rendered nowhere. #851 asked for it
+    /// to be displayed or dropped with a reason, and the reason is that the
+    /// figure is a constant on the data it describes.
+    ///
+    /// MEASURED live 2026-09-12 over this account's 50 most recent merged
+    /// pull requests: reviews totalled **0**, with no pull request carrying
+    /// even one, against 4 comments across the same sample. These are
+    /// self-merged pull requests, so a "reviews per PR" card is a permanent
+    /// 0.0. `InsightCards.tsx` had already reached that conclusion and
+    /// recorded it -- it shows PR size in that slot precisely because review
+    /// counts "came back 0 across the whole sample" -- so what remained was
+    /// a paid-for GraphQL field feeding a value the UI had deliberately
+    /// decided not to show.
+    ///
+    /// Dropped rather than kept for a future consumer: the reviews-GIVEN
+    /// board (`stats::load_reviewers`) is where review activity is actually
+    /// measured, and it uses `reviewed-by:<login>` searches because a pull
+    /// request node says how many reviews it has and never who wrote them.
+    /// So this field could not have grown into that feature either.
     pub comment_count: u64,
     pub sample_size: u64,
     pub repo_counts: Vec<RepoCount>,

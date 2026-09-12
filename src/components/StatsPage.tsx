@@ -142,12 +142,22 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
   // rather than empty -- which is the honest shape: "nobody reviewed" and
   // "nothing enumerated the reviewers" must not render as the same chart.
   const tree = useStatsTree(true).data;
-  const reviewerLogins =
+  // The org the roster comes from, held rather than re-found, so the logins
+  // and the truncation flag below are read off ONE object. Finding it twice
+  // would let a re-render between the two reads pair a complete flag with a
+  // truncated list, which is exactly the disagreement #851 is about.
+  const scopeOrg =
     scope.kind === "org"
-      ? (tree?.orgs.find((o) => o.login === scope.value)?.members ?? []).map(
-          (m) => m.login,
-        )
-      : [];
+      ? tree?.orgs.find((o) => o.login === scope.value)
+      : undefined;
+  const reviewerLogins = (scopeOrg?.members ?? []).map((m) => m.login);
+  // #851: the roster is capped at `tree::PAGE` (100) and `membersTotal`
+  // keeps telling the truth above it, so this is the board's own
+  // `members_truncated()`. Computed here rather than in the component
+  // because the component is handed LOGINS, not the tree, and a list of 100
+  // strings cannot say whether a 101st existed.
+  const reviewersTruncated =
+    !!scopeOrg && scopeOrg.members.length < scopeOrg.membersTotal;
   const reviewersQ = useStatsReviewers(scope, days, reviewerLogins, loadable);
 
   const board = boardQ.data;
@@ -433,6 +443,17 @@ function ScopedStats({ scope }: { scope: StatsScope }) {
                 // say "nobody reviewed" on the strength of never having
                 // looked.
                 reviewersAvailable={reviewerLogins.length > 0}
+                // #851: whether the roster the board ranks was itself cut
+                // short. The sidebar already says "Showing N of M members"
+                // two columns away (`StatsSidebar.tsx`), while the board
+                // said only "this organization's N listed members" -- which
+                // reads as the whole org.
+                //
+                // Read off the same `OrgTree` the logins came from, so the
+                // flag and the list cannot disagree: if the tree says the
+                // membership was truncated, the logins below it ARE the
+                // truncated set.
+                reviewersTruncated={reviewersTruncated}
               />
             </>
           )}
@@ -707,10 +728,14 @@ export function partialityCaveat(board: {
     );
   }
   if (board.refusedFields > 0) {
+    // Scope first, SSO second (#840): the two causes are indistinguishable
+    // from the response (see `tree.rs`'s `readable` doc) and only one of
+    // them is the reader's to fix, so the cheap self-serve fix is named
+    // before the one that may need an administrator.
     parts.push(
       `GitHub refused ${board.refusedFields} field${
         board.refusedFields === 1 ? "" : "s"
-      } -- if this organization uses SAML single sign-on, authorize your token for it`,
+      } -- the token may be missing the read:org scope (\`gh auth refresh -s read:org\`), or this organization may use SAML single sign-on and need the token authorized for it`,
     );
   }
   // A board can be incomplete with none of the above: an irreducible slice
