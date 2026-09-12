@@ -226,11 +226,23 @@ describe("the re-emitted event names", () => {
     const body = eventsRs.slice(start);
     const end = body.indexOf("];");
     expect(end, "EVENT_NAMES must close").toBeGreaterThan(-1);
-    // Quoted entries only. The table is heavily commented -- several
-    // entries carry paragraphs explaining why a payload was allowed --
-    // and those comments mention other event names in prose, so matching
-    // the quoted form is what separates an entry from a mention of one.
-    return [...body.slice(0, end).matchAll(/"([a-z0-9-]+)"/g)].map((m) => m[1]);
+    // An ENTRY is a quoted string alone on its line, ending in a comma --
+    // matched per line rather than by scanning the body for quotes.
+    //
+    // The distinction is load-bearing, not pedantry: this table is
+    // heavily commented, several entries carrying whole paragraphs on why
+    // a payload was allowed, and those comments quote things. One already
+    // quotes `"counts only"` today, and a future comment citing a bare
+    // event name -- `the "worktree-size" rule` -- would be read as a
+    // fifteenth entry by a body-wide scan, which then demands a
+    // POLL_EVENTS row for an event that does not exist. Both forms return
+    // the same 14 names on today's file; this one keeps doing so.
+    return body
+      .slice(0, end)
+      .split("\n")
+      .map((line) => line.trim().match(/^"([a-z0-9-]+)",$/))
+      .filter((m): m is RegExpMatchArray => m !== null)
+      .map((m) => m[1]);
   }
 
   it("reads a plausible list out of events.rs", () => {
