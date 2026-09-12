@@ -135,6 +135,54 @@ pub const AGGREGATE_MINUTES: f64 = 15.0;
 /// [`largest_share`]: Aggregate::largest_share
 pub const SINGLE_PROCESS_EXPLAINS: f64 = 0.5;
 
+/// The "worth a look" floor, as a percentage of one core (#865).
+///
+/// Half a core. Far below tier 1's 80 and tier 2's 90, deliberately: the
+/// gap those two left is exactly the band the user reported as worth
+/// investigating -- "even a process holding 50% cpu for longer than 5
+/// minutes would be a concern to investigate."
+///
+/// A process at 50% satisfied NOTHING before this tier. Tier 1 needed 80
+/// and PPID 1; tier 2 needed 90. Both floors sit above the level that
+/// actually warrants a human glance.
+pub const WATCH_PERCENT: f64 = 50.0;
+
+/// How long [`WATCH_PERCENT`] must hold before it is worth surfacing.
+///
+/// Five minutes, and the duration is the whole discriminator here --
+/// which is the opposite weighting from tiers 1 and 2, where the level
+/// does the work.
+///
+/// The reasoning, in the user's own framing: "60% for 2-3 minutes would
+/// be a compiler, but longer might be something suspicious". A build, a
+/// test run, an install: all of them are hot and SHORT. Nothing
+/// legitimate that a person is waiting on holds half a core for five
+/// minutes without them knowing why. So a short burst at any level is
+/// silence, and a moderate level that will not stop is the signal.
+pub const WATCH_MINUTES: f64 = 5.0;
+
+/// Where "worth a look" becomes "this has been going a long time".
+///
+/// Thirty minutes. Not a different rule -- the same condition, reported
+/// more firmly, because the longer a moderate burn persists the less
+/// likely any build explains it. Kept well under tier 2's two hours: by
+/// the time something has held half a core for half an hour, the user
+/// should already have been told rather than still waiting for a higher
+/// bar.
+pub const WATCH_LONG_MINUTES: f64 = 30.0;
+
+/// The nice value above which a burn is more suspicious, not less.
+///
+/// Zero, so any positive nice qualifies. See
+/// [`ProcessObservation::nice`] on why: nothing a user is waiting on
+/// runs niced, and nicing is what hid #865's twelve spinners under the
+/// aggregate rule's level gate.
+///
+/// Used to RAISE the report, never to suppress one. A nice of `None`
+/// (Windows, or a process that exited mid-walk) therefore changes
+/// nothing rather than defaulting either way.
+pub const SUSPICIOUS_NICE: i32 = 0;
+
 /// Tier 1's CPU floor, as a percentage of one core.
 pub const TIER1_PERCENT: f64 = 80.0;
 
@@ -272,6 +320,66 @@ impl Shadow {
     }
 }
 
+/// The scheduling nice value of a process, or `None`.
+///
+/// `sysinfo` 0.39 does not expose this -- there is no `nice` or
+/// `priority` accessor anywhere in the crate -- so it is read through
+/// `getpriority(2)`, which is POSIX. `libc` was already in `Cargo.lock`
+/// transitively, so this adds a direct edge rather than a new crate.
+///
+/// # The errno dance is not optional
+///
+/// `getpriority` returns `-1` on failure AND `-1` is a legal nice value
+/// (a high-priority process). The only way to tell them apart is to
+/// clear `errno` first and inspect it after, which is what this does.
+/// A naive `if v == -1 { None }` would report every high-priority
+/// process as unreadable -- quietly, and in the direction that loses
+/// exactly the processes most able to starve the machine.
+///
+/// Verified against `ps -o nice` on real niced processes before being
+/// built on: nice 10 and 17 read back as 10 and 17, a nonexistent pid
+/// reads back `None`.
+#[cfg(unix)]
+pub fn nice_of(pid: u32) -> Option<i32> {
+    // SAFETY: `getpriority` takes two integers and touches no memory we
+    // own. `errno` is thread-local, so clearing it cannot race another
+    // thread's reading of it.
+    unsafe {
+        *errno_location() = 0;
+        // `PRIO_PROCESS` is `c_int` on Apple and `__priority_which_t` on
+        // Linux, so the cast is inferred rather than named -- writing
+        // either concrete type breaks the other platform.
+        let v = libc::getpriority(libc::PRIO_PROCESS as _, pid as libc::id_t);
+        if v == -1 && *errno_location() != 0 {
+            None
+        } else {
+            Some(v)
+        }
+    }
+}
+
+/// `errno`'s address, which libc spells differently per platform.
+#[cfg(unix)]
+unsafe fn errno_location() -> *mut i32 {
+    #[cfg(target_vendor = "apple")]
+    {
+        libc::__error()
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        libc::__errno_location()
+    }
+}
+
+/// Windows has no nice, so there is nothing to read.
+///
+/// `None` rather than `Some(0)`: see [`ProcessObservation::nice`] on why
+/// a false "normal priority" is worse than an admitted unknown.
+#[cfg(not(unix))]
+pub fn nice_of(_pid: u32) -> Option<i32> {
+    None
+}
+
 /// The seed daemon names for the shadow log's tier-1 clause.
 ///
 /// **Not the allowlist #791 asks for, and must not be mistaken for
@@ -347,6 +455,29 @@ pub struct ProcessObservation {
     /// orphan. Absent is not zero, the same rule as the rest of
     /// `health`.
     pub parent: Option<u32>,
+    /// The scheduling nice value, or `None` where it cannot be read.
+    ///
+    /// `None` on Windows, which has no nice, and on a Unix process that
+    /// vanished between the table walk and the read. Not defaulted to 0:
+    /// zero is the common REAL value, so defaulting would assert
+    /// "normal priority" about a process nothing could measure -- and
+    /// this field's whole purpose is to raise suspicion, which a false
+    /// zero would silently lower.
+    ///
+    /// # Why a niced process is MORE suspicious, not less
+    ///
+    /// Nothing a user is waiting on runs niced. A build, a test run, a
+    /// language server: all of them compete at normal priority because
+    /// someone wants the answer. Nice is what a background job is given
+    /// -- or what an abandoned one was given and then forgotten.
+    ///
+    /// It is also how #865's incident hid. Twelve orphaned busy-loops
+    /// were niced to 5, so the scheduler throttled each to ~50% of a
+    /// core instead of 100%, and twelve of those on twelve cores
+    /// averaged 50% machine-wide -- under `AGGREGATE_PERCENT`'s 60. The
+    /// processes were saturating every core; the nicing is the only
+    /// reason the aggregate rule did not see it.
+    pub nice: Option<i32>,
 }
 
 impl ProcessObservation {
@@ -537,6 +668,157 @@ pub fn evaluate(samples: &[Sample], live: Option<&Aggregate>) -> Vec<Alert> {
 /// reported ONCE, as tier 1. Two log lines about one process would
 /// double-count it in the distribution the shadow week exists to
 /// produce, which is the one thing this log must get right.
+/// A process worth a human glance, for the page rather than a
+/// notification (#865).
+///
+/// # Why this is not an `Alert`
+///
+/// `Alert` is what INTERRUPTS someone, and
+/// `nothing_converts_a_shadow_into_an_alert` asserts that exactly one
+/// variant ships -- a second would mean a deferred tier had started
+/// notifying, which is a decision to make deliberately rather than as a
+/// side effect. This type is the other thing the user asked for: "should
+/// at least have an indicator in the UI to indicate that a user might
+/// want to investigate."
+///
+/// So a `Notice` reaches `health_alerts`, which #870 made a page can
+/// read, and never reaches `notify_runaway`. Seen when looked at, not
+/// pushed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Notice {
+    pub name: String,
+    /// CPU as a percentage of ONE core, so a multi-core process reads
+    /// above 100 legitimately.
+    pub cpu_percent: f64,
+    pub minutes: f64,
+    /// Raises the wording, never gates the notice. See
+    /// [`ProcessObservation::nice`].
+    pub niced: bool,
+    pub orphaned: bool,
+    /// Past [`WATCH_LONG_MINUTES`]: the same condition, said more
+    /// firmly, because duration is what separates a build from an
+    /// abandoned loop.
+    pub long: bool,
+}
+
+impl Notice {
+    /// One stable key for the whole condition, per-process.
+    ///
+    /// Keyed on the NAME and not the figures, the same rule
+    /// `Alert::key` states: a process wandering between 51% and 58%
+    /// must stay one row rather than becoming a new one each poll.
+    pub fn key(&self) -> String {
+        format!("cpu_watch:{}", self.name)
+    }
+
+    pub fn title(&self) -> String {
+        format!("{} has been busy for a while", self.name)
+    }
+
+    pub fn body(&self) -> String {
+        // The suspicious facts are stated, not scored. The user decides;
+        // this sentence only gives them what a glance at `ps` would have.
+        let mut why = String::new();
+        if self.niced {
+            why.push_str(
+                " It is running at low priority, which usually means a background job --                  nothing you are waiting on runs niced.",
+            );
+        }
+        if self.orphaned {
+            why.push_str(" Its parent has exited, so nothing is supervising it.");
+        }
+        format!(
+            "{} has held about {:.0}% of one CPU core for {:.0} minutes.{} Worth a look if you              did not start something long-running.",
+            self.name, self.cpu_percent, self.minutes, why
+        )
+    }
+}
+
+/// The most recent [`watch`] result, for a page to read.
+///
+/// # Why shared state rather than recomputed per call
+///
+/// A `Notice` is half level and half DURATION, and duration only exists
+/// in the poll loop's long-lived [`Watcher`] -- it is accumulated across
+/// 60-second passes. `health_alerts` builds a fresh `Table` per call, so
+/// it has no history at all: every process would read 0.0 minutes and
+/// nothing would ever qualify.
+///
+/// The poll loop already computes the durations once a minute. This
+/// hands that result to whoever asks, so there is ONE accumulator rather
+/// than a second one in the command that could disagree with it.
+///
+/// Empty before the first pass, which is honest: on a cold start nothing
+/// has been observed long enough to have held anything for five minutes.
+#[derive(Debug, Default)]
+pub struct Watched(std::sync::Mutex<Vec<Notice>>);
+
+impl Watched {
+    pub fn set(&self, notices: Vec<Notice>) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = notices;
+    }
+
+    pub fn get(&self) -> Vec<Notice> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+/// Processes worth surfacing on the page, cheapest clause first.
+///
+/// # Why the level floor is low and the duration carries the rule
+///
+/// This is the inverse weighting of tiers 1 and 2, on purpose. Those
+/// need 80% and 90% of a core, which is above the band that actually
+/// warrants a glance, and tier 1 additionally requires PPID 1 -- so a
+/// parented process at half a core forever matched nothing at all.
+///
+/// Duration is the discriminator because level is not: a compiler, a
+/// test run and an install are all hot and SHORT. Something holding half
+/// a core past five minutes is either known to the user or worth their
+/// attention, and the second case is the one nothing else in this module
+/// catches.
+///
+/// Allowlisted daemons are excluded for the same reason tier 1 excludes
+/// them, and the nice value only ever RAISES a notice that already
+/// qualified -- a guard that cries wolf gets turned off, which is the
+/// lesson this repo has already paid for once (#853's ~40 false
+/// positives).
+pub fn watch(
+    observations: &[ProcessObservation],
+    durations: &std::collections::HashMap<(u32, u64), f64>,
+) -> Vec<Notice> {
+    let mut out = Vec::new();
+    for p in observations {
+        // The cheap clauses first: a level test and a map lookup before
+        // anything derived. `shadow` above orders itself the same way.
+        if p.cpu_percent < WATCH_PERCENT {
+            continue;
+        }
+        let minutes = durations
+            .get(&(p.pid, p.start_time))
+            .copied()
+            .unwrap_or(0.0);
+        if minutes < WATCH_MINUTES {
+            continue;
+        }
+        if p.allowlisted() {
+            continue;
+        }
+        out.push(Notice {
+            name: p.name.clone(),
+            cpu_percent: p.cpu_percent,
+            minutes,
+            niced: p.nice.is_some_and(|n| n > SUSPICIOUS_NICE),
+            orphaned: p.orphaned(),
+            long: minutes >= WATCH_LONG_MINUTES,
+        });
+    }
+    // Longest first: if the list is ever truncated for display, the one
+    // that has been going longest is the one that survives.
+    out.sort_by(|a, b| b.minutes.total_cmp(&a.minutes));
+    out
+}
+
 pub fn shadow(
     observations: &[ProcessObservation],
     durations: &std::collections::HashMap<(u32, u64), f64>,
@@ -632,7 +914,17 @@ impl Watcher {
         observations: &[ProcessObservation],
         elapsed_ms: i64,
     ) -> &std::collections::HashMap<(u32, u64), f64> {
-        let floor = TIER1_PERCENT.min(TIER2_PERCENT);
+        // The LOWEST floor any rule reads, which is now #865's watch
+        // band rather than tier 1's. One accumulator serves every tier,
+        // and tracking from the lowest floor is what lets a process that
+        // climbs into a higher tier already have its duration behind it.
+        //
+        // This line was `TIER1_PERCENT.min(TIER2_PERCENT)` -- 80% -- and
+        // `watch` would have been decorative without changing it: a
+        // process at 50% was never accumulated, so its duration was
+        // always 0.0 and a five-minute rule could never fire. Any new
+        // tier with a lower floor has to appear here too.
+        let floor = WATCH_PERCENT.min(TIER1_PERCENT).min(TIER2_PERCENT);
         // A span nobody measured credits nothing. Past GAP_MS the two
         // passes are not comparable, so the accumulated minutes are
         // dropped rather than extended -- the same refusal as
@@ -767,6 +1059,9 @@ impl Table {
                 name: proc.name().to_string_lossy().to_string(),
                 cpu_percent: cpu,
                 parent: proc.parent().map(|p| p.as_u32()),
+                // One syscall per process. Measured rather than assumed
+                // safe: see `a_sample_stays_cheap_with_nice_reads`.
+                nice: nice_of(pid.as_u32()),
             });
         }
         let process_count = observations.len();
@@ -1033,8 +1328,156 @@ mod tests {
         assert_eq!(busy.one_process_explains_it(), Some(true));
     }
 
+    // ---- The watch tier (#865) --------------------------------------
+
+    /// THE incident, as a fixture. Twelve orphaned busy-loops, niced to
+    /// 5, each holding ~50% of a core on a 12-core machine for 8.5
+    /// hours, load average 53 -- and System Health said nothing for the
+    /// whole of it.
+    ///
+    /// Kept as a test rather than a note because it is the only
+    /// real-world sample this module has of its own central failure, and
+    /// because the aggregate rule it was supposed to trip CANNOT see it:
+    /// 12 x 50% on 12 cores is 50% machine-wide, under
+    /// `AGGREGATE_PERCENT`'s 60. Any rule set that does not fire here is
+    /// not finished.
+    #[test]
+    fn the_twelve_spinner_incident_is_surfaced() {
+        let obs: Vec<ProcessObservation> = (0..12)
+            .map(|i| proc_niced(13_574 + i, "zsh", 50.0, Some(1), Some(5)))
+            .collect();
+        let pairs: Vec<(&ProcessObservation, f64)> = obs.iter().map(|p| (p, 8.5 * 60.0)).collect();
+
+        let out = watch(&obs, &durations(&pairs));
+
+        assert_eq!(
+            out.len(),
+            12,
+            "every spinner is surfaced, not just the top one"
+        );
+        let n = &out[0];
+        assert!(
+            n.niced,
+            "nice 5 is recorded -- it is why the aggregate rule missed these"
+        );
+        assert!(n.orphaned, "PPID 1");
+        assert!(n.long, "8.5 hours is well past the long mark");
+        assert!(
+            n.body().contains("low priority"),
+            "the body says WHY it is suspicious"
+        );
+        assert!(n.body().contains("parent has exited"));
+    }
+
+    /// The user's own discriminator: "60% for 2-3 minutes would be a
+    /// compiler". A short hot burst is silence at any level.
+    #[test]
+    fn a_compiler_is_not_surfaced() {
+        let p = proc(900, "rustc", 98.0, Some(42));
+        let out = watch(std::slice::from_ref(&p), &durations(&[(&p, 2.5)]));
+        assert!(
+            out.is_empty(),
+            "two and a half minutes is a build, not a runaway"
+        );
+    }
+
+    /// And the case the old tiers could not express at all: half a core,
+    /// parented, past five minutes. Tier 1 needed 80% AND PPID 1; tier 2
+    /// needed 90%. This matched nothing before #865.
+    #[test]
+    fn half_a_core_past_five_minutes_is_surfaced_even_when_parented() {
+        let p = proc(901, "node", 52.0, Some(42));
+        let out = watch(std::slice::from_ref(&p), &durations(&[(&p, 6.0)]));
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].orphaned, "parented, and surfaced anyway");
+        assert!(!out[0].niced);
+        assert!(
+            !out[0].long,
+            "six minutes is worth a look, not yet a long burn"
+        );
+    }
+
+    /// Just under each threshold, so the boundaries are asserted rather
+    /// than assumed.
+    #[test]
+    fn the_watch_boundaries_hold() {
+        let quiet = proc(902, "a", WATCH_PERCENT - 0.1, Some(42));
+        assert!(
+            watch(std::slice::from_ref(&quiet), &durations(&[(&quiet, 60.0)])).is_empty(),
+            "below the level floor, however long"
+        );
+        let brief = proc(903, "b", 99.0, Some(42));
+        assert!(
+            watch(
+                std::slice::from_ref(&brief),
+                &durations(&[(&brief, WATCH_MINUTES - 0.1)])
+            )
+            .is_empty(),
+            "above the level, below the duration"
+        );
+    }
+
+    /// An allowlisted daemon is excluded, the same as tier 1 excludes
+    /// them: `mds_stores` holding a core during a reindex is the
+    /// machine working, not a fault.
+    #[test]
+    fn a_known_daemon_is_not_surfaced() {
+        let d = proc(904, SEED_DAEMONS[0], 95.0, Some(1));
+        assert!(watch(std::slice::from_ref(&d), &durations(&[(&d, 600.0)])).is_empty());
+    }
+
+    /// `None` nice changes nothing. Windows reports none, and a process
+    /// that exits mid-walk reports none -- neither is evidence either
+    /// way, so the notice stands on its level and duration alone.
+    #[test]
+    fn an_unreadable_nice_neither_raises_nor_suppresses() {
+        let p = proc_niced(905, "c", 60.0, Some(42), None);
+        let out = watch(std::slice::from_ref(&p), &durations(&[(&p, 10.0)]));
+        assert_eq!(out.len(), 1, "surfaced on level and duration alone");
+        assert!(!out[0].niced, "unknown is not 'niced'");
+        assert!(!out[0].body().contains("low priority"));
+    }
+
+    /// The accumulator has to track from the WATCH floor or this whole
+    /// tier is decorative: a 50% process would never be credited any
+    /// minutes, so a five-minute rule could never fire however long it
+    /// ran. This asserts the floor, not the arithmetic.
+    #[test]
+    fn the_accumulator_tracks_the_watch_band() {
+        let mut w = Watcher::default();
+        let p = proc(906, "d", WATCH_PERCENT + 1.0, Some(42));
+        // Six minutes of credit, in one-minute steps.
+        for _ in 0..6 {
+            w.observe(std::slice::from_ref(&p), 60_000);
+        }
+        let mins = w
+            .observe(std::slice::from_ref(&p), 60_000)
+            .get(&(p.pid, p.start_time))
+            .copied()
+            .expect("a process in the watch band is tracked");
+        assert!(
+            mins >= WATCH_MINUTES,
+            "{mins} minutes accumulated at the watch floor"
+        );
+    }
+
+    /// Longest first, so a truncated display keeps the worst one.
+    #[test]
+    fn notices_are_ordered_by_duration() {
+        let a = proc(907, "young", 60.0, Some(42));
+        let b = proc(908, "old", 55.0, Some(42));
+        let out = watch(
+            &[a.clone(), b.clone()],
+            &durations(&[(&a, 6.0), (&b, 400.0)]),
+        );
+        assert_eq!(out[0].name, "old");
+    }
+
     // ---- Shadow logging ---------------------------------------------
 
+    /// Nice 0, the common real value, so every pre-#865 test keeps
+    /// asserting what it asserted. `proc_niced` is for the cases that
+    /// are ABOUT the nice value.
     fn proc(pid: u32, name: &str, cpu: f64, parent: Option<u32>) -> ProcessObservation {
         ProcessObservation {
             pid,
@@ -1042,6 +1485,20 @@ mod tests {
             name: name.to_string(),
             cpu_percent: cpu,
             parent,
+            nice: Some(0),
+        }
+    }
+
+    fn proc_niced(
+        pid: u32,
+        name: &str,
+        cpu: f64,
+        parent: Option<u32>,
+        nice: Option<i32>,
+    ) -> ProcessObservation {
+        ProcessObservation {
+            nice,
+            ..proc(pid, name, cpu, parent)
         }
     }
 
@@ -1270,6 +1727,44 @@ mod tests {
             .filter(|l| l.trim_start().starts_with("DiffuseCpu"))
             .count();
         assert_eq!(variants, 1);
+    }
+
+    /// A `Notice` must never become an `Alert`, which is the #865
+    /// equivalent of `nothing_converts_a_shadow_into_an_alert` above.
+    ///
+    /// The watch tier is an INDICATOR: the user asked for something that
+    /// says "you might want to investigate", not for another thing that
+    /// interrupts them. A `From<Notice> for Alert`, or a `notify_` call
+    /// taking one, would silently promote half a core for five minutes
+    /// into a notification -- and five minutes is short enough that the
+    /// result would be a guard people turn off, which is the outcome
+    /// #853 already paid for once.
+    ///
+    /// Source text rather than types, for the same reason the sibling
+    /// test uses it: the thing being forbidden is a conversion that does
+    /// not exist yet, and you cannot write a type assertion about an
+    /// absent impl.
+    #[test]
+    fn nothing_converts_a_notice_into_an_alert() {
+        let src = include_str!("runaway.rs");
+        let body: Vec<&str> = src
+            .lines()
+            .take_while(|l| !l.starts_with("#[cfg(test)]"))
+            .collect();
+        assert!(!body.is_empty(), "the module body parsed to nothing");
+        assert!(
+            !body.iter().any(|l| l.contains("impl From<Notice>")),
+            "a Notice must not be convertible into an Alert"
+        );
+        // And the module must not hand a Notice to anything that
+        // notifies. `notify_runaway` takes `&Alert` by signature; this
+        // catches a future overload or a generic that would accept both.
+        assert!(
+            !body
+                .iter()
+                .any(|l| l.contains("notify") && l.contains("Notice")),
+            "a Notice must not reach a notification path"
+        );
     }
 
     /// Wording exists, since a notification with an empty body says

@@ -385,6 +385,9 @@ pub fn run() {
             // SQLite: this is a live reading the view asks for, and
             // there is no 24-hour series of it to keep.
             app.manage(Arc::new(health::footprint::Footprints::default()));
+            // #865's watch notices, written by the poll loop below and
+            // read by `health_alerts`. One accumulator, not two.
+            app.manage(Arc::new(health::runaway::Watched::default()));
             {
                 let app_handle = app.handle().clone();
                 // Blocking, not async: it reads the kernel and writes
@@ -462,6 +465,22 @@ pub fn run() {
                         for would in health::runaway::shadow(&observations, minutes) {
                             log::info!("{}", would.line());
                         }
+
+                        // #865's watch tier. NOT a notification: these
+                        // reach `health_alerts` and the System Health
+                        // page only, which is what the user asked for --
+                        // "at least have an indicator in the UI". The
+                        // `Alert` path above is what interrupts someone,
+                        // and `nothing_converts_a_shadow_into_an_alert`
+                        // asserts that staying deliberate.
+                        //
+                        // Written here because `minutes` only exists
+                        // here: duration is accumulated across passes by
+                        // the `watcher` above, and a command with a
+                        // fresh `Table` would see every process at 0.0.
+                        app_handle
+                            .state::<Arc<health::runaway::Watched>>()
+                            .set(health::runaway::watch(&observations, minutes));
                         // A failed sample is logged and skipped, never
                         // fatal: a gap in the chart is a far better
                         // outcome than an app that stops because it

@@ -294,6 +294,20 @@ headstate-stepup = { version = "0.1.0", path = "../crates/headstate-stepup" }
 mdns-sd = { version = "0.21", default-features = false, features = ["logging"] }
 sysinfo = { version = "0.39", default-features = false, features = ["system", "disk", "network", "component"] }
 
+# For `getpriority(2)` only -- the nice value, which #865 needs and
+# `sysinfo` does not expose (0.39 has no `nice` or `priority` accessor
+# anywhere in the crate; checked rather than assumed).
+#
+# Not a new supply-chain edge: `libc` is already in `Cargo.lock`
+# transitively, pulled by `sysinfo` itself among others. This declares a
+# direct dependency on a crate that was already being compiled.
+#
+# Unix only. Windows has no nice, so the reader returns `None` there and
+# the rules treat that as "cannot say" rather than as zero -- the same
+# absent-is-not-zero rule the rest of `health` follows.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 temp-env = "0.3"
 tempfile = "3"

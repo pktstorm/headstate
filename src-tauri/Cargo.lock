@@ -2078,6 +2078,7 @@ dependencies = [
  "hyper-util",
  "if-addrs",
  "keyring",
+ "libc",
  "log",
  "mdns-sd",
  "ml-dsa",
