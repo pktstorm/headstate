@@ -836,4 +836,781 @@ mod tests {
             unguarded.join("\n  ")
         );
     }
+
+    // ---- Shared: reading the TEST half ------------------------------------
+
+    /// The line index just past the item that starts at `lines[start]` and
+    /// is indented `indent` columns.
+    ///
+    /// The terminator is the next line that is exactly `}` at the item's OWN
+    /// column, which is reliable in this tree for the reason [`production`]
+    /// sets out at length: `cargo fmt --check` runs over all three crates in
+    /// `make lint`, so a closing brace sits at the column its `fn` keyword
+    /// started on. Nested test modules are why the column has to be a
+    /// parameter rather than zero -- `scan.rs` has `mod tests { mod
+    /// classifying { #[test] fn ... } }`, so the bodies the guards below read
+    /// are three levels in.
+    ///
+    /// Falls back to the end of the file when no such brace is found, which
+    /// errs toward seeing MORE code than the item really spans. That is the
+    /// safe direction here: a guard reading too much produces a false
+    /// positive somebody investigates, where one reading too little passes
+    /// silently over the defect. `production`'s doc makes the same argument
+    /// about the same trade.
+    fn item_end(lines: &[&str], start: usize, indent: usize) -> usize {
+        lines
+            .iter()
+            .enumerate()
+            .skip(start + 1)
+            .find(|(_, l)| l.trim() == "}" && l.len() - l.trim_start().len() == indent)
+            .map_or(lines.len(), |(j, _)| j + 1)
+    }
+
+    /// One `#[test]` function, as the three things a guard needs about it.
+    ///
+    /// The guards below (invariants 7 and 8) are the first here to assert
+    /// about TEST code rather than production code, which inverts
+    /// [`production`]: where the earlier six strip `#[cfg(test)]` items
+    /// because a fixture legitimately does what they forbid, these two are
+    /// about the fixtures themselves.
+    ///
+    /// That is not a change of heart about scope. The two defects #869
+    /// collects (#861, #868) were both in test code, both cost a release
+    /// tag, and both were a rule stated in the same file that the body one
+    /// screen down contradicted -- so the thing to guard is the
+    /// consistency between a test's prose and its body, which only exists
+    /// inside a test.
+    struct TestFn {
+        /// `crate/path/file.rs`, for a failure message that names a file
+        /// somebody can open.
+        where_: String,
+        /// The function name, as `fn NAME(` spells it.
+        name: String,
+        /// The `///` lines immediately above the `#[test]` attribute, with
+        /// the slashes stripped and joined by SPACES, so a phrase
+        /// `rustfmt` wrapped across two lines is still one string to match
+        /// on. Empty when the test has no doc comment.
+        doc: String,
+        /// The body text, from the `fn` line to the closing brace at the
+        /// same indentation.
+        body: String,
+        /// Whether this is an `async` test (`#[tokio::test]`).
+        ///
+        /// Load-bearing for invariant 7 and not a convenience: the lock it
+        /// enforces is a `std::sync::MutexGuard`, which clippy's
+        /// `await_holding_lock` forbids holding across an `.await` -- and
+        /// `-D warnings` is what CI's `lint` job runs, so an async test
+        /// CANNOT comply with the rule as the rule is currently built. See
+        /// that invariant's "What it cannot see".
+        is_async: bool,
+    }
+
+    /// Every `#[test]` function in `src`, with its doc comment and body.
+    ///
+    /// # Why the body is bounded by INDENTATION and not by brace counting
+    ///
+    /// [`production`]'s doc records the full argument and it applies
+    /// unchanged here: `scan.rs`' test module contains `"@{u}"` and
+    /// `"@{{u}}"` in assertion messages, so a counter that does not lex
+    /// string literals closes a function early, and `SAMPLE`'s
+    /// line-continuation literal puts prose at column 0. Indentation is
+    /// reliable for the same specific reason -- `cargo fmt --check` runs
+    /// over all three crates in `make lint`, so a function's closing brace
+    /// sits at exactly the column its `fn` keyword started on.
+    ///
+    /// This matters more here than it did for `production`, because test
+    /// functions nest: `scan.rs` has `mod tests { mod classifying { #[test]
+    /// fn ... } }`, so the bodies being extracted are at three levels of
+    /// indentation and a single fixed column would find none of them.
+    ///
+    /// # Why `#[test]` and not `fn`
+    ///
+    /// A helper inside a test module (`fn rl(...)`, `fn repo_with_worktrees`)
+    /// is not a test and has no doc comment making a promise about what it
+    /// asserts. Anchoring on the attribute also means `#[tokio::test]` and
+    /// `#[test]\n#[ignore]` are found, since the scan looks for the
+    /// attribute line and then the next `fn`.
+    fn test_fns(where_: &str, src: &str) -> Vec<TestFn> {
+        // Normalised before any `\n` pattern runs: a Windows checkout with
+        // `core.autocrlf` has CRLF, and `invariant 5` records this hazard
+        // being OBSERVED on the `platform (windows-latest)` job rather
+        // than merely feared.
+        let src = src.replace("\r\n", "\n");
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            if t != "#[test]" && !t.starts_with("#[tokio::test") {
+                continue;
+            }
+            // The `fn` line: the next line that declares one, so an
+            // intervening `#[ignore]` or `#[should_panic]` is skipped.
+            let Some(fn_at) = (i + 1..lines.len().min(i + 6)).find(|j| {
+                lines[*j].trim_start().starts_with("fn ")
+                    || lines[*j].trim_start().starts_with("async fn ")
+            }) else {
+                continue;
+            };
+            let fn_line = lines[fn_at];
+            let indent = fn_line.len() - fn_line.trim_start().len();
+            let name = fn_line
+                .trim_start()
+                .trim_start_matches("async ")
+                .trim_start_matches("fn ")
+                .split(['(', '<'])
+                .next()
+                .unwrap_or("<unknown>")
+                .to_string();
+
+            // The doc comment: `///` lines directly above the attribute,
+            // walking UP and stopping at the first line that is not one.
+            // Other attributes are walked through -- `#[ignore]` between
+            // the doc and the `#[test]` does not detach the prose from the
+            // test it describes.
+            let mut doc_lines: Vec<&str> = Vec::new();
+            for j in (0..i).rev() {
+                let d = lines[j].trim_start();
+                if let Some(rest) = d.strip_prefix("///") {
+                    doc_lines.push(rest.trim());
+                } else if d.starts_with("#[") {
+                    continue;
+                } else {
+                    break;
+                }
+            }
+            doc_lines.reverse();
+            // Joined with a SPACE and not a newline, because the phrases
+            // invariant 8 matches on are wrapped by `rustfmt`'s comment
+            // width: `scan.rs:6570` reads "a timing\n/// threshold", so
+            // `doc.contains("timing threshold")` is false against a
+            // newline-joined doc. That is a silent gap of exactly the kind
+            // #869 warns about -- a guard that looks like it covers a
+            // phrase and never matches it -- and it was found by asserting
+            // the match count rather than by reading the code.
+            let doc = doc_lines.join(" ");
+
+            // The body, to the closing brace at the `fn`'s own column.
+            let end = item_end(&lines, fn_at, indent);
+            out.push(TestFn {
+                where_: where_.to_string(),
+                name,
+                doc,
+                body: lines[fn_at..end].join("\n"),
+                is_async: fn_line.trim_start().starts_with("async fn "),
+            });
+        }
+        out
+    }
+
+    /// Every `#[test]` in every crate, with the file it came from.
+    ///
+    /// Derived by walking the crate tree, for the reason this module's
+    /// header gives: a hand-written list cannot cover the test nobody
+    /// remembered to add to it, and #868's defect was six siblings of a
+    /// rule that was already enforced elsewhere.
+    fn all_test_fns() -> Vec<TestFn> {
+        let mut out = Vec::new();
+        for (crate_name, root) in crate_roots() {
+            for file in rust_files(&root) {
+                let Ok(src) = std::fs::read_to_string(&file) else {
+                    continue;
+                };
+                let rel = file.strip_prefix(&root).unwrap_or(&file).display();
+                out.extend(test_fns(&format!("{crate_name}/{rel}"), &src));
+            }
+        }
+        out
+    }
+
+    /// The body text of every named function in `src`, keyed by name.
+    ///
+    /// Used to follow a call one hop at a time, which is what makes
+    /// invariant 7 a reachability check rather than a grep: a test calling
+    /// a helper that calls `Budget::record` is in scope of the lock rule,
+    /// and `observed_test_lock`'s own doc comment says so in as many words
+    /// -- *"the question is whether anything it calls can store to
+    /// `OBSERVED_REMAINING`"*.
+    ///
+    /// # What this is not
+    ///
+    /// It is not a call graph. Names are matched textually, so two
+    /// functions called `record` in different types share an entry, and a
+    /// call through a trait object or a closure variable is invisible.
+    /// #869 suggests using CodeGraph's edges for this, and that is not
+    /// available from inside a `cargo test` run -- the index is a
+    /// developer tool in `.codegraph/`, absent on CI and in a fresh
+    /// checkout, and a guard that silently becomes a no-op when its index
+    /// is missing is worse than a coarse one that always runs.
+    ///
+    /// Coarse in the direction that is safe: matching by bare name
+    /// over-approximates reachability, so the failure mode is a test told
+    /// to take a cheap lock it did not strictly need. `observed_test_lock`
+    /// anticipates exactly that trade -- *"a test that does not need them
+    /// loses nothing by holding them"*.
+    fn fn_bodies(src: &str) -> BTreeMap<String, String> {
+        let src = src.replace("\r\n", "\n");
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out: BTreeMap<String, String> = BTreeMap::new();
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            // `async` spellings are listed explicitly and are not
+            // decoration: every function that reaches `OBSERVED_REMAINING`
+            // WITHOUT naming it is async -- `client::fetch_viewer`,
+            // `client::fetch_viewer_metered`, `client::fetch_prs_with_total`
+            // and `fetch::read_metered`. Omitting them would leave invariant
+            // 7 unable to follow the only indirect paths that exist, which
+            // is the half of the rule `observed_test_lock`'s doc insists on.
+            //
+            // Longest prefix first, so `pub(crate) fn` is not matched as
+            // `pub ` + garbage.
+            let rest = [
+                "pub(crate) async fn ",
+                "pub(super) async fn ",
+                "pub async fn ",
+                "pub(crate) fn ",
+                "pub(super) fn ",
+                "pub fn ",
+                "async fn ",
+                "fn ",
+            ]
+            .iter()
+            .find_map(|p| t.strip_prefix(p));
+            let Some(rest) = rest else { continue };
+            let name = rest
+                .split(['(', '<'])
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let indent = line.len() - t.len();
+            let end = item_end(&lines, i, indent);
+            // A name declared twice (an inherent `fn` and a trait impl of
+            // the same name) has its bodies CONCATENATED rather than one
+            // overwriting the other, so following the name cannot miss the
+            // copy that happens to be second in the file.
+            out.entry(name)
+                .and_modify(|b| {
+                    b.push('\n');
+                    b.push_str(&lines[i..end].join("\n"));
+                })
+                .or_insert_with(|| lines[i..end].join("\n"));
+        }
+        out
+    }
+
+    // ---- Invariant 7: the OBSERVED_REMAINING serialisation rule ------------
+
+    /// Every test that can reach `OBSERVED_REMAINING` holds
+    /// `observed_test_lock()`.
+    ///
+    /// # What it enforces
+    ///
+    /// A `#[test]` in `src-tauri` whose body can reach
+    /// `budget::note_remaining` or `Budget::record` -- directly, or through
+    /// one hop of a function in the same file -- must call
+    /// `observed_test_lock()`.
+    ///
+    /// # The finding it would have caught (#868)
+    ///
+    /// `observed_test_lock`'s doc comment has said *"One lock for every
+    /// TEST that touches `OBSERVED_REMAINING`, directly or through
+    /// `Budget::record`"* since #843, and six tests IN THAT SAME FILE
+    /// called `record` without it: three in `tests` and three in
+    /// `metering`. `record` stores to the process-wide static at
+    /// `budget.rs:329` and `cargo test` runs test functions on a thread
+    /// pool, so those six mutated the figure underneath
+    /// `a_seeded_budget_can_actually_refuse`, which reads it. MEASURED: 4
+    /// failures in 6 local runs of `cargo test --lib github::stats::budget`,
+    /// and one failure on `main` that blocked the v5.14.0 tag.
+    ///
+    /// The rule had already been propagated ACROSS a file boundary --
+    /// `fetch.rs`'s `a_wave_is_refused_once_the_budget_is_under_the_reserve`
+    /// takes the lock, and the doc cites that as the reason the lock is
+    /// crate-visible rather than private. So a known rule, enforced once
+    /// against a different file, failed to reach six siblings in its own.
+    /// That is this module's founding observation (#854) recurring inside
+    /// the code the audit added, which is why #869 asked for it
+    /// mechanically rather than by vigilance.
+    ///
+    /// # Why reachability rather than a grep for `record`
+    ///
+    /// `observed_test_lock` states the rule in the form a future author
+    /// will get wrong: *"`record` is not the only reachable path, and 'my
+    /// test does not mention `note_remaining`' is not the question. The
+    /// question is whether anything it calls can store to
+    /// `OBSERVED_REMAINING`."* Four production functions reach the static
+    /// without naming it -- `client::fetch_viewer`,
+    /// `client::fetch_viewer_metered`, `client::fetch_prs_with_total` and
+    /// `fetch::read_metered` -- so a grep for the two names misses any test
+    /// that goes through one of them. None does today, because all four are
+    /// `async` and need a live client; the guard covers them so the first
+    /// one that appears fails here rather than in a release.
+    ///
+    /// One hop, not a full closure, and the limit is stated because it is
+    /// real: the hop is resolved inside the test's OWN file via
+    /// [`fn_bodies`], so a test calling a helper in a sibling module that
+    /// in turn calls `record` is invisible. A full transitive walk over
+    /// name-matched bodies across 1,100 tests over-approximates badly --
+    /// `record` and `new` are common names -- and an over-approximating
+    /// guard is the ~40-false-positive mistake `check-privacy.sh:120`
+    /// records. One hop covers every shape in the tree today and the
+    /// reachers above by name.
+    ///
+    /// # What it cannot see
+    ///
+    /// - **Whether the lock is held for long ENOUGH.** A test taking the
+    ///   guard and dropping it immediately passes. The `_g` binding idiom
+    ///   (an underscore-prefixed name held to end of scope) is what the
+    ///   existing tests use and what review should look for; this asserts
+    ///   the lock is taken at all, which is the half that was missing six
+    ///   times.
+    /// - **`RestoreObserved`.** NOT asserted. The lock stops two tests
+    ///   racing; the restore guard stops a seeded figure leaking into
+    ///   whatever runs next, and the two were added together in #868. Only
+    ///   the lock is required here, because the restore is conditional on
+    ///   the test actually seeding a figure and "did this test seed one"
+    ///   cannot be read off the text -- demanding it everywhere would
+    ///   report the tests that only READ the static, and a guard that asks
+    ///   for a line somebody then has to justify is how the ~40-false-
+    ///   positive mistake starts. The lock is the half that was missing six
+    ///   times.
+    /// - **Async tests.** `#[tokio::test]` is skipped, and this is a limit
+    ///   of the RULE, not of the scan: `observed_test_lock` hands back a
+    ///   `std::sync::MutexGuard`, and clippy's `await_holding_lock` --
+    ///   under the `-D warnings` that CI's `lint` job runs -- rejects
+    ///   holding one across an `.await`. So an async test cannot comply.
+    ///   `client.rs` has five that reach `note_remaining` through
+    ///   `fetch_prs_with_total` and are latent races for that reason;
+    ///   MEASURED, adding the lock to them fails the build with five
+    ///   `await_holding_lock` errors. Giving the lock an async form is a
+    ///   change to `budget.rs`'s test surface and wants its own issue. The
+    ///   body records this at the skip.
+    /// - **Other crates.** `src-mobile` and `stepup` have no `Budget`, so
+    ///   the scan is scoped to `src-tauri` rather than asserting a vacuous
+    ///   truth over two crates that cannot break it.
+    #[test]
+    fn every_test_reaching_the_observed_figure_takes_the_lock() {
+        /// The names that store to `OBSERVED_REMAINING`.
+        ///
+        /// `note_remaining` is the setter; `record` reaches it at
+        /// `budget.rs:329` and is the path all six of #868's tests took.
+        /// `OBSERVED_REMAINING` itself is included because three tests
+        /// store to the static directly by name.
+        const STORES: &[&str] = &["note_remaining(", ".record(", "OBSERVED_REMAINING.store"];
+
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut checked = 0usize;
+        let mut unlocked = Vec::new();
+        for file in rust_files(&manifest) {
+            let Ok(src) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let rel = file.strip_prefix(&manifest).unwrap_or(&file).display();
+            // This file is the guard itself: the names above appear here as
+            // string literals and in prose. Skipped by PATH rather than by
+            // comment-stripping, because a `const STORES` array is code.
+            if rel.to_string().contains("invariants.rs") {
+                continue;
+            }
+            let bodies = fn_bodies(&src);
+            for t in test_fns(&format!("src-tauri/{rel}"), &src) {
+                // Comment lines dropped before the search. This codebase
+                // documents its rules directly above the code, so `record`
+                // and `note_remaining` appear in prose far more often than
+                // in a call -- and accepting a doc comment in place of the
+                // code is the exact trap #869 names: three v5.14.0
+                // invariants initially passed over their own defect, one of
+                // them by matching a string inside a comment.
+                let code: String = t
+                    .body
+                    .lines()
+                    .filter(|l| !is_comment(l))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let direct = STORES.iter().any(|s| code.contains(s));
+                // One hop: a helper called by this test, defined in this
+                // file, that itself reaches the static.
+                let indirect = !direct
+                    && bodies.iter().any(|(name, body)| {
+                        name != &t.name
+                            && code.contains(&format!("{name}("))
+                            && body
+                                .lines()
+                                .filter(|l| !is_comment(l))
+                                .any(|l| STORES.iter().any(|s| l.contains(s)))
+                    });
+                if !direct && !indirect {
+                    continue;
+                }
+                // `#[tokio::test]` is OUT OF SCOPE, and this is a limit of
+                // the RULE rather than of the scan -- recorded here because
+                // working around it silently is how a guard stops meaning
+                // anything.
+                //
+                // `observed_test_lock` returns a `std::sync::MutexGuard`.
+                // Clippy's `await_holding_lock` rejects holding one across
+                // an `.await`, and `cargo clippy -- -D warnings` is what
+                // CI's `lint` job runs, so an async test physically cannot
+                // take this lock and stay green. MEASURED: adding the two
+                // lines to `client.rs`'s five wiremock tests produced five
+                // `await_holding_lock` errors and a failed build.
+                //
+                // Those five are real latent hazards, not false positives:
+                // `fetch_prs_with_total` calls `note_remaining` at
+                // `client.rs:1059` whenever a response carries `rateLimit`,
+                // and they drive it through a mock server. They do not race
+                // TODAY only because none of their mocks selects that field
+                // -- which is one line away from being untrue, and is
+                // exactly the shape of #868.
+                //
+                // Fixing it properly means giving the lock an async form (a
+                // `tokio::sync::Mutex`, or a sync lock acquired around a
+                // `block_in_place`), which is a change to `budget.rs`'s
+                // public test surface and belongs in its own issue rather
+                // than smuggled into a guard. Until then this scan covers
+                // the synchronous tests -- all 14 of them, including every
+                // one of #868's six -- and says plainly what it does not
+                // cover.
+                if t.is_async {
+                    continue;
+                }
+                checked += 1;
+                // Either spelling: `budget.rs`'s own `metering` module
+                // imports it as `observed_lock`, and `fetch.rs` calls it by
+                // its fully-qualified path. Matching the bare name would
+                // report two correct files as defects.
+                if !code.contains("observed_test_lock()") && !code.contains("observed_lock()") {
+                    unlocked.push(format!("{}::{}", t.where_, t.name));
+                }
+            }
+        }
+
+        // Guards the guard. MEASURED at 14 today: all 13 tests in
+        // `budget.rs`'s `tests` and `metering` modules, plus `fetch.rs`'s
+        // `a_wave_is_refused_once_the_budget_is_under_the_reserve`. A scan
+        // that found materially fewer has stopped seeing a test module,
+        // which is how a derived guard dies quietly -- and the whole point
+        // of #869 is that a guard passing is not evidence it can see
+        // anything. The other six invariants here assert the same way, and
+        // `every_recursive_delete_checks_symlinks_and_containment`'s doc
+        // records this exact assertion catching a live blind spot.
+        //
+        // Held at 13 rather than 14 so that deleting `fetch.rs`'s wave test
+        // -- a legitimate change -- does not fail this, while losing sight
+        // of `budget.rs`'s module does.
+        assert!(
+            checked >= 13,
+            "only {checked} test(s) reaching OBSERVED_REMAINING found; the scan is \
+             broken, not the tests. There are 14 -- the 13 in `budget.rs`'s `tests` \
+             and `metering` modules plus `fetch.rs`'s \
+             `a_wave_is_refused_once_the_budget_is_under_the_reserve`."
+        );
+        assert!(
+            unlocked.is_empty(),
+            "these tests can reach the process-wide OBSERVED_REMAINING and do not take \
+             `observed_test_lock()`:\n  {}\n\n\
+             `cargo test` runs test functions on a thread pool and that static is \
+             process-wide by design, so two tests touching it in parallel race -- and \
+             the one that FAILS is whichever happened to read it, in whatever file that \
+             is. `budget.rs`'s `a_seeded_budget_can_actually_refuse` failed 4 runs in 6 \
+             this way, on `main`, blocking a release tag (#868).\n\n\
+             `Budget::record` is not an exception: it stores to the static at \
+             `budget.rs:329`, which is what all six of #868's tests missed. \
+             \"My test does not mention `note_remaining`\" is not the question -- the \
+             question is whether anything it calls can store to the figure. Add \
+             `let _g = observed_test_lock();` and, if the test seeds a figure, \
+             `let _restore = RestoreObserved::capture();`. Both are cheap, and a test \
+             that does not need them loses nothing by holding them (#869).",
+            unlocked.join("\n  ")
+        );
+    }
+
+    // ---- Invariant 8: a wall-clock test that disclaims one -----------------
+
+    /// A test whose doc comment disclaims a timing threshold does not
+    /// assert on how long the run took.
+    ///
+    /// # What it enforces
+    ///
+    /// If a `#[test]`'s doc comment contains "wall-clock", "timing
+    /// threshold" or "flake generator", then no assertion in its body may
+    /// compare a RUN-SPANNING duration against a constant multiple. A
+    /// run-spanning duration is the `let t = Instant::now(); <work>; let t =
+    /// t.elapsed();` shape -- a stopwatch around the thing under test.
+    ///
+    /// # The finding it would have caught (#861)
+    ///
+    /// `worktrees::scan`'s `worktrees_are_classified_concurrently` carried,
+    /// and still carries, this sentence: *"Asserts overlap rather than
+    /// wall-clock time: a timing threshold on CI hardware is a flake
+    /// generator."* Its only assertion was `whole * 2 < serial_floor`,
+    /// where `whole` was a stopwatch around `classify_repo_streaming` --
+    /// a wall-clock threshold, four lines under the sentence denying it.
+    ///
+    /// It cost two CI runs in the #835 batch on branches touching nothing
+    /// near it, then failed on `main` and blocked the v5.14.0 tag. One
+    /// failure had MEASURED 1.8x overlap: concurrency was working and the
+    /// test rejected it anyway, which is the tell that the assertion was
+    /// not merely fragile but measuring the wrong thing.
+    ///
+    /// The doc even named a correct model one module up --
+    /// `sizing::paths_are_walked_concurrently`, which asserts `peak > 1` on
+    /// a counter of simultaneously-executing workers and carries no
+    /// duration at all. So the rule was written down, a working example sat
+    /// in the same file, and the body ignored both.
+    ///
+    /// # Why the check is the STOPWATCH and not "two Durations times a
+    /// constant"
+    ///
+    /// This is the whole difficulty of this guard and the reason it is
+    /// narrow. #869 proposes flagging a comparison of "two `Instant`/
+    /// `Duration` values against a constant multiple", and the fixed code
+    /// is exactly that: `closest * 2 < solo`. A guard written to #869's
+    /// letter fires on the FIX as loudly as on the defect, which makes it
+    /// useless for telling them apart -- and a guard that cannot
+    /// distinguish the defect from its repair is the cry-wolf shape
+    /// `check-privacy.sh:120` records ~40 false positives from.
+    ///
+    /// What actually changed in #862 is which quantity is on the left:
+    ///
+    /// - **before**: `whole` was `Instant::now()` before
+    ///   `classify_repo_streaming` and `.elapsed()` after it -- total
+    ///   runtime, which a loaded CI runner inflates without the code
+    ///   changing.
+    /// - **after**: `closest` is `arrivals.windows(2).map(|w| w[1] - w[0])
+    ///   .min()` -- the gap between two OBSERVATIONS made during the run.
+    ///   Two reports cannot land closer together than the work producing
+    ///   them unless that work overlapped, whatever the machine's speed.
+    ///
+    /// `solo` is a stopwatch too, and it stays: it is the right-hand side,
+    /// the yardstick measured moments earlier on the same machine, so a
+    /// slow runner moves both sides of the comparison equally. That is
+    /// precisely the property the old form lacked, and it is why the check
+    /// below is about the MULTIPLIED operand rather than about either
+    /// operand appearing anywhere in the expression.
+    ///
+    /// # What it cannot see
+    ///
+    /// - **A test that makes the promise without the words.** The trigger
+    ///   is three phrases, chosen because they are the ones this codebase
+    ///   actually writes rather than an attempt to understand prose. A doc
+    ///   promising overlap in other words is outside this, and #869's guard
+    ///   3 -- a general prohibition-vs-body check -- is the stretch goal
+    ///   that would cover it. It is deliberately NOT implemented here: #869
+    ///   recommends evaluating it separately because it is likely noisy,
+    ///   and this repository has already paid for one guard that cried
+    ///   wolf.
+    /// - **The three phrases do not all mean "disclaims".** Six tests match
+    ///   today and only two are disclaimers; `health/footprint.rs` and
+    ///   `health/collect.rs` write "wall-clock" to ADMIT a budget they
+    ///   assert on deliberately and gate for that reason (#853). The scan
+    ///   therefore cannot use the trigger alone to decide anything -- it
+    ///   selects a population, and the stopwatch-multiple rule below is
+    ///   what separates the defect from the four tests that are correct.
+    ///   A guard keyed on "matched the phrase and compares durations" would
+    ///   report both gated measurements as defects on its first run.
+    /// - **A wall-clock assertion in a test that promises nothing.**
+    ///   `src-mobile`'s connect-timeout tests assert on elapsed time on
+    ///   purpose and say so. This guard is a consistency check between a
+    ///   test's prose and its body, not a ban on timing assertions -- the
+    ///   defect class #869 collects is the contradiction, not the timing.
+    /// - **A stopwatch laundered through a helper.** `let t = start();` and
+    ///   `let d = stop(t);` would not match the shape. Nothing in the tree
+    ///   does this, and the `Instant::now()` / `.elapsed()` pair is the
+    ///   only spelling in all three crates.
+    #[test]
+    fn no_test_asserts_wall_clock_under_a_doc_that_disclaims_it() {
+        /// The phrases that make a test's doc a PROMISE about what it
+        /// asserts, rather than prose that happens to mention time.
+        ///
+        /// All three are drawn from the two sentences already in the tree,
+        /// not invented: `scan.rs:6570` and `:6988` both read "Asserts
+        /// overlap rather than wall-clock time: a timing threshold on CI
+        /// hardware is a flake generator." A test that writes one of these
+        /// has told the next reader it carries no timing threshold, and
+        /// that is the claim being held to.
+        const DISCLAIMS: &[&str] = &["wall-clock", "timing threshold", "flake generator"];
+
+        let mut checked = 0usize;
+        let mut contradicted = Vec::new();
+        for t in all_test_fns() {
+            // The guard's own prose quotes all three phrases and the
+            // defective assertion, so this file is skipped by path. Every
+            // scan here does the same where it must name what it forbids.
+            if t.where_.contains("invariants.rs") {
+                continue;
+            }
+            if !DISCLAIMS.iter().any(|p| t.doc.contains(p)) {
+                continue;
+            }
+            checked += 1;
+            // Comments dropped first. The fixed test explains the old
+            // defect by QUOTING `whole * 2 < serial_floor` in a comment
+            // directly above the new assertion, which is the exact shape
+            // #869 warns about: one v5.14.0 invariant accepted a doc
+            // comment explaining a fix in place of the fix. Reading the
+            // comments here would make the repaired test fail and the
+            // sabotaged one fail identically -- the guard would be blind
+            // in the one way that matters.
+            let code: Vec<&str> = t.body.lines().filter(|l| !is_comment(l)).collect();
+
+            // Every local binding that is a STOPWATCH: bound from
+            // `Instant::now()` and read back later in the same body through
+            // `NAME.elapsed()`. Both `solo` and `whole` match, and so would
+            // any future name -- nothing here is keyed to the two the
+            // defect happened to use.
+            //
+            // No minimum gap between the two lines is required, and the
+            // honest reason is that it would not buy anything: `rustfmt`
+            // keeps them on separate lines regardless, and a stopwatch
+            // started and read with nothing in between measures zero and
+            // cannot be the left side of a threshold anybody wrote on
+            // purpose. Demanding a gap would add a number to tune and a way
+            // for the scan to miss a real one.
+            //
+            // What makes this a stopwatch AROUND THE WORK rather than
+            // merely a duration is the pairing itself: the value did not
+            // come from an observation made during a run, it came from
+            // timing a span of this test's own control flow. That is the
+            // distinction invariant 8 rests on -- see its doc.
+            let mut stopwatches: Vec<String> = Vec::new();
+            for (i, line) in code.iter().enumerate() {
+                let Some(rest) = line.trim_start().strip_prefix("let ") else {
+                    continue;
+                };
+                if !line.contains("Instant::now()") {
+                    continue;
+                }
+                let name = rest
+                    .split([' ', ':', '='])
+                    .next()
+                    .unwrap_or_default()
+                    .trim_start_matches("mut ")
+                    .trim()
+                    .to_string();
+                if name.is_empty() {
+                    continue;
+                }
+                // Read back later in the same body, through `.elapsed()`.
+                if code[i + 1..]
+                    .iter()
+                    .any(|l| l.contains(&format!("{name}.elapsed()")))
+                {
+                    stopwatches.push(name);
+                }
+            }
+
+            // Whether the body ASSERTS at all. A multiple computed for a
+            // `println!` in an `#[ignore]`d benchmark is a measurement
+            // being reported, not a threshold being enforced, and
+            // `worktrees/scan.rs`' `mod live` is full of exactly that --
+            // five `Instant`/`elapsed` pairs feeding print statements with
+            // no timing assertion anywhere. Reporting those would be the
+            // cry-wolf failure, so an assertion is required before a
+            // multiple means anything.
+            let asserts: String = code
+                .iter()
+                .filter(|l| l.contains("assert"))
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n");
+            // The multiple is searched for over the WHOLE body rather than
+            // over the assertion lines, because `rustfmt` puts the operand
+            // on its own line: the real defect reads
+            //
+            //     assert!(
+            //         whole * 2 < serial_floor,
+            //
+            // so a line containing `assert` and a line containing the
+            // multiple are never the same line. Matching within the
+            // assertion lines alone finds nothing, which is how this guard
+            // would have passed over #861 while looking correct.
+            let body_code = code.join("\n");
+            for name in &stopwatches {
+                // `NAME * <anything>`, rather than a list of multipliers.
+                //
+                // Enumerating them was the first version and it is the
+                // list-based blind spot this module's header is about:
+                // `whole * 2` was covered and `solo * count as u32` -- the
+                // OTHER multiplied stopwatch in the same defect -- was not,
+                // so the first run of the sabotage reported one of the two.
+                // A scaled stopwatch is a threshold whatever the scale is
+                // spelled as.
+                //
+                // `Duration` implements `Mul<u32>` and not the reverse, so
+                // `NAME * x` is the only spelling that compiles; the mirror
+                // form does not need matching.
+                let multiple = body_code.contains(&format!("{name} * "));
+                if multiple && !asserts.is_empty() {
+                    contradicted.push(format!(
+                        "{}::{} -- `{name}` is a stopwatch around the work and the body \
+                         asserts on a multiple of it",
+                        t.where_, t.name
+                    ));
+                }
+            }
+        }
+
+        // Guards the guard, the way the other seven do. MEASURED at 6
+        // today, and the identities matter more than the number because
+        // two of the six are the reason this check is about a MULTIPLE and
+        // not about any duration comparison:
+        //
+        // - `scan.rs::worktrees_are_classified_concurrently` -- #861's
+        //   test, now correct.
+        // - `scan.rs::paths_are_walked_concurrently` -- the model its doc
+        //   cites; asserts `peak > 1` and carries no duration at all.
+        // - `health/footprint.rs::a_sample_is_cheap_enough_for_a_timer` and
+        //   `health/collect.rs::reading_the_gpu_is_cheap_enough_for_the_sampler`
+        //   -- these say "wall-clock" to ADMIT one, not to disclaim it:
+        //   both assert `elapsed < <constant>` deliberately and are gated
+        //   behind `#[ignore]` plus an env var for precisely that reason
+        //   (#853). They are in scope of the scan and must not be reported,
+        //   which a rule phrased as "no duration comparison" would get
+        //   wrong in both cases.
+        // - `packages/tools.rs::a_missing_tool_is_not_looked_up_twice` --
+        //   a test that WAS a wall-clock proxy and now asserts on the cache
+        //   instead; its doc explains the fix, and it has no `Instant` left.
+        // - `github/stats/board.rs::a_board_load_is_bounded_once_around_the_whole_thing`
+        //   -- a source scan about where a timeout sits; no clock.
+        //
+        // A scan finding fewer has stopped reading doc comments, which
+        // would make the assertion below vacuously true forever -- the
+        // failure mode #869 names. This threshold found a real one: the
+        // phrases are wrapped by `rustfmt`'s comment width, so a
+        // newline-joined doc never matched "timing threshold". See
+        // [`test_fns`].
+        assert!(
+            checked >= 6,
+            "only {checked} test(s) found whose doc disclaims or admits a timing \
+             threshold; the scan is broken, not the tests. There are six -- two in \
+             `worktrees/scan.rs`, two gated live measurements in `health/`, and one \
+             each in `packages/tools.rs` and `github/stats/board.rs`."
+        );
+        assert!(
+            contradicted.is_empty(),
+            "these tests promise in prose that they assert overlap rather than \
+             wall-clock time, and then assert on wall-clock time:\n  {}\n\n\
+             A stopwatch around the work measures the MACHINE as much as the code, so \
+             the threshold fails on a loaded CI runner while the property holds. \
+             `worktrees_are_classified_concurrently` asserted `whole * 2 < \
+             serial_floor` under exactly this doc comment: two CI runs lost in the #835 \
+             batch, then a failure on `main` that blocked the v5.14.0 tag -- one of them \
+             having MEASURED 1.8x overlap, so concurrency was working and the test \
+             rejected it anyway (#861).\n\n\
+             Assert the overlap itself. `sizing::paths_are_walked_concurrently` counts \
+             simultaneously-executing workers and asserts `peak > 1`, which is true at \
+             any machine speed. Where the callback is serialised and a count cannot \
+             work, compare OBSERVATIONS made during the run -- \
+             `worktrees_are_classified_concurrently` now takes the gap between the two \
+             closest report arrivals against a solo cost measured moments earlier on \
+             the same machine, so a slow runner moves both sides equally. Do not widen \
+             the threshold and do not add a retry: a widened wall-clock bound is still \
+             a wall-clock bound, and #811's retry is the lesson on the other (#869).",
+            contradicted.join("\n  ")
+        );
+    }
 }

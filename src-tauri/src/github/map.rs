@@ -846,6 +846,48 @@ mod tests {
         }]}})
     }
 
+    /// More than twenty threads are all counted (#810).
+    ///
+    /// The mapper was never wrong here -- it counts whatever the document
+    /// returns -- so this asserts the pairing rather than the arithmetic:
+    /// with the query's old `first: 20` window the badge could not
+    /// receive more than twenty nodes, and the count silently capped
+    /// while reading like an exact number.
+    ///
+    /// The figures are a real pull request. vercel/next.js #98469 carried
+    /// 33 threads, 9 of them unresolved and un-outdated, and the old
+    /// window reported 2 -- the unresolved ones sat outside the first
+    /// twenty. Measured live while fixing this, not invented: a
+    /// hand-made 21-thread fixture would assert the same thing but would
+    /// not record that the case occurs in the wild.
+    ///
+    /// `the_list_query_counts_every_thread_rather_than_the_first_twenty`
+    /// in `query.rs` is the other half, and is the one that fails if the
+    /// window narrows again.
+    #[test]
+    fn counts_every_conversation_past_the_old_twenty_thread_window() {
+        let mut threads: Vec<serde_json::Value> = Vec::new();
+        // The first twenty, all settled: exactly the shape that made the
+        // old window report almost nothing on a busy pull request.
+        for _ in 0..20 {
+            threads.push(json!({"isResolved": true, "isOutdated": false}));
+        }
+        for _ in 0..9 {
+            threads.push(json!({"isResolved": false, "isOutdated": false}));
+        }
+        for _ in 0..4 {
+            threads.push(json!({"isResolved": false, "isOutdated": true}));
+        }
+        assert_eq!(threads.len(), 33, "vercel/next.js #98469's thread count");
+
+        let v = node_with_threads(json!(threads));
+        assert_eq!(
+            map_search(&v)[0].unresolved_threads,
+            9,
+            "all nine unresolved threads are counted, including the ones past the 20th"
+        );
+    }
+
     #[test]
     fn counts_only_open_conversations() {
         let v = node_with_threads(json!([
