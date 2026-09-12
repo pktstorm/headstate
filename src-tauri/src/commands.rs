@@ -2961,7 +2961,8 @@ pub async fn stats_series(
     // charts and must not share a row.
     let viewer = client
         .fetch_viewer_metered(&budget)
-        .await.map_err(|e| e.to_string())?;
+        .await
+        .map_err(|e| e.to_string())?;
     let key = crate::store::stats::key(crate::store::stats::Kind::Series, &q.cache_key(&viewer));
     let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
     note_stats_viewer(&conn, &viewer);
