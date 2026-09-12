@@ -38,6 +38,16 @@ vi.mock("./api/hooks", () => ({
   useUpdateRunResume: () => undefined,
   usePollInterval: () => ({ seconds: 120, set: () => Promise.resolve(120) }),
   useWorktreeDirs: () => ({ dirs: [], set: () => Promise.resolve([]) }),
+  // The five stats queries (#863 put PR Stats on the phone). Idle rather
+  // than populated: these are lazy by design and do not run until the
+  // view is opened, so an idle shape is what the page actually renders
+  // on arrival. A populated mock here would assert a loaded page that
+  // the real app reaches only after six round trips to the desktop.
+  useStatsTree: () => ({ data: undefined, isLoading: false, isSuccess: false }),
+  useStatsBoard: () => ({ data: undefined, isLoading: false, isSuccess: false }),
+  useStatsSeries: () => ({ data: undefined, isLoading: false, isSuccess: false }),
+  useStatsReviewers: () => ({ data: undefined, isLoading: false, isSuccess: false }),
+  useScopedCounts: () => ({ data: undefined, isLoading: false, isSuccess: false }),
   useNotifyPrefs: () => ({
     prefs: { enabled: true, ci_failed: true, conflicted: true },
     set: () => Promise.resolve(),
@@ -240,40 +250,43 @@ describe("Stats on the companion build", () => {
     vi.unstubAllEnvs();
   });
 
-  /// The deliberate mobile classification from #794: PR Stats stays off
-  /// the phone. It was never offered there, and promoting it from `panel`
-  /// to `View` is a move between desktop surfaces, not a decision to ship
-  /// it. `MOBILE_HIDDEN_VIEWS` is where that is recorded; this asserts
-  /// the switcher honours it.
-  it("offers no PR Stats entry in the view switcher", async () => {
+  /// #863 ships PR Stats to the companion, reversing #794's
+  /// classification. These four tests are the inverted form of the four
+  /// that pinned the hiding; they are kept as a group so a future change
+  /// of heart has one place to look.
+  ///
+  /// The entry must be in the MENU, not merely reachable by a stored
+  /// value: a page you cannot navigate to is not shipped.
+  it("offers a PR Stats entry in the view switcher", async () => {
     stubViewport(390);
     await renderMobileApp();
     fireEvent.click(screen.getByRole("button", { name: /open navigation/i }));
     await waitFor(() => expect(screen.getByRole("navigation")).toBeTruthy());
     const nav = within(screen.getByRole("navigation"));
-    // Open the switcher: the entry must be absent from the MENU, not
-    // merely absent from a collapsed control that lists one view.
     fireEvent.click(nav.getByRole("button", { name: /my pull requests/i }));
-    expect(nav.queryByText("PR Stats")).toBeNull();
-    // A view the phone DOES have, so this proves the menu rendered.
+    expect(nav.getByRole("menuitem", { name: /pr stats/i })).toBeTruthy();
+    // A view the phone already had, so this proves the menu rendered
+    // rather than that every query matches.
     expect(nav.getByRole("menuitem", { name: /worktrees/i })).toBeTruthy();
   });
 
-  it("shows the list rather than PR Stats even when that was the stored view", async () => {
-    // `view` persists across launches exactly as `panel` did, so a
-    // desktop that closed on PR Stats must not open a companion on a page
-    // it does not have -- and with the entry hidden there would be no
-    // switcher row to leave it by.
+  /// The case that motivated #863: a desktop closed on PR Stats, and the
+  /// phone picks up the same persisted `view`. It now opens ON that page
+  /// instead of silently showing the list.
+  it("opens on PR Stats when that was the stored view", async () => {
     useFilters.setState({ view: "pr-stats" } as never);
     stubViewport(390);
     await renderMobileApp();
-    expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Pull requests");
-    expect(screen.getByText(/^\d+ Open$/)).toBeTruthy();
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("PR Stats"),
+    );
   });
 
-  /// The stored value is NOT corrected, only declined. The phone and the
-  /// desktop can share a persisted store, so writing "my-prs" back would
-  /// silently move the desktop off PR Stats too.
+  /// Unchanged by #863, and still worth asserting: nothing rewrites the
+  /// persisted value. It passed when the phone DECLINED the stored view
+  /// and it passes now that the phone honours it -- which is the point,
+  /// because the phone and desktop can share a store and a write here
+  /// would move the desktop too.
   it("leaves the stored view alone rather than rewriting it", async () => {
     useFilters.setState({ view: "pr-stats" } as never);
     stubViewport(390);
@@ -281,11 +294,10 @@ describe("Stats on the companion build", () => {
     expect(useFilters.getState().view).toBe("pr-stats");
   });
 
-  /// The consequence of declining rather than correcting: two components
-  /// route on `view`, and both must apply the same fallback. `App` renders
-  /// the PR list; if `ViewSwitcher` read the raw stored value its collapsed
-  /// button would say "PR Stats" above that list, naming a page not on
-  /// screen.
+  /// Two components route on `view` and must agree. The old hazard was a
+  /// collapsed button reading "PR Stats" above a PR list; the new one is
+  /// the mirror image -- a button still reading "My pull requests" above
+  /// the Stats page. One set read by both is what rules out each.
   it("names the page it is actually showing in the switcher", async () => {
     useFilters.setState({ view: "pr-stats" } as never);
     stubViewport(390);
@@ -293,8 +305,7 @@ describe("Stats on the companion build", () => {
     fireEvent.click(screen.getByRole("button", { name: /open navigation/i }));
     await waitFor(() => expect(screen.getByRole("navigation")).toBeTruthy());
     const nav = within(screen.getByRole("navigation"));
-    expect(nav.getByRole("button", { name: /my pull requests/i })).toBeTruthy();
-    expect(nav.queryByText("PR Stats")).toBeNull();
+    expect(nav.getByRole("button", { name: /pr stats/i })).toBeTruthy();
   });
 
   it("keeps PR Stats on a narrow DESKTOP window", async () => {

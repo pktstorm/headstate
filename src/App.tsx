@@ -97,13 +97,20 @@ import { MOBILE_HIDDEN_VIEWS, useActiveFilters, useFilters } from "./store/filte
 ///
 /// # The phone gets more out of this than the desktop
 ///
-/// `pr-stats` is in `MOBILE_HIDDEN_VIEWS` (`store/filters.ts`), so the
-/// companion has no way to reach the Stats route at all -- which means the
-/// 382 kB StatsPage chunk, recharts included, is never fetched there
-/// rather than merely fetched late. Before the split that code was in the
-/// one chunk every phone launch parsed, for a view the phone does not
-/// ship. System Health is NOT hidden, so its chunk is still reachable on
-/// a phone; it is 51 kB and carries no charting library, per the
+/// Before #838 the StatsPage code sat in the one chunk every phone launch
+/// parsed. It is now behind the route boundary, so a phone fetches the
+/// 382 kB chunk -- recharts included -- only when the user opens Stats,
+/// and a launch that never goes there never pays for it.
+///
+/// This paragraph said something stronger until #863: that the companion
+/// could not reach the Stats route AT ALL, so the chunk was never fetched
+/// rather than merely fetched late. That followed from `pr-stats` being in
+/// `MOBILE_HIDDEN_VIEWS`, and #863 emptied that set. The split is what
+/// makes shipping Stats to the phone cheap -- on-demand instead of on the
+/// launch path -- but "never fetched" is no longer true, and the deferral
+/// now matters MORE on the phone than it did when it was a guarantee.
+///
+/// System Health is 51 kB and carries no charting library, per the
 /// correction above.
 ///
 /// Verified on the mobile build rather than assumed: `VITE_TARGET=mobile
