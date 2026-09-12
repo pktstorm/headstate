@@ -1873,6 +1873,81 @@ mod tests {
     /// `mergeStateStatus`, which GitHub computes per pull request
     /// synchronously: measured at ~154ms each against a ~0.7s baseline
     /// for the whole search. At 25 the query lands inside the timeout.
+    /// No mock in this file may select `rateLimit` (#875).
+    ///
+    /// # What this is actually protecting
+    ///
+    /// `fetch_prs_with_total` calls `budget::note_remaining` at the top of
+    /// this file, which stores to the PROCESS-WIDE `OBSERVED_REMAINING`.
+    /// `budget.rs` serialises every test that touches that static behind
+    /// `observed_test_lock()`, and #874's invariant enforces the rule --
+    /// for SYNC tests. The async tests here structurally cannot comply:
+    /// the lock returns a `std::sync::MutexGuard`, and clippy's
+    /// `await_holding_lock` under `-D warnings` refuses to let one be held
+    /// across an `.await`. Adding the lock does not race; it fails the
+    /// build, measured at five errors while #874 was being written.
+    ///
+    /// So these tests are safe today for ONE reason only: the branch that
+    /// calls `note_remaining` is gated on `map_rate_limit` returning
+    /// `Some`, which needs `rateLimit.remaining` to be a number, and no
+    /// mock response in this file supplies one. That is an accident of the
+    /// fixtures, not a design -- and it is one line from untrue. A mock
+    /// gaining a `rateLimit` field for any unrelated reason silently arms
+    /// a cross-test race that nothing would report, because the resulting
+    /// flake would surface in `budget.rs` rather than here.
+    ///
+    /// #868 was exactly this shape: a rule written down, code correct by
+    /// accident, and a flake in another file when the accident ended. This
+    /// converts the accident into a checked fact so the arming is what
+    /// fails, loudly, in the file that caused it.
+    ///
+    /// Asserting the ABSENCE of a field rather than adding the lock,
+    /// deliberately: the lock is unavailable here for a reason that is not
+    /// this test's to fix. #875 records the async-lock options, and if one
+    /// is ever adopted this assertion is what should be deleted, in that
+    /// change, on purpose.
+    #[test]
+    fn no_mock_here_arms_the_process_wide_budget_race() {
+        let src = include_str!("client.rs");
+        // The test module only -- a `rateLimit` selection in a real
+        // document above is the whole point of the feature and must not
+        // trip this.
+        let tests = src.split_once("mod tests {").expect("the test module").1;
+        // Stop before this function's own body. It necessarily contains
+        // the field name -- in the scan, in the message -- and a guard
+        // that reports itself reports nothing useful. Anchored on the fn
+        // name rather than a line number so moving the test does not
+        // silently turn the scan into a no-op over the whole module.
+        let needle = concat!("fn ", "no_mock_here_arms_the_process_wide_budget_race");
+        let scanned = tests.split_once(needle).map_or(tests, |(before, _)| before);
+        assert!(
+            scanned.len() < tests.len(),
+            "the scan must stop at this test; if it was renamed, update `needle`"
+        );
+        let offenders: Vec<&str> = scanned
+            .lines()
+            .filter(|l| l.contains("rate") && l.contains("Limit"))
+            // A doc comment explaining the hazard is not the hazard. This
+            // exclusion is narrow on purpose: #874's own sabotage proof
+            // showed a comment standing in for code is the trap these
+            // source-reading guards fall into, so only `///` and `//`
+            // lines are skipped, never a line with code on it.
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("///") && !t.starts_with("//")
+            })
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "a mock here now selects `rateLimit`, which arms the \
+             OBSERVED_REMAINING race these async tests cannot lock against \
+             (#875). Either drop the field from the mock, or adopt an async \
+             form of `observed_test_lock` and delete this assertion \
+             deliberately. Offending lines:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     #[tokio::test]
     async fn the_first_page_is_small_enough_to_answer() {
         let server = MockServer::start().await;
