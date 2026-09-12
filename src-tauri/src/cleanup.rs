@@ -231,6 +231,18 @@ pub fn record(conn: &Connection, entries: &[LedgerEntry]) {
 /// table's own physical order, and a `LIMIT`ed scan from the end of it
 /// needs no index at all.
 ///
+/// The two orderings are therefore not identical -- [`recent`] reads
+/// `ORDER BY at DESC, id DESC`, putting `at` first. They agree whenever
+/// `at` is monotonic, which is every normal run. If a clock moved
+/// backwards they could disagree: a row with a later `id` but an earlier
+/// `at` is kept here while sorting late there. That cannot cost a
+/// displayable row at these numbers -- the trim keeps 2,000 and the read
+/// asks for 200, so the disagreement would have to span ten times the
+/// read limit to reach the boundary -- and the alternative, trimming by
+/// `at`, would hand the decision to the same untrusted clock rather than
+/// to insert order. Recorded rather than fixed, because the fix would be
+/// the worse of the two.
+///
 /// Failure is logged and swallowed for the same reason the insert's is:
 /// a ledger that cannot be trimmed is a table that grows, which is
 /// strictly better than a cleanup pass that fails.
