@@ -65,6 +65,12 @@ MARK_FILE = pathlib.Path(".github/mobile-build-high-water-mark")
 # before the extension so a version containing the word cannot match.
 ASSET_BUILD = re.compile(r"-build(\d+)\.(?:ipa|aab)$")
 
+# How many of the newest mobile releases to fetch assets for. The answer
+# wanted is a MAX and `gh release list` is newest-first, so the newest
+# release almost always carries it; the extras cover a re-tag publishing
+# out of build order.
+PROBE = 5
+
 # Matches mobile-release.yml's own parser, which is the contract: strip
 # comment lines, then strip all whitespace. Kept deliberately identical
 # so this guard cannot accept a file Preflight would reject.
@@ -112,8 +118,15 @@ def shipped_builds() -> tuple[dict[str, int], str | None]:
     if not tags:
         return {}, "no mobile-v releases are published"
 
+    # `gh release list` is newest-first, and the answer wanted is a MAX,
+    # so only the newest few need their assets fetched -- one `gh release
+    # view` per release would otherwise grow without bound (81 releases
+    # already, 9 of them mobile). PROBE is comfortably more than the
+    # number of mobile releases that could be published out of build
+    # order by a re-tag, and the floor below catches it being too small
+    # rather than letting a short read pass as an answer.
     builds: dict[str, int] = {}
-    for tag in tags:
+    for tag in tags[:PROBE]:
         try:
             assets = json.loads(subprocess.run(
                 ["gh", "release", "view", tag, "--json", "assets"],
@@ -129,8 +142,8 @@ def shipped_builds() -> tuple[dict[str, int], str | None]:
 
     if not builds:
         return {}, (
-            f"none of the {len(tags)} mobile-v releases carry a "
-            "`-build<N>` asset"
+            f"none of the newest {len(tags[:PROBE])} mobile-v releases "
+            f"carry a `-build<N>` asset (of {len(tags)} published)"
         )
     return builds, None
 
