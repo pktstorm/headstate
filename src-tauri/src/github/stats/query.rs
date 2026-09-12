@@ -520,16 +520,148 @@ mod tests {
         );
     }
 
+    /// Every document in this file, so a new one cannot be added without
+    /// reaching the guards below.
+    ///
+    /// `series_query` was missing from BOTH `every_document_meters_itself`
+    /// and `documents_are_balanced` (#847's table), which is what this
+    /// function is for: the two guards now iterate one list, so a document
+    /// added to this module is either in that list or conspicuously absent
+    /// from it. Named rather than derived -- a `pub fn` in this file is not
+    /// necessarily a document builder (`slice_alias` and `day_aliases` are
+    /// not), so scanning for `pub fn` would assert against the wrong things.
+    fn every_document() -> Vec<(&'static str, String)> {
+        let window = Slice::new("2026-08-12", "2026-09-10");
+        let logins = ["a".to_string(), "b".to_string(), "c".to_string()];
+        let days = ["2026-09-08".to_string(), "2026-09-09".to_string()];
+        vec![
+            ("probe_query", probe_query(&q(), &slices(3), 0)),
+            (
+                "slice_detail_query",
+                slice_detail_query(&q(), &slices(3), 0, 100),
+            ),
+            ("series_query", series_query(&q(), &days, 0)),
+            ("reviewer_query", reviewer_query(&q(), &logins, &window, 0)),
+            ("REPO_CONNECTION_QUERY", REPO_CONNECTION_QUERY.to_string()),
+        ]
+    }
+
     /// Every document in this file selects `rateLimit`, so its cost is
     /// readable. A query that forgot it would have its spend counted as
     /// `unmetered` rather than guessed -- honest, but it would make the
     /// reported total a floor for no reason.
+    ///
+    /// Iterates [`every_document`] rather than listing three by hand, which
+    /// is how `series_query` came to be absent from it (#847).
     #[test]
     fn every_document_meters_itself() {
-        assert!(probe_query(&q(), &slices(2), 0).contains("rateLimit { cost remaining resetAt }"));
-        assert!(slice_detail_query(&q(), &slices(2), 0, 100)
-            .contains("rateLimit { cost remaining resetAt }"));
-        assert!(REPO_CONNECTION_QUERY.contains("rateLimit { cost remaining resetAt }"));
+        for (name, doc) in every_document() {
+            assert!(
+                doc.contains("rateLimit { cost remaining resetAt }"),
+                "{name} does not select rateLimit; its cost cannot be read"
+            );
+        }
+    }
+
+    /// Every field the board's mapper READS, taken from the mapper's own
+    /// source -- the same derivation `query.rs`'s `fields_read_by` performs,
+    /// applied to the document on this side of the module boundary.
+    ///
+    /// `Board::from_alias_map` (`board.rs:459`) indexes `serde_json::Value`
+    /// by string literal, so every field it reads appears in its body as
+    /// `["name"]`. Deriving the list means a field added to the mapper
+    /// demands its place in the document on the next `cargo test`, with
+    /// nothing for a reviewer to remember -- which is the failure mode
+    /// #842's poll guard and #844's metering guard both document.
+    ///
+    /// This SUBSUMES `board.rs:1521`'s hand-written
+    /// `the_detail_document_carries_pull_request_identity` for the four
+    /// identity fields and extends it to every other field the mapper reads.
+    /// That test stays: it also asserts the NEGATIVE (`!contains
+    /// "repository("`), which a read-set derivation cannot express, and its
+    /// four names are the ones whose absence is silent rather than zero.
+    #[test]
+    fn the_detail_document_carries_every_field_the_board_reads() {
+        let src = include_str!("board.rs");
+        let anchor = "pub fn from_alias_map(";
+        let from = src
+            .find(anchor)
+            .expect("from_alias_map not found in board.rs");
+        // To the end of the impl block's next method, so only this mapper's
+        // reads are collected. `query.rs:796-816` scopes the same way and
+        // for the same reason: a test that reads the wrong region reports a
+        // defect at a location that does not have one.
+        let body = &src[from..];
+        let end = ["\n    fn ", "\n    pub fn ", "\n#[cfg(test)]"]
+            .iter()
+            .filter_map(|m| body[1..].find(m).map(|i| i + 1))
+            .min()
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        let doc = slice_detail_query(&q(), &slices(1), 0, 50);
+        let mut found = 0usize;
+        let mut rest = body;
+        while let Some(i) = rest.find("[\"") {
+            rest = &rest[i + 2..];
+            let Some(j) = rest.find('"') else { break };
+            let name = &rest[..j];
+            if rest[j..].starts_with("\"]")
+                && !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                found += 1;
+                assert!(
+                    doc.contains(name),
+                    "Board::from_alias_map reads `{name}` and slice_detail_query does \
+                     not select it; the mapper defaults it, so a missing field renders \
+                     as a measurement rather than as a gap"
+                );
+            }
+            rest = &rest[j..];
+        }
+        assert!(
+            found >= 10,
+            "only {found} field reads found in from_alias_map -- the scan is broken, \
+             not the document"
+        );
+    }
+
+    /// The series document carries what its mapper reads, which is one
+    /// field and two alias families.
+    ///
+    /// `series_inner` (`fetch.rs:816`) reads `v[&m]["issueCount"]` through
+    /// an alias held in a LOCAL, so the derivation above cannot see it:
+    /// only the field name is a literal. Asserted by hand for that reason,
+    /// and the aliases are asserted through `day_aliases` so the document
+    /// and the reader cannot spell them differently -- the failure
+    /// `slice_alias`'s doc describes.
+    #[test]
+    fn the_series_document_carries_what_its_reader_reads() {
+        let days = ["2026-09-08".to_string(), "2026-09-09".to_string()];
+        let doc = series_query(&q(), &days, 7);
+        for i in 0..days.len() {
+            let (m, o) = day_aliases(7 + i);
+            assert!(
+                doc.contains(&format!("{m}: search")),
+                "series_inner reads the `{m}` alias; a document that does not \
+                 build it leaves that day unmeasured"
+            );
+            assert!(doc.contains(&format!("{o}: search")));
+        }
+        assert!(
+            doc.contains("issueCount"),
+            "a count document that selects no count measures nothing"
+        );
+        // COUNT-ONLY is what makes it affordable: MEASURED 2026-09-11, 10
+        // count-only aliases over dense day-slices answered in 1.4-1.5s
+        // where the same 10 carrying 50 nodes each straddled the ~11s
+        // deadline and failed.
+        assert!(
+            !doc.contains("nodes"),
+            "nodes would put the series under the node deadline this \
+             document is sized to avoid"
+        );
     }
 
     /// Alias indices are ABSOLUTE across the load, not per chunk.
@@ -739,24 +871,29 @@ mod tests {
         assert_eq!(doc.matches('{').count(), doc.matches('}').count());
     }
 
-    /// Both documents must be valid GraphQL: balanced braces, one
+    /// EVERY document must be valid GraphQL: balanced braces, one
     /// top-level closing brace, and it closes the document.
+    ///
+    /// Iterates [`every_document`], which is what brought `series_query` in
+    /// -- it was absent from this test and from the metering one, the only
+    /// document in the module missing from both (#847).
+    ///
+    /// `REPO_CONNECTION_QUERY` is skipped: it is a `const` with a leading
+    /// newline rather than a built string, so its braces are balanced but
+    /// the "one bare closing brace on the last line" shape does not apply.
+    /// Its own guard is
+    /// `the_connection_query_orders_by_update_time_and_filters_client_side`.
     #[test]
     fn documents_are_balanced() {
-        for doc in [
-            probe_query(&q(), &slices(3), 0),
-            slice_detail_query(&q(), &slices(3), 0, 100),
-            reviewer_query(
-                &q(),
-                &["a".to_string(), "b".to_string(), "c".to_string()],
-                &Slice::new("2026-08-12", "2026-09-10"),
-                0,
-            ),
-        ] {
+        for (name, doc) in every_document() {
+            if name == "REPO_CONNECTION_QUERY" {
+                assert_eq!(doc.matches('{').count(), doc.matches('}').count());
+                continue;
+            }
             assert_eq!(
                 doc.matches('{').count(),
                 doc.matches('}').count(),
-                "unbalanced braces in: {doc}"
+                "unbalanced braces in {name}: {doc}"
             );
             let bare: Vec<usize> = doc
                 .lines()
