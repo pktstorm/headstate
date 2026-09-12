@@ -367,8 +367,17 @@ pub fn cycle_trend_query(now: DateTime<Utc>) -> String {
 /// Deliberately no file diff and no commit history. Headstate is for
 /// deciding and acting; reviewing code belongs in GitHub or an editor,
 /// and fetching a diff here would cost far more than a point.
+///
+/// `rateLimit` added for #844. It was one of two documents the
+/// hand-written list in `budget::tests::every_stats_query_meters_itself`
+/// never covered, and the derived replacement found it immediately -- which
+/// is the whole argument for deriving the list. RE-MEASURED live 2026-09-11
+/// on this document extracted verbatim (`gh api graphql`, `pktstorm/headstate`
+/// PR 786, 3 runs): **cost 1** in 1.25-1.52s, confirming the figure this
+/// comment already claimed and that the field is free.
 pub const PR_DETAIL_QUERY: &str = r#"
 query($owner: String!, $repo: String!, $number: Int!) {
+  rateLimit { cost remaining resetAt }
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
       id number title url state isDraft body
@@ -532,8 +541,20 @@ query($owner: String!, $repo: String!, $number: Int!) {
 /// threads and labels, none of which change between check pages, so
 /// paging with it would pay for all of that again per page. Named
 /// `ChecksPage` so the follow-up is identifiable in a request log.
+///
+/// `rateLimit` added for #844, alongside `PR_DETAIL_QUERY` and for the same
+/// reason: the derived metering guard found both, where the hand-written
+/// six-name list it replaced covered neither. It matters more here than on
+/// most documents, because this one runs in a LOOP bounded by `MAX_PAGES =
+/// 10` -- so a per-page cost that nothing reads is a spend of up to ten
+/// points per detail view that no total could account for.
+///
+/// MEASURED live 2026-09-11 on this document extracted verbatim (`gh api
+/// graphql`, 3 runs): **cost 1 per page** in 1.08-1.17s, so the field is
+/// free and the loop's worst case is 10 points.
 pub const PR_CHECKS_PAGE_QUERY: &str = r#"
 query ChecksPage($owner: String!, $repo: String!, $number: Int!, $after: String!) {
+  rateLimit { cost remaining resetAt }
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
       commits(last: 1) {
@@ -560,6 +581,44 @@ query ChecksPage($owner: String!, $repo: String!, $number: Int!, $after: String!
     }
   }
 }"#;
+
+/// The authenticated user's login, and what asking cost.
+///
+/// # Why this is a named const and not an inline literal (#844)
+///
+/// It used to be `json!({ "query": "query { viewer { login } }" })` written
+/// inline at `client.rs:889`, and it selected no `rateLimit`. MEASURED live
+/// 2026-09-11 via the `X-Ratelimit-Used` response header, which advances
+/// whether or not the document asks: three consecutive `viewer { login }`
+/// requests moved it 86 -> 87 -> 88, and the same document WITH
+/// `rateLimit { cost }` moved it 88 -> 89. **One point either way** -- so the
+/// request was always costing a point and simply not reporting it, and adding
+/// the field is free.
+///
+/// The consequence was worse than an undercount. `Budget::record` counts a
+/// response with no `rateLimit` as `unmetered`, which is what makes
+/// `Spend::is_exact()` false and a total honest about being a floor -- but
+/// `fetch_viewer` was called BEFORE `Budget::new()` (`commands.rs:2301`,
+/// `:2638`), so it was not recorded at all. `points` and `requests`
+/// understated by one per call while `is_exact()` returned **true**: exactly
+/// what `budget.rs:252-255` forbids -- "the accumulated spend UNDERSTATES the
+/// truth ... A reported total must say so rather than look exact."
+///
+/// Notably `board_projection` already budgeted for it (`commands.rs:2557`,
+/// `// +1 for fetch_viewer.`), so the PROJECTION knew about a request the
+/// ACCOUNTING did not.
+///
+/// Named rather than left inline so
+/// `budget::tests::every_stats_query_meters_itself` can find it: that guard
+/// enumerated six query names by hand and omitted this one, which is the same
+/// list-based blind spot as #842's poll guard. It now derives its list from
+/// this file, and an inline literal would be invisible to that.
+pub const VIEWER_QUERY: &str = r#"
+query {
+  rateLimit { cost remaining resetAt }
+  viewer { login }
+}
+"#;
 
 /// How many pull requests a search matches, and nothing else.
 ///
@@ -742,6 +801,240 @@ mod tests {
         assert!(
             before_nodes.contains("totalCount"),
             "the thread connection must select totalCount, or truncation is silent again"
+        );
+    }
+
+    /// Every field a mapper READS, taken from the mapper's own source.
+    ///
+    /// # Why this is derived rather than a list
+    ///
+    /// #847's fix asks for a shape guard on documents whose mappers feed on
+    /// `json!` literals in their own tests -- a document can drop a field and
+    /// every mapper test still passes, because the literal supplies it. The
+    /// obvious guard is `assert!(doc.contains("issueCount"))` per field, and
+    /// the obvious guard has the failure mode #842's poll guard and #844's
+    /// metering guard both have and both document: a HAND-WRITTEN list of
+    /// names cannot cover the name nobody remembered to add. `poll.rs`'s own
+    /// comment calls that out as its third occurrence.
+    ///
+    /// So the list comes from the mapper. `serde_json::Value` is indexed by
+    /// string literal -- `v["current"]["issueCount"]` -- so every field a
+    /// mapper reads appears in its body as `["name"]`, and scanning the
+    /// source for that pattern yields the read set exactly. Add a field to a
+    /// mapper and the guard demands it in the document on the next `cargo
+    /// test`, with nothing to remember.
+    ///
+    /// # What it cannot see, and why that is acceptable
+    ///
+    /// - A field read through a LOCAL variable rather than a literal index
+    ///   (`v[&alias]`, which `stats/fetch.rs` does for its aliases). Those
+    ///   are alias names rather than schema fields, and the alias guards in
+    ///   `stats/query.rs` cover them.
+    /// - A field read in a HELPER the mapper calls. Helpers are passed
+    ///   explicitly here for that reason -- `check_state` reads `conclusion`
+    ///   and `state`, which `map_detail_checks` never names itself.
+    /// - A name that is a field in one document and a local key in another
+    ///   (`nodes`, `state`). Harmless: a document that selects nodes contains
+    ///   the word, and one that does not has a real gap.
+    ///
+    /// It is a SHAPE guard, not a schema check: it asserts the document
+    /// mentions the field, not that it mentions it in the right place. The
+    /// nesting checks that need precision are written separately below
+    /// (`a_cycle_window_reports_its_true_total_beside_its_nodes`), which is
+    /// the split `stats/query.rs:550` already uses.
+    fn fields_read_by(fns: &[&str]) -> Vec<String> {
+        let src = include_str!("map.rs");
+        let mut out = std::collections::BTreeSet::new();
+        for name in fns {
+            let anchor = format!("fn {name}(");
+            let from = src
+                .find(&anchor)
+                .unwrap_or_else(|| panic!("{name} not found in map.rs -- rename it here too"));
+            let body = &src[from..];
+            // To the next top-level item, so only THIS function's reads are
+            // collected. `every_stats_query_meters_itself` scopes the same
+            // way and for the same reason: a test that reads the wrong
+            // region reports a defect at a location that does not have one.
+            let end = ["\nfn ", "\npub fn ", "\n#[cfg(test)]"]
+                .iter()
+                .filter_map(|m| body[1..].find(m).map(|i| i + 1))
+                .min()
+                .unwrap_or(body.len());
+            let body = &body[..end];
+            // `["name"]` -- serde_json's index-by-literal, which is how
+            // every mapper in this file names a GraphQL field.
+            let mut rest = body;
+            while let Some(i) = rest.find("[\"") {
+                rest = &rest[i + 2..];
+                let Some(j) = rest.find('"') else { break };
+                let name = &rest[..j];
+                if rest[j..].starts_with("\"]")
+                    && !name.is_empty()
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    out.insert(name.to_string());
+                }
+                rest = &rest[j..];
+            }
+        }
+        assert!(
+            !out.is_empty(),
+            "no field reads found -- the scan is broken, not the documents"
+        );
+        out.into_iter().collect()
+    }
+
+    /// Deleting `issueCount` from `cycle_trend_query` turns a SAMPLE into a
+    /// census, and nothing else notices.
+    ///
+    /// `map_cycle_trend` (`map.rs:666-686`) computes
+    /// `sampled: cur_n > cur_len` from `issueCount`, through
+    /// `as_u64().unwrap_or(0)`. Drop the field and `cur_n` is 0, so
+    /// `0 > 100` is false, `sampled` flips to FALSE, and a 100-PR sample of
+    /// a busy week is presented as the complete week -- a median cycle time
+    /// labelled as the week's, computed from an arbitrary 100 of N.
+    ///
+    /// The three mapper tests (`map.rs:1334`, `:1358`, `:1371`) cannot catch
+    /// it: they feed `json!` literals that supply `issueCount` themselves,
+    /// which is exactly the hole
+    /// `the_detail_query_asks_for_every_thread_and_its_true_count` above
+    /// describes for review threads and `stats/query.rs:550` closes for the
+    /// detail slice. This is the same guard for the same property.
+    #[test]
+    fn the_cycle_trend_query_asks_for_every_field_its_mapper_reads() {
+        let q = cycle_trend_query(at("2026-08-20T14:00:00Z"));
+        for f in fields_read_by(&["map_cycle_trend", "median_hours"]) {
+            assert!(
+                q.contains(&f),
+                "map_cycle_trend reads `{f}` and cycle_trend_query does not select it; \
+                 a field the mapper defaults would be silently missing"
+            );
+        }
+    }
+
+    /// And `issueCount` must sit on the SAME connection as the nodes it
+    /// qualifies, per window.
+    ///
+    /// The derived guard above asserts the document mentions `issueCount`; it
+    /// cannot tell `current` from `previous`, so dropping it from ONE window
+    /// would still pass. `sampled` is an OR over both windows, so one window
+    /// losing its count silently halves the check.
+    ///
+    /// The same nesting assertion `stats/query.rs:550`
+    /// (`a_detail_slice_reports_its_true_total_beside_its_nodes`) makes for
+    /// its slices, for the same reason: the count and the node list have to
+    /// describe the same search or the comparison between them means nothing.
+    #[test]
+    fn a_cycle_window_reports_its_true_total_beside_its_nodes() {
+        let q = cycle_trend_query(at("2026-08-20T14:00:00Z"));
+        for window in ["current: search", "previous: search"] {
+            let body = q
+                .split_once(window)
+                .unwrap_or_else(|| panic!("the {window} alias"))
+                .1;
+            let before_nodes = body
+                .split_once("nodes")
+                .unwrap_or_else(|| panic!("{window} nodes"))
+                .0;
+            assert!(
+                before_nodes.contains("issueCount"),
+                "{window} must select issueCount beside its nodes, or a 100-PR \
+                 sample of that window reads as the complete window"
+            );
+        }
+    }
+
+    /// Deleting `pageInfo` from `PR_CHECKS_PAGE_QUERY` stops the cursor loop
+    /// after page 1 while all three of its tests pass.
+    ///
+    /// The loop reads `pageInfo` (`client.rs:822`, `:830`) and the three
+    /// tests that exercise it (`client.rs:2379`, `:2445`, `:2510`) are
+    /// wiremock tests whose RESPONSES are `json!` literals supplying
+    /// `pageInfo` themselves. Their only contact with the document is the
+    /// mock router's `body_string_contains("ChecksPage")` -- an operation
+    /// name chosen to route mocks, not a contract. A PR with 150 checks would
+    /// show 100, which is #790's understated-shortfall bug reintroduced.
+    ///
+    /// Derived from `map_detail_checks` for the node fields, plus the three
+    /// the LOOP reads rather than the mapper: `pageInfo`, `hasNextPage` and
+    /// `endCursor` are read in `client.rs`, and `totalCount` is read by
+    /// `map_detail`'s `checks_total`. Those four are named here because they
+    /// live in a different function in a different file; every per-check
+    /// field comes from the mapper's own source.
+    #[test]
+    fn the_checks_page_query_asks_for_every_field_its_readers_read() {
+        let q = PR_CHECKS_PAGE_QUERY;
+        for f in fields_read_by(&["map_detail_checks", "check_state"]) {
+            assert!(
+                q.contains(&f),
+                "map_detail_checks reads `{f}` and PR_CHECKS_PAGE_QUERY does not \
+                 select it; the merged page would be missing it silently"
+            );
+        }
+        // What the PAGINATION reads, which no mapper names. Without these the
+        // loop stops after one page and the list is short without saying so.
+        for f in ["pageInfo", "hasNextPage", "endCursor"] {
+            assert!(
+                q.contains(f),
+                "the cursor loop at client.rs:822 reads `{f}`; without it \
+                 pagination stops after page 1 and a 150-check PR shows 100"
+            );
+        }
+        // Re-selected per page so the merged total is the LAST page's -- a
+        // rollup that grows mid-pagination would otherwise report a total
+        // from before the growth, understating what is missing.
+        assert!(
+            q.contains("totalCount"),
+            "each page must carry the connection's own total, or a capped \
+             check list cannot say how many it is missing"
+        );
+        // Named so the follow-up is identifiable in a request log, and
+        // because `client.rs`'s own wiremock router matches on it: renaming
+        // the operation would silently stop routing the mocks.
+        assert!(q.contains("query ChecksPage"), "the operation name is read");
+    }
+
+    /// `MERGED_DETAIL_QUERY` had NO text assertion at all (#847's table).
+    ///
+    /// It is the insight-card sample, and every figure on those cards is a
+    /// scalar off a node: drop `additions` and the size distribution reads as
+    /// zeros rather than as missing, because `map_merged_detail` defaults
+    /// each field. Derived from the mapper, so a card added later cannot
+    /// reach a document that does not feed it.
+    #[test]
+    fn the_merged_detail_query_asks_for_every_field_its_mapper_reads() {
+        for f in fields_read_by(&["map_merged_detail"]) {
+            assert!(
+                MERGED_DETAIL_QUERY.contains(&f),
+                "map_merged_detail reads `{f}` and MERGED_DETAIL_QUERY does not \
+                 select it; the card would render a default as a measurement"
+            );
+        }
+    }
+
+    /// `COUNT_QUERY`'s `matching:` alias, pinned against its reader.
+    ///
+    /// `count_reviewing` (`client.rs:554`) reads `v["matching"]["issueCount"]`
+    /// through `unwrap_or(0)`. Rename the alias in the document and the
+    /// sidebar badge reads 0 -- "no pull requests await your review", which
+    /// is a claim rather than a gap, and is indistinguishable from the true
+    /// answer on a quiet day.
+    #[test]
+    fn the_count_query_alias_matches_its_reader() {
+        assert!(
+            COUNT_QUERY.contains("matching: search"),
+            "count_reviewing reads the `matching` alias; renaming it here \
+             makes the sidebar badge read 0 rather than fail"
+        );
+        assert!(COUNT_QUERY.contains("issueCount"));
+        // A COUNT: no nodes, which is the whole reason this document exists
+        // rather than reusing PRS_QUERY. Measured at 1 point and ~0.9s
+        // against 2 points and ~2.3s for the list (`client.rs:545-551`, and
+        // the 2-point figure re-measured live 2026-09-11 for #842).
+        assert!(
+            !COUNT_QUERY.contains("nodes"),
+            "nodes here would resolve the per-PR fields this document exists \
+             to avoid"
         );
     }
 }

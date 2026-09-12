@@ -139,6 +139,124 @@ pub const MEASURED_PROBE_COST: u64 = 1;
 /// that made the board's document narrower than the probe's.
 pub const MEASURED_DETAIL_CHUNK_COST: u64 = 1;
 
+/// The lowest `remaining` ANY request in this process has been told, or
+/// the `u64::MAX` sentinel if none has.
+///
+/// # Why this exists outside `Budget` (#843)
+///
+/// `Budget` is per-load by design -- "the unit that matters to a user is
+/// the CLICK, not the request" -- and that is the right scope for SPEND.
+/// It is the wrong scope for the GATE, and conflating the two is what made
+/// `Budget::permits` structurally unable to refuse: the gate asks "is there
+/// room left in the hour", which is a property of the process and of the
+/// poll loop's standing spend, not of a command that has issued nothing yet.
+///
+/// Two scopes, two homes. A load reports what IT cost; the gate reads what
+/// the HOUR has left.
+///
+/// # Why a static rather than state threaded through Tauri
+///
+/// `Budget::record` is the one function that knows where `rateLimit` sits in
+/// a response, and it is called from inside spawned tasks holding cloned
+/// clients (`fetch.rs`'s `JoinSet`s). Threading a handle to managed state
+/// into each of those is reach the feature does not need, and a gate that
+/// could be constructed WITHOUT the shared figure would be a gate that can
+/// silently go back to always-true -- which is the defect. A static cannot
+/// be forgotten at a call site.
+///
+/// Reset is deliberately absent. GitHub's hourly window rolls over on its
+/// own and the next response reports the higher `remaining`, which
+/// [`note_remaining`] takes because it tracks the LATEST observation rather
+/// than a running minimum -- see its docs for why that differs from
+/// `Budget::lowest_remaining`.
+static OBSERVED_REMAINING: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Record what GitHub said is left, from anywhere in the process.
+///
+/// # LATEST, not lowest -- the opposite of `Budget::lowest_remaining`
+///
+/// `Budget` keeps the lowest figure a LOAD saw, because its requests are
+/// concurrent and "the last response to arrive" is a race, so a refusal
+/// inside one load should rest on the worst thing GitHub said.
+///
+/// This one keeps the latest, and the difference is the hourly window. A
+/// minimum held over the life of the process would latch at whatever the
+/// budget was just before a reset and never recover: the window rolls over,
+/// GitHub reports 5,000 again, and a stale minimum of 120 would refuse
+/// every stats load for the rest of the session. A "remaining" figure is
+/// only meaningful as of when it was read, and the most recent read is the
+/// most meaningful one.
+///
+/// That is safe in the direction that matters because the poll loop is the
+/// most frequent caller -- every 60-120s, unconditionally
+/// (`client.rs:908`) -- so the figure is never stale for long, and the
+/// window itself is an hour.
+pub fn note_remaining(remaining: u64) {
+    OBSERVED_REMAINING.store(remaining, Ordering::Relaxed);
+}
+
+/// The lowest remaining budget anything in this process has been told.
+///
+/// `None` before ANY request anywhere has reported one, which is a genuine
+/// cold start and not the same as zero -- the NULL-not-0 rule
+/// [`Budget::remaining`] states.
+pub fn observed_remaining() -> Option<u64> {
+    match OBSERVED_REMAINING.load(Ordering::Relaxed) {
+        u64::MAX => None,
+        n => Some(n),
+    }
+}
+
+/// One lock for every TEST that touches [`OBSERVED_REMAINING`], directly or
+/// through [`Budget::record`].
+///
+/// # Why this is crate-visible rather than private to this module's tests
+///
+/// `OBSERVED_REMAINING` is process-wide by design, and `cargo test` runs test
+/// functions on a thread pool -- so ANY test in the crate that calls `record`
+/// mutates it, not only the ones in this file. `fetch.rs`'s
+/// `a_wave_is_refused_once_the_budget_is_under_the_reserve` does exactly that,
+/// and without a shared lock it raced this module's cold-start test: an
+/// intermittent failure in one file caused by a test in another, which is the
+/// worst kind to diagnose.
+///
+/// Serialised rather than made injectable per test. An injectable figure is
+/// one a production call site could forget to pass, and that is precisely how
+/// `permits` came to be always-true (#843).
+///
+/// Poison is recovered from rather than propagated: a test that panicked while
+/// holding this lock has already failed, and turning that into a cascade of
+/// unrelated `unwrap` panics in every subsequent test hides the one real
+/// failure.
+#[cfg(test)]
+pub fn observed_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Restores [`OBSERVED_REMAINING`] on drop, so a test that seeds it cannot
+/// leak a figure into whatever runs next.
+///
+/// A guard rather than a line at the end of each test: an early `panic!` from
+/// a failing assertion would skip a manual restore and turn one genuine
+/// failure into a cascade of unrelated ones.
+#[cfg(test)]
+pub struct RestoreObserved(u64);
+
+#[cfg(test)]
+impl RestoreObserved {
+    pub fn capture() -> Self {
+        Self(OBSERVED_REMAINING.load(Ordering::Relaxed))
+    }
+}
+
+#[cfg(test)]
+impl Drop for RestoreObserved {
+    fn drop(&mut self) {
+        OBSERVED_REMAINING.store(self.0, Ordering::Relaxed);
+    }
+}
+
 /// What one scope load spent.
 ///
 /// Cheap to clone: the counters are in an `Arc`, so every concurrent
@@ -204,6 +322,11 @@ impl Budget {
         if let Some(remaining) = rl["remaining"].as_u64() {
             self.lowest_remaining
                 .fetch_min(remaining, Ordering::Relaxed);
+            // And into the process-wide figure the GATE reads, so the next
+            // load's `permits` knows what this one spent. Without this the
+            // only feed is the poll loop, and two stats loads in a row would
+            // both be gated on the figure from before the first (#843).
+            note_remaining(remaining);
         }
         if let Some(reset) = rl["resetAt"].as_str() {
             if let Ok(t) = chrono::DateTime::parse_from_rfc3339(reset) {
@@ -273,13 +396,48 @@ impl Budget {
     /// poll loop keeps working. Item 1 of #824 asks for "refuse, or warn
     /// hard" -- this is the refusal, and [`Spend::pressure`] is the warning.
     ///
-    /// `None` remaining means no response has reported one yet, which is
-    /// the state at the START of the first load of a session. Permitted:
-    /// refusing on the absence of information would make a cold start
-    /// fail, and the first response will supply the real number before
-    /// the load has spent anything meaningful.
+    /// # Why this reads a PROCESS-WIDE figure and not only its own (#843)
+    ///
+    /// This used to be `match self.remaining() { None => true, ... }`, and
+    /// that arm was taken at 4 of 4 gates, in every session, permanently.
+    /// `lowest_remaining` starts at the `u64::MAX` sentinel, so
+    /// `remaining()` is `None` until a response has been recorded -- and
+    /// every gate constructs a fresh `Budget` IMMEDIATELY before checking it
+    /// (`commands.rs:2317`, `:2640`, `:2741`, `:2890`). A brand-new
+    /// accumulator has recorded nothing by construction, so `permits` could
+    /// not refuse. The gates looked like refusals and were unconditional
+    /// approvals.
+    ///
+    /// The old doc defended the `None` arm as "the state at the START of the
+    /// first load of a session", which is sound for a budget that outlives
+    /// its first request. This one does not: it is a per-COMMAND
+    /// accumulator consulted once, before request one. And the arm's stated
+    /// purpose -- "the one case where `remaining` is already near the floor
+    /// because something else spent it" -- names precisely the thing a fresh
+    /// `Budget` cannot know.
+    ///
+    /// So the gate now consults [`observed_remaining`], a process-lifetime
+    /// floor fed by every `rateLimit` this process reads -- including the
+    /// poll loop's (`client.rs:908`), which is the "something else" in
+    /// question and runs every 60-120s whether or not a stats page is open.
+    /// Its own accumulator is still consulted and still wins when it is the
+    /// lower of the two, because a load that has already driven the budget
+    /// down mid-flight is the most current information there is.
+    ///
+    /// `None` from BOTH -- nothing anywhere in the process has seen a
+    /// `rateLimit` yet -- is still permitted, and now means what the old
+    /// comment claimed: a genuine cold start, before the poll loop's first
+    /// tick. Refusing there would fail the first load of a session on the
+    /// absence of information.
     pub fn permits(&self, projected: u64) -> bool {
-        match self.remaining() {
+        // The pessimistic figure: whichever is lower of what this load has
+        // seen and what the process has seen. `min` over two `Option`s via
+        // `chain`, so "one of them knows" is not the same as "neither does".
+        let floor = [self.remaining(), observed_remaining()]
+            .into_iter()
+            .flatten()
+            .min();
+        match floor {
             None => true,
             Some(remaining) => remaining.saturating_sub(projected) >= RESERVE,
         }
@@ -395,14 +553,189 @@ mod tests {
     /// "Nothing reported a remaining figure" and "zero remaining" are
     /// opposite answers. Rendering the first as the second would claim
     /// the budget is gone on a cold start.
+    ///
+    /// # RE-SCOPED, because the old version asserted the defect (#843)
+    ///
+    /// It used to end with `assert!(b.permits(50))` -- "the absence does not
+    /// refuse the first load of a session" -- which pinned the behaviour that
+    /// made `permits` structurally unable to refuse at 4 of 4 gates, in every
+    /// session, permanently. That assertion is why the defect survived
+    /// review: the test said the bug was the intent.
+    ///
+    /// What is GENUINELY about this accumulator, and is kept, is the
+    /// NULL-not-0 rule: a fresh `Budget` has seen nothing, and `None` must
+    /// not render as zero. `permits` is no longer a property of a fresh
+    /// accumulator alone -- it reads the process-wide figure too -- so it is
+    /// tested in `a_seeded_budget_can_actually_refuse` and
+    /// `a_cold_start_is_still_permitted` instead, where the process figure
+    /// can be set deliberately.
     #[test]
     fn no_response_yet_is_not_zero_remaining() {
         let b = Budget::new();
         assert_eq!(b.remaining(), None);
         assert_eq!(b.reset_at(), None);
-        // And the absence does not refuse the first load of a session.
-        assert!(b.permits(50));
+        assert_eq!(b.spent(), 0);
+        assert_eq!(b.requests(), 0);
+        // And a spend of zero requests is exactly metered, not a floor: the
+        // `unmetered` counter is about requests that ANSWERED without a cost,
+        // and there have been none.
+        assert!(b.snapshot().is_exact());
     }
+
+    /// `permits` can refuse in a real session. This is #843's first
+    /// acceptance criterion, and the property the old code could not have.
+    ///
+    /// A FRESH `Budget` is used deliberately -- that is what every gate
+    /// constructs (`commands.rs:2317`, `:2640`, `:2741`, `:2890`) -- with the
+    /// process-wide figure seeded the way the poll loop seeds it
+    /// (`client.rs:908`). Before the fix this took the `None => true` arm and
+    /// returned true for every projection including `u64::MAX`.
+    ///
+    /// Serialised with the other tests that touch `OBSERVED_REMAINING`: it is
+    /// process-wide by design, so two tests mutating it in parallel would
+    /// race. `cargo test` runs test fns on a thread pool, so the lock is
+    /// necessary rather than decorative.
+    #[test]
+    fn a_seeded_budget_can_actually_refuse() {
+        let _g = observed_lock();
+        let restore = RestoreObserved::capture();
+
+        // The poll loop has been running for most of the hour and has spent
+        // the budget down near the reserve. Nothing a stats load did.
+        note_remaining(600);
+        let b = Budget::new();
+        assert_eq!(
+            b.remaining(),
+            None,
+            "the gate's own accumulator has recorded nothing -- that is the point"
+        );
+        assert!(b.permits(100), "600 - 100 = 500, exactly the reserve");
+        assert!(
+            !b.permits(101),
+            "a fresh Budget MUST be able to refuse; this is the whole of #843"
+        );
+        assert!(!b.permits(10_000));
+
+        // And a load already under the reserve refuses everything.
+        note_remaining(499);
+        assert!(!Budget::new().permits(1));
+
+        drop(restore);
+    }
+
+    /// The load's OWN figure still wins when it is the lower of the two.
+    ///
+    /// A load that has driven the budget down mid-flight holds the most
+    /// current information there is, and the process-wide figure may be a
+    /// poll-loop reading from a minute ago. Pessimistic, which is the same
+    /// rule `remaining_is_the_lowest_seen_not_the_last` states one scope down.
+    #[test]
+    fn the_lower_of_the_two_figures_is_what_gates() {
+        let _g = observed_lock();
+        let restore = RestoreObserved::capture();
+
+        // Process says plenty; this load has already spent it down.
+        note_remaining(4_900);
+        let b = Budget::new();
+        b.record(&rl(1, 520, "2026-09-11T16:52:14Z"));
+        assert!(
+            !b.permits(100),
+            "the load's own 520 must gate, not the process-wide 4900"
+        );
+
+        // And the other way round: the load looks fine, the process does not.
+        // `record` feeds the static too, so the process figure is set
+        // explicitly AFTER recording to model a poll tick landing in between.
+        let b = Budget::new();
+        b.record(&rl(1, 4_800, "2026-09-11T16:52:14Z"));
+        note_remaining(520);
+        assert!(
+            !b.permits(100),
+            "the process-wide 520 must gate, not this load's own 4800"
+        );
+
+        drop(restore);
+    }
+
+    /// A genuine cold start is still permitted -- nothing ANYWHERE in the
+    /// process has seen a `rateLimit`, which is the state before the poll
+    /// loop's first tick.
+    ///
+    /// This is the case the old `None => true` arm claimed to be for. It is
+    /// now the only case it covers, rather than all four gates forever.
+    #[test]
+    fn a_cold_start_is_still_permitted() {
+        let _g = observed_lock();
+        let restore = RestoreObserved::capture();
+
+        OBSERVED_REMAINING.store(u64::MAX, Ordering::Relaxed);
+        assert_eq!(observed_remaining(), None);
+        let b = Budget::new();
+        assert!(
+            b.permits(50),
+            "refusing on the absence of information would fail the first load \
+             of a session"
+        );
+        // Even an absurd projection: with no information there is nothing to
+        // refuse it against, and the first response supplies the real number
+        // before the load has spent anything meaningful.
+        assert!(b.permits(u64::MAX));
+
+        drop(restore);
+    }
+
+    /// `note_remaining` keeps the LATEST figure, not a running minimum, so
+    /// the hourly reset recovers.
+    ///
+    /// A process-lifetime minimum would latch at whatever the budget was just
+    /// before the window rolled over and refuse every load for the rest of
+    /// the session -- GitHub reporting 5,000 again would never be believed.
+    /// That is the opposite of `Budget::lowest_remaining`'s rule, and the
+    /// difference is deliberate: one figure is scoped to a set of concurrent
+    /// requests, the other to an hour that ends.
+    #[test]
+    fn the_observed_figure_recovers_after_the_window_rolls_over() {
+        let _g = observed_lock();
+        let restore = RestoreObserved::capture();
+
+        note_remaining(80);
+        assert_eq!(observed_remaining(), Some(80));
+        assert!(!Budget::new().permits(1), "under the reserve, so refused");
+
+        // The hour rolls over and GitHub reports a full budget.
+        note_remaining(HOURLY_BUDGET);
+        assert_eq!(observed_remaining(), Some(HOURLY_BUDGET));
+        assert!(
+            Budget::new().permits(100),
+            "a stale minimum would refuse for the rest of the session"
+        );
+
+        drop(restore);
+    }
+
+    /// Recording a response feeds the process-wide figure, so a second load
+    /// is gated on what the first one spent.
+    ///
+    /// Without this the only feed is the poll loop, and two stats loads back
+    /// to back would both be gated on the figure from before the first.
+    #[test]
+    fn recording_a_response_feeds_the_process_wide_figure() {
+        let _g = observed_lock();
+        let restore = RestoreObserved::capture();
+
+        OBSERVED_REMAINING.store(u64::MAX, Ordering::Relaxed);
+        Budget::new().record(&rl(4, 530, "2026-09-11T16:52:14Z"));
+        assert_eq!(observed_remaining(), Some(530));
+        // A DIFFERENT, fresh accumulator -- the next command's gate.
+        assert!(!Budget::new().permits(100), "530 - 100 < 500");
+
+        drop(restore);
+    }
+
+    /// The lock and the restore guard live at module scope rather than here,
+    /// because tests in OTHER files mutate `OBSERVED_REMAINING` too -- any
+    /// test calling `Budget::record` does. See `observed_test_lock`.
+    use super::{observed_test_lock as observed_lock, RestoreObserved};
 
     /// A query that forgot `rateLimit` must NOT have its cost guessed at
     /// one point. The guess would be indistinguishable from a measurement
@@ -426,23 +759,34 @@ mod tests {
     /// The poll loop must keep working. It is the only part of the app
     /// with a standing obligation, and a leaderboard is never worth
     /// starving it.
+    ///
+    /// Takes `observed_lock` because `record` now feeds the process-wide
+    /// figure as well (#843), so this test MUTATES shared state even though
+    /// it reads only its own accumulator. Without the lock it races the tests
+    /// that seed that figure deliberately.
     #[test]
     fn refuses_a_load_that_would_eat_the_poll_loops_reserve() {
+        let _g = observed_lock();
+        let restore = RestoreObserved::capture();
         let b = Budget::new();
         b.record(&rl(1, 600, "2026-09-11T16:52:14Z"));
         assert!(b.permits(100), "600 - 100 = 500, exactly the reserve");
         assert!(!b.permits(101), "601 would breach it");
         assert!(!b.permits(10_000));
+        drop(restore);
     }
 
     /// A load that has already driven the budget under the reserve
     /// refuses even a single further point.
     #[test]
     fn refuses_everything_once_under_the_reserve() {
+        let _g = observed_lock();
+        let restore = RestoreObserved::capture();
         let b = Budget::new();
         b.record(&rl(1, 499, "2026-09-11T16:52:14Z"));
         assert!(!b.permits(1));
         assert!(!b.permits(0) || RESERVE == 499);
+        drop(restore);
     }
 
     #[test]
@@ -493,62 +837,182 @@ mod tests {
         assert_eq!(RESERVE, 500);
     }
 
-    /// Item 1 of #824: `rateLimit` on EVERY stats query, not three of
-    /// seven. Asserted on the query source, because no mapper test can
-    /// tell the difference -- they feed JSON literals and pass happily
-    /// against a document that never asked for the field. This is the
-    /// same reasoning `query.rs`'s own
+    /// Every document in both query files, DERIVED from the files rather
+    /// than named.
+    ///
+    /// # Why derivation matters here (#844)
+    ///
+    /// This guard used to enumerate six names by hand -- and it omitted
+    /// `fetch_viewer`'s document, which was an inline string literal in
+    /// `client.rs` selecting no `rateLimit` at all. That is the same
+    /// list-based blind spot as #842's poll cost guard and #847's missing
+    /// shape guards: a hand-written list cannot cover the document nobody
+    /// remembered to add to it, and all three defects were exactly that.
+    ///
+    /// So the list comes from the source. A document in this app is either
+    /// a `pub const <NAME>_QUERY` or a `pub fn <name>_query`, both of which
+    /// are greppable and neither of which a new document can avoid being
+    /// while staying reachable from a caller. `VIEWER_QUERY` is now one
+    /// (promoted out of the inline literal for this reason), so it is covered
+    /// without being named.
+    ///
+    /// # What counts as a document
+    ///
+    /// Any `pub const` or `pub fn` whose name CONTAINS `query` / `QUERY`,
+    /// rather than one that ends in it. Ends-with was tried first and was too
+    /// narrow by exactly the amount that matters: it matched `history_query`
+    /// but not `history_query_range`, `history_query_with_periods` or
+    /// `history_query_range_with_periods` -- three of the four builders in
+    /// that family, including the one that actually writes the document. A
+    /// pattern that covers the delegator and misses the delegate is worse than
+    /// no pattern, because it looks like coverage.
+    ///
+    /// Contains-`query` admits a few non-documents, which is the right
+    /// direction to be wrong in: a false positive is a test failure somebody
+    /// reads, and a false negative is a document nobody checks. The
+    /// delegation exemption below is what keeps the false positives quiet
+    /// without silencing anything real.
+    ///
+    /// Returns `(file, name, body)` per document, the body scoped to the next
+    /// top-level item so the field has to be inside THIS document rather than
+    /// merely somewhere in a file that has many -- the scoping rule an earlier
+    /// version of this test got wrong by anchoring on the first mention of a
+    /// name rather than on its definition, then reading the wrong region and
+    /// reporting a defect at a location that did not have one.
+    fn every_query_document() -> Vec<(&'static str, String, String)> {
+        let files = [
+            ("query.rs", include_str!("../query.rs")),
+            ("stats/query.rs", include_str!("query.rs")),
+        ];
+        let mut out = Vec::new();
+        for (file, src) in files {
+            for kind in ["pub const ", "pub fn "] {
+                let mut at = 0usize;
+                while let Some(i) = src[at..].find(kind) {
+                    let start = at + i;
+                    at = start + kind.len();
+                    // The identifier that follows the keyword.
+                    let rest = &src[at..];
+                    let end_name = rest
+                        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .unwrap_or(rest.len());
+                    let name = &rest[..end_name];
+                    if !(name.contains("query") || name.contains("QUERY")) {
+                        continue;
+                    }
+                    // To the next top-level item. `\npub ` rather than
+                    // `\npub fn `, so a `pub const` following a `pub fn`
+                    // terminates the body too.
+                    let body = &src[start..];
+                    let end = body[1..].find("\npub ").map_or(body.len(), |j| j + 1);
+                    out.push((file, name.to_string(), body[..end].to_string()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Item 1 of #824: `rateLimit` on EVERY query document, derived rather
+    /// than enumerated (#844).
+    ///
+    /// Asserted on the query source, because no mapper test can tell the
+    /// difference -- they feed JSON literals and pass happily against a
+    /// document that never asked for the field. This is the same reasoning
+    /// `query.rs`'s own
     /// `the_detail_query_asks_for_every_thread_and_its_true_count` gives.
+    ///
+    /// A document with no `rateLimit` has its spend counted as `unmetered`
+    /// rather than guessed, which is honest -- but it makes the reported total
+    /// a FLOOR for no reason, and in `fetch_viewer`'s case the request was not
+    /// recorded at all, so `points` understated while `is_exact()` still
+    /// returned true. That is what `budget.rs:252-255` forbids.
     #[test]
     fn every_stats_query_meters_itself() {
-        let src = include_str!("../query.rs");
-        // ALL FOUR that #824 names as missing it, not just the const.
-        // `STATS_QUERY` is a document; the other three BUILD documents,
-        // and each was hardcoded `author:@me` with no `rateLimit` -- so
-        // each had to be changed, and each can be changed back.
+        let docs = every_query_document();
+        // The scan is asserted to have FOUND something, so a rename that
+        // breaks the pattern fails loudly rather than passing vacuously over
+        // an empty list -- which is how a derived guard dies quietly.
+        assert!(
+            docs.len() >= 10,
+            "only {} query documents found; the scan is broken, not the \
+             documents",
+            docs.len()
+        );
+        // Builders that DELEGATE: their whole body is a call to another
+        // document builder, so the field is selected one level down and
+        // asserting on their own text would be asserting on a forwarding
+        // line. Checked by looking for a call to another `_query` in the body
+        // rather than by naming them, so a new delegator is covered and a
+        // delegator that grows a document of its own stops being exempt.
         //
-        // Scoped to the text between this name and the next top-level
-        // `pub`, so the field has to be inside the right document rather
-        // than merely somewhere in a file that has many.
-        // Anchored on the DEFINITION, not the first mention of the name.
-        // An earlier version searched for the bare name and found
-        // `history_query_range`'s call site inside `history_query` three
-        // lines above the function, then scanned the wrong body and
-        // failed on a document that does select the field. A test that
-        // reads the wrong region is worse than none: it reports a defect
-        // at a location that does not have one.
-        for (name, anchor) in [
-            ("STATS_QUERY", "pub const STATS_QUERY"),
-            ("history_query_range", "pub fn history_query_range("),
-            ("periods_query", "pub fn periods_query("),
-            ("cycle_trend_query", "pub fn cycle_trend_query("),
-        ] {
-            let from = src
-                .find(anchor)
-                .unwrap_or_else(|| panic!("{name} definition not found in query.rs"));
-            let body = &src[from..];
-            // To the next top-level item, so the field has to be inside
-            // THIS document rather than merely somewhere below it.
-            let end = body[anchor.len()..]
-                .find("\npub ")
-                .map_or(body.len(), |i| i + anchor.len());
+        // This is the derivation's real limitation and it is stated rather
+        // than papered over: the scan reads TEXT, so it cannot follow a call.
+        // What it can do is tell a forwarding body from a document body,
+        // which is enough -- a delegator that does not forward has a
+        // document, and a document must meter itself.
+        let names: Vec<&str> = docs.iter().map(|(_, n, _)| n.as_str()).collect();
+        for (file, name, body) in &docs {
+            if body.contains("rateLimit") {
+                continue;
+            }
+            // The body after the signature, so the function's OWN name does
+            // not count as a call to itself.
+            let after_sig = body.split_once(')').map_or("", |(_, r)| r);
+            let delegates_to = names
+                .iter()
+                .find(|other| **other != name.as_str() && after_sig.contains(&format!("{other}(")));
             assert!(
-                body[..end].contains("rateLimit"),
-                "{name} does not select rateLimit; its cost cannot be read"
+                delegates_to.is_some(),
+                "{file}'s {name} does not select rateLimit and does not delegate \
+                 to a document that does, so its cost cannot be read. Either add \
+                 `rateLimit {{ cost remaining resetAt }}` -- MEASURED free on \
+                 every document in this app, including the viewer lookup \
+                 (`query::VIEWER_QUERY`), the detail query and the checks page \
+                 -- or record here why this one cannot."
             );
         }
-        // And the builders in this module's own query file.
-        let stats = include_str!("query.rs");
-        for name in ["probe_query", "slice_detail_query"] {
-            let from = stats
-                .find(&format!("pub fn {name}"))
-                .unwrap_or_else(|| panic!("{name} not found"));
-            let body = &stats[from..];
-            let end = body[1..].find("\npub fn ").map_or(body.len(), |i| i + 1);
-            assert!(
-                body[..end].contains("rateLimit"),
-                "{name} must select rateLimit so its cost can be read"
-            );
-        }
+        // `VIEWER_QUERY` specifically, by name, because its ABSENCE from the
+        // derived list is the failure this guard could not previously see: it
+        // was an inline literal in `client.rs` and matched no pattern at all.
+        // If someone inlines it again, the derived scan would silently stop
+        // covering it and this is what says so.
+        assert!(
+            docs.iter().any(|(_, n, _)| n == "VIEWER_QUERY"),
+            "VIEWER_QUERY is not a named document any more -- inlining it back \
+             into client.rs puts it outside every guard in this file, which is \
+             exactly how it came to be unmetered (#844)"
+        );
+    }
+
+    /// `fetch_viewer`'s point is RECORDED, not merely askable.
+    ///
+    /// Selecting `rateLimit` is half the fix; the other half is that somebody
+    /// calls `record`. The defect was both: the document did not ask, and the
+    /// call happened before `Budget::new()` so there was nothing to ask on
+    /// behalf of. A stats command calling plain `fetch_viewer` instead of
+    /// `fetch_viewer_metered` would reintroduce the second half while the
+    /// guard above still passed.
+    #[test]
+    fn the_stats_commands_meter_their_viewer_lookup() {
+        let src = include_str!("../../commands.rs");
+        // The stats commands, which are the ones inside a budgeted load.
+        // `get_viewer`, the remote gate and startup have no accumulator to
+        // report into and are outside this file.
+        let stats_region = src
+            .find("pub async fn stats_count")
+            .expect("stats_count not found in commands.rs");
+        let region = &src[stats_region..];
+        let plain = region.matches("fetch_viewer()").count();
+        assert_eq!(
+            plain, 0,
+            "{plain} stats command(s) call plain `fetch_viewer()`, which spends \
+             a rate-limit point outside any accumulator -- `Spend.points` would \
+             understate by one while `is_exact()` returned true (#844). Use \
+             `fetch_viewer_metered(&budget)`."
+        );
+        assert!(
+            region.matches("fetch_viewer_metered(&budget)").count() >= 2,
+            "both stats commands that resolve the viewer must meter it"
+        );
     }
 }

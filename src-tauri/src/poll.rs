@@ -17,21 +17,51 @@ use tokio::sync::Notify;
 /// Default focused cadence, in seconds.
 ///
 /// Two minutes rather than one: PR state rarely changes minute-to-minute,
-/// and the shipped query costs 6 rate-limit points, so halving the rate
-/// halves the spend for no practical loss of freshness.
+/// and a tick costs 4 rate-limit points, so halving the rate halves the
+/// spend for no practical loss of freshness.
+///
+/// At 120s that is 30 ticks/hour x 4 = **120 points/hour** of 5,000.
+///
+/// The cost figure is per TICK, which is two searches -- see
+/// `MIN_FOCUSED_SECS` for the measurement and for what the "6 points"
+/// these comments used to quote actually described.
 pub const DEFAULT_FOCUSED_SECS: u64 = 120;
 
 /// Floor on the configured interval.
 ///
-/// 60s, not 30: the shipped query costs 6 rate-limit points, so a 30s
-/// cadence would spend 720/hour and a 60s one spends 360. Both are
-/// survivable against a 5000/hour budget, but the app should not be able
-/// to consume a seventh of the user's own `gh` allowance on a setting they
-/// picked without knowing the cost.
+/// # What a tick costs, measured
 ///
-/// The budget test asserts against THIS value rather than the default, so
-/// a user choosing the fastest allowed setting still cannot blow through
-/// the guard.
+/// 4 rate-limit points, not the 6 these comments claimed (#842, #844).
+/// Both numbers were wrong in both directions and for the same reason: 6
+/// was measured on a document carrying TWO search aliases, which
+/// `PRS_QUERY`'s own doc records was split into one search per request --
+/// and nothing re-measured afterwards. Meanwhile the tick grew a SECOND
+/// request, so reasoning from one fetch understated it by half.
+///
+/// MEASURED live 2026-09-11, `gh api graphql -F first=25`, the document
+/// extracted verbatim from `PRS_QUERY` with its `#` comment lines
+/// stripped, 3 runs per row:
+///
+/// | Search (`poll.rs` line)                     | Cost | Wall clock  |
+/// |---------------------------------------------|------|-------------|
+/// | `is:pr is:open author:@me` (`:835`)         | 2    | 2.31-2.56s  |
+/// | `is:pr is:open review-requested:@me` (`:851`)| 2   | 0.84-0.99s  |
+///
+/// = **4 points per tick** when the ready-to-review notification is on,
+/// which is the default. The second search is skipped when it is off, so
+/// 2 is the floor and 4 is what to budget for.
+///
+/// # Why 60s and not 30
+///
+/// At 60s that is 60 ticks/hour x 4 = **240 points/hour**; at 30s it
+/// would be 480. Both survive a 5,000/hour budget, but the app should not
+/// be able to consume a tenth of the user's own `gh` allowance on a
+/// setting they picked without knowing the cost.
+///
+/// `both_cadences_stay_well_inside_the_rate_limit` asserts against THIS
+/// value rather than the default, so a user choosing the fastest allowed
+/// setting still cannot blow through the guard -- and it now reasons from
+/// the measured 4 rather than from a count of connection names.
 pub const MIN_FOCUSED_SECS: u64 = 60;
 pub const MAX_FOCUSED_SECS: u64 = 3600;
 
@@ -62,10 +92,13 @@ pub const RECHECK_DELAY: Duration = Duration::from_secs(5);
 
 /// The cadence for the current window state, given a configured interval.
 ///
-/// The shipped query costs 6 rate-limit points (see the budget test), so
-/// the default 120s focused cadence spends ~180 points/hour against a
-/// 5000/hour budget. The test asserts the FLOOR, not the default, so no
-/// reachable setting can blow the budget.
+/// A tick costs 4 rate-limit points -- TWO sequential searches at a
+/// measured 2 each, see `MIN_FOCUSED_SECS` for the table -- so the default
+/// 120s focused cadence spends **120 points/hour** against a 5,000/hour
+/// budget, and the 60s floor spends 240.
+///
+/// `both_cadences_stay_well_inside_the_rate_limit` asserts the FLOOR, not
+/// the default, so no reachable setting can blow the budget.
 pub fn interval_for_secs(focused: bool, configured_secs: u64) -> Duration {
     let secs = clamp_interval(configured_secs);
     Duration::from_secs(if focused {
@@ -735,6 +768,80 @@ fn spawn_recheck(app: AppHandle, client: Arc<GitHubClient>, last_known: Vec<Pull
 /// so the loop's job is to fail fast and retry rather than to hang.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The ceiling on a whole TICK, which is what must clear the next one.
+///
+/// # The gap this closes (#844)
+///
+/// `FETCH_TIMEOUT` bounds ONE fetch, and
+/// `the_fetch_ceiling_is_under_the_shortest_poll_interval` asserted
+/// `30s < 60s` on the premise that a tick IS one fetch. It is not: a tick
+/// awaits two sequential 30-second timeouts (`:868` and `:884`), so the
+/// worst case is 60s -- **exactly equal** to `MIN_FOCUSED_SECS`, which
+/// reintroduces the overlapping-fetch regression that test was written to
+/// prevent. Two hung fetches, both spending budget, for requests that had
+/// already been useless for a full interval.
+///
+/// # Why a shared deadline rather than halving `FETCH_TIMEOUT`
+///
+/// #844 offers both. Halving does not survive the OTHER guard:
+/// `the_fetch_ceiling_still_clears_the_measured_p90` requires
+/// `FETCH_TIMEOUT >= 3 x p90`, and p90 is 8,814ms per POST over 3,806
+/// requests in a reported six-day session -- so 15s would leave 1.7x
+/// headroom and cut off polls on accounts that are merely large, which is
+/// the failure that guard exists to prevent. The two requirements are only
+/// jointly satisfiable by bounding the TICK rather than shrinking each
+/// fetch, so the deadline is shared: the second fetch gets whatever the
+/// first left of it.
+///
+/// # And NOT by parallelising the two fetches
+///
+/// The obvious alternative is `tokio::join!`, and it is measurably worse.
+/// MEASURED (#844, and reproduced by this issue's own figures): sequential
+/// 3.5s against concurrent 5.6s -- GitHub contends on simultaneous
+/// node-heavy queries, so issuing both at once makes the slow one slower
+/// by more than the overlap saves. `fetch_prs_and_reviewing`
+/// (`client.rs:564`) does run two searches concurrently, and its own
+/// diagnostic comment is about exactly this: a total far above the slower
+/// of the two means they are not actually overlapping.
+///
+/// # Why 45s
+///
+/// It must be under `MIN_FOCUSED_SECS` (60) with enough margin that a tick
+/// finishing at the ceiling still lands before its successor starts, and
+/// it must leave the FIRST fetch its full `FETCH_TIMEOUT` -- the authored
+/// list is what the UI renders, and the review queue is a notification
+/// whose loss costs nothing (`:880`). 45s gives the first fetch all 30s
+/// and the second up to 15s, and 45 < 60 holds with 15s of slack.
+///
+/// The budget is generous on purpose for `fetch::LOAD_TIMEOUT`'s reason:
+/// "the budget exists to convert an unbounded hang into an actionable
+/// error, not to tighten a latency target". Measured tick latency is
+/// 3.37s + 0.78s = ~4.2s, so this ceiling is an order of magnitude above
+/// what a real tick needs.
+pub const TICK_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// What is left of [`TICK_TIMEOUT`] after `spent`, capped at
+/// [`FETCH_TIMEOUT`].
+///
+/// Extracted rather than inlined in the loop for the reason
+/// `clamp_interval` is: the loop needs a live `AppHandle` and a network, so
+/// the arithmetic is only testable if it lives apart from them. The
+/// property that matters -- the two fetches together cannot outlast a tick
+/// -- is then asserted directly instead of inferred from two constants.
+///
+/// Capped at `FETCH_TIMEOUT` so the second fetch never gets a LONGER
+/// ceiling than the first: a fast authored fetch leaves 40+ seconds, and
+/// handing all of it to the review queue would make a hung notification
+/// fetch the thing that overruns the tick.
+///
+/// Saturating, so a first fetch that somehow outran the whole budget
+/// yields zero rather than wrapping into a near-infinite ceiling. The
+/// caller treats zero as "skip": a request with no time to answer still
+/// spends a rate-limit point.
+pub fn remaining_tick_budget(spent: Duration) -> Duration {
+    TICK_TIMEOUT.saturating_sub(spent).min(FETCH_TIMEOUT)
+}
+
 /// Wakes the poll loop out of its sleep.
 ///
 /// Managed in Tauri state so the tray and the window-focus handler can
@@ -831,6 +938,14 @@ pub fn spawn(
             // visible against the `cmd get_reviewing` bracket.
             crate::diag!("[diag] poll tick start");
             let tick_started = std::time::Instant::now();
+            // ONE deadline across BOTH fetches, not one per fetch (#844).
+            // Two independent 30s ceilings make the worst-case tick 60s,
+            // exactly `MIN_FOCUSED_SECS` -- so a hung tick overlaps its own
+            // successor, which is the regression
+            // `the_fetch_ceiling_is_under_the_shortest_poll_interval` exists
+            // to prevent. See `TICK_TIMEOUT` for why the fix is a shared
+            // deadline rather than a smaller `FETCH_TIMEOUT` or a
+            // `tokio::join!`.
             let fetched =
                 match tokio::time::timeout(FETCH_TIMEOUT, client.fetch_prs_with_total()).await {
                     Ok(res) => res,
@@ -846,17 +961,32 @@ pub fn spawn(
             //
             // A failure here is NOT a tick failure: the authored list
             // above is what the UI renders, and losing one notification
-            // must not cost the poll.
+            // must not cost the poll. That is also what makes it the right
+            // half to squeeze when the shared deadline is nearly spent.
+            let remaining = remaining_tick_budget(tick_started.elapsed());
             let reviewing_now = if read_notify_prefs(&app).ready_to_review {
-                match tokio::time::timeout(FETCH_TIMEOUT, client.fetch_reviewing()).await {
-                    Ok(Ok(list)) => Some(list),
-                    Ok(Err(e)) => {
-                        crate::diag!("[diag] poll reviewing failed: {e}");
-                        None
-                    }
-                    Err(_) => {
-                        crate::diag!("[diag] poll reviewing timed out");
-                        None
+                if remaining.is_zero() {
+                    // The authored fetch used the whole tick. Skipped rather
+                    // than issued with no time to answer: a request that
+                    // cannot finish still SPENDS a rate-limit point, and the
+                    // next tick is about to ask the same question with a
+                    // full budget.
+                    crate::diag!("[diag] poll reviewing skipped: tick budget spent");
+                    None
+                } else {
+                    match tokio::time::timeout(remaining, client.fetch_reviewing()).await {
+                        Ok(Ok(list)) => Some(list),
+                        Ok(Err(e)) => {
+                            crate::diag!("[diag] poll reviewing failed: {e}");
+                            None
+                        }
+                        Err(_) => {
+                            crate::diag!(
+                                "[diag] poll reviewing timed out after {}ms of tick budget",
+                                remaining.as_millis()
+                            );
+                            None
+                        }
                     }
                 }
             } else {
@@ -1271,7 +1401,8 @@ mod tests {
         assert!(ClientError::Timeout(90).is_transient());
     }
 
-    /// A poll must give up before its successor starts.
+    /// A poll must give up before its successor starts -- the whole TICK,
+    /// not one fetch of it.
     ///
     /// The regression this guards: `FETCH_TIMEOUT` was 90s while
     /// `MIN_FOCUSED_SECS` is 60, so a user on the fastest allowed
@@ -1280,15 +1411,85 @@ mod tests {
     /// budget, for a request that had already been useless for a full
     /// interval.
     ///
-    /// Asserted against the CONSTANT rather than a literal, so raising
-    /// the ceiling past the floor fails here instead of in the field.
+    /// # What this test MISSED, and why it is rewritten (#844)
+    ///
+    /// It asserted `FETCH_TIMEOUT < MIN_FOCUSED_SECS` -- `30s < 60s`, true
+    /// -- on the premise that a tick is one fetch. A tick awaits TWO
+    /// sequential 30s timeouts (`:868` and `:884`), so the worst case was
+    /// 60s: exactly equal to the floor, which reintroduces the very overlap
+    /// the test was written to prevent. The assertion passed while the
+    /// property failed, which is the shape of every defect in #842 and #847
+    /// as well.
+    ///
+    /// Asserted against `TICK_TIMEOUT` and against the arithmetic that
+    /// enforces it, rather than against a pair of constants plus a belief
+    /// about how many fetches there are. `remaining_tick_budget` is the
+    /// thing the loop actually calls, so this measures the shipped
+    /// behaviour -- the property `a_tick_cannot_outlast_its_own_cadence`
+    /// below pins end to end.
     #[test]
     fn the_fetch_ceiling_is_under_the_shortest_poll_interval() {
+        // The TICK is what must clear the next tick.
         assert!(
-            FETCH_TIMEOUT < Duration::from_secs(MIN_FOCUSED_SECS),
-            "a fetch may not outlive the gap to the next poll: \
-             FETCH_TIMEOUT={FETCH_TIMEOUT:?} MIN_FOCUSED_SECS={MIN_FOCUSED_SECS}"
+            TICK_TIMEOUT < Duration::from_secs(MIN_FOCUSED_SECS),
+            "a tick may not outlive the gap to the next poll: \
+             TICK_TIMEOUT={TICK_TIMEOUT:?} MIN_FOCUSED_SECS={MIN_FOCUSED_SECS}"
         );
+        // And one fetch must still fit inside a tick, or the first fetch
+        // alone could exhaust the budget and the second would always skip.
+        assert!(
+            FETCH_TIMEOUT < TICK_TIMEOUT,
+            "the first fetch must leave the second some budget: \
+             FETCH_TIMEOUT={FETCH_TIMEOUT:?} TICK_TIMEOUT={TICK_TIMEOUT:?}"
+        );
+    }
+
+    /// The two sequential fetches, together, cannot outlast a tick.
+    ///
+    /// This is the property the old single-constant assertion could not
+    /// state. Driven through `remaining_tick_budget`, which is what the loop
+    /// calls, so it holds for the code that ships rather than for a
+    /// restatement of it.
+    ///
+    /// Includes the pathological case the loop has to handle: a first fetch
+    /// that ran to its own ceiling leaves 15s, not 30, so the pair is 45s
+    /// and not the 60s two independent ceilings allowed.
+    #[test]
+    fn a_tick_cannot_outlast_its_own_cadence() {
+        let floor = Duration::from_secs(MIN_FOCUSED_SECS);
+        // Every point at which the first fetch could finish, including
+        // running to its own ceiling and past the whole tick budget.
+        for spent_secs in [0, 1, 10, 29, 30, 44, 45, 60, 600] {
+            let spent = Duration::from_secs(spent_secs);
+            let first = spent.min(FETCH_TIMEOUT);
+            let worst = first + remaining_tick_budget(spent);
+            assert!(
+                worst <= TICK_TIMEOUT,
+                "a tick whose first fetch took {spent:?} could run {worst:?}, \
+                 past TICK_TIMEOUT={TICK_TIMEOUT:?}"
+            );
+            assert!(
+                worst < floor,
+                "a tick whose first fetch took {spent:?} could run {worst:?} and \
+                 overlap the next tick at {floor:?}"
+            );
+        }
+        // A first fetch at its full ceiling does NOT hand the second
+        // another full one. Pinned as a number because it is the case the
+        // old guard got wrong: 30 + 30 = 60, not 30 + 15 = 45.
+        assert_eq!(
+            remaining_tick_budget(FETCH_TIMEOUT),
+            Duration::from_secs(15),
+            "a hung first fetch must shrink the second's ceiling, not reset it"
+        );
+        // Overrunning the budget yields zero rather than wrapping, which the
+        // loop reads as "skip": a request with no time to answer still
+        // spends a rate-limit point.
+        assert!(remaining_tick_budget(Duration::from_secs(600)).is_zero());
+        // A fast first fetch does not hand the second a LONGER ceiling than
+        // the first had, or a hung notification fetch becomes the thing that
+        // overruns the tick.
+        assert_eq!(remaining_tick_budget(Duration::ZERO), FETCH_TIMEOUT);
     }
 
     /// The ceiling must still clear the measured p90, or ordinary slow
@@ -1490,15 +1691,66 @@ mod tests {
         assert!(on_worktrees.as_secs() > 0, "must not stop");
     }
 
-    /// Budget guard for BOTH cadences, with the per-poll cost derived from
-    /// the query rather than hardcoded.
+    /// Budget guard for BOTH cadences, against the MEASURED cost of the
+    /// shipped query and a deny-list that refuses the connections nobody
+    /// has priced.
     ///
-    /// The previous version tested only the focused cadence and could not
-    /// fail unless `polls_faster_when_focused` already had -- both read the
-    /// same `interval_for(true)`, which that test pins exactly. Its `* 2`
-    /// was also a literal unconnected to what PRS_QUERY actually costs, so
-    /// adding a search alias would silently double the real spend while the
-    /// assertion kept passing.
+    /// # Why a deny-list replaced the count (#842)
+    ///
+    /// The previous version summed occurrences of eight connection names and
+    /// asserted the total was 7. Its own comment recorded the failure mode
+    /// twice -- "a NESTED connection is invisible to a substring count of its
+    /// parent, so a new connection has to be listed here BY NAME" -- and then
+    /// shipped a third instance of it: `commits(` was never on the list, and
+    /// `commits(last: 1)` is the connection that WRAPS the entire
+    /// check-status subtree in `query.rs`.
+    ///
+    /// So the logic is inverted, copying `stats/query.rs:604-620`: split at
+    /// the node selection and DENY every paged connection that has not been
+    /// explicitly approved. "Count the ones I remembered" cannot catch the
+    /// next addition; "refuse the ones I have not approved" can, because the
+    /// next addition is by definition not on the approved list.
+    ///
+    /// # The numbers, re-measured
+    ///
+    /// Both old numbers were stale: the assertion said `cost == 7` and the
+    /// failure message said "7 connections = 4 points", against a shipped
+    /// query that costs **2**.
+    ///
+    /// #842 records a disagreement about whether `commits(` is one of those
+    /// two points -- the auditor measured yes, the issue's own author could
+    /// not reproduce it from hand-built approximations. I settled it with the
+    /// auditor's method: the document extracted VERBATIM from `PRS_QUERY`
+    /// with its `#` comment lines stripped, `gh api graphql -F first=25`,
+    /// three runs per row, 2026-09-11, against `is:pr is:open author:@me`:
+    ///
+    /// | Document                            | Cost | Wall clock  |
+    /// |-------------------------------------|------|-------------|
+    /// | shipped, verbatim                   | **2**| 2.31-2.56s  |
+    /// | same, `commits(last: 1)` block gone | **1**| 2.04-2.26s  |
+    /// | same, `reviewThreads(` block gone   | 2    | 2.18-2.56s  |
+    /// | same, inner `contexts(` block gone  | 2    | 2.68-3.34s  |
+    ///
+    /// The auditor was right and the reproduction attempt was not: removing
+    /// `commits(` halves the cost, while removing either of the two sibling
+    /// paged connections leaves it at 2. So the marginal point is `commits(`
+    /// specifically, not "whichever connection is dropped last" -- which is
+    /// the hypothesis the hand-built approximations could not distinguish.
+    /// `commits(` is **1 of 2 points, 50% of per-poll spend**, and the old
+    /// guard could not see it.
+    ///
+    /// # Per TICK, not per query
+    ///
+    /// A tick issues TWO searches (`poll.rs:835` and `:851`), and each is its
+    /// own request at its own cost. Measured the same day, same method:
+    /// `is:pr is:open author:@me` cost 2 in 2.31-2.56s, `is:pr is:open
+    /// review-requested:@me` cost 2 in 0.84-0.99s. So a tick costs **4**
+    /// points with ready-to-review on, which is the default.
+    ///
+    /// The budget arithmetic below is therefore against 4, not 2. At the
+    /// FLOOR cadence that is 240/hr of 5,000 -- which is why this is an
+    /// accuracy defect rather than a budget risk, and why the old 7 was
+    /// never unsafe, only wrong.
     #[test]
     fn both_cadences_stay_well_inside_the_rate_limit() {
         let q = crate::github::query::PRS_QUERY;
@@ -1506,69 +1758,118 @@ mod tests {
             q.contains("search("),
             "PRS_QUERY must contain at least one search"
         );
-        // Cost is driven by NESTED CONNECTIONS, not the search count.
-        // Measured against the live API: labels, statusCheckRollup and
-        // reviewThreads each cost a point PER SEARCH and are additive, so
-        // three connections across two searches is 6 -- what the shipped
-        // query actually costs. (An earlier comment here claimed 2; that
-        // was measured on a stripped-down query, not the real one.)
-        //
-        // Occurrences, not presence: dropping a connection from a single
-        // search has to move this number.
-        // A PROXY for the real cost, not the cost itself: GitHub charges
-        // for connection fields, and these three are the ones the query
-        // currently has. It is a tripwire for "someone edited the query",
-        // and it only trips for fields already on this list.
-        //
-        // That gap is real and was found by measuring: adding
-        // `reviewRequests(first: 10)` takes the LIVE cost from 6 to 7
-        // while leaving this count at 6, so the guard would have passed
-        // a 17%-per-poll increase in silence. The list below is therefore
-        // every connection field in the query, not only the expensive
-        // ones -- a new connection must either appear here or be a
-        // deliberate, measured exception.
-        let connections = [
-            "labels(",
-            "statusCheckRollup",
-            "contexts(",
-            "reviewThreads(",
+        // ONE search per document. The query carried two aliases and cost 6
+        // until they were split; a second alias here would double every
+        // caller's spend, which is the change that split them.
+        assert_eq!(
+            q.matches("search(").count(),
+            1,
+            "PRS_QUERY is ONE search per request; a second alias makes every \
+             caller pay for both"
+        );
+
+        // The NODE SELECTION, which is where a per-PR field is added. The
+        // outer `search(` and the document's own `first:` are not nested
+        // connections and are excluded by splitting here --
+        // `stats/query.rs:604-620`'s rule, and the reason that guard works
+        // where a whole-document substring count does not.
+        let nodes = q
+            .split_once("... on PullRequest {")
+            .expect("the node selection")
+            .1;
+
+        // APPROVED paged connections: each one is in the shipped document,
+        // has been measured, and its cost is accounted for in MEASURED_COST
+        // below. Anything else nested here is REFUSED until somebody
+        // measures it -- which is the whole inversion #842 asks for.
+        const APPROVED: [&str; 7] = [
+            "assignees(",
             "reviewRequests(",
             "latestReviews(",
-            "assignees(",
-            "comments(",
+            "labels(",
+            "reviewThreads(",
+            // The connection the old count-based guard could not see, and
+            // the one that costs a point: 2 -> 1 when it is removed.
+            "commits(",
+            // Nested INSIDE `commits(`, which is exactly why a substring
+            // count of the parent was blind to it (#312). Free on top of
+            // its parent: removing it alone leaves the cost at 2.
+            "contexts(",
         ];
-        let cost = connections
-            .iter()
-            .map(|c| q.matches(c).count() as u64)
-            .sum::<u64>();
-        // This number counts CONNECTION APPEARANCES, which is a proxy
-        // for the live cost and not the cost itself. The two moved apart
-        // here: `reviewRequests` and `latestReviews` took this count
-        // from 3 to 5 while the MEASURED cost stayed at 3 points
-        // (re-measured against the live API on 2026-08-26 by extracting
-        // the query and running it with `rateLimit { cost }`).
-        //
-        // The guard still earns its place -- it caught that change and
-        // forced the measurement, which is exactly its job.
-        //
-        // It MISSED the next one, and that is worth recording: adding
-        // `contexts(` for #312 took the live cost from 3 to 4 while
-        // this count stayed at 6, because `contexts` nests inside
-        // `statusCheckRollup`, which was already in the list. A NESTED
-        // connection is invisible to a substring count of its parent,
-        // so a new connection has to be listed here BY NAME rather than
-        // assumed covered by the field it sits inside.
-        assert_eq!(
-            cost, 7,
-            "PRS_QUERY connection count changed; re-measure the LIVE cost \
-             (7 connections = 4 points on 2026-08-28, for ONE search -- \
-              the query carried two aliases and cost 6 until they were \
-              split)"
-        );
+        // Every `name(` in the node selection: a paged connection is one
+        // taking an argument, which is the shape GitHub prices
+        // (`stats/query.rs:575-600` measured `reviews { totalCount }` at 1
+        // point and `reviews(first: 1) { totalCount }` at 2). Scanning for
+        // the SHAPE rather than for known names is what makes this a
+        // deny-list instead of another allow-list with a blind spot.
+        let mut rest = nodes;
+        while let Some(i) = rest.find('(') {
+            // Walk back over the identifier immediately before the paren.
+            let head = &rest[..i];
+            let name_start = head
+                .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .map_or(0, |p| p + 1);
+            let name = &head[name_start..];
+            rest = &rest[i + 1..];
+            if name.is_empty() {
+                continue;
+            }
+            let paged = format!("{name}(");
+            // `... on User {` style fragments and GraphQL directives have no
+            // identifier before the paren and are skipped above. A bare
+            // `repository(` WOULD be caught, correctly: it is free as an
+            // object and priced as a page.
+            assert!(
+                APPROVED.contains(&paged.as_str()),
+                "`{paged}` is a paged nested connection in PRS_QUERY's node \
+                 selection and is NOT on the approved list. GitHub prices the \
+                 `first:`/`last:` ARGUMENT, so this may have changed what every \
+                 poll costs. Measure the LIVE cost -- extract the document, \
+                 strip the `#` comment lines, run it with `rateLimit {{ cost }}` \
+                 -- then update MEASURED_COST and add the name here. \
+                 (`commits(` was missing from the previous guard and is 1 of the \
+                 2 points: measured 2 -> 1 with it removed, 2026-09-11.)"
+            );
+        }
+        // And the approved connections must still BE there: a deny-list
+        // refuses additions but cannot notice a removal, and removing one
+        // would make MEASURED_COST an overstatement.
+        for c in APPROVED {
+            assert!(
+                nodes.contains(c),
+                "`{c}` is approved and measured but no longer in the document; \
+                 re-measure before lowering MEASURED_COST"
+            );
+        }
+
+        /// MEASURED live 2026-09-11, `gh api graphql -F first=25`, the
+        /// document extracted verbatim from `PRS_QUERY` with `#` comment
+        /// lines stripped: **cost 2**, 3 runs (2.31s, 2.32s, 2.56s).
+        ///
+        /// Not a count of anything. The previous guard's number was a count
+        /// of connection appearances asserted to be 7, which had drifted
+        /// three separate times from a live cost that was 2 -- so this is
+        /// the measurement itself, with the method recorded beside it so the
+        /// next reader can repeat it rather than trust it.
+        const MEASURED_COST: u64 = 2;
+        /// Searches per TICK. `poll.rs:835` fetches the authored list and
+        /// `:851` the review queue, sequentially, each its own request.
+        ///
+        /// Measured the same day and the same way: authored cost 2 in
+        /// 2.31-2.56s, review-requested cost 2 in 0.84-0.99s. The second is
+        /// issued only when the ready-to-review notification is on, which is
+        /// the DEFAULT -- so 2 is the cadence docs' real shape, and reasoning
+        /// from one fetch understated every figure by half.
+        const SEARCHES_PER_TICK: u64 = 2;
+        let cost = MEASURED_COST * SEARCHES_PER_TICK;
 
         // The FLOOR, not the default: a user picking the fastest allowed
         // setting must still be inside budget, or this guard only protects
         // people who never touch the setting.
+        //
+        // At the floor that is 60 ticks/hr x 4 = 240 points of 5,000. The
+        // old assertion reasoned from 7 and passed for the wrong reason;
+        // this one reasons from 4 and passes for the right one.
         for focused in [true, false] {
             let per_hour = 3600 / interval_for_secs(focused, MIN_FOCUSED_SECS).as_secs();
             let points = per_hour * cost;

@@ -66,7 +66,91 @@ use serde_json::json;
 /// applied and has to be reasoned about, where a refused read is just a
 /// read to do again. The asymmetry is the justification for the two
 /// numbers differing rather than being unified.
+///
+/// # It is enforced PER PROCESS, not per call (#844)
+///
+/// The waves below enforce it correctly WITHIN one command: each drains its
+/// `JoinSet` before the next, so at most six are in flight per call. But six
+/// per call is not six, because a Stats page render fires FIVE independent
+/// commands with no gating between them (`StatsPage.tsx:126-151`:
+/// `useScopedCounts` is 2x `stats_count`, plus `useStatsSeries`,
+/// `useStatsBoard`, `useStatsReviewers`). 5 x 6 is ~30 concurrent POSTs.
+///
+/// That exceeds this module's own safety argument. The evidence above is
+/// "`fetch_history_values` has shipped at 18 without a reported
+/// secondary-limit failure, so the real threshold is above 18" -- which
+/// covers 18, and says nothing about 30. And the penalty it names is severe:
+/// octocrab is `min_wait_seconds: 60` against a `LOAD_TIMEOUT` of 60s, so one
+/// secondary limit becomes a TIMEOUT rather than a retry.
+///
+/// So the cap is a process-wide [`READ_PERMITS`] acquired per request, which
+/// is what makes the number above true of the app rather than of one command.
 pub const READ_CONCURRENCY: usize = 6;
+
+/// The process-wide permits that make [`READ_CONCURRENCY`] real.
+///
+/// # Why a static semaphore and not a parameter
+///
+/// The cap has to hold across COMMANDS, and commands have no shared object to
+/// hang it on: each `#[tauri::command]` is entered independently with a
+/// cloned client. A permit threaded in as an argument would be a permit a new
+/// call site could decline to take -- and "the cap is a local variable" is
+/// precisely the defect (#844). A static cannot be forgotten.
+///
+/// Acquired INSIDE each spawned task rather than around a wave, so a wave
+/// that is wider than the cap simply queues rather than deadlocking, and so
+/// the permit is held for exactly the duration of the POST. `tokio`'s
+/// semaphore is fair (FIFO), so one command cannot starve another
+/// indefinitely: five commands contending for six permits interleave instead
+/// of the first to arrive holding them until it finishes.
+///
+/// # Why this does not make the page slower than it was
+///
+/// It changes the page from ~30 concurrent requests to 6, which sounds like
+/// a 5x serialisation and is not: the five commands were never independent in
+/// wall-clock terms, because they contend for one connection pool and for
+/// GitHub's own serial evaluation of search aliases. `client.rs:564`'s
+/// diagnostic comment records the same effect for two concurrent searches
+/// ("a total far above the slower of the two means they are NOT actually
+/// overlapping"), and #844 measured the poll loop's two searches at 3.5s
+/// sequential against 5.6s concurrent -- GitHub contends on simultaneous
+/// node-heavy queries. Bounded concurrency is what the latency figures in
+/// this module were measured under in the first place.
+///
+/// `const_new` so there is no lazy initialisation and no `OnceLock` to reason
+/// about: the permits exist for the life of the process.
+static READ_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(READ_CONCURRENCY);
+
+/// Run one stats read, holding a process-wide permit for its duration.
+///
+/// Every POST this module issues goes through here, which is what makes
+/// [`READ_CONCURRENCY`] a property of the app rather than of one command.
+///
+/// The permit is released when the future completes, including on error: it
+/// is held in a local that drops at the end of this function. `acquire` fails
+/// only if the semaphore has been CLOSED, which nothing closes -- mapped to an
+/// error rather than unwrapped, because a panic inside a Tauri command aborts
+/// the whole app (`board.rs`'s `total_cmp` comment makes the same call).
+/// `pub(super)` so `tree.rs`'s two reads go through it too. Every stats POST
+/// in the module has to, or the cap is a property of this file rather than of
+/// the feature -- and the sidebar tree is one of the things a Stats page
+/// render has in flight (`StatsPage.tsx` reads `useStatsTree`).
+pub(super) async fn metered_read(
+    client: &GitHubClient,
+    budget: &Budget,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, ClientError> {
+    let _permit = READ_PERMITS
+        .acquire()
+        .await
+        .map_err(|_| ClientError::Graphql("the stats read semaphore is closed".into()))?;
+    let v = client.stats_graphql(&body).await?;
+    // Recorded HERE rather than at each call site, so a new read cannot be
+    // added that takes a permit and then forgets to meter itself -- which is
+    // the `fetch_viewer` defect in #844, one layer up.
+    budget.record(&v);
+    Ok(v)
+}
 
 /// Wall-clock ceiling on one whole scope load.
 ///
@@ -480,6 +564,51 @@ async fn plan(
     })
 }
 
+/// Whether one more wave may be issued.
+///
+/// # The second half of #843
+///
+/// The in-advance gate in `commands.rs` is consulted ONCE, before request
+/// one. All four wave loops below then iterate on input length alone, with
+/// `budget` threaded in only so each chunk can `record()` -- so a load
+/// committed to its projection and could not stop. `budget.rs:15-18`
+/// diagnoses exactly this ("the probe-driven slicer cannot be costed in
+/// advance by construction: how many slices it takes IS the thing it
+/// discovers") and then implemented only the in-advance check. The real
+/// bounds on spend were `MAX_DEPTH = 24` and `LOAD_TIMEOUT = 60s`; the
+/// budget contributed nothing once a load had started.
+///
+/// The failure it allows: a user opens a 90-day org scope while the poll
+/// loop has already spent most of the hour. The gate passes, the load runs
+/// every wave it discovers, and the poll loop -- the thing the gate exists
+/// to protect -- starves.
+///
+/// # Why PER WAVE and not per request
+///
+/// A wave is the unit that is actually decided: requests within one are
+/// spawned together into a `JoinSet` and run concurrently, so there is no
+/// point between them at which anything could be refused. Checking per wave
+/// also bounds the overshoot to one wave's worth of spend, which is at most
+/// `READ_CONCURRENCY` requests at the measured 1 point each.
+///
+/// # Why PROJECTED is one wave, not the rest of the load
+///
+/// What is left to do is unknowable here for the same reason the planner is
+/// probe-driven. Projecting the remaining load would need a number nobody
+/// has; projecting the NEXT wave needs only the wave's own size, and
+/// refusing a wave stops the load just as effectively one wave later. The
+/// projection is deliberately the small honest number rather than the large
+/// invented one.
+fn wave_permitted(budget: &Budget, requests_in_wave: usize) -> bool {
+    // One point per request, which is the measured figure for every document
+    // this module issues: `MEASURED_PROBE_COST` and
+    // `MEASURED_DETAIL_CHUNK_COST` are both 1, each confirmed live at 36, 60
+    // and 80 aliases and at 12, 24 and 36 aliases respectively
+    // (`budget.rs:91-140`). A projection is allowed to be a round number; it
+    // is not allowed to be an invented one.
+    budget.permits(requests_in_wave as u64)
+}
+
 /// One probe round: every slice's `issueCount`, in chunks of
 /// [`ALIAS_CHUNK`] run at [`READ_CONCURRENCY`].
 ///
@@ -488,6 +617,20 @@ async fn plan(
 /// pre-sized vector rather than by collection order, because the chunks
 /// complete out of order -- the same hazard `query.rs:667-678` records
 /// for the history series, solved the same way: absolute indices.
+///
+/// # A refused wave is an ERROR here, not a partial
+///
+/// This is the one path where a short answer is not honest-partial. A probe
+/// round feeds the PLANNER: a missing count reads as "no activity in that
+/// range", which silently shrinks the total and tiles the window wrongly for
+/// every subsequent round. The same reasoning the per-alias check below
+/// gives -- "a missing alias is NOT zero" -- and the same reasoning
+/// `load_series`'s doc gives for why a count differs from a chart.
+///
+/// So a budget refusal mid-plan fails the load with a message naming the
+/// budget, rather than returning a plan over part of the window. The
+/// honest-partial channels exist for the paths that read NODES
+/// (`board.rs:566-573`), and they are where the other three loops return to.
 async fn probe_round(
     client: &GitHubClient,
     q: &StatsQuery,
@@ -498,6 +641,16 @@ async fn probe_round(
     let per_wave = ALIAS_CHUNK * READ_CONCURRENCY;
     for (w, wave) in slices.chunks(per_wave).enumerate() {
         let base = w * per_wave;
+        // MID-LOAD budget re-check (#843). Errors rather than truncating,
+        // for the reason this function's doc gives: a short probe round
+        // mis-tiles the window for every round after it.
+        if !wave_permitted(budget, wave.len().div_ceil(ALIAS_CHUNK)) {
+            return Err(ClientError::Graphql(format!(
+                "GitHub budget fell below the {}-point reserve while planning \
+                 this scope; stopping so the background refresh keeps working",
+                super::budget::RESERVE
+            )));
+        }
         let mut set = tokio::task::JoinSet::new();
         for (n, chunk) in wave.chunks(ALIAS_CHUNK).enumerate() {
             let first_index = base + n * ALIAS_CHUNK;
@@ -506,8 +659,7 @@ async fn probe_round(
             let budget = budget.clone();
             let len = chunk.len();
             set.spawn(async move {
-                let v = client.stats_graphql(&json!({ "query": doc })).await?;
-                budget.record(&v);
+                let v = metered_read(&client, &budget, json!({ "query": doc })).await?;
                 let mut out = Vec::with_capacity(len);
                 for i in 0..len {
                     let alias = super::query::slice_alias(first_index + i);
@@ -553,17 +705,19 @@ async fn connection_count(
     name: &str,
     budget: &Budget,
 ) -> Result<Outcome, ClientError> {
-    let v = client
-        .stats_graphql(&json!({
+    let v = metered_read(
+        client,
+        budget,
+        json!({
             "query": REPO_CONNECTION_QUERY,
             // `first: 1` because only `totalCount` is wanted here. The
             // page is not the cost -- `query.rs:480-484` records that
             // GitHub charges the connection, not the page -- so this is
             // about bytes on the wire, not points.
             "variables": { "owner": owner, "name": name, "first": 1, "after": null },
-        }))
-        .await?;
-    budget.record(&v);
+        }),
+    )
+    .await?;
     let total = v["repository"]["pullRequests"]["totalCount"]
         .as_u64()
         .ok_or_else(|| {
@@ -714,6 +868,22 @@ async fn detail_with_ladder(
     }
 }
 
+/// One pass over every slice's nodes, wave by wave.
+///
+/// # A refused wave returns a PARTIAL, not an error (#843)
+///
+/// This is the path the honest-partial channels were built for, and they need
+/// nothing new: `Board::from_alias_map` (`board.rs:480-493`) already treats an
+/// alias whose `issueCount` is absent as a `ShortSlice` with `retrieved: 0`
+/// and an UNKNOWN true size -- "the honest shape, since the only figure that
+/// could have said how big it was is the one that is missing" -- and any
+/// non-empty `truncated_slices` clears `Board::complete`.
+///
+/// So stopping at a wave boundary produces a board that names every range it
+/// did not read and reports itself incomplete, which is what #826's rule
+/// asks for: never a confident top-five over a sample. Returning an error
+/// instead would discard waves already paid for and show the user nothing
+/// for spend they have already made.
 async fn detail_round(
     client: &GitHubClient,
     q: &StatsQuery,
@@ -727,17 +897,28 @@ async fn detail_round(
     let per_wave = chunk * READ_CONCURRENCY;
     for (w, wave) in slices.chunks(per_wave).enumerate() {
         let base = w * per_wave;
+        // MID-LOAD budget re-check (#843). The aliases for the slices this
+        // skips are simply absent from the merged map, which `from_alias_map`
+        // already reads as a named short slice -- so the board comes back
+        // partial and says which ranges it is missing, rather than running to
+        // completion and starving the poll loop.
+        if !wave_permitted(budget, wave.len().div_ceil(chunk)) {
+            log::warn!(
+                "GitHub budget fell below the {}-point reserve mid-load; \
+                 returning a partial board over {} of {} slices",
+                super::budget::RESERVE,
+                base,
+                slices.len()
+            );
+            break;
+        }
         let mut set = tokio::task::JoinSet::new();
         for (n, part) in wave.chunks(chunk).enumerate() {
             let first_index = base + n * chunk;
             let doc = slice_detail_query(q, part, first_index, page);
             let client = client.clone();
             let budget = budget.clone();
-            set.spawn(async move {
-                let v = client.stats_graphql(&json!({ "query": doc })).await?;
-                budget.record(&v);
-                Ok::<serde_json::Value, ClientError>(v)
-            });
+            set.spawn(async move { metered_read(&client, &budget, json!({ "query": doc })).await });
         }
         while let Some(joined) = set.join_next().await {
             let v = joined.map_err(|e| ClientError::Join(e.to_string()))??;
@@ -868,6 +1049,22 @@ async fn series_inner(
 
     for (w, wave) in days.chunks(per_wave).enumerate() {
         let base = w * per_wave;
+        // MID-LOAD budget re-check (#843). Stopping leaves these days as
+        // `None`, which the tail of this function turns into named
+        // `failed_days` rather than into a trough at zero -- "defaulting here
+        // would draw a trough that reads as a quiet day". A chart of 30 days
+        // missing 8 is still the most informative thing available, provided
+        // it says which 8, which is `load_series`'s own stated rule.
+        if !wave_permitted(budget, wave.len().div_ceil(ALIAS_CHUNK)) {
+            log::warn!(
+                "GitHub budget fell below the {}-point reserve mid-load; \
+                 the remaining {} days are reported as unmeasured rather than \
+                 as zero",
+                super::budget::RESERVE,
+                days.len().saturating_sub(base)
+            );
+            break;
+        }
         let mut set = tokio::task::JoinSet::new();
         for (n, chunk) in wave.chunks(ALIAS_CHUNK).enumerate() {
             let first_index = base + n * ALIAS_CHUNK;
@@ -876,8 +1073,7 @@ async fn series_inner(
             let budget = budget.clone();
             let len = chunk.len();
             set.spawn(async move {
-                let v = client.stats_graphql(&json!({ "query": doc })).await?;
-                budget.record(&v);
+                let v = metered_read(&client, &budget, json!({ "query": doc })).await?;
                 let refused = crate::github::client::refused_fields_of(&v);
                 let mut out = Vec::with_capacity(len);
                 for i in 0..len {
@@ -1062,6 +1258,20 @@ async fn reviewers_inner(
 
     for (w, wave) in logins.chunks(per_wave).enumerate() {
         let base = w * per_wave;
+        // MID-LOAD budget re-check (#843). Stopping leaves these logins as
+        // `None`, which becomes `Reviewers::unmeasured` -- named people whose
+        // count did not come back, kept distinct from a measured zero.
+        // Defaulting them to 0 would rank colleagues last on a query that was
+        // never issued, which this function's own doc forbids.
+        if !wave_permitted(budget, wave.len().div_ceil(ALIAS_CHUNK)) {
+            log::warn!(
+                "GitHub budget fell below the {}-point reserve mid-load; \
+                 {} reviewers are reported as unmeasured rather than as zero",
+                super::budget::RESERVE,
+                logins.len().saturating_sub(base)
+            );
+            break;
+        }
         let mut set = tokio::task::JoinSet::new();
         for (n, chunk) in wave.chunks(ALIAS_CHUNK).enumerate() {
             let first_index = base + n * ALIAS_CHUNK;
@@ -1070,8 +1280,7 @@ async fn reviewers_inner(
             let budget = budget.clone();
             let len = chunk.len();
             set.spawn(async move {
-                let v = client.stats_graphql(&json!({ "query": doc })).await?;
-                budget.record(&v);
+                let v = metered_read(&client, &budget, json!({ "query": doc })).await?;
                 let refused = crate::github::client::refused_fields_of(&v);
                 let mut out = Vec::with_capacity(len);
                 for i in 0..len {
@@ -1175,6 +1384,61 @@ mod tests {
             src.contains("const BATCH_CONCURRENCY: usize = 4"),
             "the mutation cap moved; re-read why reads differ from it"
         );
+    }
+
+    /// The cap is enforced PER PROCESS, not per call (#844).
+    ///
+    /// # Why this is a source scan rather than a concurrency test
+    ///
+    /// The property is "no stats POST bypasses the permit", which is a
+    /// statement about every call site rather than about observable behaviour
+    /// at one of them. A test that spawned 30 futures and counted peak
+    /// concurrency would prove the semaphore works -- which is tokio's job,
+    /// not this module's -- while saying nothing about a SEVENTH call site
+    /// added later that calls `stats_graphql` directly. That seventh call site
+    /// is the defect: the cap was real within each command and meaningless
+    /// across the five a Stats page fires (`StatsPage.tsx:126-151`).
+    ///
+    /// So the scan asserts the chokepoint is the only door. `metered_read` is
+    /// the one function that may call `stats_graphql`, and it holds a permit
+    /// and records the spend -- which also means a new read cannot take a
+    /// permit and then forget to meter itself, the `fetch_viewer` half of
+    /// #844.
+    #[test]
+    fn every_stats_read_goes_through_the_process_wide_permit() {
+        for (file, src) in [
+            ("fetch.rs", include_str!("fetch.rs")),
+            ("tree.rs", include_str!("tree.rs")),
+            ("board.rs", include_str!("board.rs")),
+            ("slice.rs", include_str!("slice.rs")),
+        ] {
+            // Production half only: a doc comment may legitimately name the
+            // method it is explaining, and the test module below discusses it.
+            let prod = src.split_once("\n#[cfg(test)]").map_or(src, |(p, _)| p);
+            for (i, line) in prod.lines().enumerate() {
+                if !line.contains("stats_graphql(") {
+                    continue;
+                }
+                // The one permitted caller, and only inside `metered_read`.
+                let inside_chokepoint =
+                    file == "fetch.rs" && line.contains("client.stats_graphql(&body)");
+                // A doc comment or ordinary comment mentioning the name.
+                let t = line.trim_start();
+                let is_comment = t.starts_with("//");
+                assert!(
+                    inside_chokepoint || is_comment,
+                    "{file}:{} calls `stats_graphql` directly, bypassing the \
+                     process-wide READ_PERMITS. A Stats page fires five \
+                     independent commands, so a per-call cap is not a cap \
+                     (#844) -- route it through `metered_read`, which holds a \
+                     permit and records the spend.\n    {line}",
+                    i + 1
+                );
+            }
+        }
+        // And the permit count IS the documented cap, rather than a second
+        // number that could drift from it.
+        assert_eq!(READ_PERMITS.available_permits(), READ_CONCURRENCY);
     }
 
     /// A whole-load ceiling exists, and it is NOT `poll::FETCH_TIMEOUT`
@@ -1546,5 +1810,98 @@ mod tests {
     #[test]
     fn a_wave_covers_sixty_slices() {
         const { assert!(ALIAS_CHUNK * READ_CONCURRENCY == 60) };
+    }
+
+    /// A wave is refused once the budget is under the reserve, and permitted
+    /// while it is not -- which is what makes the mid-load check able to stop
+    /// a load rather than merely being threaded through it (#843).
+    ///
+    /// Tested through `wave_permitted` itself rather than through a wiremock
+    /// load, deliberately: the wave loops are four copies of one decision,
+    /// and the decision is what has to be right. A mock load would assert it
+    /// once for whichever loop the mock happened to exercise, and the other
+    /// three would be covered by inspection -- which is how the in-advance
+    /// gate came to be always-true at 4 of 4 call sites in the first place.
+    ///
+    /// The partial SHAPES each loop produces are asserted where they are
+    /// read: `board.rs:480-493` for a missing detail alias, and
+    /// `series_inner`/`reviewers_inner`'s own `None`-not-zero handling for
+    /// the other two.
+    #[test]
+    fn a_wave_is_refused_once_the_budget_is_under_the_reserve() {
+        use crate::github::stats::budget::RESERVE;
+
+        // `record` feeds the PROCESS-WIDE figure as well as this accumulator
+        // (#843), so this test mutates state shared with `budget.rs`'s tests.
+        // Serialised and restored, or it races them -- an intermittent failure
+        // in another file caused by a test in this one.
+        let _g = crate::github::stats::budget::observed_test_lock();
+        let _restore = crate::github::stats::budget::RestoreObserved::capture();
+
+        // A fresh `Budget` with a seeded process figure, which is exactly
+        // the state a wave loop is in: the accumulator belongs to this load,
+        // the remaining figure came from the poll loop or an earlier wave.
+        let b = Budget::new();
+        b.record(&serde_json::json!({
+            "rateLimit": { "cost": 1, "remaining": RESERVE + 6, "resetAt": "2026-09-11T17:00:00Z" }
+        }));
+        // Six requests would leave exactly the reserve, which is permitted --
+        // `RESERVE` is the floor, not a margin above it. Stated as
+        // `READ_CONCURRENCY` because it happens to be 6, and a full wave at
+        // the shipped concurrency is the realistic ask.
+        assert!(wave_permitted(&b, READ_CONCURRENCY));
+        assert!(
+            !wave_permitted(&b, READ_CONCURRENCY + 1),
+            "one request past the reserve must be refused"
+        );
+
+        // And once under the reserve, nothing is permitted.
+        let b = Budget::new();
+        b.record(&serde_json::json!({
+            "rateLimit": { "cost": 1, "remaining": RESERVE - 1, "resetAt": "2026-09-11T17:00:00Z" }
+        }));
+        assert!(!wave_permitted(&b, 1));
+
+        // With plenty of budget a full wave goes ahead, or the check would be
+        // a refusal rather than a gate.
+        let b = Budget::new();
+        b.record(&serde_json::json!({
+            "rateLimit": { "cost": 1, "remaining": 4_900, "resetAt": "2026-09-11T17:00:00Z" }
+        }));
+        assert!(wave_permitted(&b, READ_CONCURRENCY));
+    }
+
+    /// Every wave loop checks the budget before spawning its `JoinSet`.
+    ///
+    /// Asserted on the SOURCE, because there is no other way to tell: a
+    /// mock-driven test of one loop says nothing about the other three, and
+    /// the defect #843 describes is precisely that `budget` was threaded into
+    /// all four and consulted by none of them. The `JoinSet` is the point of
+    /// no return -- once it is spawned the requests are in flight -- so the
+    /// check has to come before it in every loop.
+    ///
+    /// Counts `wave_permitted` call sites against `JoinSet::new` ones rather
+    /// than naming the four functions, so a FIFTH wave loop added later
+    /// cannot be the one that forgets.
+    #[test]
+    fn every_wave_loop_checks_the_budget_before_spawning() {
+        let src = include_str!("fetch.rs");
+        // Only the production half: the test module below deliberately
+        // restates the tiling arithmetic with its own `JoinSet`-free loop,
+        // and calls `wave_permitted` directly.
+        let prod = src.split_once("\n#[cfg(test)]").expect("the test module").0;
+        let spawners = prod.matches("JoinSet::new()").count();
+        // `!wave_permitted(budget` -- the CALL in a loop guard, which is
+        // negated every time because the guard stops the loop. Matching the
+        // bare name would also count the function's own definition.
+        let gates = prod.matches("!wave_permitted(budget").count();
+        assert!(spawners > 0, "no wave loops found -- the scan is broken");
+        assert_eq!(
+            gates, spawners,
+            "{spawners} wave loops spawn a JoinSet but only {gates} check \
+             `wave_permitted` first. A loop that does not check cannot be \
+             stopped mid-load, which is #843: `budget` was threaded into all \
+             four and consulted by none."
+        );
     }
 }
