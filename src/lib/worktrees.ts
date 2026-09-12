@@ -755,15 +755,24 @@ export function totalSize(items: { size_bytes: number | null }[]): number | null
 /// `null` fetch time is NOT silent: never fetched is the stalest state
 /// there is, not the freshest.
 ///
-/// No fetch button beside it yet, though #815 asks for one (item 3) and
-/// it is the right answer. Not done here because the only render site is
-/// `WorktreesPage.tsx`, which another change owns concurrently; a button
-/// also needs a command to call, and there is no production fetch
-/// anywhere in this app -- the six in `scan.rs` are all test fixtures.
-/// That is a Rust command, a surface-allowlist entry in three places, a
-/// mutation hook and a re-scan on completion, which is its own change
-/// rather than a rider on this one. What this function can do alone is
-/// stop being silent while the refs go stale, and that is what changed.
+/// THE FETCH BUTTON NOW EXISTS (#788), which closes what this comment
+/// used to defer. #815 asked for one as item 3 and was right; it was left
+/// out then because `WorktreesPage.tsx` was owned by a concurrent change
+/// and because there was no production fetch anywhere in the app -- the
+/// six in `scan.rs` were all test fixtures -- so it needed a Rust
+/// command, allowlist entries, a mutation hook and a re-scan. #788 did
+/// all of that: `fetch_refs`, `Class::Write` in both surfaces, and
+/// `useFetchRefs`. So this function's caveat is no longer a dead end the
+/// reader can do nothing about.
+///
+/// #788 also moved the age ONTO THE ROW, as `refAgeShort` and
+/// `upstreamReasonAged`. This function is still the PAGE HEADER's form
+/// and is not superseded: it qualifies every row including the merge
+/// verdicts, which have no per-row note of their own and are what #702
+/// and #815 were actually filed about. The row's note qualifies the one
+/// claim -- "up to date with upstream" -- that a reader takes at face
+/// value. Both read this same threshold, deliberately, so the row and the
+/// header cannot disagree about whether a repository is stale at all.
 export function refAge(fetchedAt: string | null, now = new Date()): string | null {
   if (fetchedAt === null) return "never fetched";
   const at = Date.parse(fetchedAt);
@@ -836,7 +845,11 @@ export function refAge(fetchedAt: string | null, now = new Date()): string | nul
 type RefStaleness =
   | { kind: "fresh" }
   /// `age` is `refAge`'s prose, e.g. "as of a fetch 4 hours ago".
-  | { kind: "stale"; age: string }
+  /// `hours` is the same quantity as a number, so a caller wanting a
+  /// different wording does not have to re-parse the timestamp (and so
+  /// cannot disagree with the prose about which side of a boundary it
+  /// falls on).
+  | { kind: "stale"; age: string; hours: number }
   | { kind: "unknown" };
 
 function refStaleness(fetchedAt: string | null, now = new Date()): RefStaleness {
@@ -851,7 +864,14 @@ function refStaleness(fetchedAt: string | null, now = new Date()): RefStaleness 
   // unknown -- duplicating its null-and-NaN checks here is how the two
   // would later disagree about a malformed timestamp.
   if (age === "never fetched") return { kind: "unknown" };
-  return { kind: "stale", age };
+  // Reaching here means `refAge` already parsed `fetchedAt` successfully
+  // and found it at least an hour old, so this subtraction is safe
+  // without a re-check and `fetchedAt` is necessarily a string. The
+  // arithmetic duplicates `refAge`'s, which is the cost of not widening
+  // that function's return type -- but it is bounded here, in the one
+  // place, rather than at each caller that wants a number.
+  const hours = Math.floor((now.getTime() - Date.parse(fetchedAt as string)) / 3_600_000);
+  return { kind: "stale", age, hours };
 }
 
 /// The row-sized version of `refAge`'s prose (#788).
@@ -882,12 +902,14 @@ function refAgeShort(fetchedAt: string | null, now = new Date()): string | null 
   const s = refStaleness(fetchedAt, now);
   if (s.kind === "fresh") return null;
   if (s.kind === "unknown") return "never fetched";
-  // Re-measured from the timestamp rather than parsed back out of
-  // `s.age`'s prose: a regex over "as of a fetch 4 hours ago" would be a
-  // second reader of `refAge`'s wording, and changing that wording would
-  // then silently return null here instead of failing a test.
-  const hours = Math.floor((now.getTime() - Date.parse(fetchedAt as string)) / 3_600_000);
-  return hours < 24 ? `as of ${hours}h ago` : `as of ${Math.floor(hours / 24)}d ago`;
+  // `s.hours`, not a regex over `s.age`. Parsing "as of a fetch 4 hours
+  // ago" back into a number would make this a second reader of `refAge`'s
+  // WORDING, so rewording the header note would silently change the row's
+  // number rather than failing a test. The narrowed `stale` variant
+  // carries the quantity for exactly this reason.
+  return s.hours < 24
+    ? `as of ${s.hours}h ago`
+    : `as of ${Math.floor(s.hours / 24)}d ago`;
 }
 
 /// Tailwind colour for an upstream state, given how old the refs behind
@@ -956,19 +978,22 @@ export function upstreamToneAged(u: Upstream, fetchedAt: string | null, now = ne
 /// refs are old, so the caveat is about the size of a real problem
 /// rather than about whether there is one.
 export function upstreamReasonAged(u: Upstream, fetchedAt: string | null, now = new Date()): string {
+  // `current` loses its "(as of last fetch)" in BOTH branches: with a
+  // number beside it the parenthetical is the same caveat twice, and
+  // without one the refs are genuinely current and there is nothing to
+  // hedge. Every other state keeps `upstreamReason`'s wording verbatim --
+  // `behind`'s own parenthetical included, because staleness means
+  // something different there (it can only make "40 behind" an
+  // understatement, so the hedge is about the size of a real problem
+  // rather than whether there is one).
+  //
+  // `upstreamReason` is no longer exported and this is now its only
+  // caller, which is why the distinction lives here rather than being
+  // pushed into it: the two phrasings differ by whether a `fetched_at` is
+  // in hand, and only this function has one.
+  const base = u.kind === "current" ? "up to date with upstream" : upstreamReason(u);
   const short = refAgeShort(fetchedAt, now);
-  if (short === null) {
-    // Fresh refs: strip the now-redundant hedge from `current`, leaving
-    // the other states' wording exactly as it was. `upstreamReason`
-    // keeps the parenthetical because it is also used where no
-    // `fetched_at` is in hand (the force-removal dialog, the tooltip
-    // fallback), and there a hedge with no number is still better than
-    // a bare claim.
-    return u.kind === "current" ? "up to date with upstream" : upstreamReason(u);
-  }
-  const base =
-    u.kind === "current" ? "up to date with upstream" : upstreamReason(u);
-  return `${base} · ${short}`;
+  return short === null ? base : `${base} · ${short}`;
 }
 
 /// The orderings the worktree list offers (#771).
