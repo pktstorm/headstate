@@ -909,6 +909,20 @@ impl GitHubClient {
             if remaining < 500 {
                 log::warn!("GitHub rate limit low: {remaining} remaining, resets at {reset}");
             }
+            // And FEED the stats gate, which had no source of truth at all
+            // (#843). This is the poll loop's own read -- it runs every
+            // 60-120s whether or not a stats page is open, so it is the only
+            // thing in the app that knows the budget is low BEFORE a load
+            // starts. `Budget::permits` was structurally always-true without
+            // it, because every gate constructs a fresh accumulator
+            // immediately before checking it.
+            //
+            // The one number, two consumers: the warning threshold here and
+            // `budget::RESERVE` are deliberately the same 500
+            // (`the_reserve_matches_the_existing_low_budget_warning` pins
+            // that), so the user cannot get a warning from one and a refusal
+            // from the other at different moments.
+            crate::github::stats::budget::note_remaining(remaining);
         }
         Ok((map_search(&v), map_total(&v)))
     }

@@ -480,6 +480,51 @@ async fn plan(
     })
 }
 
+/// Whether one more wave may be issued.
+///
+/// # The second half of #843
+///
+/// The in-advance gate in `commands.rs` is consulted ONCE, before request
+/// one. All four wave loops below then iterate on input length alone, with
+/// `budget` threaded in only so each chunk can `record()` -- so a load
+/// committed to its projection and could not stop. `budget.rs:15-18`
+/// diagnoses exactly this ("the probe-driven slicer cannot be costed in
+/// advance by construction: how many slices it takes IS the thing it
+/// discovers") and then implemented only the in-advance check. The real
+/// bounds on spend were `MAX_DEPTH = 24` and `LOAD_TIMEOUT = 60s`; the
+/// budget contributed nothing once a load had started.
+///
+/// The failure it allows: a user opens a 90-day org scope while the poll
+/// loop has already spent most of the hour. The gate passes, the load runs
+/// every wave it discovers, and the poll loop -- the thing the gate exists
+/// to protect -- starves.
+///
+/// # Why PER WAVE and not per request
+///
+/// A wave is the unit that is actually decided: requests within one are
+/// spawned together into a `JoinSet` and run concurrently, so there is no
+/// point between them at which anything could be refused. Checking per wave
+/// also bounds the overshoot to one wave's worth of spend, which is at most
+/// `READ_CONCURRENCY` requests at the measured 1 point each.
+///
+/// # Why PROJECTED is one wave, not the rest of the load
+///
+/// What is left to do is unknowable here for the same reason the planner is
+/// probe-driven. Projecting the remaining load would need a number nobody
+/// has; projecting the NEXT wave needs only the wave's own size, and
+/// refusing a wave stops the load just as effectively one wave later. The
+/// projection is deliberately the small honest number rather than the large
+/// invented one.
+fn wave_permitted(budget: &Budget, requests_in_wave: usize) -> bool {
+    // One point per request, which is the measured figure for every document
+    // this module issues: `MEASURED_PROBE_COST` and
+    // `MEASURED_DETAIL_CHUNK_COST` are both 1, each confirmed live at 36, 60
+    // and 80 aliases and at 12, 24 and 36 aliases respectively
+    // (`budget.rs:91-140`). A projection is allowed to be a round number; it
+    // is not allowed to be an invented one.
+    budget.permits(requests_in_wave as u64)
+}
+
 /// One probe round: every slice's `issueCount`, in chunks of
 /// [`ALIAS_CHUNK`] run at [`READ_CONCURRENCY`].
 ///
@@ -488,6 +533,20 @@ async fn plan(
 /// pre-sized vector rather than by collection order, because the chunks
 /// complete out of order -- the same hazard `query.rs:667-678` records
 /// for the history series, solved the same way: absolute indices.
+///
+/// # A refused wave is an ERROR here, not a partial
+///
+/// This is the one path where a short answer is not honest-partial. A probe
+/// round feeds the PLANNER: a missing count reads as "no activity in that
+/// range", which silently shrinks the total and tiles the window wrongly for
+/// every subsequent round. The same reasoning the per-alias check below
+/// gives -- "a missing alias is NOT zero" -- and the same reasoning
+/// `load_series`'s doc gives for why a count differs from a chart.
+///
+/// So a budget refusal mid-plan fails the load with a message naming the
+/// budget, rather than returning a plan over part of the window. The
+/// honest-partial channels exist for the paths that read NODES
+/// (`board.rs:566-573`), and they are where the other three loops return to.
 async fn probe_round(
     client: &GitHubClient,
     q: &StatsQuery,
@@ -498,6 +557,16 @@ async fn probe_round(
     let per_wave = ALIAS_CHUNK * READ_CONCURRENCY;
     for (w, wave) in slices.chunks(per_wave).enumerate() {
         let base = w * per_wave;
+        // MID-LOAD budget re-check (#843). Errors rather than truncating,
+        // for the reason this function's doc gives: a short probe round
+        // mis-tiles the window for every round after it.
+        if !wave_permitted(budget, wave.len().div_ceil(ALIAS_CHUNK)) {
+            return Err(ClientError::Graphql(format!(
+                "GitHub budget fell below the {}-point reserve while planning \
+                 this scope; stopping so the background refresh keeps working",
+                super::budget::RESERVE
+            )));
+        }
         let mut set = tokio::task::JoinSet::new();
         for (n, chunk) in wave.chunks(ALIAS_CHUNK).enumerate() {
             let first_index = base + n * ALIAS_CHUNK;
@@ -714,6 +783,22 @@ async fn detail_with_ladder(
     }
 }
 
+/// One pass over every slice's nodes, wave by wave.
+///
+/// # A refused wave returns a PARTIAL, not an error (#843)
+///
+/// This is the path the honest-partial channels were built for, and they need
+/// nothing new: `Board::from_alias_map` (`board.rs:480-493`) already treats an
+/// alias whose `issueCount` is absent as a `ShortSlice` with `retrieved: 0`
+/// and an UNKNOWN true size -- "the honest shape, since the only figure that
+/// could have said how big it was is the one that is missing" -- and any
+/// non-empty `truncated_slices` clears `Board::complete`.
+///
+/// So stopping at a wave boundary produces a board that names every range it
+/// did not read and reports itself incomplete, which is what #826's rule
+/// asks for: never a confident top-five over a sample. Returning an error
+/// instead would discard waves already paid for and show the user nothing
+/// for spend they have already made.
 async fn detail_round(
     client: &GitHubClient,
     q: &StatsQuery,
@@ -727,6 +812,21 @@ async fn detail_round(
     let per_wave = chunk * READ_CONCURRENCY;
     for (w, wave) in slices.chunks(per_wave).enumerate() {
         let base = w * per_wave;
+        // MID-LOAD budget re-check (#843). The aliases for the slices this
+        // skips are simply absent from the merged map, which `from_alias_map`
+        // already reads as a named short slice -- so the board comes back
+        // partial and says which ranges it is missing, rather than running to
+        // completion and starving the poll loop.
+        if !wave_permitted(budget, wave.len().div_ceil(chunk)) {
+            log::warn!(
+                "GitHub budget fell below the {}-point reserve mid-load; \
+                 returning a partial board over {} of {} slices",
+                super::budget::RESERVE,
+                base,
+                slices.len()
+            );
+            break;
+        }
         let mut set = tokio::task::JoinSet::new();
         for (n, part) in wave.chunks(chunk).enumerate() {
             let first_index = base + n * chunk;
@@ -868,6 +968,22 @@ async fn series_inner(
 
     for (w, wave) in days.chunks(per_wave).enumerate() {
         let base = w * per_wave;
+        // MID-LOAD budget re-check (#843). Stopping leaves these days as
+        // `None`, which the tail of this function turns into named
+        // `failed_days` rather than into a trough at zero -- "defaulting here
+        // would draw a trough that reads as a quiet day". A chart of 30 days
+        // missing 8 is still the most informative thing available, provided
+        // it says which 8, which is `load_series`'s own stated rule.
+        if !wave_permitted(budget, wave.len().div_ceil(ALIAS_CHUNK)) {
+            log::warn!(
+                "GitHub budget fell below the {}-point reserve mid-load; \
+                 the remaining {} days are reported as unmeasured rather than \
+                 as zero",
+                super::budget::RESERVE,
+                days.len().saturating_sub(base)
+            );
+            break;
+        }
         let mut set = tokio::task::JoinSet::new();
         for (n, chunk) in wave.chunks(ALIAS_CHUNK).enumerate() {
             let first_index = base + n * ALIAS_CHUNK;
@@ -1062,6 +1178,20 @@ async fn reviewers_inner(
 
     for (w, wave) in logins.chunks(per_wave).enumerate() {
         let base = w * per_wave;
+        // MID-LOAD budget re-check (#843). Stopping leaves these logins as
+        // `None`, which becomes `Reviewers::unmeasured` -- named people whose
+        // count did not come back, kept distinct from a measured zero.
+        // Defaulting them to 0 would rank colleagues last on a query that was
+        // never issued, which this function's own doc forbids.
+        if !wave_permitted(budget, wave.len().div_ceil(ALIAS_CHUNK)) {
+            log::warn!(
+                "GitHub budget fell below the {}-point reserve mid-load; \
+                 {} reviewers are reported as unmeasured rather than as zero",
+                super::budget::RESERVE,
+                logins.len().saturating_sub(base)
+            );
+            break;
+        }
         let mut set = tokio::task::JoinSet::new();
         for (n, chunk) in wave.chunks(ALIAS_CHUNK).enumerate() {
             let first_index = base + n * ALIAS_CHUNK;
@@ -1546,5 +1676,91 @@ mod tests {
     #[test]
     fn a_wave_covers_sixty_slices() {
         const { assert!(ALIAS_CHUNK * READ_CONCURRENCY == 60) };
+    }
+
+    /// A wave is refused once the budget is under the reserve, and permitted
+    /// while it is not -- which is what makes the mid-load check able to stop
+    /// a load rather than merely being threaded through it (#843).
+    ///
+    /// Tested through `wave_permitted` itself rather than through a wiremock
+    /// load, deliberately: the wave loops are four copies of one decision,
+    /// and the decision is what has to be right. A mock load would assert it
+    /// once for whichever loop the mock happened to exercise, and the other
+    /// three would be covered by inspection -- which is how the in-advance
+    /// gate came to be always-true at 4 of 4 call sites in the first place.
+    ///
+    /// The partial SHAPES each loop produces are asserted where they are
+    /// read: `board.rs:480-493` for a missing detail alias, and
+    /// `series_inner`/`reviewers_inner`'s own `None`-not-zero handling for
+    /// the other two.
+    #[test]
+    fn a_wave_is_refused_once_the_budget_is_under_the_reserve() {
+        use crate::github::stats::budget::RESERVE;
+
+        // A fresh `Budget` with a seeded process figure, which is exactly
+        // the state a wave loop is in: the accumulator belongs to this load,
+        // the remaining figure came from the poll loop or an earlier wave.
+        let b = Budget::new();
+        b.record(&serde_json::json!({
+            "rateLimit": { "cost": 1, "remaining": RESERVE + 6, "resetAt": "2026-09-11T17:00:00Z" }
+        }));
+        // Six requests would leave exactly the reserve, which is permitted --
+        // `RESERVE` is the floor, not a margin above it. Stated as
+        // `READ_CONCURRENCY` because it happens to be 6, and a full wave at
+        // the shipped concurrency is the realistic ask.
+        assert!(wave_permitted(&b, READ_CONCURRENCY));
+        assert!(
+            !wave_permitted(&b, READ_CONCURRENCY + 1),
+            "one request past the reserve must be refused"
+        );
+
+        // And once under the reserve, nothing is permitted.
+        let b = Budget::new();
+        b.record(&serde_json::json!({
+            "rateLimit": { "cost": 1, "remaining": RESERVE - 1, "resetAt": "2026-09-11T17:00:00Z" }
+        }));
+        assert!(!wave_permitted(&b, 1));
+
+        // With plenty of budget a full wave goes ahead, or the check would be
+        // a refusal rather than a gate.
+        let b = Budget::new();
+        b.record(&serde_json::json!({
+            "rateLimit": { "cost": 1, "remaining": 4_900, "resetAt": "2026-09-11T17:00:00Z" }
+        }));
+        assert!(wave_permitted(&b, READ_CONCURRENCY));
+    }
+
+    /// Every wave loop checks the budget before spawning its `JoinSet`.
+    ///
+    /// Asserted on the SOURCE, because there is no other way to tell: a
+    /// mock-driven test of one loop says nothing about the other three, and
+    /// the defect #843 describes is precisely that `budget` was threaded into
+    /// all four and consulted by none of them. The `JoinSet` is the point of
+    /// no return -- once it is spawned the requests are in flight -- so the
+    /// check has to come before it in every loop.
+    ///
+    /// Counts `wave_permitted` call sites against `JoinSet::new` ones rather
+    /// than naming the four functions, so a FIFTH wave loop added later
+    /// cannot be the one that forgets.
+    #[test]
+    fn every_wave_loop_checks_the_budget_before_spawning() {
+        let src = include_str!("fetch.rs");
+        // Only the production half: the test module below deliberately
+        // restates the tiling arithmetic with its own `JoinSet`-free loop,
+        // and calls `wave_permitted` directly.
+        let prod = src.split_once("\n#[cfg(test)]").expect("the test module").0;
+        let spawners = prod.matches("JoinSet::new()").count();
+        // `!wave_permitted(budget` -- the CALL in a loop guard, which is
+        // negated every time because the guard stops the loop. Matching the
+        // bare name would also count the function's own definition.
+        let gates = prod.matches("!wave_permitted(budget").count();
+        assert!(spawners > 0, "no wave loops found -- the scan is broken");
+        assert_eq!(
+            gates, spawners,
+            "{spawners} wave loops spawn a JoinSet but only {gates} check \
+             `wave_permitted` first. A loop that does not check cannot be \
+             stopped mid-load, which is #843: `budget` was threaded into all \
+             four and consulted by none."
+        );
     }
 }
