@@ -45,6 +45,10 @@ permissions:
 
 jobs:
   lint:
+    # 2m measured. Generous on purpose: this must never fire on a slow but
+    # healthy run, only on a hang. Without it the job inherits
+    # GitHub's 360-minute default (#885).
+    timeout-minutes: 30
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -132,6 +136,10 @@ jobs:
           (cd src-tauri && cargo clippy --all-targets -- -D warnings)
 
   test-rust:
+    # 4m measured, incl. the 3x race check. Generous on purpose: this must never fire on a slow but
+    # healthy run, only on a hang. Without it the job inherits
+    # GitHub's 360-minute default (#885).
+    timeout-minutes: 30
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -161,6 +169,10 @@ jobs:
           done
 
   test-frontend:
+    # under 1m measured. Generous on purpose: this must never fire on a slow but
+    # healthy run, only on a hang. Without it the job inherits
+    # GitHub's 360-minute default (#885).
+    timeout-minutes: 20
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -170,6 +182,10 @@ jobs:
         run: yarn vitest run
 
   build:
+    # 4m measured. Generous on purpose: this must never fire on a slow but
+    # healthy run, only on a hang. Without it the job inherits
+    # GitHub's 360-minute default (#885).
+    timeout-minutes: 30
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -251,6 +267,10 @@ jobs:
           cd src-tauri && cargo check --target x86_64-apple-darwin --all-targets
 
   supply-chain:
+    # 51s measured. Generous on purpose: this must never fire on a slow but
+    # healthy run, only on a hang. Without it the job inherits
+    # GitHub's 360-minute default (#885).
+    timeout-minutes: 20
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -357,6 +377,12 @@ jobs:
   # so it wants its own branch and its own measurement, not a ride on a
   # caching fix.
   platform:
+    # 10m measured on windows-latest, 5m on ubuntu -- this matrix is the
+    # critical path, so its ceiling is the highest here. Generous on
+    # purpose: it must never fire on a slow but healthy run, only on a
+    # hang. Without it the job inherits GitHub's 360-minute default
+    # (#885).
+    timeout-minutes: 45
     name: platform (${{ matrix.os }})
     strategy:
       # One platform failing must not cancel the other: when both are
@@ -505,6 +531,10 @@ jobs:
   # a `git diff --name-only` and a `grep`; buying that with another
   # supply-chain entry to audit is the wrong trade.
   mobile-changes:
+    # 8s measured; it is one diff and a grep. Generous on purpose: this must never fire on a slow but
+    # healthy run, only on a hang. Without it the job inherits
+    # GitHub's 360-minute default (#885).
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     outputs:
       # "true" when the mobile jobs must do their real work.
@@ -650,6 +680,10 @@ jobs:
   # make this job skippable -- `mobile-changes` has no condition of its
   # own, so it always succeeds and this always runs.
   mobile-android:
+    # 7m measured. Generous on purpose: this must never fire on a slow but
+    # healthy run, only on a hang. Without it the job inherits
+    # GitHub's 360-minute default (#885).
+    timeout-minutes: 45
     needs: mobile-changes
     runs-on: ubuntu-latest
     env:
@@ -813,6 +847,10 @@ jobs:
   # forever. That is the precise false negative this whole change has to
   # avoid, so it is worth naming where it would happen.
   mobile-ios:
+    # 1.5m measured. Generous on purpose: this must never fire on a slow but
+    # healthy run, only on a hang. Without it the job inherits
+    # GitHub's 360-minute default (#885).
+    timeout-minutes: 30
     needs: mobile-changes
     runs-on: macos-latest
     steps:

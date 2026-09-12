@@ -28,10 +28,15 @@ on:
         type: boolean
         default: true
 
-# Least privilege: contents:write solely to create the pre-release and
-# upload its assets. The store uploads use their own credentials.
+# Least privilege, per job rather than per workflow (#886).
+#
+# contents:write is for creating the pre-release and uploading its assets,
+# and `publish` is the only job that does either -- the store uploads use
+# their own credentials. Granting it workflow-wide gave it to the two
+# build jobs as well, which run `yarn install` and `cargo build` over the
+# whole dependency tree and create nothing in this repository.
 permissions:
-  contents: write
+  contents: read
 
 env:
   # Load-bearing on every `yarn tauri` call, and ABSOLUTE rather than the
@@ -76,6 +81,12 @@ jobs:
   # Set ANDROID_RELEASE_ENABLED to `true` once the five Android secrets
   # exist. Nothing else needs editing.
   ios-release:
+    # The long pole: archive, sign, upload to TestFlight. Measured around
+    # 20m; 60 absorbs a slow App Store Connect without ever hanging for
+    # six hours (#885).
+    timeout-minutes: 60
+    permissions:
+      contents: read
     if: vars.MOBILE_RELEASE_ENABLED == 'true' || (github.event_name == 'workflow_dispatch' && inputs.dry_run)
     runs-on: macos-latest
     steps:
@@ -580,6 +591,11 @@ jobs:
             "$RUNNER_TEMP/dist.p12" "$RUNNER_TEMP/dist.mobileprovision" "$RUNNER_TEMP/altool.json"
 
   android-release:
+    # Skips early today (#673's secrets are not configured), so this is a
+    # ceiling for the day it does run (#885).
+    timeout-minutes: 60
+    permissions:
+      contents: read
     # Both gates: the mobile release gate AND Android's own. A dry run
     # is exempt from the first but NOT the second -- rehearsing a build
     # whose signing secrets do not exist only reproduces the failure
@@ -861,6 +877,12 @@ jobs:
   # (spec: "for provenance, not for distribution"), and the stores are
   # where users get the app.
   publish:
+    # Collects both platforms' artifacts and creates the pre-release
+    # (#885).
+    timeout-minutes: 30
+    # The only job that writes to this repository (#886).
+    permissions:
+      contents: write
     needs: [ios-release, android-release]
     # `always()` so a SKIPPED android-release does not skip this too.
     # Without it, `needs` treats "skipped" like "did not succeed" and
