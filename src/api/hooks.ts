@@ -62,6 +62,7 @@ import {
   listWorktrees,
   removeWorktree,
   pullCheckout,
+  fetchRefs,
   removeOrphan,
   assessedWorktrees,
   dockerBuilds,
@@ -1643,6 +1644,33 @@ export function usePullCheckout() {
       // SUCCESSFUL pull, until something else happened to refresh it --
       // so the button looked like it had done nothing, which is exactly
       // what #346 reported.
+      void qc.invalidateQueries({ queryKey: ["worktree-safety"] });
+      return out;
+    });
+}
+
+/// Refresh one repository's remote refs without moving a branch (#788).
+///
+/// Invalidates exactly what `usePullCheckout` does, and for the same
+/// reason: `fetched_at` lives on the worktree LIST (it is
+/// `FETCH_HEAD`'s mtime, stat'd during the scan) while the
+/// ahead/behind counts come from the CLASSIFICATION pass, so a refresh
+/// that invalidated only one of the two would leave the page
+/// half-updated -- a row whose age note said "just now" beside an
+/// ahead/behind from before the fetch, which is a worse lie than the
+/// stale one this feature exists to stop.
+///
+/// Does NOT unwrap git's output into a user-facing message. `git fetch`
+/// prints its progress to stderr and nothing to stdout, so a successful
+/// refresh resolves to the empty string -- the caller must phrase its
+/// own success line. That asymmetry with `usePullCheckout`, whose `git
+/// pull` does say "Already up to date.", is the reason this is not
+/// simply the same hook with a different command string.
+export function useFetchRefs() {
+  const qc = useQueryClient();
+  return (path: string) =>
+    fetchRefs(path).then((out) => {
+      void qc.invalidateQueries({ queryKey: ["worktrees"] });
       void qc.invalidateQueries({ queryKey: ["worktree-safety"] });
       return out;
     });

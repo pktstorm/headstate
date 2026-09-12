@@ -163,6 +163,7 @@ pub fn run() {
             commands::diag_log,
             commands::reveal_log,
             commands::pull_checkout,
+            commands::fetch_refs,
             commands::remove_orphan,
             commands::get_cached,
             commands::get_cached_reviewing,

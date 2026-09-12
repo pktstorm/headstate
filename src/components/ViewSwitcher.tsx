@@ -13,6 +13,16 @@ import { IS_MOBILE_BUILD } from "../lib/target";
 /// complete (#675). One array, one order, one set of labels, which is why
 /// #794's tenth view needed no edit there.
 export const VIEWS: { id: View; label: string; Icon: typeof GitPullRequest }[] = [
+  // FIRST in the menu, per #823 -- the order here is what the user sees,
+  // and `ALL_VIEWS` in `store/filters.ts` is kept in step so the two read
+  // alike. See that list for why this leads.
+  //
+  // "PR Stats", not "Stats" (#794). The bare word had the sidebar's
+  // context to lean on -- it sat under a list of repositories with open
+  // pull requests in them. In a flat menu beside "System health" it
+  // would read as stats about the machine, which is the one thing it is
+  // not about.
+  { id: "pr-stats", label: "PR Stats", Icon: BarChart3 },
   { id: "my-prs", label: "My pull requests", Icon: GitPullRequest },
   { id: "to-review", label: "To review", Icon: Eye },
   { id: "worktrees", label: "Worktrees", Icon: FolderGit2 },
@@ -21,12 +31,6 @@ export const VIEWS: { id: View; label: string; Icon: typeof GitPullRequest }[] =
   { id: "artifacts", label: "Artifacts", Icon: HardDrive },
   { id: "packages", label: "Package updates", Icon: Package },
   { id: "claude-md", label: "CLAUDE.md", Icon: FileText },
-  // "PR Stats", not "Stats" (#794). The bare word had the sidebar's
-  // context to lean on -- it sat under a list of repositories with open
-  // pull requests in them. In a flat menu beside "System health" it
-  // would read as stats about the machine, which is the one thing it is
-  // not about.
-  { id: "pr-stats", label: "PR Stats", Icon: BarChart3 },
   // Last, and deliberately so: it is the only entry that is not about
   // the user's code at all. Grouping it with the repo-scoped views
   // would imply it takes a repository, which it does not.

@@ -222,6 +222,26 @@ pub const SURFACE: &[(&str, Class)] = &[
     // phone to do. They change the desktop but delete nothing, so
     // they do not carry the step-up signature.
     ("pull_checkout", Class::Write),
+    // Refreshing one repository's remote refs (#788). WRITE, not Read.
+    //
+    // It mutates nothing on GitHub, which is what makes the Read
+    // classification tempting -- `git fetch` is the most read-shaped
+    // thing git does. But this table's Read means "no side effects on
+    // GitHub OR DISK", and a fetch writes: `origin/*` refs, `FETCH_HEAD`,
+    // and new objects in the repository. It is not Destructive either --
+    // `fetch_refs` passes no `--prune`, precisely so that it cannot
+    // delete the `origin/*` refs that `MergedUpstreamDeleted` (#732)
+    // reads, and it moves no branch the user is standing on. Write is
+    // exactly the middle the class exists for: changes local state,
+    // deletes nothing, so no step-up signature.
+    //
+    // Exposed rather than Local on the same argument the three rows
+    // around it make: driving the desktop IS the companion. A phone
+    // reading "up to date with upstream · as of a fetch 2 days ago" can
+    // act on that answer perfectly well, and it is the one screen where
+    // the alternative -- pull, to find out whether you needed to pull --
+    // is worst, because the phone cannot then fix a conflict.
+    ("fetch_refs", Class::Write),
     ("docker_start", Class::Write),
     ("docker_restart", Class::Write),
     // Preferences, not machine capabilities: they live in the
@@ -678,6 +698,7 @@ async fn call(app: &AppHandle, command: &str, a: Args<'_>) -> Result<Value, Remo
         .await),
         "cancel_update_run" => res(commands::cancel_update_run(app.state(), a.get("repoPath")?)),
         "pull_checkout" => res(commands::pull_checkout(a.get("path")?).await),
+        "fetch_refs" => res(commands::fetch_refs(a.get("path")?).await),
         // Shell out like the other sync Docker commands, so a slow
         // engine start does not stall the listener for everyone else.
         "docker_start" => res(blocking(commands::docker_start).await?),
@@ -891,6 +912,12 @@ mod tests {
             ("get_ui_prefs", Class::Read),
             ("update_run_state", Class::Read),
             ("pull_checkout", Class::Write),
+            // Never Local at any point -- it was born exposed (#788) --
+            // but it belongs in this list for the same reason the rest
+            // do: moving it to Local would remove the companion's only
+            // way to refresh a stale comparison, and that is a product
+            // decision that should have to be argued here.
+            ("fetch_refs", Class::Write),
             ("docker_start", Class::Write),
             ("docker_restart", Class::Write),
             ("set_ui_prefs", Class::Write),
