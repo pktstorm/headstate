@@ -228,6 +228,21 @@ pub fn observed_remaining() -> Option<u64> {
 /// holding this lock has already failed, and turning that into a cascade of
 /// unrelated `unwrap` panics in every subsequent test hides the one real
 /// failure.
+///
+/// # This rule did not reach six of its own siblings
+///
+/// The paragraph above said "directly or through `Budget::record`" from the
+/// start, and six tests IN THIS FILE called `record` without the lock anyway:
+/// three in the `tests` module and three in `metering`. They mutated
+/// `OBSERVED_REMAINING` under `a_seeded_budget_can_actually_refuse`, which
+/// reads it -- so the cold-start test failed roughly two runs in three under
+/// `--test-threads`, in a file whose own doc comment named the hazard.
+///
+/// If you add a test here: `record` is not the only reachable path, and
+/// "my test does not mention `note_remaining`" is not the question. The
+/// question is whether anything it calls can store to `OBSERVED_REMAINING`.
+/// Take the lock and capture `RestoreObserved` -- both are cheap, and a test
+/// that does not need them loses nothing by holding them.
 #[cfg(test)]
 pub fn observed_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -517,6 +532,8 @@ pub(crate) mod tests {
 
     #[test]
     fn accumulates_cost_across_requests() {
+        let _g = observed_test_lock();
+        let _restore = RestoreObserved::capture();
         let b = Budget::new();
         b.record(&rl(1, 4999, "2026-09-11T16:52:14Z"));
         b.record(&rl(4, 4995, "2026-09-11T16:52:14Z"));
@@ -530,6 +547,8 @@ pub(crate) mod tests {
     /// not on whichever reply won.
     #[test]
     fn remaining_is_the_lowest_seen_not_the_last() {
+        let _g = observed_test_lock();
+        let _restore = RestoreObserved::capture();
         let b = Budget::new();
         b.record(&rl(1, 900, "2026-09-11T16:52:14Z"));
         b.record(&rl(1, 400, "2026-09-11T16:52:14Z"));
@@ -544,6 +563,8 @@ pub(crate) mod tests {
     /// passed by the time the user reads it.
     #[test]
     fn reset_at_is_the_latest_seen() {
+        let _g = observed_test_lock();
+        let _restore = RestoreObserved::capture();
         let b = Budget::new();
         b.record(&rl(1, 100, "2026-09-11T16:00:00Z"));
         b.record(&rl(1, 100, "2026-09-11T17:00:00Z"));
@@ -747,6 +768,8 @@ pub(crate) mod tests {
     /// exists to fix.
     #[test]
     fn an_unmetered_response_is_counted_but_not_costed() {
+        let _g = observed_lock();
+        let _restore = RestoreObserved::capture();
         let b = Budget::new();
         b.record(&rl(3, 4997, "2026-09-11T16:52:14Z"));
         b.record(&json!({ "merged_week": { "issueCount": 7 } }));
@@ -795,6 +818,8 @@ pub(crate) mod tests {
 
     #[test]
     fn pressure_rises_from_zero_to_one_at_the_reserve() {
+        let _g = observed_lock();
+        let _restore = RestoreObserved::capture();
         let b = Budget::new();
         b.record(&rl(1, HOURLY_BUDGET, "2026-09-11T16:52:14Z"));
         assert_eq!(b.snapshot().pressure(), Some(0.0));
@@ -818,6 +843,8 @@ pub(crate) mod tests {
     /// whole reason the counters are atomics in an `Arc`.
     #[test]
     fn clones_share_one_accumulator() {
+        let _g = observed_lock();
+        let _restore = RestoreObserved::capture();
         let b = Budget::new();
         let c = b.clone();
         b.record(&rl(2, 4998, "2026-09-11T16:52:14Z"));
