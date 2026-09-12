@@ -4,10 +4,21 @@ on:
   push:
     tags: ["v*"]
 
-# Least privilege: only the release job runs, and it needs contents:write
-# solely to create the GitHub Release and upload assets.
+# Least privilege, per job rather than per workflow (#886).
+#
+# This block used to say "only the release job runs, and it needs
+# contents:write" while granting it at WORKFLOW level -- so `gate` and all
+# three `build` legs held it too. The comment stated the intent correctly
+# and the code was broader, which is the shape #886 was filed about.
+#
+# It matters because the build legs run `yarn install` and `cargo build`
+# over the whole dependency tree. A compromised build dependency holding
+# contents:write can push to this repository; the same dependency under
+# contents:read cannot. That is the blast-radius argument this file
+# already makes for pinning every action to a full commit SHA, applied to
+# token scope.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # CI runs independently on the tag (see ci.yml's `tags:` trigger). This
@@ -100,6 +111,16 @@ jobs:
   # that never reports is the permanently-unmergeable class ci.yml:388-412
   # warns about.
   gate:
+    # 1-8m measured. A gate waiting on a status that never arrives is the
+    # exact hang this ceiling exists for -- without it, six hours of a
+    # runner (#885).
+    timeout-minutes: 30
+    # Reads check runs on the tag's commit. `checks: read` is explicit
+    # rather than inherited, so tightening the workflow default above
+    # cannot silently blind the gate.
+    permissions:
+      contents: read
+      checks: read
     runs-on: ubuntu-latest
     steps:
       - name: Wait for CI to pass on this commit
@@ -117,6 +138,14 @@ jobs:
 
   build:
     needs: gate
+    # Up to ~20m measured for a signed, notarized macOS bundle; 60 leaves
+    # room for a slow notarization queue without ever sitting for six
+    # hours (#885).
+    timeout-minutes: 60
+    # Builds and uploads artifacts for `publish` to collect. It creates
+    # nothing in the repository, so it does not need write (#886).
+    permissions:
+      contents: read
     strategy:
       # One platform failing must not cancel the others: a release that
       # advertises three platforms and ships one is worse than a release
@@ -491,6 +520,13 @@ jobs:
   # no release. It also avoids three parallel jobs racing to create the
   # same tag.
   publish:
+    # 5-15m measured: it downloads three platforms' artifacts, builds the
+    # manifest and uploads. 30 is ample (#885).
+    timeout-minutes: 30
+    # The ONE job that needs write: it creates the GitHub Release and
+    # uploads its assets (#886).
+    permissions:
+      contents: write
     needs: build
     runs-on: ubuntu-latest
     steps:
