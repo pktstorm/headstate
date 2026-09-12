@@ -19,8 +19,29 @@
 //! | tier | rule | this release |
 //! |---|---|---|
 //! | 3 | total CPU >= [`AGGREGATE_PERCENT`] for >= [`AGGREGATE_MINUTES`] min, no single process explains it | **alerts** |
+//! | watch | a process >= [`WATCH_PERCENT`] for >= [`WATCH_MINUTES`] min, not allowlisted (#865) | [`Notice`], page only |
+//! | load | load average / cores >= [`OVERSUBSCRIBED_RATIO`] for >= [`OVERSUBSCRIBED_MINUTES`] min (#872) | [`Notice`], page only |
 //! | 1 | a process >= [`TIER1_PERCENT`] for >= [`TIER1_MINUTES`] min, PPID 1, not allowlisted | shadow log only |
 //! | 2 | a process >= [`TIER2_PERCENT`] for >= [`TIER2_MINUTES`] min | shadow log only |
+//!
+//! A [`Notice`] is an INDICATOR and an [`Alert`] is an INTERRUPTION, and
+//! the two are kept apart on purpose: the watch tier and the load rule
+//! both describe conditions that a large build produces legitimately, so
+//! notifying on either would be the #853 outcome (~40 false positives,
+//! guard turned off). They reach `health_alerts` and the System Health
+//! page; nothing converts one into an `Alert`, and two tests assert that
+//! rather than leaving it to review.
+//!
+//! # Why load average is here at all (#872)
+//!
+//! Because `cpu_percent` SATURATES and load average does not. The mean
+//! of per-core usage is capped at 100, so twelve busy cores and twelve
+//! busy cores with forty-one more threads queued behind them read the
+//! same. #865's incident reached **load average 53 on 12 cores** and no
+//! rule in this module consulted it -- the aggregate rule saw 50%
+//! machine-wide and stayed under its own 60% bar. Load average is the one
+//! signal that says how many things are waiting for a core that does not
+//! exist, and it was already being sampled and stored the whole time.
 //!
 //! Tier 3 ships because it is satisfiable against the schema that
 //! already exists: `cpu_percent` is stored per sample
@@ -182,6 +203,114 @@ pub const WATCH_LONG_MINUTES: f64 = 30.0;
 /// (Windows, or a process that exited mid-walk) therefore changes
 /// nothing rather than defaulting either way.
 pub const SUSPICIOUS_NICE: i32 = 0;
+
+/// Runnable threads per core above which the machine is OVERSUBSCRIBED
+/// (#872).
+///
+/// Load average normalised by core count: 1.0 is "exactly as many
+/// things want a core as there are cores". This is 1.5, so a 12-core
+/// machine qualifies at a load of 18.
+///
+/// # Why load average at all, when `cpu_percent` exists
+///
+/// Because a mean of per-core usage SATURATES. `collect.rs` computes
+/// `cpu_percent` as the mean of `cpu_per_core`, and every core is capped
+/// at 100 -- so a machine with twelve busy cores and a machine with
+/// twelve busy cores plus forty-one more threads queued behind them both
+/// read 100%. #865's incident reached load average **53 on 12 cores**
+/// and no rule in this module consulted it; the aggregate rule saw 50%
+/// machine-wide and stayed under its own 60% bar.
+///
+/// Load average is the only signal here that says how many things are
+/// waiting for a core that does not exist. It is already sampled
+/// (`collect.rs`) and already stored (`store::schema`'s `load_1`,
+/// `load_5`, `load_15`), so this is arithmetic over a series the charts
+/// already draw -- the same claim [`AGGREGATE_PERCENT`] makes.
+///
+/// # Why 1.5 rather than 1.0, and why it is measured rather than chosen
+///
+/// 1.0 is the textbook figure and it is wrong for this rule: it fires on
+/// builds. Measured on a 12-core machine (the incident's own core count)
+/// during `cargo build -j12` of this repo, 2026-09-12, sampling
+/// `vm.loadavg` every 5-6 seconds across a 68-second build:
+///
+/// ```text
+///            peak    / 12 cores
+///   1-min    51.78     4.31x
+///   5-min    16.86     1.40x
+///   15-min    8.06     0.67x
+/// ```
+///
+/// The 5-minute figure crossed 1.0x and STAYED there for about three and
+/// a half minutes. So a rule at 1.0 on the five-minute average would
+/// have fired on an ordinary build of this very repository -- which is
+/// the #853 outcome (~40 false positives, guard disabled) arrived at
+/// from a different direction.
+///
+/// 1.5x clears that build's 15-minute peak by better than a factor of
+/// two and its 5-minute peak with room to spare, while the incident --
+/// 53/12 = 4.4x -- clears 1.5x by nearly three times. The gap between
+/// "the worst ordinary thing measured" and "the incident" is wide, and
+/// 1.5 sits in it rather than at either edge.
+pub const OVERSUBSCRIBED_RATIO: f64 = 1.5;
+
+/// Which of the three load averages this rule reads.
+///
+/// Index 2, the FIFTEEN-minute average. `Sample::load` is
+/// `[one, five, fifteen]`, per `collect.rs`.
+///
+/// This is the discriminating choice in the whole rule, and it is the
+/// one the measurement above settled. During the `-j12` build the
+/// one-minute average hit 4.31x core count -- a rule reading index 0
+/// would fire on every link step on the machine -- and the five-minute
+/// average held above 1.0x for three and a half minutes. The
+/// fifteen-minute average peaked at 0.67x and never reached core count
+/// at all.
+///
+/// A fifteen-minute average is itself a duration requirement, built into
+/// the kernel's own arithmetic: a sixty-second spike enters it damped by
+/// roughly the ratio of the spike to the window. That is why this rule
+/// can afford a relatively low ratio where a one-minute reading could
+/// not.
+///
+/// It is NOT a substitute for [`OVERSUBSCRIBED_MINUTES`]: the kernel's
+/// window tells us the load was high for a while, and the sample run
+/// tells us that the CONDITION is still true now and was true when last
+/// looked at. A single high fifteen-minute reading can be the tail of
+/// something that has already stopped.
+///
+/// Out of range is a COMPILE error rather than a runtime panic --
+/// `Sample::load` is a `[f64; 3]` and this is a const index, so `rustc`
+/// refuses a `3` with "this operation will panic at runtime". Verified by
+/// setting it to 3 and watching the build fail, rather than assumed.
+pub const OVERSUBSCRIBED_INDEX: usize = 2;
+
+/// How long [`OVERSUBSCRIBED_RATIO`] must hold, in minutes.
+///
+/// Ten. Shorter than the eight and a half hours the incident ran and
+/// longer than anything measured above: the build's fifteen-minute
+/// average never crossed the ratio at all, so this duration is not what
+/// excludes it -- it is the second line of defence, for the machine
+/// whose builds are larger than this repo's.
+///
+/// Deliberately NOT five, the figure [`WATCH_MINUTES`] uses. That rule
+/// reads a per-process instantaneous CPU figure, where five minutes of
+/// samples is five minutes of evidence. This one reads a fifteen-minute
+/// kernel average, so two samples ten minutes apart already describe
+/// roughly twenty-five minutes of machine history.
+///
+/// # Why not longer, given the incident ran for 8.5 hours
+///
+/// Because `store::health::history` DOWNSAMPLES. It returns at most
+/// `MAX_POINTS` (120) rows across `RETENTION_HOURS` (24), so on a
+/// machine that has been open all day consecutive samples are twelve
+/// minutes apart, not sixty seconds. A threshold of thirty minutes would
+/// need three such samples and a threshold of ten needs two -- and two
+/// is the minimum [`sustained_above_load`] can measure any duration from
+/// at all. Pushing this higher buys nothing against the incident (which
+/// would satisfy any figure up to eight hours) and costs detection on a
+/// freshly opened app, where the series is short.
+pub const OVERSUBSCRIBED_MINUTES: f64 = 10.0;
 
 /// Tier 1's CPU floor, as a percentage of one core.
 pub const TIER1_PERCENT: f64 = 80.0;
@@ -684,53 +813,176 @@ pub fn evaluate(samples: &[Sample], live: Option<&Aggregate>) -> Vec<Alert> {
 /// So a `Notice` reaches `health_alerts`, which #870 made a page can
 /// read, and never reaches `notify_runaway`. Seen when looked at, not
 /// pushed.
+///
+/// # Why this is an enum (#872)
+///
+/// It shipped in #865 as a struct describing one process. #872 adds a
+/// condition of the MACHINE rather than of a process -- sustained
+/// oversubscription, read from load average -- and the two share a
+/// destination and nothing else: the page, `health_alerts`, and the rule
+/// that neither ever becomes an [`Alert`].
+///
+/// Flattening both into one struct would mean a `name` and a
+/// `cpu_percent` on a row that is about no process in particular, which
+/// is the shape that invites a zero to be read as a measurement. Two
+/// unrelated types would mean [`Watched`] holding two lists and
+/// `health_alerts` concatenating them, for a consumer that only ever
+/// calls [`key`], [`title`] and [`body`]. So: one enum, two variants,
+/// three methods.
+///
+/// [`key`]: Notice::key
+/// [`title`]: Notice::title
+/// [`body`]: Notice::body
 #[derive(Debug, Clone, PartialEq)]
-pub struct Notice {
-    pub name: String,
-    /// CPU as a percentage of ONE core, so a multi-core process reads
-    /// above 100 legitimately.
-    pub cpu_percent: f64,
-    pub minutes: f64,
-    /// Raises the wording, never gates the notice. See
-    /// [`ProcessObservation::nice`].
-    pub niced: bool,
-    pub orphaned: bool,
-    /// Past [`WATCH_LONG_MINUTES`]: the same condition, said more
-    /// firmly, because duration is what separates a build from an
-    /// abandoned loop.
-    pub long: bool,
+pub enum Notice {
+    /// One process worth a human glance (#865).
+    Process {
+        name: String,
+        /// CPU as a percentage of ONE core, so a multi-core process reads
+        /// above 100 legitimately.
+        cpu_percent: f64,
+        minutes: f64,
+        /// Raises the wording, never gates the notice. See
+        /// [`ProcessObservation::nice`].
+        niced: bool,
+        orphaned: bool,
+        /// Past [`WATCH_LONG_MINUTES`]: the same condition, said more
+        /// firmly, because duration is what separates a build from an
+        /// abandoned loop.
+        long: bool,
+    },
+    /// More runnable threads than the machine has cores, held (#872).
+    ///
+    /// The condition #865's incident was screaming and nothing read:
+    /// load average 53 on 12 cores, for eight and a half hours. See
+    /// [`oversubscribed`] and [`OVERSUBSCRIBED_RATIO`].
+    Oversubscribed {
+        /// The mean load average across the run -- the FIFTEEN-minute
+        /// figure, per [`OVERSUBSCRIBED_INDEX`]. Absolute, as the kernel
+        /// reports it, because that is the number the System Health page
+        /// shows under "Load (15m)" and the user should be able to match
+        /// the two.
+        load: f64,
+        /// The core count it was normalised by. Never 0 -- a 0 makes
+        /// [`oversubscribed`] return `None` rather than divide.
+        cores: usize,
+        /// `load / cores`: runnable threads per core, so 1.0 is exactly
+        /// saturated and 4.4 is the incident.
+        ratio: f64,
+        /// How long it has held, in minutes, over ungapped samples only.
+        minutes: f64,
+    },
 }
 
 impl Notice {
-    /// One stable key for the whole condition, per-process.
+    /// One stable key per condition.
     ///
-    /// Keyed on the NAME and not the figures, the same rule
-    /// `Alert::key` states: a process wandering between 51% and 58%
-    /// must stay one row rather than becoming a new one each poll.
+    /// Keyed on the process NAME, or on nothing at all for the machine-wide
+    /// variant, and never on the figures -- the same rule `Alert::key`
+    /// states: a process wandering between 51% and 58%, or a load wandering
+    /// between 19 and 21, must stay ONE row rather than becoming a new one
+    /// every poll.
     pub fn key(&self) -> String {
-        format!("cpu_watch:{}", self.name)
+        match self {
+            Notice::Process { name, .. } => format!("cpu_watch:{name}"),
+            // No figures and no name: there is one machine, so there is
+            // one row, however the load moves.
+            Notice::Oversubscribed { .. } => "cpu_oversubscribed".to_string(),
+        }
     }
 
     pub fn title(&self) -> String {
-        format!("{} has been busy for a while", self.name)
+        match self {
+            Notice::Process { name, .. } => format!("{name} has been busy for a while"),
+            // Names the SHAPE, not the level, for the reason
+            // `Alert::title` gives: "load average 53" is a number the
+            // page already shows, and "more work queued than cores"
+            // is the thing it means.
+            Notice::Oversubscribed { .. } => {
+                "More work is queued than this machine has cores".to_string()
+            }
+        }
     }
 
     pub fn body(&self) -> String {
-        // The suspicious facts are stated, not scored. The user decides;
-        // this sentence only gives them what a glance at `ps` would have.
-        let mut why = String::new();
-        if self.niced {
-            why.push_str(
-                " It is running at low priority, which usually means a background job --                  nothing you are waiting on runs niced.",
-            );
+        match self {
+            Notice::Process {
+                name,
+                cpu_percent,
+                minutes,
+                niced,
+                orphaned,
+                ..
+            } => {
+                // The suspicious facts are stated, not scored. The user
+                // decides; this sentence only gives them what a glance at
+                // `ps` would have.
+                let mut why = String::new();
+                if *niced {
+                    why.push_str(
+                        " It is running at low priority, which usually means a background job --                  nothing you are waiting on runs niced.",
+                    );
+                }
+                if *orphaned {
+                    why.push_str(" Its parent has exited, so nothing is supervising it.");
+                }
+                format!(
+                    "{name} has held about {cpu_percent:.0}% of one CPU core for {minutes:.0} minutes.{why} Worth a look if you              did not start something long-running."
+                )
+            }
+            // Says the ratio in words rather than only the raw load,
+            // because "53" means nothing without "on 12 cores" beside
+            // it -- and the whole reason this rule exists is that a
+            // saturating percentage cannot express the difference.
+            Notice::Oversubscribed {
+                load,
+                cores,
+                ratio,
+                minutes,
+            } => format!(
+                "The load average has been about {load:.0} on {cores} cores for {minutes:.0} minutes -- roughly {ratio:.1} times as much work queued as there are cores to run it. A large build does this briefly; for this long it usually means something is not finishing."
+            ),
         }
-        if self.orphaned {
-            why.push_str(" Its parent has exited, so nothing is supervising it.");
+    }
+
+    /// The process name, or `None` for a machine-wide notice.
+    ///
+    /// An accessor rather than a field because the machine-wide variant
+    /// has no name, and inventing one ("system") would put a string that
+    /// names no process where callers read process names.
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Notice::Process { name, .. } => Some(name),
+            Notice::Oversubscribed { .. } => None,
         }
-        format!(
-            "{} has held about {:.0}% of one CPU core for {:.0} minutes.{} Worth a look if you              did not start something long-running.",
-            self.name, self.cpu_percent, self.minutes, why
-        )
+    }
+
+    /// How long the condition has held, in minutes. Both variants have
+    /// one, and it is what [`watch`] sorts on.
+    pub fn minutes(&self) -> f64 {
+        match self {
+            Notice::Process { minutes, .. } | Notice::Oversubscribed { minutes, .. } => *minutes,
+        }
+    }
+
+    /// Whether the process is niced. `false` for a machine-wide notice,
+    /// which is about no process and so has no priority.
+    pub fn niced(&self) -> bool {
+        matches!(self, Notice::Process { niced: true, .. })
+    }
+
+    /// Whether the process's parent has exited. `false` for a
+    /// machine-wide notice, for the same reason as [`niced`].
+    ///
+    /// [`niced`]: Notice::niced
+    pub fn orphaned(&self) -> bool {
+        matches!(self, Notice::Process { orphaned: true, .. })
+    }
+
+    /// Whether the condition is past its "this has been going a long
+    /// time" mark ([`WATCH_LONG_MINUTES`]).
+    pub fn long(&self) -> bool {
+        matches!(self, Notice::Process { long: true, .. })
     }
 }
 
@@ -804,7 +1056,7 @@ pub fn watch(
         if p.allowlisted() {
             continue;
         }
-        out.push(Notice {
+        out.push(Notice::Process {
             name: p.name.clone(),
             cpu_percent: p.cpu_percent,
             minutes,
@@ -815,8 +1067,140 @@ pub fn watch(
     }
     // Longest first: if the list is ever truncated for display, the one
     // that has been going longest is the one that survives.
-    out.sort_by(|a, b| b.minutes.total_cmp(&a.minutes));
+    out.sort_by(|a, b| b.minutes().total_cmp(&a.minutes()));
     out
+}
+
+/// A run of consecutive, ungapped samples at the end of the series whose
+/// normalised load average is all at or above `ratio` (#872).
+///
+/// Returns `(minutes, mean_ratio, mean_load)`, or `None` when the newest
+/// sample is below the ratio, when a load reading is missing, when the
+/// core count is unknown, or when there is not enough measured time.
+///
+/// The sibling of [`sustained_above`] and deliberately a separate
+/// function rather than a generic over "some field of `Sample`". Three
+/// things differ and all three are the substance of the rule: the field
+/// is an `Option<[f64; 3]>` and not an `Option<f64>`, the comparison is
+/// against a NORMALISED figure rather than the stored one, and the
+/// normalisation can itself fail. A closure-taking generic would hide
+/// exactly those three decisions behind a call site.
+///
+/// # `cores == 0` is silence, not a division
+///
+/// `Aggregate::cores` is 0 when `available_parallelism` failed, and this
+/// follows [`Aggregate::largest_share`] exactly: return `None` rather
+/// than divide. `load / 0` is `+inf` in IEEE 754, which would clear
+/// every threshold this module has at once -- a single unreadable core
+/// count would turn the rule into "always fire", on every machine it
+/// could not measure. That is the characteristic failure this repo calls
+/// absent-is-not-zero, in its most expensive form.
+///
+/// # A missing load reading breaks the run
+///
+/// `Sample::load` is `None` on Windows BY DESIGN -- `collect.rs` maps
+/// Windows' three zeroes to absent, because Windows has no load average
+/// and three zeroes are indistinguishable from a genuinely idle machine.
+/// So a `None` ends the run, the same way a missing `cpu_percent` ends
+/// [`sustained_above`]: "not measured" is an unknown and not a low
+/// reading. On Windows every sample is `None`, the run is empty, and the
+/// rule says nothing at all -- which is the correct answer for a
+/// platform that cannot be asked the question.
+fn sustained_above_load(samples: &[Sample], cores: usize, ratio: f64) -> Option<(f64, f64, f64)> {
+    if cores == 0 {
+        return None;
+    }
+    let cores = cores as f64;
+    let mut total_minutes = 0.0;
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    let mut newer_ms: Option<i64> = None;
+
+    for s in samples.iter().rev() {
+        // Absent on Windows, and absent is not zero. The run ends here.
+        let Some(load) = s.load else { break };
+        let reading = load[OVERSUBSCRIBED_INDEX];
+        // A NaN or an infinity from the platform is not a reading. Left
+        // in, a NaN loses every comparison silently -- so it would not
+        // break the run, it would be averaged into a mean that is NaN
+        // forever after.
+        if !reading.is_finite() || reading / cores < ratio {
+            break;
+        }
+        let Ok(at) = chrono::DateTime::parse_from_rfc3339(&s.sampled_at) else {
+            break;
+        };
+        let ms = at.timestamp_millis();
+        if let Some(newer) = newer_ms {
+            let spacing = newer - ms;
+            // Identical to `sustained_above`'s rule, and the same
+            // constant: out-of-order or same-instant rows, and spacings
+            // wider than GAP_MS, are not intervals. The run ends HERE
+            // with what is already counted kept, rather than stitching
+            // across hours nobody sampled.
+            if spacing <= 0 || spacing > GAP_MS {
+                break;
+            }
+            total_minutes += spacing as f64 / 60_000.0;
+        }
+        sum += reading;
+        count += 1;
+        newer_ms = Some(ms);
+    }
+
+    // One sample is a reading, not a duration -- `sustained_above` says
+    // the same and for the same reason. It spans no measured time, so
+    // there is nothing to compare against a minutes-long threshold.
+    if count < 2 {
+        return None;
+    }
+    let mean_load = sum / count as f64;
+    Some((total_minutes, mean_load / cores, mean_load))
+}
+
+/// Whether the machine has been oversubscribed for long enough to say so
+/// (#872).
+///
+/// `samples` is oldest-first, as `store::health::history` returns it.
+/// `cores` is the logical core count, 0 when unknown -- which produces
+/// `None`, never a division.
+///
+/// Returns `None` on every form of "cannot say": no load average
+/// (Windows), an unknown core count, too short a run, or a ratio under
+/// [`OVERSUBSCRIBED_RATIO`]. The caller cannot tell those apart and does
+/// not need to; all of them mean the same thing, which is that nothing
+/// should be shown.
+///
+/// # Why this is a [`Notice`] and not an [`Alert`]
+///
+/// Oversubscription during a large build is normal, and the measurement
+/// in [`OVERSUBSCRIBED_RATIO`] is how normal: an ordinary `cargo build
+/// -j12` of this repo drove the one-minute load to 4.3x core count.
+/// Interrupting on that would be crying wolf at a condition the user
+/// created on purpose thirty seconds earlier, and a guard that cries wolf
+/// gets turned off -- #853's ~40 false positives are the receipt.
+///
+/// So this is an indicator on the System Health page: it reaches
+/// `health_alerts` and the page, and never `notify_runaway`.
+/// `nothing_converts_a_notice_into_an_alert` holds that boundary, and
+/// `nothing_converts_a_shadow_into_an_alert` asserts that exactly one
+/// `Alert` variant still ships -- this change deliberately adds none.
+///
+/// Pure, like [`evaluate`] and [`watch`]: no clock, no database, no
+/// process table. The incident it exists for ran for eight and a half
+/// hours, and a test must be able to state that as arithmetic rather than
+/// arrange it.
+pub fn oversubscribed(samples: &[Sample], cores: usize) -> Option<Notice> {
+    let (minutes, ratio, load) = sustained_above_load(samples, cores, OVERSUBSCRIBED_RATIO)?;
+    if minutes < OVERSUBSCRIBED_MINUTES {
+        return None;
+    }
+    Some(Notice::Oversubscribed {
+        load,
+        cores,
+        ratio,
+        minutes,
+    })
 }
 
 pub fn shadow(
@@ -1357,11 +1741,11 @@ mod tests {
         );
         let n = &out[0];
         assert!(
-            n.niced,
+            n.niced(),
             "nice 5 is recorded -- it is why the aggregate rule missed these"
         );
-        assert!(n.orphaned, "PPID 1");
-        assert!(n.long, "8.5 hours is well past the long mark");
+        assert!(n.orphaned(), "PPID 1");
+        assert!(n.long(), "8.5 hours is well past the long mark");
         assert!(
             n.body().contains("low priority"),
             "the body says WHY it is suspicious"
@@ -1389,10 +1773,10 @@ mod tests {
         let p = proc(901, "node", 52.0, Some(42));
         let out = watch(std::slice::from_ref(&p), &durations(&[(&p, 6.0)]));
         assert_eq!(out.len(), 1);
-        assert!(!out[0].orphaned, "parented, and surfaced anyway");
-        assert!(!out[0].niced);
+        assert!(!out[0].orphaned(), "parented, and surfaced anyway");
+        assert!(!out[0].niced());
         assert!(
-            !out[0].long,
+            !out[0].long(),
             "six minutes is worth a look, not yet a long burn"
         );
     }
@@ -1434,7 +1818,7 @@ mod tests {
         let p = proc_niced(905, "c", 60.0, Some(42), None);
         let out = watch(std::slice::from_ref(&p), &durations(&[(&p, 10.0)]));
         assert_eq!(out.len(), 1, "surfaced on level and duration alone");
-        assert!(!out[0].niced, "unknown is not 'niced'");
+        assert!(!out[0].niced(), "unknown is not 'niced'");
         assert!(!out[0].body().contains("low priority"));
     }
 
@@ -1470,7 +1854,393 @@ mod tests {
             &[a.clone(), b.clone()],
             &durations(&[(&a, 6.0), (&b, 400.0)]),
         );
-        assert_eq!(out[0].name, "old");
+        assert_eq!(out[0].name(), Some("old"));
+    }
+
+    // ---- Oversubscription, from load average (#872) ------------------
+
+    /// A series of FIFTEEN-minute load averages at the sampler's own
+    /// cadence, ending now: oldest first, one minute apart.
+    ///
+    /// # The one- and five-minute slots are deliberately LOW, not equal
+    ///
+    /// They were equal in the first draft of these tests, and sabotage
+    /// proved that made `OVERSUBSCRIBED_INDEX` -- the single most
+    /// load-bearing decision in the rule -- untestable: changing the
+    /// constant from 2 to 0 left all 47 tests PASSING, because every slot
+    /// held the same number. That is the v5.14.0 lesson again, in the one
+    /// place it would have cost the most.
+    ///
+    /// So the shorter windows carry a quiet machine's figures while index
+    /// 2 carries the oversubscribed one. The combination is not artificial
+    /// -- it is what the tail of a long runaway looks like once the
+    /// one-minute average has settled -- and it means a rule reading the
+    /// wrong index reports silence on the incident fixture and fails
+    /// loudly.
+    fn load_series(points: &[f64]) -> Vec<Sample> {
+        let end = chrono::Utc::now();
+        points
+            .iter()
+            .enumerate()
+            .map(|(i, la)| {
+                let at = end - chrono::Duration::minutes((points.len() - 1 - i) as i64);
+                let mut s = bare(&at.to_rfc3339());
+                // 0.5 and 1.0: well under core count on any machine these
+                // tests use, so only index 2 can satisfy the ratio.
+                s.load = Some([0.5, 1.0, *la]);
+                s
+            })
+            .collect()
+    }
+
+    /// **THE incident, as a fixture, read through load average (#872).**
+    ///
+    /// 12 cores, load average 53, sustained 8.5 hours. That is 4.4
+    /// runnable threads per core -- the machine was not busy, it was
+    /// buried -- and `the_twelve_spinner_incident_is_surfaced` above
+    /// shows what every OTHER rule in this module saw instead: 50%
+    /// machine-wide CPU, comfortably under `AGGREGATE_PERCENT`'s 60.
+    ///
+    /// This is the one signal that was unambiguous at the time and the one
+    /// nothing read. A rule set that stays quiet here is not finished.
+    #[test]
+    fn the_twelve_spinner_incident_is_oversubscribed() {
+        // 8.5 hours of samples would be 510 entries; the rule measures a
+        // run over CONSECUTIVE samples, so thirty of them (29 minutes) is
+        // already far past `OVERSUBSCRIBED_MINUTES` and the arithmetic is
+        // identical. The duration is asserted against the threshold, not
+        // against 510.
+        let s = load_series(&[53.0; 30]);
+
+        let n = oversubscribed(&s, 12).expect("load 53 on 12 cores for half an hour must surface");
+
+        match &n {
+            Notice::Oversubscribed {
+                load,
+                cores,
+                ratio,
+                minutes,
+            } => {
+                assert!((load - 53.0).abs() < 0.01, "{load}");
+                assert_eq!(*cores, 12);
+                // 53/12 = 4.416..., which is what "catastrophically
+                // oversubscribed" looks like as a number.
+                assert!((ratio - 53.0 / 12.0).abs() < 0.01, "{ratio}");
+                assert!(*minutes >= OVERSUBSCRIBED_MINUTES, "{minutes}");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        assert_eq!(n.key(), "cpu_oversubscribed");
+        assert!(
+            n.body().contains("53"),
+            "the body says the load: {}",
+            n.body()
+        );
+        assert!(
+            n.body().contains("12 cores"),
+            "and the core count: {}",
+            n.body()
+        );
+    }
+
+    /// **The false-positive test this rule exists to pass, from real
+    /// measurement rather than reasoning.**
+    ///
+    /// `cargo build -j12` of THIS repository on a 12-core machine,
+    /// 2026-09-12, `vm.loadavg` sampled every 5-6 seconds across a
+    /// 68-second build. These are the fifteen-minute readings, one per
+    /// minute, through the build and its link phase:
+    ///
+    /// ```text
+    ///   1.83 2.31 3.16 3.27 3.25 3.22 3.19 3.13 3.38 3.53
+    ///   5.88 7.57 7.71 7.86 8.00 8.06 7.90 7.71 7.45 7.23
+    /// ```
+    ///
+    /// The peak is **8.06 on 12 cores: 0.67x**, and it never reached core
+    /// count at all. Meanwhile the ONE-minute average in the same run
+    /// peaked at 51.78 (4.31x) and the five-minute at 16.86 (1.40x) --
+    /// which is the measurement that chose `OVERSUBSCRIBED_INDEX`, and the
+    /// reason a rule reading index 0 or 1 would fire on every build on
+    /// this machine.
+    ///
+    /// If this test fails the guard cries wolf on ordinary work, and a
+    /// guard that cries wolf gets turned off -- #853 already paid ~40
+    /// false positives for that lesson once.
+    #[test]
+    fn a_parallel_build_is_not_oversubscribed() {
+        // The whole run, rise through decay, one reading per minute.
+        let measured = [
+            1.83, 2.31, 3.16, 3.27, 3.25, 3.22, 3.19, 3.13, 3.38, 3.53, 5.88, 7.57, 7.71, 7.86,
+            8.00, 8.06, 7.90, 7.71, 7.45, 7.23,
+        ];
+        assert!(
+            oversubscribed(&load_series(&measured), 12).is_none(),
+            "a real `cargo build -j12` must stay silent"
+        );
+
+        // And again truncated at its WORST moment, which is the case that
+        // actually tests the threshold. The rule measures backwards from
+        // the newest sample, so a series ending on the decay tail breaks
+        // its run early and would pass at almost any ratio -- sabotage
+        // proved exactly that, with `OVERSUBSCRIBED_RATIO` lowered to 0.6
+        // and the full series above still silent. Ending the series at the
+        // 8.06 peak removes that accident: every sample in the run is at
+        // or near the build's maximum, so the assertion is about the ratio
+        // and nothing else.
+        let peak = &measured[..16];
+        assert!(
+            (peak[15] - 8.06).abs() < 0.01,
+            "the truncation ends on the measured peak"
+        );
+        assert!(
+            oversubscribed(&load_series(peak), 12).is_none(),
+            "the build's worst fifteen-minute reading is 8.06 on 12 cores -- 0.67x, and \
+             OVERSUBSCRIBED_RATIO is {OVERSUBSCRIBED_RATIO}"
+        );
+        // Measured by sabotage, and worth stating because it is not what
+        // the paragraph above implies: the ratio ALONE does not exclude
+        // this build. Lowering `OVERSUBSCRIBED_RATIO` to 0.6 leaves this
+        // test passing, because the run then breaks at the 5.88 sample
+        // four minutes back and `OVERSUBSCRIBED_MINUTES` refuses it.
+        // Lowering BOTH -- ratio to 0.6 and minutes to 3 -- fails it. The
+        // two clauses exclude the build together, and a future change to
+        // either one has this fixture standing behind it.
+
+        // The reading the rule deliberately does NOT use, from the same
+        // run, to show what choosing the fifteen-minute window bought: the
+        // FIVE-minute average held above core count for three and a half
+        // minutes during this very build, so a rule at index 1 and any
+        // ratio at or under 1.4 would have fired on it.
+        let five_minute = [
+            12.26, 15.98, 16.12, 16.65, 16.86, 16.60, 16.35, 16.11, 15.86, 15.67, 15.26, 15.03,
+            14.81,
+        ];
+        assert!(
+            five_minute.iter().all(|la| la / 12.0 >= 1.0),
+            "every one of these five-minute readings is above core count, which is why \
+             OVERSUBSCRIBED_INDEX is 2 and not 1"
+        );
+    }
+
+    /// **Windows: `load` is `None` by design, and the rule must stay
+    /// SILENT rather than read it as zero.**
+    ///
+    /// `collect.rs` maps Windows' three zeroes to `None`, because Windows
+    /// has no load average and three zeroes are indistinguishable from a
+    /// genuinely idle machine. Absent is not zero -- the characteristic
+    /// bug class of this module.
+    ///
+    /// # What the silence assertion can and cannot prove
+    ///
+    /// Recorded because sabotaging the code proved the obvious version of
+    /// this test VACUOUS, which is the v5.14.0 lesson arriving again:
+    /// replacing `let Some(load) = s.load else { break }` with
+    /// `s.load.unwrap_or([0.0; 3])` -- absent-is-not-zero committed
+    /// outright -- and the first two assertions below still PASSED. They
+    /// have to: a defaulted 0.0 is below every ratio, so it breaks the run
+    /// at the same place the `else` branch does, and the rule is silent
+    /// either way. "Stays quiet on Windows" is the same observable for the
+    /// right reason and the wrong one.
+    ///
+    /// So the third clause is the one that carries the guard, and it is
+    /// here rather than in a test of its own for exactly that reason. It
+    /// puts a `None` part-way through a high series: absent must END the
+    /// run, as a missing `cpu_percent` does in `sustained_above`, leaving
+    /// only the four samples after the hole. A `continue` that skipped the
+    /// hole -- the other shape absent-is-not-zero takes, and the one that
+    /// INVENTS duration rather than losing it -- fails it, reporting 29
+    /// minutes of load 53 across a series that was never continuous.
+    ///
+    /// The two vacuous assertions are kept anyway: they are cheap, they
+    /// document the platform contract, and they would catch a `Some([0.0;
+    /// 3])` fallback substituted in `collect.rs` if the rule ever grew a
+    /// clause that read a zero as information.
+    #[test]
+    fn windows_has_no_load_average_and_says_nothing() {
+        // `bare` leaves `load: None`, which is exactly what a Windows
+        // sample looks like.
+        let end = chrono::Utc::now();
+        let windows: Vec<Sample> = (0..30)
+            .map(|i| bare(&(end - chrono::Duration::minutes(29 - i)).to_rfc3339()))
+            .collect();
+        assert!(
+            windows.iter().all(|s| s.load.is_none()),
+            "the fixture is a Windows series"
+        );
+        assert!(
+            oversubscribed(&windows, 12).is_none(),
+            "no load average is 'cannot say', never 'zero'"
+        );
+
+        // The same series with the incident's load present DOES fire, so
+        // the silence above is attributable to the absent reading and not
+        // to something else about the fixture.
+        assert!(
+            oversubscribed(&load_series(&[53.0; 30]), 12).is_some(),
+            "the only difference is whether `load` was readable"
+        );
+
+        // And a `None` part-way through ENDS the run rather than being
+        // skipped, the same as a missing `cpu_percent` in
+        // `sustained_above`: a mixed series cannot be measured across the
+        // hole.
+        let mut mixed = load_series(&[53.0; 30]);
+        mixed[25].load = None;
+        let after_the_hole = oversubscribed(&mixed, 12);
+        assert!(
+            after_the_hole.is_none(),
+            "only four samples sit after the missing reading: {after_the_hole:?}"
+        );
+    }
+
+    /// An unknown core count is "cannot say", not a division.
+    ///
+    /// `Aggregate::cores` is 0 when `available_parallelism` failed, and
+    /// `largest_share` already treats a 0 that way for exactly this
+    /// reason: `load / 0` is `+inf` in IEEE 754, which clears every
+    /// threshold at once. A single unreadable core count would otherwise
+    /// turn this rule into "always fire".
+    #[test]
+    fn an_unknown_core_count_does_not_divide() {
+        assert!(
+            oversubscribed(&load_series(&[53.0; 30]), 0).is_none(),
+            "zero cores is unknown, and an unknown cannot be evidence"
+        );
+    }
+
+    /// The duration clause, asserted rather than assumed.
+    ///
+    /// A load spike at any level is silence until it has held, because the
+    /// whole discriminator between a build and a runaway is persistence --
+    /// the same weighting `WATCH_MINUTES` uses, for the same reason.
+    #[test]
+    fn a_load_spike_must_hold_before_it_is_said() {
+        // Nine minutes of samples is nine minutes of measured span (ten
+        // samples, one minute apart), just under the threshold.
+        let brief = load_series(&[60.0; 10]);
+        assert!(
+            oversubscribed(&brief, 12).is_none(),
+            "nine minutes of measured span is under OVERSUBSCRIBED_MINUTES"
+        );
+        // One more sample crosses it.
+        let held = load_series(&[60.0; 12]);
+        assert!(
+            oversubscribed(&held, 12).is_some(),
+            "eleven minutes is over it"
+        );
+    }
+
+    /// The ratio boundary, and the normalisation that makes it mean
+    /// anything.
+    ///
+    /// The SAME load average is a fault on one machine and ordinary on
+    /// another: 18 on 12 cores is 1.5x and qualifies, while 18 on 64 cores
+    /// is 0.28x and is a quiet machine. Comparing a raw load average to a
+    /// fixed number -- the obvious shortcut -- would call every large
+    /// machine broken and every small one healthy.
+    #[test]
+    fn the_ratio_is_normalised_by_core_count() {
+        let eighteen = load_series(&[18.0; 30]);
+        assert!(
+            oversubscribed(&eighteen, 12).is_some(),
+            "18 on 12 cores is 1.5x: oversubscribed"
+        );
+        assert!(
+            oversubscribed(&eighteen, 64).is_none(),
+            "the same 18 on 64 cores is 0.28x: a quiet machine"
+        );
+        // Just under the ratio on the 12-core machine, so the boundary is
+        // asserted and not assumed.
+        let under = load_series(&[12.0 * OVERSUBSCRIBED_RATIO - 0.1; 30]);
+        assert!(
+            oversubscribed(&under, 12).is_none(),
+            "just under the ratio is silence"
+        );
+    }
+
+    /// **Gap discipline, the same refusal as every other duration in this
+    /// module.**
+    ///
+    /// The incident ran for 8.5 hours while nobody was watching. If the
+    /// run could be stitched across a gap, the first sample after the app
+    /// reopens would sit beside the last one before it and a condition
+    /// nobody measured would be reported as sustained -- which is the
+    /// failure `a_gap_is_not_sustained_burn` exists for, applied to load
+    /// average.
+    #[test]
+    fn a_gap_is_not_sustained_oversubscription() {
+        let end = chrono::Utc::now();
+        let mut s = Vec::new();
+        // Twenty high samples, then a six-hour hole, then three more.
+        for i in 0..20 {
+            let at = end - chrono::Duration::hours(6) - chrono::Duration::minutes(20 - i);
+            let mut one = bare(&at.to_rfc3339());
+            one.load = Some([0.5, 1.0, 53.0]);
+            s.push(one);
+        }
+        for i in 0..3 {
+            let at = end - chrono::Duration::minutes(2 - i);
+            let mut one = bare(&at.to_rfc3339());
+            one.load = Some([0.5, 1.0, 53.0]);
+            s.push(one);
+        }
+        let out = oversubscribed(&s, 12);
+        assert!(
+            out.is_none(),
+            "only two minutes of measured span sits after the gap: {out:?}"
+        );
+        assert_eq!(
+            GAP_MS,
+            crate::health::alerts::GAP_MS,
+            "and it is the same gap rule as the rest of health, not a second one"
+        );
+    }
+
+    /// A machine-wide notice has no process, and says so rather than
+    /// inventing one.
+    ///
+    /// `name()` is `None`, `niced()` and `orphaned()` are `false`: it is a
+    /// condition of the machine, so there is no priority and no parent to
+    /// report. The key carries no figures either, so a load wandering
+    /// between 19 and 21 stays ONE row rather than becoming a new one
+    /// every poll -- the rule `Alert::key` states.
+    #[test]
+    fn a_machine_wide_notice_names_no_process() {
+        let n = oversubscribed(&load_series(&[53.0; 30]), 12).expect("fires");
+        assert_eq!(n.name(), None, "it is about no process in particular");
+        assert!(!n.niced());
+        assert!(!n.orphaned());
+        assert_eq!(n.key(), "cpu_oversubscribed", "no figures in the key");
+        assert!(!n.title().is_empty());
+        assert!(n.minutes() >= OVERSUBSCRIBED_MINUTES);
+    }
+
+    /// An empty series is no information, not a quiet machine -- and one
+    /// sample is a reading, not a duration.
+    #[test]
+    fn one_load_reading_is_not_a_duration() {
+        assert!(oversubscribed(&[], 12).is_none(), "nothing measured");
+        assert!(
+            oversubscribed(&load_series(&[53.0]), 12).is_none(),
+            "one sample spans no measured time at all"
+        );
+    }
+
+    /// A NaN from the platform is not a reading.
+    ///
+    /// Left in, a NaN loses every comparison silently: `nan / 12.0 < 1.5`
+    /// is `false`, so it would NOT break the run -- it would be summed
+    /// into a mean that is NaN from then on, and the notice would report
+    /// "load average NaN". `Table::read` refuses a NaN for the same reason
+    /// one line over.
+    #[test]
+    fn a_nan_load_reading_is_not_a_reading() {
+        let mut s = load_series(&[53.0; 30]);
+        s[29].load = Some([0.5, 1.0, f64::NAN]);
+        assert!(
+            oversubscribed(&s, 12).is_none(),
+            "the newest reading is unusable, so there is no run at all"
+        );
     }
 
     // ---- Shadow logging ---------------------------------------------
