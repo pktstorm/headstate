@@ -509,11 +509,38 @@ jobs:
           # macOS. An EV certificate is a purchase, and it should not hold
           # up shipping working builds -- but a user should read about
           # SmartScreen here rather than discover it.
+          # The self-update asymmetry is stated in the notes rather than
+          # left to be discovered (#839). Only the AppImage reaches the
+          # updater manifest below, and that is structural rather than an
+          # oversight: Tauri produces no updater signature for a `.deb`
+          # (the collect glob takes `.sig` files only for `*.exe.sig` and
+          # `*.AppImage.sig` because those are the only ones that exist),
+          # and `add_platform` correctly refuses to advertise an unsigned
+          # bundle. So a `.deb` install finds no matching platform entry
+          # and stays on its version indefinitely, with no error and no
+          # prompt -- nothing tells the user, it simply never updates.
+          #
+          # NOT fixed in the pipeline, deliberately. `.deb` self-update is
+          # properly apt's job, and inventing one means hosting an apt
+          # repository with its own signing keys -- a disproportionate
+          # amount of new surface for a platform whose users reasonably
+          # expect their package manager to handle updates. Saying so
+          # plainly is the honest fix.
+          #
+          # The arm64 gap is stated in the same place because it has the
+          # same shape: a user on that architecture finds no entry for it
+          # either. Neither Linux nor Windows arm64 is built -- the
+          # Windows matrix entry above has `target: ""`, so it is
+          # runner-arch x64 only, and the Linux entry likewise.
           NOTES="$MAC
 
           **Windows** — this build is unsigned, so SmartScreen will warn on first run. Choose \"More info\" then \"Run anyway\".
 
-          **Linux** — \`.deb\` for Debian and Ubuntu, \`.AppImage\` for everything else. Mark the AppImage executable with \`chmod +x\` before running it."
+          **Linux** — \`.deb\` for Debian and Ubuntu, \`.AppImage\` for everything else. Mark the AppImage executable with \`chmod +x\` before running it.
+
+          The \`.AppImage\` is the auto-updating artifact. The \`.deb\` does **not** self-update — Tauri publishes no updater signature for it, so it is never advertised in the update manifest and a \`.deb\` install stays on the version you installed. Use the AppImage if you want automatic updates, or re-download the \`.deb\` for each release.
+
+          **Architectures** — x86_64 only on Windows and Linux. arm64 builds are not produced for either, so there is nothing for the updater to offer an arm64 install. macOS ships a universal binary and is unaffected."
 
           # The updater manifest. `latest.json` is what the plugin
           # fetches; it maps each platform to a download URL and the

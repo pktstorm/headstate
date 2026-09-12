@@ -1,7 +1,18 @@
 /// The marker the companion rejects with when the user dismisses the
 /// biometric prompt. Must match `CANCELLED` in
 /// `src-mobile/src/companion.rs`.
-const CANCELLED = "headstate:cancelled";
+///
+/// EXPORTED so the agreement can be asserted against that Rust source
+/// rather than restated (#850). This string existed in THREE hand-written
+/// copies: here, in `companion.rs`, and a third inside
+/// `cancelled.test.ts` -- which compared its own copy to this one and so
+/// structurally could not see the Rust one change. A changed Rust
+/// constant left every Rust test passing (they use the symbol) and every
+/// TS test passing (literal against literal), while at runtime each
+/// dismissed Face ID prompt showed the user a toast reading
+/// `headstate:cancelled` -- their own decision reported back as an
+/// error, in marker syntax.
+export const CANCELLED = "headstate:cancelled";
 
 /// Whether this rejection is the user declining a confirmation prompt,
 /// rather than anything going wrong.

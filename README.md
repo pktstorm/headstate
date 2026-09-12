@@ -35,10 +35,43 @@ separate modules so the read path stays independently auditable.
   gh auth login
   ```
 
-  Headstate reads your GitHub token from `gh auth token` at startup. If
-  `gh` isn't installed or isn't logged in, Headstate shows you the same two
-  commands on launch and won't proceed until they work — there is no
-  separate login flow inside the app itself.
+  Headstate reads your GitHub token from `GH_TOKEN` or `GITHUB_TOKEN` if
+  either is set, and otherwise from `gh auth token`. If no token is found,
+  Headstate shows you the same two commands on launch and won't proceed
+  until they work — there is no separate login flow inside the app itself.
+
+#### Token scopes
+
+Headstate needs three scopes:
+
+| Scope | What stops working without it |
+| --- | --- |
+| `repo` | Everything. Pull requests are not readable at all. |
+| `read:org` | **PR Stats only.** The sidebar lists no organizations, so an org or a team cannot be selected — which looks like having no organizations rather than like a missing permission. |
+| `gist` | Nothing in Headstate. It is in `gh auth login`'s own minimum set, so a `gh`-authenticated token has it regardless. |
+
+`gh auth login` requests all three: `repo`, `read:org` and `gist` are its
+stated minimum (`gh auth login --help`, verified on gh 2.100.0), so if you
+authenticated that way there is nothing to do.
+
+The gap is a **hand-made token**. A classic personal access token or a CI
+token in `GH_TOKEN` / `GITHUB_TOKEN` carries only the scopes it was created
+with, and `read:org` is easy to leave off — it is not needed for anything
+except PR Stats. Check what a token actually has:
+
+```
+gh api -i user 2>/dev/null | grep -i '^x-oauth-scopes:'
+```
+
+and if `read:org` is missing from a `gh`-managed token, add it in place:
+
+```
+gh auth refresh -s read:org
+```
+
+Fine-grained personal access tokens report no scopes at all through that
+header; they carry permissions instead, and the one to grant is
+**Organization permissions → Members: read**.
 
 ### Building from source on Linux
 

@@ -574,7 +574,6 @@ pub fn map_merged_detail(v: &Value) -> MergedDetail {
         d.additions += n["additions"].as_u64().unwrap_or(0);
         d.deletions += n["deletions"].as_u64().unwrap_or(0);
         d.changed_files += n["changedFiles"].as_u64().unwrap_or(0);
-        d.review_count += n["reviews"]["totalCount"].as_u64().unwrap_or(0);
         d.comment_count += n["comments"]["totalCount"].as_u64().unwrap_or(0);
         if let Some(r) = n["repository"]["nameWithOwner"].as_str() {
             *repos.entry(r.to_string()).or_insert(0) += 1;

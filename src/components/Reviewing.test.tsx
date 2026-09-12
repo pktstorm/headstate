@@ -44,7 +44,7 @@ function renderApp() {
 describe("PRs to review", () => {
   it("shows the incoming count on the view switcher", () => {
     useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} }, view: "my-prs", panel: "list" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} }, view: "my-prs" } as never);
     renderApp();
     // The switcher heads the sidebar and badges the count; the old
     // bottom-pinned entry is gone.
@@ -53,7 +53,7 @@ describe("PRs to review", () => {
 
   it("lists the incoming PRs on its own view", () => {
     useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} }, view: "to-review", panel: "list" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} }, view: "to-review" } as never);
     renderApp();
     expect(screen.getByText("Someone else's PR")).toBeTruthy();
   });
@@ -65,7 +65,6 @@ describe("PRs to review", () => {
       filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
   branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} },
       view: "to-review",
-      panel: "list",
     } as never);
     renderApp();
     // The reviewing fixture is one PR in octocat/hello-world; the
@@ -78,7 +77,6 @@ describe("PRs to review", () => {
       filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
   branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} },
       view: "to-review",
-      panel: "list",
     } as never);
     renderApp();
     expect(screen.getByLabelText(/search pull requests/i)).toBeTruthy();
@@ -90,7 +88,7 @@ describe("PRs to review", () => {
   // tray badge.
   it("does not let another author's red CI reach the priorities strip", () => {
     useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} }, view: "my-prs", panel: "list" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} }, view: "my-prs" } as never);
     renderApp();
     expect(screen.queryByText("Someone else's PR")).toBeNull();
   });

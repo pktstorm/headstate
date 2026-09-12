@@ -7,7 +7,6 @@ const EMPTY = { "my-prs": {}, "to-review": {}, worktrees: {},
 beforeEach(() => {
   useFilters.setState({
     view: "my-prs",
-    panel: "list",
     selectedPr: null,
     filtersByView: { ...EMPTY },
   });

@@ -9,6 +9,7 @@ import { relativeSeconds } from "@/lib/time";
 import { useIsMobile } from "@/lib/useIsMobile";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 import { HelpButton } from "./HelpButton";
+import { QueryError, errorMessage } from "./QueryError";
 
 /// How long idle counts as stale, mirroring `STALE_SECS` in Rust.
 ///
@@ -85,7 +86,22 @@ export function VenvSection() {
   // the scan takes 26 SECONDS -- measured, walking 28,144 directories --
   // so the page was indistinguishable from one with no virtualenvs for
   // almost half a minute, which is exactly how it was reported.
-  const { data: venvs = [], isLoading } = useVenvs(true);
+  //
+  // And `isError` too (#846). This is the sharpest case in that issue,
+  // because it was ALREADY FIXED ONCE for the adjacent bug and the fix
+  // did not carry: `isLoading` was separated from empty, `isError` was
+  // not. So a rejected scan still left `venvs` at `[]` and the
+  // `venvs.length === 0` return below still removed the entire section --
+  // its orphan count, its bulk-remove button, all of it -- with no error
+  // and nothing to retry. Worse than the 26-second wait this comment was
+  // written about, because a wait ends.
+  //
+  // Aggravated by the hook's own settings: `staleTime: 30 * 60 * 1000`
+  // and `refetchOnWindowFocus: false` are right for data and pinned a
+  // FAILURE for half an hour. `useVenvs` now carries `retry: false` and
+  // this renders an explicit retry, which is the pairing
+  // `useStatsBoard`'s rule requires.
+  const { data: venvs = [], isLoading, isError, error, refetch } = useVenvs(true);
   const { sizes, idle, measuring, pending, total } = useVenvSizes(venvs, venvs.length > 0);
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [confirming, setConfirming] = useState(false);
@@ -99,6 +115,38 @@ export function VenvSection() {
       <p className="px-1 py-2 text-xs text-[#8b949e]" aria-live="polite">
         Looking for Poetry virtualenvs…
       </p>
+    );
+  }
+  // BEFORE the `return null` below, which is what used to swallow it
+  // (#846). An error arm placed after that line would be unreachable in
+  // exactly the case it exists for, since a rejection leaves `venvs` at
+  // `[]`.
+  //
+  // Keeps the section's HEADING, unlike the empty case. A bare error
+  // panel floating under the artifact list would not say what failed; the
+  // section is how the reader knows this is about virtualenvs and not
+  // about the build output above it. Absence is what the empty state is
+  // for, and a failure is not an absence.
+  if (isError) {
+    return (
+      <section className="mt-6">
+        <div className="mb-3 flex items-center gap-2 text-sm">
+          <span className="font-semibold text-[#e6edf3]">Poetry virtualenvs</span>
+          <HelpButton topic="poetry-venvs" />
+        </div>
+        <QueryError
+          title="Could not look for Poetry virtualenvs"
+          message={errorMessage(error)}
+          onRetry={() => void refetch()}
+        >
+          {/* Says what the failure COSTS, which matters more here than
+              anywhere else on the page: the orphan count is the number the
+              user acts on, and its absence is not a zero. */}
+          <p className="mx-auto mt-2 max-w-lg text-sm text-[#8b949e]">
+            Nothing was scanned, so the orphan count is unknown — not zero.
+          </p>
+        </QueryError>
+      </section>
     );
   }
   // Only once the scan has ANSWERED does an empty list mean "none".
@@ -115,6 +163,23 @@ export function VenvSection() {
   // real one -- there may be orphans hiding among them (#747).
   const unknown = rows.filter((r) => r.state === "unknown");
   const selectedBytes = [...checked].reduce((n, p) => n + (sizes.get(p) ?? 0), 0);
+  // What the confirmation is actually about, split by KIND (#852).
+  //
+  // The dialog used to assert that every selected venv's project "no
+  // longer exists", unconditionally, while `isRemovable` admits `stale`
+  // too -- and this file's own doc comment defines the difference: "An
+  // orphan is a FACT… A stale venv is a JUDGEMENT about a project that
+  // STILL EXISTS." So for every stale row the reassurance stated the
+  // opposite of the truth.
+  //
+  // Derived from `rows` rather than from `checked` alone, because
+  // `checked` holds paths and the VERDICT is what the sentence turns on --
+  // and `displayState` is where a verdict comes from. Computed here beside
+  // `rows` rather than inside the dialog's JSX, so the dialog renders a
+  // value instead of running a filter.
+  const chosen = rows.filter((r) => checked.has(r.v.path));
+  const chosenOrphans = chosen.filter((r) => r.state === "orphaned").length;
+  const chosenStale = chosen.filter((r) => r.state === "stale").length;
 
   return (
     <section className="mt-6">
@@ -123,15 +188,22 @@ export function VenvSection() {
         <span className="text-[#8b949e]">
           {orphans.length} orphaned{measuring ? "" : ` · ${formatSize(orphanBytes)}`}
         </span>
-        {measuring ? (
-          // COUNTED, not a bare "measuring…". Sizing is chunked now, so
-          // there is real progress to report -- and a bare word on a
-          // pass that took 73 seconds is indistinguishable from being
-          // stuck, which is how it was reported.
-          <span aria-live="polite" className="text-xs text-[#58a6ff]">
-            measuring — {total - pending} of {total}
-          </span>
-        ) : null}
+        {/* COUNTED, not a bare "measuring…". Sizing is chunked now, so
+            there is real progress to report -- and a bare word on a
+            pass that took 73 seconds is indistinguishable from being
+            stuck, which is how it was reported.
+
+            ALWAYS MOUNTED, holding an empty string when idle (#852).
+            `StatusBar` states the rule: "A live region has to exist before
+            the text appears or the first announcement is missed -- the one
+            that matters most, since it is the one saying work started."
+            The `<span>` carrying `aria-live` was created by the same
+            render that first gave it text, so on a 73-second pass the
+            announcement that the pass had BEGUN was the one never heard.
+            An empty span with no padding costs nothing visually. */}
+        <span aria-live="polite" className="text-xs text-[#58a6ff]">
+          {measuring ? `measuring — ${total - pending} of ${total}` : ""}
+        </span>
         <HelpButton topic="poetry-venvs" />
 
         {/* One click for the whole provable set. With 78 orphans across
@@ -190,10 +262,59 @@ export function VenvSection() {
               Remove {checked.size} virtualenv{checked.size === 1 ? "" : "s"}?
             </DialogTitle>
             <ActingOnDesktop />
+            {/* SPLIT by what is actually true of each half (#852).
+
+                This read "Every one of these belongs to a project
+                directory that no longer exists, so nothing can use them
+                again" -- unconditionally, while `isRemovable` admits
+                `stale` as well. And the distinction is this component's
+                own, stated at the top of the file: "An orphan is a FACT --
+                the path that made it is gone… A stale venv is a JUDGEMENT
+                about a project that STILL EXISTS."
+
+                So for every stale row the dialog asserted the opposite of
+                the truth, at the exact moment the gate's own
+                justification says the user forms their intent: "Ticking a
+                specific row and confirming in a dialog IS the intent."
+                A dialog that misinforms there is not a gate, it is a
+                rubber stamp with wrong words on it.
+
+                Counted rather than listed, because the dialog already
+                frees a stated number of bytes and a 78-row list would bury
+                the one sentence that matters. The stale sentence names the
+                threshold and the consequence -- `poetry install` -- so the
+                judgement is reviewable rather than merely flagged. */}
             <p className="mt-3 text-sm text-[#e6edf3]">
-              This frees {formatSize(selectedBytes)}. Every one of these belongs to a
-              project directory that no longer exists, so nothing can use them again.
+              This frees {formatSize(selectedBytes)}.
             </p>
+            {chosenOrphans > 0 ? (
+              <p className="mt-2 text-sm text-[#8b949e]">
+                {chosenOrphans === chosen.length
+                  ? "Every one of these belongs"
+                  : `${chosenOrphans} of these belong`}{" "}
+                to a project directory that no longer exists, so nothing can use{" "}
+                {chosenOrphans === 1 ? "it" : "them"} again.
+              </p>
+            ) : null}
+            {/* The amber of the `stale` badge, not the body grey: this is
+                the half of the selection the user is being asked to make a
+                JUDGEMENT about, and it has to read as a caveat rather than
+                as more reassurance. The 90 days and the `poetry install`
+                are both stated, so the judgement is reviewable -- "what
+                does this cost if I am wrong" is the question, and the
+                answer is what makes the gate meaningful. */}
+            {chosenStale > 0 ? (
+              <p className="mt-2 text-sm text-[#d29922]">
+                {chosenStale === chosen.length
+                  ? "Every one of these belongs"
+                  : `${chosenStale} of these belong`}{" "}
+                to a project that still exists and{" "}
+                {chosenStale === 1 ? "has" : "have"} simply not been used for 90 days.
+                Removing {chosenStale === 1 ? "it" : "them"} costs a{" "}
+                <span className="font-mono">poetry install</span> if the project is picked
+                up again.
+              </p>
+            ) : null}
             <div className="mt-5 flex justify-end gap-2">
               <button
                 type="button"
@@ -292,7 +413,41 @@ export function VenvSection() {
               />
           );
           const project = (
-              <span className={isMobile ? "min-w-0 flex-1 truncate font-semibold text-[#e6edf3]" : "shrink-0 font-semibold text-[#e6edf3]"}>{v.project}</span>
+              // The desktop branch had the #818 shape INVERTED (#852):
+              // the IDENTIFIER was `shrink-0` with no truncate while the
+              // evidence beside it was `min-w-0 flex-1 truncate`. So under
+              // pressure the project name claimed its full intrinsic
+              // width and the source path -- which is the row's evidence,
+              // not its identity -- gave up all of it.
+              //
+              // Backwards by #818's own priority rule: of the two the
+              // identifier is what means nothing partially, so it should
+              // be the last to yield, not the only one that never does. A
+              // long project name pushed the verdict, the age and the size
+              // along instead of clipping itself.
+              //
+              // This component's own MOBILE branch already had it right
+              // -- `min-w-0 flex-1 truncate` -- so the correct classes
+              // were known here and simply not applied to the other
+              // layout. The two now agree, with `flex-auto` on the desktop
+              // for `WorktreesPage`'s reason: sized from its content as it
+              // effectively was while `shrink-0`, the only change being
+              // that it can give width back. The phone keeps `flex-1`
+              // because the name is the only flexible cell on its line,
+              // where the two behave identically.
+              //
+              // And a `title` on both, which neither had: a clipped
+              // project name is otherwise unrecoverable.
+              <span
+                title={v.project}
+                className={
+                  isMobile
+                    ? "min-w-0 flex-1 truncate font-semibold text-[#e6edf3]"
+                    : "min-w-0 flex-auto truncate font-semibold text-[#e6edf3]"
+                }
+              >
+                {v.project}
+              </span>
           );
           const verdict = (
               <span className={`shrink-0 rounded-full px-2 py-0.5 text-xs ${TONE[state]}`}>
@@ -303,7 +458,15 @@ export function VenvSection() {
               /* The SOURCE is the evidence for the verdict. For a live
                   or stale venv it names the directory that still exists,
                   which is what lets someone disagree with the label. */
-              <span className="min-w-0 flex-1 truncate font-mono text-xs text-[#8b949e]">
+              // A `title`, the other half of the #818 remedy (#852). This
+              // cell already truncated correctly; what it lacked was
+              // anywhere for the clipped tail to go, and a truncated
+              // project path is exactly what "lets someone disagree with
+              // the label" -- the reason the cell exists.
+              <span
+                title={v.source ?? "no project directory found"}
+                className="min-w-0 flex-1 truncate font-mono text-xs text-[#8b949e]"
+              >
                 {v.source ?? "no project directory found"}
               </span>
           );
@@ -330,7 +493,11 @@ export function VenvSection() {
             return (
               <li
                 key={v.path}
-                className="flex flex-col gap-1 rounded border border-[#30363d] px-3 py-2 text-sm"
+                // `overflow-hidden`, the third part of the #818 remedy
+                // (#852): without it a cell that overflows its share
+                // draws straight through the bordered box, so the box
+                // stops describing what is in it.
+                className="flex flex-col gap-1 overflow-hidden rounded border border-[#30363d] px-3 py-2 text-sm"
               >
                 <div className="flex items-center gap-3">
                   {checkbox}
@@ -348,7 +515,9 @@ export function VenvSection() {
           return (
             <li
               key={v.path}
-              className="flex items-center gap-3 rounded border border-[#30363d] px-3 py-2 text-sm"
+              // `overflow-hidden`, as on the phone branch above and for
+              // the same reason (#852).
+              className="flex items-center gap-3 overflow-hidden rounded border border-[#30363d] px-3 py-2 text-sm"
             >
               {checkbox}
               {project}

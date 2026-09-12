@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Branch } from "@/types/pr";
-import { scopeLabel, scopesFor, targetsFor } from "./branchDelete";
+import { scopeEffect, scopeLabel, scopesFor, targetsFor } from "./branchDelete";
 
 const b = (over: Partial<Branch> = {}): Branch => ({
   name: "feature",
@@ -101,5 +101,41 @@ describe("scopeLabel", () => {
   it("counts what will actually be deleted", () => {
     expect(scopeLabel("local", { local: ["a", "b"], remote: [] })).toMatch(/2 branches/);
     expect(scopeLabel("local", { local: ["a"], remote: [] })).toMatch(/1 branch\b/);
+  });
+});
+
+describe("scopeEffect", () => {
+  /// The sentence two surfaces now share (#845).
+  ///
+  /// `BranchesPage`'s scope questionnaire and the PR detail view's
+  /// single-branch confirmation both render it. They used to be one local
+  /// closure and one missing dialog; a copy in each would let them
+  /// disagree about the one operation a reflog cannot undo, which is the
+  /// same argument `scopeLabel` above exists for.
+  it("says a remote deletion cannot be undone by a reflog", () => {
+    expect(scopeEffect("remote")).toMatch(/no local reflog can undo/);
+  });
+
+  /// The local sentence is the CONTRAST that makes the remote one mean
+  /// something. Asserted here so a future edit cannot quietly make both
+  /// scopes sound equally final, which would flatten the distinction
+  /// `BranchesPage` defaults its scope choice on ("Local deletion is
+  /// recoverable from the reflog; a remote deletion is not").
+  it("says a local deletion is recoverable, unlike the remote one", () => {
+    expect(scopeEffect("local")).toMatch(/recoverable from the reflog/i);
+    expect(scopeEffect("local")).not.toMatch(/cannot be undone/i);
+  });
+
+  it("says the remote half of a both-scope deletion is the final one", () => {
+    expect(scopeEffect("both")).toMatch(/remote half cannot be undone/);
+  });
+
+  /// Every scope answers, because the PR detail view reads one of them
+  /// straight into a dialog -- an undefined there would render an empty
+  /// warning under a red title, which is worse than no dialog.
+  it("answers for every scope", () => {
+    for (const s of ["local", "remote", "both"] as const) {
+      expect(scopeEffect(s).length).toBeGreaterThan(0);
+    }
   });
 });

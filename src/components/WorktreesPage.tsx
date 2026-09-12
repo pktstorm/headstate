@@ -16,6 +16,7 @@ import {
   useWorktrees,
   usePullCheckout,
   useRemoveOrphan,
+  useOrphanSize,
   useAllWorktreeSizes,
   useRemovalProgress,
   useAssessment,
@@ -421,7 +422,14 @@ function Row({
           onClick={() => (orphaned ? onRemoveOrphan(wt) : onRemove(wt))}
           title={
             orphaned
-              ? "Delete this directory — its repository is gone, so nothing about the contents can be checked first"
+              ? // The title no longer carries the WARNING (#845). It
+                // used to be the only place "nothing about the contents
+                // can be checked" was said before the click, which made
+                // a hover-only surface load-bearing on a page with a
+                // mobile layout. `ConfirmRemoveOrphan` says it now, in a
+                // dialog that exists on touch, so this is back to what a
+                // title is for: naming where the button goes.
+                "Ask before deleting this directory — its repository is gone, so nothing about the contents can be checked"
               : safe
                 ? "Remove this worktree"
                 : // A prunable row says where its action IS, which is
@@ -452,7 +460,15 @@ function Row({
               : "border-[#30363d] text-[#8b949e] opacity-50"
           }`}
         >
-          {removing ? "Removing…" : orphaned ? "Delete" : "Remove"}
+          {/* The ellipsis says a question comes first (#845), matching
+              "Remove anyway…" beside it and "Delete {n}…" on the
+              branches page. A bare "Delete" on a button that now opens a
+              dialog would understate it in the one direction that
+              matters: a user who expects the deletion to have happened
+              and does not see the modal has lost nothing, but one who
+              expects a prompt and does not get one has lost a
+              directory. */}
+          {removing ? "Removing…" : orphaned ? "Delete…" : "Remove"}
         </button>
       )}
       {/* On EVERY row now, not only the assessed ones (#770).
@@ -631,6 +647,121 @@ function ConfirmRemove({
             className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#c93c37]"
           >
             Remove
+          </button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/// Confirmation for deleting an ORPHANED directory (#845).
+///
+/// This is the one deletion in the app where NOTHING about the contents
+/// was verified, and until #845 it was also the only directory-deleting
+/// action with no dialog at all. The ceremony was exactly inverted: a
+/// PROVABLY merged-and-pushed worktree got `ConfirmRemove`, and an
+/// unverifiable one got a single click from the row.
+///
+/// The argument for having no dialog (the old comment on
+/// `runRemoveOrphan`) was that "nothing about the contents can be
+/// checked, so a dialog could only repeat what the button's title
+/// already says". It fails on its own terms, and the app's own help text
+/// is the proof -- `help/topics.ts`'s "orphaned-worktrees" says "you are
+/// the only check" and "If you are unsure, copy the directory somewhere
+/// first. Nothing about it can be recovered afterwards." That advice is
+/// only actionable BEFORE the click, so a surface that appears only
+/// after it cannot carry it. It is reproduced here verbatim rather than
+/// paraphrased: it is the one piece of advice that survives the
+/// deletion, and two wordings of it would be two pieces of advice.
+///
+/// The `title` the old argument leaned on is hover-only. This page has a
+/// mobile layout (`isMobile`), and on touch there is no hover -- so on
+/// the phone the justification described a surface that does not exist.
+///
+/// At least as heavy as `ConfirmRemove`, as #845 asks, and it carries
+/// one thing that dialog does not: the SIZE, measured on open. An
+/// orphan's size is absent everywhere else on this page (see
+/// `useOrphanSize`), so the dialog is the only place it can be stated --
+/// and "2.5 GB" is what makes "copy it somewhere first" a decision
+/// rather than a slogan.
+///
+/// The size has three states and says which one it is in, never
+/// defaulting to a number. `formatSize(0)` would read as "this tree is
+/// empty, delete it" -- the most damaging thing this dialog could say
+/// about a directory it could not measure, which is the same rule
+/// `size_worktrees` states about flattening its own nulls.
+function ConfirmRemoveOrphan({
+  wt,
+  onConfirm,
+  onCancel,
+}: {
+  wt: Worktree;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  // Measured because the dialog is open, not because the row exists.
+  const { bytes, measuring, failed } = useOrphanSize(wt.path, true);
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onCancel()}>
+      <DialogContent className="max-w-lg">
+        <DialogTitle>Delete {pathBasename(wt.path)}?</DialogTitle>
+        <ActingOnDesktop />
+        {/* The PATH, for the reason `ConfirmRemove` states: a count is
+            not enough to act on safely, the user needs to see WHICH
+            directory is about to disappear. More so here -- there is no
+            branch name and no merge date to recognise it by, because
+            the repository that held them is gone. */}
+        <p className="mt-3 break-all font-mono text-xs text-[#8b949e]">{wt.path}</p>
+        <p className="mt-3 text-sm text-[#e6edf3]">
+          {measuring
+            ? "Measuring how much is in here…"
+            : failed
+              ? // NAMED, not silently omitted. An unmeasurable
+                // directory is the second thing about this orphan that
+                // could not be checked, and a dialog that simply left
+                // the size out would look like one that had measured
+                // nothing worth mentioning.
+                "How much is in here could not be measured either."
+              : bytes === null
+                ? "How much is in here is not known."
+                : `This frees ${formatSize(bytes)}.`}
+        </p>
+        {/* The red sentence, and the whole reason this dialog is as
+            heavy as the forced-removal one. `forceWarning` can be
+            specific about what is at risk because git could still be
+            asked; here it could not, so the honest statement is the
+            absence itself. */}
+        <p className="mt-2 text-sm text-[#f85149]">
+          Nothing inside could be checked — not whether it holds uncommitted work,
+          and not whether its branch ever merged. The repository that could have
+          answered is gone, so you are the only check.
+        </p>
+        {/* The help text's own sentence, verbatim (`help/topics.ts`,
+            "orphaned-worktrees"). The only advice that survives this
+            click, and the only surface it can be read on in time. */}
+        <p className="mt-2 text-sm text-[#8b949e]">
+          If you are unsure, copy the directory somewhere first. Nothing about it
+          can be recovered afterwards.
+        </p>
+        <div className="mt-5 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="rounded border border-[#30363d] px-3 py-1.5 text-sm hover:bg-[#21262d]"
+          >
+            Cancel
+          </button>
+          {/* Names the reading, not just the act -- the same shape as
+              the forced removal's "I have reviewed this — remove it".
+              A bare "Delete" here would be the one-click deletion this
+              dialog exists to stop, with a modal in front of it. */}
+          <button
+            type="button"
+            onClick={onConfirm}
+            className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#c93c37]"
+          >
+            Delete it anyway
           </button>
         </div>
       </DialogContent>
@@ -1072,12 +1203,30 @@ export function WorktreesPage() {
     !filters.repo,
   );
 
+  /// The orphan whose deletion is awaiting confirmation, or null (#845).
+  ///
+  /// Its own slot rather than reusing `pending`, for the same reason
+  /// `unlocking` is separate from `forcing`: the two dialogs make
+  /// opposite claims. `ConfirmRemove` says "nothing is lost"; this one
+  /// says nothing could be checked. Sharing a slot would put them one
+  /// boolean away from showing the wrong one over the wrong directory.
+  const [pendingOrphan, setPendingOrphan] = useState<Worktree | null>(null);
+
   /// Delete an orphaned directory, reporting the Rust side's own words.
   ///
-  /// No confirmation dialog: nothing about the contents can be checked
-  /// -- that is the definition of an orphan -- so a dialog could only
-  /// repeat what the button's title already says. The re-check that
-  /// matters happens in Rust, at the moment of deletion.
+  /// Reached only from `ConfirmRemoveOrphan`'s confirm button now
+  /// (#845). It used to fire straight from the row, which made this the
+  /// ONLY directory-deleting action in the app with no dialog -- and the
+  /// only one where nothing about the contents had been verified. The
+  /// argument for that (a dialog "could only repeat what the button's
+  /// title already says") is dismantled in `ConfirmRemoveOrphan`'s own
+  /// comment; the short version is that the help text's "copy the
+  /// directory somewhere first" is only actionable before the click, and
+  /// `title` does not exist on touch.
+  ///
+  /// The Rust re-check still happens at the moment of deletion and is
+  /// still not a substitute: it confirms only that the directory is
+  /// STILL an orphan, which says nothing about its contents.
   const runRemoveOrphan = (wt: Worktree) => {
     setRemoving(wt.path);
     removeOrphanFn(wt.path).then(
@@ -1164,6 +1313,38 @@ export function WorktreesPage() {
     );
   };
 
+  /// The orphan confirmation, as ONE element rendered on two paths
+  /// (#845).
+  ///
+  /// An orphan row appears in two places -- the Orphaned section, which
+  /// is its own early `return`, and a repository page that happens to
+  /// contain one -- so a dialog written into either branch alone leaves
+  /// the other click unconfirmed. That is exactly the split that let this
+  /// action ship with no dialog at all, so the fix must not reproduce its
+  /// shape.
+  ///
+  /// A local `const` rather than a second copy of the JSX, and rather
+  /// than hoisting the whole page into one return: a copy is two things
+  /// to keep in step, and the early returns are load-bearing -- the
+  /// Orphaned section is deliberately not a repository page (an orphan
+  /// belongs to no repository, so `selected` cannot express it).
+  ///
+  /// Built unconditionally and cheap when closed: `pendingOrphan` is null
+  /// on every render but the one that matters, so this is `null` and
+  /// `useOrphanSize` is never mounted -- no walk is started for a
+  /// directory nobody asked about.
+  const orphanDialog = pendingOrphan ? (
+    <ConfirmRemoveOrphan
+      wt={pendingOrphan}
+      onCancel={() => setPendingOrphan(null)}
+      onConfirm={() => {
+        const target = pendingOrphan;
+        setPendingOrphan(null);
+        runRemoveOrphan(target);
+      }}
+    />
+  ) : null;
+
   if (isLoading) {
     return (
       <div className="rounded-md border border-[#30363d] px-4 py-12 text-center text-sm text-[#8b949e]">
@@ -1209,6 +1390,8 @@ export function WorktreesPage() {
       .flatMap((r) => r.worktrees)
       .filter((w) => isOrphaned(w.safety));
     return (
+      <>
+      {orphanDialog}
       <div className="rounded-md border border-[#30363d]">
         <div className="border-b border-[#30363d] px-4 py-3">
           <span className="text-sm font-semibold text-[#e6edf3]">
@@ -1236,7 +1419,7 @@ export function WorktreesPage() {
             assessed={false}
             onForce={setForcing}
             onUnlock={setUnlocking}
-            onRemoveOrphan={runRemoveOrphan}
+            onRemoveOrphan={setPendingOrphan}
             onPull={runPull}
             onRemove={setPending}
             onClaudify={claudify}
@@ -1245,6 +1428,7 @@ export function WorktreesPage() {
           />
         ))}
       </div>
+      </>
     );
   }
 
@@ -1840,6 +2024,11 @@ export function WorktreesPage() {
         />
       ) : null}
 
+      {/* The orphan confirmation (#845). The SAME element the Orphaned
+          section renders -- see `orphanDialog` for why it is one value
+          rather than two copies. */}
+      {orphanDialog}
+
       {forcing ? (
         <Dialog open onOpenChange={(o) => !o && setForcing(null)}>
           <DialogContent className="max-w-lg">
@@ -2281,7 +2470,7 @@ export function WorktreesPage() {
               assessed={assessed.has(wt.path)}
               onForce={setForcing}
               onUnlock={setUnlocking}
-              onRemoveOrphan={runRemoveOrphan}
+              onRemoveOrphan={setPendingOrphan}
               onPull={runPull}
               pulling={pullingPath === wt.path}
               onRemove={setPending}

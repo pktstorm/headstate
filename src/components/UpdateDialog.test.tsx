@@ -110,5 +110,51 @@ describe("UpdateDialog", () => {
       fireEvent.click(screen.getByRole("button", { name: /not now/i }));
       expect(onDismiss).not.toHaveBeenCalled();
     });
+
+    /// #852: download progress was announced to sighted users only.
+    ///
+    /// The error path beside it has `role="alert"` and this had NOTHING -- so
+    /// the operation that replaces and restarts the app reported its progress
+    /// to nobody using a screen reader, not even the line saying the install
+    /// had started.
+    ///
+    /// Always mounted, which is `StatusBar`'s rule: "A live region has to
+    /// exist before the text appears or the first announcement is missed --
+    /// the one that matters most, since it is the one saying work started."
+    /// Here that announcement is the whole point: the user has just pressed
+    /// Install on something that will close the app under them.
+    it("mounts a live region before the download starts", () => {
+      // `document`, not the render container: `DialogContent` renders
+      // through a portal, so the dialog's own markup is not inside it.
+      render(<UpdateDialog version="3.4.0" open onDismiss={vi.fn()} />);
+      const region = document.querySelector('[aria-live="polite"]');
+      expect(region).toBeTruthy();
+      expect(region?.textContent).toBe("");
+    });
+
+    it("announces the download through that region", async () => {
+      installFn.mockImplementationOnce((cb) => {
+        cb?.(5_000_000, 20_000_000);
+        return new Promise(() => {});
+      });
+      render(<UpdateDialog version="3.4.0" open onDismiss={vi.fn()} />);
+      fireEvent.click(screen.getByRole("button", { name: /^install$/i }));
+      await waitFor(() => {
+        const region = document.querySelector('[aria-live="polite"]');
+        expect(region?.textContent).toMatch(/downloading — 25%/i);
+      });
+    });
+
+    /// `polite`, not `assertive`: a percentage must not interrupt. The error
+    /// beside it keeps `role="alert"`, which IS assertive, and the asymmetry
+    /// is correct -- a refused update is news, a progressing one is not.
+    it("does not interrupt with progress, while an error still does", async () => {
+      installFn.mockRejectedValueOnce(new Error("signature mismatch"));
+      render(<UpdateDialog version="3.4.0" open onDismiss={vi.fn()} />);
+      expect(document.querySelector('[aria-live="assertive"]')).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: /^install$/i }));
+      const alert = await screen.findByRole("alert");
+      expect(alert.textContent).toMatch(/signature mismatch/i);
+    });
   });
 });

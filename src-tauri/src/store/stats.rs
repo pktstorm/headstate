@@ -32,6 +32,39 @@
 //! it is drawn on the window's own end date rather than on the row's age,
 //! because the age of the row tells you nothing about whether its answer
 //! can still move.
+//!
+//! # Why three kinds of answer share one table (#836)
+//!
+//! Until #836 only `stats_count` cached, which is the CHEAPEST of the
+//! three stats queries. `commands::stats_count` projects a count at
+//! `days/5 + 8` -- about 26 points for 90 days -- while
+//! `commands::board_projection` computes roughly 45 for the same window,
+//! and `commands::stats_board`'s own doc calls a board over a busy org
+//! "seconds" of node fetching. So the cache covered the query that costs
+//! least to recompute and skipped the two that cost most.
+//!
+//! The argument above applies HARDER to a board than to a count: a
+//! leaderboard over a month that has ended is as constant as a total over
+//! it, and far more expensive to rebuild. The blocker was never the
+//! schema -- `payload` is already an opaque blob and `complete` already
+//! carries partiality -- it was that `StatsQuery::cache_key` has no
+//! subject for a board (a board is about EVERYONE), so every board in a
+//! scope would have collided with that scope's `*`-subject count.
+//!
+//! [`Kind`] is that missing discriminator, and it lives here rather than
+//! in `StatsQuery::cache_key` because it is a property of the STORED
+//! ANSWER's shape, not of the question's scope: a board and a count can
+//! be built from the very same `StatsQuery`, and only the caller knows
+//! which one it is about to write. Keeping it here also means a new
+//! cached answer shape is one variant in this file, not a change to the
+//! query model every stats path depends on.
+//!
+//! One consequence, accepted deliberately: rows written before #836 have
+//! un-prefixed keys and will never be read again. They are a handful of
+//! stale counts per user, served to nobody, and migrating them would mean
+//! a schema migration to rewrite a cache -- a cache being exactly the
+//! thing it is safe to lose. `put`'s `INSERT OR REPLACE` cannot collide
+//! with them either, because no new key is un-prefixed.
 
 use super::schema::StoreError;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -49,6 +82,55 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// as "it did not count". Long enough that the repeated clicking that
 /// motivates the cache at all is actually covered.
 pub const OPEN_WINDOW_TTL_SECS: i64 = 300;
+
+/// Which of the three stats answers a row holds.
+///
+/// The discriminator #836 needed. `StatsQuery::cache_key` is
+/// `measure|subject|scope`, and for a board the subject is absent -- a
+/// board is about everyone -- so a board's key would be byte-identical to
+/// the whole-scope count's. Two different answers under one key is the
+/// bug this type makes unrepresentable: an enum rather than a `&str`
+/// parameter precisely so a caller cannot pass `"boards"` in one place and
+/// `"board"` in another and get a silent permanent miss.
+///
+/// Ordered cheapest to most expensive, which is the order #836 argues they
+/// should have been cached in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// One total: `commands::stats_count`.
+    Count,
+    /// A row per author: `commands::stats_board`.
+    Board,
+    /// A point per day: `commands::stats_series`.
+    Series,
+}
+
+impl Kind {
+    /// The key prefix. Short, lowercase, and stable: it is persisted, so
+    /// renaming a variant's string silently orphans every row written
+    /// under the old one.
+    fn tag(self) -> &'static str {
+        match self {
+            Kind::Count => "count",
+            Kind::Board => "board",
+            Kind::Series => "series",
+        }
+    }
+}
+
+/// The stored key for one answer: a [`Kind`] and a `StatsQuery::cache_key`.
+///
+/// Built here rather than by each caller so the separator and the order
+/// cannot drift between the writer and the reader -- a mismatch there is
+/// not an error, it is a cache that silently never hits, which is the
+/// hardest kind of failure to notice because everything still works and
+/// only the request bill goes up.
+///
+/// `|` matches the separator `StatsQuery::cache_key` already uses, so a
+/// full key reads `count|merged|octocat|org:Stohic`.
+pub fn key(kind: Kind, query_key: &str) -> String {
+    format!("{}|{query_key}", kind.tag())
+}
 
 /// A cached answer and what is known about its trustworthiness.
 #[derive(Debug, Clone, PartialEq)]
@@ -187,12 +269,76 @@ pub fn get(
 /// time-based eviction would throw away exactly the rows the cache exists
 /// for. This table grows in proportion to the number of distinct scopes
 /// and windows a user actually looks at, which is small.
+///
+/// #840 found this had no production caller, so the scenario the
+/// paragraph above describes never actually fired.
+/// [`note_viewer`] is that caller.
 pub fn clear(conn: &Connection) -> Result<usize, StoreError> {
     Ok(conn.execute("DELETE FROM stats_cache", [])?)
 }
 
-/// How many answers are cached. For diagnostics and for the test below
-/// that proves this table is written to.
+/// Record who `@me` currently is, clearing the cache if it changed.
+///
+/// Returns how many rows were dropped, which is 0 on every call but the
+/// one after a token swap.
+///
+/// # Why this is the right trigger
+///
+/// `clear`'s doc names the event it exists for -- "a new token is a
+/// different person" -- and #840 found nothing ever raised it. The only
+/// place the app learns the current identity is `fetch_viewer`, whose
+/// result `stats_count` and `stats_board` already need for their keys, so
+/// the check is free: compare the login against the last one seen and
+/// store it.
+///
+/// # Why the cache is cleared WHOLESALE rather than per login
+///
+/// Deleting only the departed user's rows would need the key's subject
+/// field parsed back out, and the subject is not the only place a login
+/// appears in an answer -- a board's `payload` is a row per person and its
+/// viewer split was made against the OLD login. A board cached under
+/// `board|merged|*|org:X` is keyed on no login at all, so a per-login
+/// delete would leave exactly the rows whose contents are most tied to the
+/// identity that went away. The table is small by construction (see
+/// `clear`), so dropping all of it costs one re-fetch of whatever the new
+/// user looks at first.
+///
+/// # Why a row counts as "no previous identity" rather than as a change
+///
+/// A fresh install has no stored login, and treating that as a change
+/// would mean the first stats load of every install clears an empty
+/// table -- harmless, but it would also make the test below unable to
+/// distinguish "first run" from "swapped", which is the distinction that
+/// matters.
+///
+/// Failure to READ the stored login is treated as absent rather than
+/// propagated: a settings row that will not parse must not be able to
+/// break the stats page, and the cost of getting this wrong is one
+/// unnecessary re-fetch.
+pub fn note_viewer(conn: &Connection, login: &str) -> Result<usize, StoreError> {
+    let previous: Option<String> = super::settings::get(conn, super::settings::keys::STATS_VIEWER)
+        .ok()
+        .flatten();
+    if previous.as_deref() == Some(login) {
+        return Ok(0);
+    }
+    let dropped = match previous {
+        // A DIFFERENT login: the rows belong to whoever was here before.
+        Some(_) => clear(conn)?,
+        // First run. Nothing to drop, and nothing stale to worry about.
+        None => 0,
+    };
+    super::settings::set(conn, super::settings::keys::STATS_VIEWER, &login)?;
+    Ok(dropped)
+}
+
+/// How many answers are cached.
+///
+/// For diagnostics, and for the tests below that prove this table is
+/// written to. #840 noted it had no production caller beyond that test;
+/// it stays `pub` rather than `pub(crate)` because `commands`' own
+/// command-level guard (#840: the module-level one would have passed with
+/// every caller deleted) reads it too.
 pub fn count(conn: &Connection) -> Result<u64, StoreError> {
     let n: i64 = conn.query_row("SELECT count(*) FROM stats_cache", [], |r| r.get(0))?;
     Ok(n.max(0) as u64)
@@ -489,6 +635,148 @@ mod tests {
         assert_eq!(count(&conn).unwrap(), 0);
     }
 
+    /// A board and a count over the SAME scope and window are two rows.
+    ///
+    /// The collision #836 had to fix before a board could be cached at
+    /// all. A board has no subject -- it is about everyone -- so
+    /// `StatsQuery::cache_key` gives it the `*` subject, which is exactly
+    /// what a whole-scope count gets. Without [`Kind`] the second of the
+    /// two written would have REPLACED the first (`put` is `INSERT OR
+    /// REPLACE`), and the reader would have deserialised a board's payload
+    /// into an `Outcome` or the reverse -- which fails softly, as a cache
+    /// row that is discarded and re-fetched forever.
+    #[test]
+    fn a_board_and_a_count_over_one_scope_do_not_collide() {
+        let conn = db();
+        // What `StatsQuery::cache_key` produces for a subject-less query.
+        let q = "merged|*|org:FNX-Labs";
+        let w = ("2026-08-01", "2026-08-31");
+
+        let count_key = key(Kind::Count, q);
+        let board_key = key(Kind::Board, q);
+        let series_key = key(Kind::Series, q);
+        assert_ne!(count_key, board_key, "a board must not share a count's row");
+        assert_ne!(count_key, series_key);
+        assert_ne!(board_key, series_key);
+
+        for (k, total) in [(&count_key, 706), (&board_key, 41), (&series_key, 706)] {
+            put(
+                &conn,
+                k,
+                w.0,
+                w.1,
+                total,
+                true,
+                "{}",
+                at("2026-09-01T00:00:00Z"),
+            )
+            .unwrap();
+        }
+        assert_eq!(count(&conn).unwrap(), 3, "three answers, three rows");
+        let got = get(&conn, &board_key, w.0, w.1, at("2026-09-02T00:00:00Z"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.total, 41, "the board's row, not the count's");
+    }
+
+    /// The key's prefix is the kind's tag, and it is STABLE.
+    ///
+    /// Pinned on the literal strings because they are persisted: renaming
+    /// a tag does not fail to compile, it silently orphans every row
+    /// written under the old one, which presents as a cache that stopped
+    /// working for no visible reason.
+    #[test]
+    fn the_kind_tags_are_the_persisted_strings() {
+        assert_eq!(
+            key(Kind::Count, "merged|octocat|org:X"),
+            "count|merged|octocat|org:X"
+        );
+        assert_eq!(key(Kind::Board, "merged|*|org:X"), "board|merged|*|org:X");
+        assert_eq!(key(Kind::Series, "merged|*|all"), "series|merged|*|all");
+    }
+
+    /// A partial board must not read back as a complete one.
+    ///
+    /// #836's acceptance item: "a partial result is never cached as
+    /// complete". Asserted for a BOARD payload specifically rather than
+    /// relying on `a_partial_answer_is_read_back_as_partial` above, which
+    /// covers a count -- the board is the answer whose partiality is a
+    /// short ROSTER, and a leaderboard that forgot it was short is a
+    /// ranking presented as the whole population.
+    #[test]
+    fn a_partial_board_is_never_cached_as_complete() {
+        let conn = db();
+        let k = key(Kind::Board, "merged|*|org:FNX-Labs");
+        let w = ("2026-08-01", "2026-08-31");
+        put(
+            &conn,
+            &k,
+            w.0,
+            w.1,
+            1_200,
+            // The board's own `complete` flag: false because a slice came
+            // back short of the 1,000-result cap.
+            false,
+            r#"{"rows":[],"total":1200,"retrieved":1000,"complete":false}"#,
+            at("2026-09-01T00:00:00Z"),
+        )
+        .unwrap();
+        let got = get(&conn, &k, w.0, w.1, at("2027-01-01T00:00:00Z"))
+            .unwrap()
+            .expect("a closed window is still served");
+        assert!(
+            !got.complete,
+            "a board assembled from a short roster must not read back whole"
+        );
+        assert!(got.payload.contains(r#""complete":false"#));
+    }
+
+    /// An identity change drops the previous user's rows; a repeat login
+    /// does not.
+    ///
+    /// #840: `clear`'s doc described this scenario and nothing ever raised
+    /// it. The three cases asserted here are the three that exist -- first
+    /// run, same person again, and a swap -- and the middle one is the one
+    /// that would be easy to get wrong in the expensive direction: a
+    /// `note_viewer` that cleared whenever the stored value was not
+    /// *compared* correctly would throw the cache away on every load,
+    /// turning the fix into a permanent cache miss.
+    #[test]
+    fn a_changed_identity_drops_the_previous_users_rows() {
+        let conn = db();
+        let k = key(Kind::Count, "merged|octocat|org:FNX-Labs");
+        let w = ("2026-08-01", "2026-08-31");
+        let put_one = |c: &Connection| {
+            put(c, &k, w.0, w.1, 706, true, "{}", at("2026-09-01T00:00:00Z")).unwrap();
+        };
+
+        // First run: nothing stored, nothing to drop.
+        assert_eq!(
+            note_viewer(&conn, "octocat").unwrap(),
+            0,
+            "a fresh install must not report a clear it did not need"
+        );
+        put_one(&conn);
+
+        // The same person again: the cache survives, which is the whole
+        // point of having one.
+        assert_eq!(note_viewer(&conn, "octocat").unwrap(), 0);
+        assert_eq!(count(&conn).unwrap(), 1, "a repeat login keeps the cache");
+
+        // A different token: the rows belong to whoever was here before.
+        assert_eq!(
+            note_viewer(&conn, "pktstorm").unwrap(),
+            1,
+            "a new identity must reclaim the previous one's rows"
+        );
+        assert_eq!(count(&conn).unwrap(), 0);
+
+        // And the new login is now the remembered one, so going back is
+        // itself a change rather than a free hit on stale rows.
+        put_one(&conn);
+        assert_eq!(note_viewer(&conn, "octocat").unwrap(), 1);
+    }
+
     /// THE guard against this becoming the second `merge_history`.
     ///
     /// Migration 2 dropped that table because nothing ever wrote to it,
@@ -496,6 +784,13 @@ mod tests {
     /// does not exist". This asserts the write path exists and works end
     /// to end -- schema, insert, read back -- so a table with no writer
     /// cannot ship again.
+    ///
+    /// #840 noted the weakness this does NOT cover: it exercises the
+    /// MODULE's write path, so it would still pass with every `put` call
+    /// in `commands.rs` deleted -- which is precisely the `merge_history`
+    /// failure it is named for. `commands`' own
+    /// `every_stats_command_writes_its_answer_to_the_cache` is the half
+    /// that asserts a COMMAND writes a row.
     #[test]
     fn the_table_is_actually_written_to() {
         let conn = db();

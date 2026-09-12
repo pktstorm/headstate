@@ -7,6 +7,14 @@ import type { AuthorRow, StatsReviewers } from "@/types/pr";
 /// -- this is the number the HEADING quotes. Re-cutting here would produce a
 /// "top five" heading over three rows, or a top-three whose fourth place was
 /// decided by a tie-break this side never saw.
+///
+/// That equality is asserted by `src/lib/mirroredConstants.test.ts`, which
+/// reads the literal out of `github/stats/board.rs` (#850). Nothing asserted
+/// it before: `top_n_is_five` in `board.rs` only sees Rust, and every test in
+/// this directory uses `TOP_N` SYMBOLICALLY -- `expect(rows.length).toBe(TOP_N)`
+/// and `` getByText(`Top ${TOP_N} ...`) `` are self-consistent at any value,
+/// so setting this to 3 passed the whole suite while the page rendered "Top 3
+/// pull request authors" over a Rust-ranked list of five.
 export const TOP_N = 5;
 
 /// The label for the lines-changed measure, and it is load-bearing.
@@ -185,6 +193,7 @@ export function Leaderboards({
   reviewersPending = false,
   reviewersError = false,
   reviewersAvailable = false,
+  reviewersTruncated = false,
 }: {
   /// Every author in scope. Ranked and cut here, per measure, because the
   /// rankings disagree -- the most prolific author is rarely the one with the
@@ -218,6 +227,16 @@ export function Leaderboards({
   /// reviewed" and "nothing enumerated the reviewers" are different claims,
   /// and only one of them is ours to make.
   reviewersAvailable?: boolean;
+  /// Whether the ROSTER this board ranks was itself cut short (#851).
+  ///
+  /// True when `OrgTree::members_truncated()` is -- the org has more members
+  /// than `tree::PAGE` returned, so the board asked about a SUBSET of the
+  /// population and ranked that.
+  ///
+  /// A separate prop from `reviewersAvailable` because it is a different
+  /// claim: that one is "was there a roster at all", this one is "was the
+  /// roster complete". Both can be true, and the honest board says so.
+  reviewersTruncated?: boolean;
   /// Why the board is partial, in the caller's words -- the caller knows
   /// which of the three partiality channels applied and this component does
   /// not.
@@ -316,6 +335,7 @@ export function Leaderboards({
             reviewers={reviewers}
             pending={reviewersPending}
             failed={reviewersError}
+            truncated={reviewersTruncated}
           />
         )}
       </div>
@@ -353,10 +373,13 @@ function ReviewsGiven({
   reviewers,
   pending,
   failed,
+  truncated = false,
 }: {
   reviewers?: StatsReviewers;
   pending: boolean;
   failed: boolean;
+  /// Whether the roster was cut short before this board ever asked (#851).
+  truncated?: boolean;
 }) {
   const title = `Top ${TOP_N} reviewers`;
 
@@ -427,11 +450,38 @@ function ReviewsGiven({
           {reviewers.unmeasured.join(", ")}.
         </p>
       )}
+      {/* #851: the roster itself was cut short, so this ranking is over a
+          SUBSET of the organisation and the leader may not be in it.
+          Deliberately in the same register as the `unmeasured` line above --
+          "this ranking could be missing the leader" -- because it is the same
+          kind of claim arriving one layer earlier: that line is about people
+          who were asked and did not answer, this one about people who were
+          never asked.
+
+          Worse than the repository truncation the module documents, and said
+          so rather than softened: `tree::PAGE`'s doc reasons that "because
+          the order is most-recently-active, a truncation at 100 drops the
+          DEADEST repositories". `membersWithRole` takes no `orderBy` at all,
+          so the members cut is ARBITRARY -- on a 224-member org (the size the
+          module records verifying against) the top reviewer can be among the
+          124 never asked about, and nothing about the cut makes that less
+          likely. */}
+      {truncated && (
+        <p className="text-xs text-[#d29922]">
+          This organization has more members than the roster could list, so
+          this ranking covers only the members that were listed -- and the
+          member list is not ordered by anything, so the people it left out
+          are an arbitrary slice rather than the least active. Somebody absent
+          here may have reviewed more than anybody shown.
+        </p>
+      )}
       {reviewers.refusedFields > 0 && (
         <p className="text-xs text-[#d29922]">
           GitHub refused {reviewers.refusedFields} field
-          {reviewers.refusedFields === 1 ? "" : "s"} on this ranking -- if this
-          organization uses SAML single sign-on, authorize your token for it.
+          {reviewers.refusedFields === 1 ? "" : "s"} on this ranking -- the
+          token may be missing the <code>read:org</code> scope
+          (<code>gh auth refresh -s read:org</code>), or this organization may
+          use SAML single sign-on and need the token authorized for it.
         </p>
       )}
       {/* Who is IN scope for this board, stated because it is a real and

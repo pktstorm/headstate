@@ -59,6 +59,16 @@ function Stat({
 /// 0.0 that teaches nothing. Size has real spread (measured: 3 to 10,088
 /// lines, median 324) and speaks to whether generated PRs are staying
 /// reviewable, which is the question the review card was reaching for.
+///
+/// #851 followed that decision through to the data: `MergedDetail` still
+/// carried a `review_count`, and the query still paid for
+/// `reviews { totalCount }` on every merged-detail fetch, to feed a figure
+/// this comment had already decided not to show. Re-measured live
+/// 2026-09-12 -- 0 reviews across the 50 most recent merged pull requests,
+/// against 4 comments -- and then the field and its GraphQL selection were
+/// removed rather than rendered. Review activity that IS worth showing is
+/// measured by the reviews-GIVEN board, which needs `reviewed-by:<login>`
+/// searches because a pull request node never says who wrote its reviews.
 export function InsightCards({
   detail,
   trend,

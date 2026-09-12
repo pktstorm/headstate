@@ -272,6 +272,60 @@ describe("DockerPage", () => {
     expect(removeImagesFn.mock.calls[0][0]).toEqual(["dead", "unattributed"]);
   });
 
+  /// #852: the dialog's words have to be true of the set it is confirming.
+  ///
+  /// Title and reassurance keyed off `bulkOpen`, which is assigned
+  /// `"stale"` at its ONLY call site -- so the `"superseded"` arm of both
+  /// was dead code, while `bulkSet` followed the checkbox. Ticking the
+  /// opt-in widened the set and left the title reading "stale" with the
+  /// reassurance claiming "its branch has merged": false for exactly the
+  /// images the checkbox added.
+  it("stops claiming the branch merged once the opt-in widens the set", () => {
+    state.images = [
+      img({ id: "dead" }),
+      img({ id: "unattributed", origin: null }),
+      img({ id: "live", origin: { ...img().origin!, merged: false } }),
+    ];
+    render(<DockerPage />);
+    fireEvent.click(screen.getByRole("button", { name: /remove 1 stale image/i }));
+    const dialog = screen.getByRole("dialog");
+    // Before: the narrow set, and the reassurance is true of it.
+    expect(within(dialog).getByText(/its branch has merged/i)).toBeTruthy();
+
+    fireEvent.click(within(dialog).getByRole("checkbox"));
+    // After: the wide set, and the merged claim is GONE -- the sentence
+    // beneath the checkbox says some branches are still open, so the
+    // reassurance above it contradicted the page's own words.
+    expect(within(dialog).queryByText(/its branch has merged/i)).toBeNull();
+    expect(within(dialog).getByText(/branches that are still open/i)).toBeTruthy();
+  });
+
+  /// And the TITLE, which named the narrow set over a list of the wide one.
+  it("renames the title for the set it is actually removing", () => {
+    state.images = [
+      img({ id: "dead" }),
+      img({ id: "unattributed", origin: null }),
+      img({ id: "live", origin: { ...img().origin!, merged: false } }),
+    ];
+    render(<DockerPage />);
+    fireEvent.click(screen.getByRole("button", { name: /remove 1 stale image/i }));
+    const dialog = screen.getByRole("dialog");
+    // Read off the title ELEMENT, not by text matching: the heading is
+    // built from several JSX expressions (count, word, plural), so
+    // `getByText` with a whole-phrase regex never matches a single node.
+    const title = () =>
+      (dialog.querySelector('[data-slot="dialog-title"]') as HTMLElement).textContent ?? "";
+    expect(title()).toMatch(/remove 1 stale image\?/i);
+
+    fireEvent.click(within(dialog).getByRole("checkbox"));
+    // 3, not 1: all three fixtures are superseded and provably unused,
+    // while only `dead` also has a merged branch. The jump from 1 to 3 is
+    // the whole point -- the title used to say "1 stale" over a list of
+    // three.
+    expect(title()).toMatch(/remove 3 superseded images\?/i);
+    expect(title()).not.toMatch(/stale/i);
+  });
+
   /// Silence when the wide set adds nothing -- an opt-in that widens by
   /// zero is a checkbox that does nothing.
   it("hides the opt-in when it would cover no more", () => {
@@ -355,9 +409,50 @@ describe("DockerPage", () => {
 
   it("reports what a prune actually freed", async () => {
     render(<DockerPage />);
-    fireEvent.click(screen.getByRole("button", { name: /clear/i }));
+    fireEvent.click(screen.getByRole("button", { name: /clear…/i }));
+    // Through the confirmation now (#852): `reclaim.rs` says "this is a
+    // trade the user must make knowingly", and a bare link fired it on
+    // click.
+    fireEvent.click(screen.getByRole("button", { name: /clear the older cache/i }));
     await waitFor(() => expect(toastSuccess).toHaveBeenCalled());
     expect((toastSuccess.mock.calls[0] as [string])[0]).toMatch(/4\.7 GB|4\.65 GB/);
+  });
+
+  /// #852: the cache prune must ASK.
+  ///
+  /// This page asserts the invariant it was breaking -- "Every other
+  /// destructive path on this page already uses Dialog" -- while the cache
+  /// prune fired `prune("168h")` from a bare text link. The negative
+  /// assertion is the defect.
+  it("prunes nothing on the link's own click", () => {
+    render(<DockerPage />);
+    fireEvent.click(screen.getByRole("button", { name: /clear…/i }));
+    expect(pruneFn).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog")).toBeTruthy();
+  });
+
+  /// Carries the measurement `reclaim.rs` asks for: "real build durations
+  /// went 7m8s -> 1m20s -> 56.9s as the cache warmed". A number the user
+  /// can weigh is what separates a knowing trade from a click.
+  it("names the cost and the scope before clearing", () => {
+    render(<DockerPage />);
+    fireEvent.click(screen.getByRole("button", { name: /clear…/i }));
+    const dialog = screen.getByRole("dialog");
+    // The SCOPE: "clear" beside a total invites reading it as "clear all
+    // of that", and the call deliberately keeps the last week.
+    expect(within(dialog).getByText(/last 7 days are kept/i)).toBeTruthy();
+    expect(within(dialog).getByText(/7m08s to 1m20s to 56\.9s/i)).toBeTruthy();
+    // And says nothing is LOST, because nothing is -- overstating a
+    // recoverable cost is how users learn to discount the dialogs that
+    // describe unrecoverable ones.
+    expect(within(dialog).getByText(/nothing is lost/i)).toBeTruthy();
+  });
+
+  it("prunes nothing when the confirmation is cancelled", () => {
+    render(<DockerPage />);
+    fireEvent.click(screen.getByRole("button", { name: /clear…/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
+    expect(pruneFn).not.toHaveBeenCalled();
   });
 
   // On a disk-cleanup tool, "No images." reads as "your machine is

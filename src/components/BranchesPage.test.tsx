@@ -412,9 +412,16 @@ describe("BranchesPage", () => {
     streamingScan(rows, 512, 47);
     show();
 
-    const status = screen.getByRole("status");
-    expect(status.textContent).toMatch(/still scanning/i);
-    expect(status.textContent).toMatch(/47 of 512/);
+    // `getAllByRole`, because both live regions are ALWAYS MOUNTED now
+    // (#852) -- the scan banner and the deletion-progress chip. The text
+    // is what distinguishes them; their existence no longer does, which is
+    // precisely the change: `StatusBar`'s rule is that "a live region has
+    // to exist before the text appears or the first announcement is
+    // missed".
+    const statuses = screen.getAllByRole("status");
+    const scanning = statuses.find((s) => /still scanning/i.test(s.textContent ?? ""));
+    expect(scanning).toBeTruthy();
+    expect(scanning?.textContent).toMatch(/47 of 512/);
 
     // And it must not offer a sweep of a list it only half has. "All"
     // over a partial list means "all of the ones that turned up".
@@ -435,7 +442,14 @@ describe("BranchesPage", () => {
     listFn.mockResolvedValue([branch({ name: "done" })]);
     show();
     await screen.findByText(/merged \(squashed\)/i);
-    expect(screen.queryByRole("status")).toBeNull();
+    // The region still EXISTS -- always mounted, per #852 -- so what has
+    // to be empty is its text, not the element. An always-mounted region
+    // that announced nothing when idle would be the same defect in
+    // reverse: a permanent banner trains the eye to skip it.
+    for (const s of screen.getAllByRole("status")) {
+      expect(s.textContent).toBe("");
+    }
+    expect(screen.queryByText(/still scanning/i)).toBeNull();
     const all = screen.getByRole("button", { name: /select all/i }) as HTMLButtonElement;
     expect(all.disabled).toBe(false);
   });
@@ -589,5 +603,119 @@ describe("BranchesPage", () => {
     show();
     await screen.findByText("done");
     expect(screen.queryByText(/deleting 3 of 10/i)).toBeNull();
+  });
+
+  /// #852: #817's advisory-displacement bug, and the live-region half.
+  ///
+  /// The chip's text grows a lot -- "Deleting…" becomes "Checking 562
+  /// branches before deleting — 317 checked" becomes "Deleting 412 of 562 —
+  /// 30 refused" -- and it sat UPSTREAM of "Delete {n}…" in a `flex-wrap`
+  /// row, so each of those widened the row and pushed the destructive button
+  /// sideways or onto a second line.
+  ///
+  /// #852 grants this was MITIGATED (the button is `disabled` while the chip
+  /// shows, so it could not be misclicked) and that is exactly why the fix
+  /// is ordering: the defect was never the misclick, it was a control that
+  /// visibly jumps. `WorktreesPage`: "nothing upstream of Remove changes
+  /// width when the button appears… by construction rather than by tuning."
+  describe("progress must not move the delete button", () => {
+    it("puts the progress chip after every button, not before them", async () => {
+      deleteState.current = { phase: "deleting", done: 100, total: 562, failed: 0 };
+      const status = await deletionInFlight();
+      const del = screen.getByRole("button", { name: /^delete 1…/i });
+      // `compareDocumentPosition`, not a parent check: #817's own structural
+      // test asserted only that the two were not siblings, which was true
+      // and insufficient -- the button still moved.
+      expect(
+        del.compareDocumentPosition(status) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    });
+
+    /// The Clear button too, so the whole group is upstream of the chip and
+    /// nothing the chip does can reach any of it.
+    it("puts it after Clear as well, so the whole group is upstream", async () => {
+      deleteState.current = { phase: "deleting", done: 100, total: 562, failed: 0 };
+      const status = await deletionInFlight();
+      const clear = screen.getByRole("button", { name: /^clear$/i });
+      expect(
+        clear.compareDocumentPosition(status) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    });
+
+    /// ALWAYS MOUNTED, holding an empty string when idle. `StatusBar` states
+    /// the rule: "A live region has to exist before the text appears or the
+    /// first announcement is missed -- the one that matters most, since it is
+    /// the one saying work started." This `role="status"` element was created
+    /// by the same render that first gave it text, on a flow that runs
+    /// `git branch -D` across hundreds of refs and takes MINUTES.
+    it("mounts the progress region before there is progress to report", async () => {
+      deleteState.current = null;
+      show();
+      await screen.findByText("done");
+      // Both regions exist and both are silent: nothing is scanning and
+      // nothing is being deleted.
+      const regions = screen.getAllByRole("status");
+      expect(regions.length).toBeGreaterThanOrEqual(2);
+      for (const r of regions) expect(r.textContent).toBe("");
+    });
+
+    /// And the scan banner, which is the other conditional region on this
+    /// page. Its first announcement says a ten-second classification has
+    /// begun and which rows cannot be acted on yet.
+    it("mounts the scan region before the scan has anything to say", async () => {
+      listFn.mockResolvedValue([branch({ name: "done" })]);
+      scanState.current = { branches: [], total: null, classified: 0 };
+      show();
+      await screen.findByText("done");
+      expect(screen.getAllByRole("status").length).toBeGreaterThanOrEqual(2);
+      expect(screen.queryByText(/still scanning/i)).toBeNull();
+    });
+  });
+
+  /// #852: `{b.author}` was `shrink-0` with an INERT inner `truncate`.
+  ///
+  /// A `shrink-0` parent is sized to its content, so the inner `truncate`
+  /// had no narrower box to truncate into -- it could never fire, and a long
+  /// author name simply widened the column and squeezed the branch name and
+  /// its verdict beside it. The declared intent was right; the mechanism was
+  /// missing.
+  describe("a branch with a long author name", () => {
+    const longAuthor = "a-very-long-bot-account-name-indeed";
+
+    it("bounds the metadata column so its truncate can actually fire", async () => {
+      listFn.mockResolvedValue([branch({ name: "done", author: longAuthor })]);
+      show();
+      const author = await screen.findByText(longAuthor);
+      const column = author.parentElement as HTMLElement;
+      // Still the trailing column -- `min-w-0 flex-1` beside it is the name,
+      // which is the cell that should keep the room (#818's priority).
+      expect(column.className).toContain("shrink-0");
+      // But now bounded, which is what makes the `truncate` real. `max-w-`
+      // rather than a fixed `w-`: the column is two short lines and is
+      // usually narrower than the cap, so a fixed width would hold dead
+      // space on every row to bound the occasional long one.
+      expect(column.className).toMatch(/\bmax-w-/);
+      expect(author.className).toContain("truncate");
+    });
+
+    /// "Who last touched this branch" is the question the cell answers, and
+    /// half a username does not answer it -- so the clipped tail has to
+    /// survive somewhere.
+    it("keeps the full author name recoverable", async () => {
+      listFn.mockResolvedValue([branch({ name: "done", author: longAuthor })]);
+      show();
+      const author = await screen.findByText(longAuthor);
+      expect(author.getAttribute("title")).toBe(longAuthor);
+    });
+
+    /// The third part of the #818 remedy: without `overflow-hidden` a cell
+    /// that overflows its share draws straight through the bordered box.
+    it("clips the row at its own border", async () => {
+      listFn.mockResolvedValue([branch({ name: "done", author: longAuthor })]);
+      show();
+      const author = await screen.findByText(longAuthor);
+      const row = author.closest("li") as HTMLElement;
+      expect(row.className).toContain("overflow-hidden");
+    });
   });
 });

@@ -96,6 +96,21 @@ pub struct ArtifactRemoval {
 /// Fifteen minutes rather than an hour: long enough to cover a build's
 /// quiet phases (linking a large binary writes nothing for minutes), short
 /// enough that yesterday's work is not still blocked today.
+///
+/// Mirrored by `ACTIVE_SECS` in `src/components/ArtifactsPage.tsx` and by
+/// `cleanup.rs`' copy of the same rule, and the three are asserted equal
+/// by `src/lib/mirroredConstants.test.ts`, which reads this literal via
+/// Vite's `?raw`.
+///
+/// The assertion exists because the UI had DRIFTED to `60 * 60` while
+/// both sides' comments claimed they matched (#850). For any `target/`
+/// written 15-60 minutes ago that was visible three ways at once: this
+/// gate would remove it, but the page left it out of `removable` so the
+/// Remove button under-counted, out of `removableBytes` so the
+/// reclaimable figure under-reported, and counted it as active so the
+/// dialog warned "something is building here" about a directory this
+/// gate does not consider active. Fifteen won because the choice against
+/// an hour is argued above; the hour was drift, not a second opinion.
 const ACTIVE_WINDOW_SECS: u64 = 15 * 60;
 
 /// Remove one artifact directory, refusing anything that is not provably
@@ -155,9 +170,41 @@ pub fn remove_artifact(path: &str, roots: &[String]) -> Result<(), String> {
 
     // 4. Nothing is writing to it. Last, because it is the only check
     //    that needs a full walk.
+    //
+    //    Matched on exhaustively rather than through `is_some_and`,
+    //    which is what this was and what made it the one gate in the
+    //    module that failed OPEN (#841). `is_some_and` maps None to
+    //    false, so "we could not tell" read as "it is old enough" and
+    //    the delete proceeded.
+    //
+    //    `measure` returns None for two unrelated reasons, and neither
+    //    is evidence of idleness: no mtime was readable anywhere in the
+    //    tree (restrictive permissions, an untraversable volume, macOS
+    //    TCC), or the newest mtime is in the FUTURE -- `measure` ends in
+    //    `newest.and_then(|n| n.elapsed().ok())`, and `elapsed()` is
+    //    `Err` for a future timestamp. An NTP correction mid-`cargo
+    //    build` produces exactly that, and the delete then lands on a
+    //    live build's output: the precise cost ACTIVE_WINDOW_SECS exists
+    //    to prevent.
+    //
+    //    `measure`'s own doc justifies skipping unreadable ENTRIES ("a
+    //    permission error on one file should not turn a real size into
+    //    'unknown'"), which is right for a size column. It says nothing
+    //    about a wholly-None result at a delete gate, so this is the
+    //    decision that was missing rather than one being reversed.
+    //
+    //    This is `remove_venv`'s rule, verbatim from `caches/mod.rs`:
+    //    an idle time we could not read is not evidence that anything is
+    //    disposable -- the direction every other check in this codebase
+    //    fails in. The two functions used the same helper and the same
+    //    Option and disagreed on identical evidence.
     let (_, newest) = measure(&canon);
-    if newest.is_some_and(|secs| secs < ACTIVE_WINDOW_SECS) {
-        return Err("something wrote to that directory in the last few minutes".into());
+    match newest {
+        None => return Err("could not tell whether something is writing to that directory".into()),
+        Some(secs) if secs < ACTIVE_WINDOW_SECS => {
+            return Err("something wrote to that directory in the last few minutes".into())
+        }
+        Some(_) => {}
     }
 
     std::fs::remove_dir_all(&canon).map_err(|e| format!("could not remove it: {e}"))
@@ -333,6 +380,72 @@ mod removal_tests {
         let err = remove_artifact(&target, &roots).unwrap_err();
         assert!(err.contains("no longer recognised"), "{err}");
         assert!(Path::new(&target).exists());
+    }
+
+    /// The fail-open hole #841 describes: "could not tell" is not "idle".
+    ///
+    /// `measure` returns `newest: None` in two different situations, and
+    /// neither of them means the directory is quiet. One is that no mtime
+    /// was readable anywhere in the tree -- restrictive permissions, a
+    /// volume whose subdirectories cannot be traversed, macOS TCC. The
+    /// other is the one this test reproduces: `mod.rs:70` is
+    /// `newest.and_then(|n| n.elapsed().ok())`, and `elapsed()` returns
+    /// `Err` for an mtime in the FUTURE.
+    ///
+    /// The old guard was `newest.is_some_and(|secs| secs <
+    /// ACTIVE_WINDOW_SECS)`, which maps None to false -- so the guard
+    /// passed and `remove_dir_all` ran on a directory nothing had proved
+    /// was idle.
+    ///
+    /// A future mtime is not exotic. An NTP correction during a
+    /// `cargo build` leaves the newest file in `target/` a few seconds
+    /// ahead, and the delete then lands on the output of a LIVE build --
+    /// precisely the cost `ACTIVE_WINDOW_SECS`' own doc comment exists
+    /// to prevent, and the one way this feature spends an hour rather
+    /// than a rebuild.
+    ///
+    /// Asserted through the FUTURE mtime rather than by unreadable
+    /// permissions because a permissions test cannot run as root and
+    /// would be skipped in exactly the CI that needs it. Both reach the
+    /// same `None`.
+    ///
+    /// `#[cfg(unix)]` because setting an mtime needs `touch -t`: `std::fs`
+    /// cannot set one, and `filetime` would be a new crate in the supply
+    /// chain for one call -- the trade `make_old` above already made and
+    /// documents. This test ASSERTS `touch` succeeded rather than
+    /// ignoring the status as `make_old` does, since a silently-unset
+    /// mtime would leave it passing for the wrong reason; that assert is
+    /// what makes the gate necessary rather than merely tidy. The guard
+    /// it covers is platform-independent, so unix coverage establishes it.
+    #[test]
+    #[cfg(unix)]
+    fn refuses_a_directory_whose_age_it_could_not_read() {
+        let (_t, target, roots) = root_with_target();
+        // Far enough ahead to survive any clock skew between the `touch`
+        // and the `elapsed()` that follows it; the year is what matters,
+        // not the precision.
+        let status = std::process::Command::new("touch")
+            .args(["-t", "209901010000"])
+            .arg(Path::new(&target).join("artifact.bin"))
+            .status()
+            .expect("touch should be available");
+        assert!(status.success(), "could not set a future mtime");
+
+        // Confirm the premise before asserting on the consequence: if
+        // `measure` ever learns to report a future mtime as an age, this
+        // test would otherwise go on passing while testing nothing.
+        let (_, newest) = measure(Path::new(&target));
+        assert!(
+            newest.is_none(),
+            "a future mtime must yield None, got {newest:?}"
+        );
+
+        let err = remove_artifact(&target, &roots).unwrap_err();
+        assert!(err.contains("could not tell"), "{err}");
+        assert!(
+            Path::new(&target).exists(),
+            "an unmeasurable directory must survive"
+        );
     }
 
     /// Partial failure is the normal case, and one verdict for the batch

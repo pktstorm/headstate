@@ -343,8 +343,42 @@ pub struct OrgTree {
     ///
     /// `false` means the alias came back `null` -- the token resolved the
     /// organisation (it is in [`orgs_query`]'s list) and was then refused
-    /// its contents, typically a SAML-SSO authorisation the user has not
-    /// granted, or a token without `read:org`.
+    /// its contents.
+    ///
+    /// # Two causes, and the app cannot tell them apart from here (#840)
+    ///
+    /// Either a SAML-SSO authorisation the user has not granted, or a token
+    /// without `read:org`. They are very different to the user -- the first
+    /// needs an administrator, the second is one command they can run
+    /// themselves (`gh auth refresh -s read:org`) -- and this flag cannot
+    /// distinguish them, because a `null` alias carries no cause.
+    ///
+    /// #840 asked for the distinction to be drawn from the
+    /// `X-OAuth-Scopes` response header, which IS present on the GraphQL
+    /// endpoint (verified live 2026-09-12 against `api.github.com/graphql`:
+    /// `x-oauth-scopes: admin:org, gist, repo, workflow`). It is not drawn
+    /// here because this module has no access to response headers:
+    /// `client::graphql_partial_ok` goes through `octocrab.post`, which
+    /// deserialises the body and discards the response. Reading the header
+    /// means a new call path in `client.rs` -- `octocrab::_get` does return
+    /// the full `http::Response` -- which is a change to the shared client
+    /// rather than to this module.
+    ///
+    /// What #840 is actually about is the MESSAGE, and that is fixed where
+    /// the message lives (`StatsSidebar.tsx`, `StatsPage.tsx`,
+    /// `stats/Leaderboard.tsx`): all three now name the scope fix first and
+    /// SSO second, because the scope fix is the one the reader can act on
+    /// alone. Telling a user to contact an administrator about SSO when one
+    /// command would have fixed it is the failure; saying both, cheapest
+    /// first, costs nothing and needs no header.
+    ///
+    /// Also worth recording, because #840's premise was out of date:
+    /// `gh auth login` DOES request `read:org`. Its own help on gh 2.100.0
+    /// states the minimum scopes as `repo`, `read:org` and `gist`, so a
+    /// `gh`-authenticated user is not in this situation at all. The real
+    /// case is a hand-made token in `GH_TOKEN`/`GITHUB_TOKEN` (`auth.rs`
+    /// accepts both), where `read:org` is easy to omit -- which is what the
+    /// README's scope table now documents.
     ///
     /// This is the whole point of #825 requirement 2 and it must not be
     /// collapsed into "empty": an org with no members readable and an org

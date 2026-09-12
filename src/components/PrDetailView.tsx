@@ -22,6 +22,8 @@ import { Section } from "./Section";
 import { PrActions } from "./PrActions";
 import { ReviewBox } from "./ReviewBox";
 import { QueryError, errorMessage } from "./QueryError";
+import { scopeEffect } from "../lib/branchDelete";
+import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 
 /// One check, with its outcome and a link to the run.
 function CheckRow({ name, state, url }: { name: string; state: string; url: string }) {
@@ -96,6 +98,15 @@ export function PrDetailView({
   const [reviewing, setReviewing] = useState<ReviewVerdictName | null>(null);
   const rerun = useRerunChecks();
   const [rerunning, setRerunning] = useState(false);
+  /// Whether the remote-branch deletion is awaiting confirmation (#845).
+  ///
+  /// A boolean rather than a nullable ref, because the dialog can only
+  /// ever be about this view's own head ref -- there is one branch on
+  /// this page, and it is `pr.head_ref`. The gate it renders behind
+  /// re-reads `pr.head_ref_id`, so a detail refetch that loses the ref
+  /// closes the question rather than leaving a dialog offering to delete
+  /// something the view can no longer name.
+  const [deleting, setDeleting] = useState(false);
   const rerunnable = pr ? rerunnableRun(pr.checks) : null;
   // The same actions in a different arrangement: on a phone the sticky
   // header stacks the action buttons under the back link, and the
@@ -557,23 +568,100 @@ export function PrDetailView({
         {pr.state === "MERGED" && pr.head_ref_id ? (
           <button
             type="button"
-            onClick={() => {
-              const refId = pr.head_ref_id as string;
-              deleteBranch(refId, pr.repo, pr.number, pr.head_ref, true).then(
-                () => toast.success(`Deleted ${pr.head_ref}`),
-                (e: unknown) =>
-                  toast.error(`Could not delete ${pr.head_ref}`, {
-                    description: typeof e === "string" ? e : undefined,
-                  }),
-              );
-            }}
-            className="flex w-fit items-center gap-1.5 rounded border border-[#30363d] px-3 py-1.5 text-sm hover:bg-[#161b22]"
+            // ASKS, rather than deleting (#845). This fired
+            // `deleteBranch(..., true)` straight from `onClick` -- a
+            // REMOTE deletion, the one operation in this app that no
+            // reflog can undo, on one click. `BranchesPage` states the
+            // rule for the very same operation: "Local deletion is
+            // recoverable from the reflog; a remote deletion is not, so
+            // it is never what a distracted Enter press does." This view
+            // made it exactly that.
+            onClick={() => setDeleting(true)}
+            // DESTRUCTIVE styling, the classes every other destructive
+            // button in the app uses. The old `className` was
+            // BYTE-IDENTICAL to "View on GitHub" and "Copy for agent"
+            // directly above it -- two actions that change nothing --
+            // so the control that destroyed a shared ref was the one
+            // thing in the row with no visual warning at all.
+            className="flex w-fit items-center gap-1.5 rounded border border-[#f85149]/40 px-3 py-1.5 text-sm text-[#f85149] hover:bg-[#f85149]/10"
           >
             <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
-            Delete branch
+            {/* The ellipsis says a question comes first, as on
+                `BranchesPage`'s "Delete {n}…" and the orphan row's
+                "Delete…". */}
+            Delete branch…
           </button>
         ) : null}
       </div>
+
+      {/* The confirmation (#845).
+
+          Reuses `scopeEffect("remote")` rather than wording its own
+          warning. That sentence is `BranchesPage`'s, lifted into
+          `lib/branchDelete` so there is exactly one of it: two wordings
+          of "no local reflog can undo that" is two claims about one
+          operation, and `scopeLabel`'s comment makes the same argument
+          for the confirm button's text.
+
+          Deliberately NOT a scope questionnaire like `BranchesPage`'s.
+          There is no choice to offer -- this view knows only the head
+          ref on GitHub, and `deleteBranch(..., true)` is hardwired to
+          the remote -- and a question with one answer trains people to
+          click through questions that have several. What it borrows is
+          the WARNING, not the form. */}
+      {deleting && pr.head_ref_id ? (
+        <Dialog open onOpenChange={(o) => !o && setDeleting(false)}>
+          <DialogContent className="max-w-lg">
+            <DialogTitle>Delete {pr.head_ref} on the remote?</DialogTitle>
+            {/* The REF, spelled out in mono. A branch name in prose is
+                easy to skim past, and this is the only identifier of
+                what is about to go. */}
+            <p className="mt-3 break-all font-mono text-xs text-[#8b949e]">
+              {pr.repo} · {pr.head_ref}
+            </p>
+            <p className="mt-3 text-sm text-[#f85149]">{scopeEffect("remote")}</p>
+            {/* What is actually lost, which the scope sentence cannot
+                say on its own: the ref is the only NAMED handle on the
+                pre-merge history. The commits survive in the merge, so
+                overstating this as "the work is gone" would be the kind
+                of wrongness that teaches users to discount the red. */}
+            <p className="mt-2 text-sm text-[#8b949e]">
+              The commits are already in the merge. What goes is the only named
+              reference to the branch as it stood before it.
+            </p>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setDeleting(false)}
+                className="rounded border border-[#30363d] px-3 py-1.5 text-sm hover:bg-[#21262d]"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const refId = pr.head_ref_id as string;
+                  setDeleting(false);
+                  deleteBranch(refId, pr.repo, pr.number, pr.head_ref, true).then(
+                    () => toast.success(`Deleted ${pr.head_ref}`),
+                    (e: unknown) =>
+                      toast.error(`Could not delete ${pr.head_ref}`, {
+                        description: typeof e === "string" ? e : undefined,
+                      }),
+                  );
+                }}
+                className="rounded bg-[#da3633] px-3 py-1.5 text-sm font-medium text-white hover:bg-[#c93c37]"
+              >
+                {/* `scopeLabel`'s own wording for this scope, minus the
+                    count: "on the remote" is the half that carries the
+                    warning into the button, which is where a distracted
+                    Enter press lands. */}
+                Delete on the remote
+              </button>
+            </div>
+          </DialogContent>
+        </Dialog>
+      ) : null}
     </div>
   );
 }

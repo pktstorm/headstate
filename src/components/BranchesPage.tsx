@@ -6,7 +6,7 @@ import { useBranchDeleteProgress, useBranchScan, useBranches } from "@/api/hooks
 import { deleteBranches, deleteRemoteBranches } from "@/api/tauri";
 import { useActiveFilters } from "@/store/filters";
 import type { Branch, Deletable } from "@/types/pr";
-import { type Scope, scopeLabel, scopesFor, targetsFor } from "@/lib/branchDelete";
+import { type Scope, scopeEffect, scopeLabel, scopesFor, targetsFor } from "@/lib/branchDelete";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 
 /// Why a branch is or is not deletable, in words.
@@ -193,16 +193,28 @@ export function BranchesPage() {
           exactly like one that had received them all. It is a status
           line, not a spinner: it says what is known, so a stalled scan
           is legible rather than silent. */}
-      {streaming ? (
-        <p
-          role="status"
-          className="rounded border border-[#9e6a03] bg-[#9e6a03]/10 px-2 py-1 text-xs text-[#d29922]"
-        >
-          Still scanning — {scan.classified} of {scan.total ?? branches.length} branches
-          classified. Rows still marked “Checking…” have no verdict yet and cannot be
-          selected for deletion.
-        </p>
-      ) : null}
+      {/* ALWAYS MOUNTED, with the styling on the inner element so an idle
+          region draws nothing (#852).
+
+          `StatusBar` states the rule: "`aria-live` on the CONTAINER, which
+          is always mounted, rather than on the message, which is not. A
+          live region has to exist before the text appears or the first
+          announcement is missed -- the one that matters most, since it is
+          the one saying work started." This banner was the conditional
+          form, and its first announcement is the one that says a
+          ten-second classification has begun and which rows cannot be
+          acted on yet -- precisely the announcement worth having. */}
+      <div role="status">
+        {streaming ? (
+          <p className="rounded border border-[#9e6a03] bg-[#9e6a03]/10 px-2 py-1 text-xs text-[#d29922]">
+            Still scanning — {scan.classified} of {scan.total ?? branches.length} branches
+            classified. Rows still marked “Checking…” have no verdict yet and cannot be
+            selected for deletion.
+          </p>
+        ) : (
+          ""
+        )}
+      </div>
 
       <div className="flex flex-wrap items-center gap-2">
         {/* Visible while it runs, not just a disabled button, and it
@@ -220,26 +232,10 @@ export function BranchesPage() {
             SCAN's branches, and the deleting phase counts the batch
             and shows refusals as they happen. `busy` alone is the
             fallback for the gap before the first frame arrives. */}
-        {busy ? (
-          <span
-            role="status"
-            className="rounded border border-[#30363d] bg-[#161b22] px-2 py-1 text-xs text-[#8b949e]"
-          >
-            {deleting === null
-              ? "Deleting…"
-              : deleting.phase === "checking"
-                ? // Nothing has been deleted yet, and the wording has
-                  // to say so: a user who reads "deleting" here and
-                  // cancels believes refs are already gone.
-                  `Checking ${deleting.total} branch${deleting.total === 1 ? "" : "es"} before deleting — ${deleting.done} checked`
-                : `Deleting ${deleting.done} of ${deleting.total}${
-                    // Named while it runs, not saved for the summary. A
-                    // batch losing thirty branches to refusals is worth
-                    // knowing before the other five hundred go by.
-                    deleting.failed > 0 ? ` — ${deleting.failed} refused` : ""
-                  }`}
-          </span>
-        ) : null}
+        {/* The progress chip has MOVED, to after the button group (#852).
+            See its comment down there: ordering is #817's remedy, and a
+            chip whose text grows continuously sat upstream of a button
+            that deletes refs. */}
         {/* Selects exactly what ticking every deletable row by hand
             would select -- the same `merged` gate, not a second
             definition that could drift from it.
@@ -284,6 +280,63 @@ export function BranchesPage() {
             </button>
           </>
         ) : null}
+
+        {/* The progress chip, AFTER every button -- #817's remedy applied
+            (#852).
+
+            Its text grows continuously and by a lot: "Deleting…" becomes
+            "Checking 562 branches before deleting — 317 checked" becomes
+            "Deleting 412 of 562 — 30 refused". Upstream of "Delete
+            {n}…" in a `flex-wrap` row, each of those widened the row and
+            pushed the destructive button sideways or onto a second line.
+
+            #852 grants this was MITIGATED -- the button is `disabled`
+            while the chip shows, so it could not be misclicked -- and
+            that is exactly why the fix is ordering rather than anything
+            cleverer: the defect was never a misclick, it was a control
+            that visibly jumps, and `WorktreesPage` settles the general
+            case: "nothing upstream of Remove changes width when the
+            button appears… by construction rather than by tuning."
+
+            After `Clear` rather than between the buttons, so the whole
+            button group is upstream of it and nothing the chip does can
+            reach any of them.
+
+            ALWAYS MOUNTED now, holding an empty string when idle, which
+            is the other half of #852. `StatusBar` states the rule: "A live
+            region has to exist before the text appears or the first
+            announcement is missed -- the one that matters most, since it
+            is the one saying work started." This `role="status"` element
+            was created by the same render that first gave it text, so the
+            announcement it existed to make was the one never heard -- on a
+            flow that runs `git branch -D` across hundreds of refs and
+            takes MINUTES. The border and padding move onto the text, so
+            an idle region draws nothing.
+
+            `role="status"` rather than `aria-live="polite"`: it is what
+            this element already had, and the two are equivalent here --
+            `role="status"` carries an implicit `aria-live="polite"`. */}
+        <span role="status" className="text-xs text-[#8b949e]">
+          {busy ? (
+            <span className="rounded border border-[#30363d] bg-[#161b22] px-2 py-1">
+              {deleting === null
+                ? "Deleting…"
+                : deleting.phase === "checking"
+                  ? // Nothing has been deleted yet, and the wording has
+                    // to say so: a user who reads "deleting" here and
+                    // cancels believes refs are already gone.
+                    `Checking ${deleting.total} branch${deleting.total === 1 ? "" : "es"} before deleting — ${deleting.done} checked`
+                  : `Deleting ${deleting.done} of ${deleting.total}${
+                      // Named while it runs, not saved for the summary. A
+                      // batch losing thirty branches to refusals is worth
+                      // knowing before the other five hundred go by.
+                      deleting.failed > 0 ? ` — ${deleting.failed} refused` : ""
+                    }`}
+            </span>
+          ) : (
+            ""
+          )}
+        </span>
       </div>
 
       <DeleteScopeDialog
@@ -301,7 +354,10 @@ export function BranchesPage() {
           return (
             <li
               key={`${b.location}:${b.name}`}
-              className="flex items-center gap-3 rounded border border-[#30363d] px-3 py-2"
+              // `overflow-hidden`, the third part of the #818 remedy
+              // (#852): a cell that overflows its share otherwise draws
+              // straight through the bordered box.
+              className="flex items-center gap-3 overflow-hidden rounded border border-[#30363d] px-3 py-2"
             >
               <input
                 type="checkbox"
@@ -337,9 +393,34 @@ export function BranchesPage() {
                   {reason(b.deletable)}
                 </div>
               </div>
-              <div className="shrink-0 text-right text-xs text-[#8b949e]">
+              {/* The `truncate` here used to be INERT (#852).
+
+                  A `shrink-0` parent is sized to its content, so the
+                  inner `truncate` had no narrower box to truncate into --
+                  it could never fire, and a long author name simply
+                  widened the column and squeezed the branch name and its
+                  verdict beside it. The declared intent was right; the
+                  mechanism was missing.
+
+                  A bounded width is what makes it real. `max-w-32`
+                  rather than a fixed `w-32`: the column is two short
+                  lines (a relative date and a username) and is usually
+                  narrower than the cap, so a fixed width would hold dead
+                  space on every row to bound the occasional long one.
+                  `shrink-0` stays -- this is the trailing metadata column
+                  and `min-w-0 flex-1` beside it is the name, which is
+                  the cell that should keep the room, exactly as #818
+                  settled for the worktree row.
+
+                  And a `title` on the author, so the clipped tail
+                  survives somewhere: "who last touched this branch" is
+                  the question the cell answers, and half a username does
+                  not answer it. */}
+              <div className="max-w-32 shrink-0 text-right text-xs text-[#8b949e]">
                 <div>{ago(b.committed)}</div>
-                <div className="truncate">{b.author}</div>
+                <div className="truncate" title={b.author}>
+                  {b.author}
+                </div>
               </div>
             </li>
           );
@@ -385,16 +466,14 @@ function DeleteScopeDialog({
       ? chosenScope
       : (scopes[0] ?? "local");
 
-  const describe = (s: Scope) => {
-    switch (s) {
-      case "local":
-        return "Removes the branch here. Recoverable from the reflog.";
-      case "remote":
-        return "Pushes a deletion to the remote. Everyone loses it, and no local reflog can undo that.";
-      case "both":
-        return "Removes it here and on the remote. The remote half cannot be undone.";
-    }
-  };
+  // `scopeEffect` from `lib/branchDelete`, not a local closure (#845).
+  //
+  // The PR detail view deletes a remote branch too and shipped with no
+  // confirmation at all; giving it one meant it needed this sentence,
+  // and a copy of it there would let the two surfaces drift about the
+  // one operation a reflog cannot undo. Same reason `scopeLabel` lives
+  // beside it: the warning is carried by the words.
+  const describe = scopeEffect;
 
   const targets = targetsFor(chosen, scope);
   const label = scopeLabel(scope, targets);

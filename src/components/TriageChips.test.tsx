@@ -23,7 +23,7 @@ const PRS: PullRequest[] = [
 describe("TriageChips", () => {
   beforeEach(() => {
     useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} }, view: "my-prs", panel: "list" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} }, view: "my-prs" } as never);
   });
 
   it("shows a count for each non-empty triage state", () => {
@@ -39,11 +39,16 @@ describe("TriageChips", () => {
     expect(container).toBeTruthy();
   });
 
-  it("applies the preset and switches to the list on click", () => {
+  /// The `panel` half of this assertion is gone with the axis (#852).
+  /// `applyPreset` used to reset `panel: "list"` to drop the user out of
+  /// the stats sub-page; that destination became a view in #794, so by the
+  /// time the axis was removed the reset was writing the only value
+  /// anything read. What the chip must still do is apply the preset, which
+  /// is what remains asserted here.
+  it("applies the preset on click", () => {
     render(<TriageChips prs={PRS} now={NOW} />);
     fireEvent.click(screen.getByRole("button", { name: /need attention/i }));
     expect(useFilters.getState().filtersByView[useFilters.getState().view].needsAttentionOnly).toBe(true);
-    expect(useFilters.getState().panel).toBe("list");
   });
 
   it("toggles back off when clicked again", () => {
@@ -63,7 +68,6 @@ describe("TriageChips", () => {
   branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {},
       },
       view: "my-prs",
-      panel: "list",
     } as never);
     render(<TriageChips prs={PRS} now={NOW} />);
     fireEvent.click(screen.getByRole("button", { name: /need attention/i }));
@@ -84,7 +88,7 @@ describe("TriageChips", () => {
       expect(listed).toBe(shown);
       // Reset for the next chip.
       useFilters.setState({ filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
-  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} }, view: "my-prs", panel: "list" } as never);
+  branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} }, view: "my-prs" } as never);
     }
   });
 

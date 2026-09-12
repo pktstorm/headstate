@@ -186,7 +186,6 @@ query($first: Int!) {
         additions
         deletions
         changedFiles
-        reviews { totalCount }
         comments { totalCount }
         repository { nameWithOwner }
       }

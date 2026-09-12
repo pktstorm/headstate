@@ -117,9 +117,24 @@ function DiskSummary({
               <button
                 type="button"
                 onClick={onPrune}
+                // Still a text link rather than a red button, and the
+                // ellipsis is what changed (#852).
+                //
+                // Recoverable, so dressing it in the red reserved for the
+                // unrecoverable actions on this page would teach the user
+                // to discount both -- the argument `WorktreesPage` makes
+                // about its unlock dialog. What WAS wrong is that a bare
+                // link fired it immediately: `reclaim.rs` says "Cache is
+                // not waste, it is speed: real build durations went
+                // 7m8s -> 1m20s -> 56.9s as the cache warmed… this is a
+                // trade the user must make knowingly", and a link you
+                // cannot un-click is not a knowing trade.
+                //
+                // The ellipsis says a question comes first, as everywhere
+                // else in the app that a control opens a dialog.
                 className="text-[#58a6ff] hover:underline"
               >
-                clear
+                clear…
               </button>
             ) : null}
           </>
@@ -331,13 +346,22 @@ export function DockerPage() {
   /// its early return and the click did nothing at all, with no error.
   /// Every other destructive path on this page already uses Dialog.
   const [pendingVolume, setPendingVolume] = useState<DanglingVolume | null>(null);
-  /// Which bulk set the confirmation is for, or null when closed.
+  /// Whether the bulk confirmation is open.
   ///
-  /// "stale" is the conservative set (superseded AND merged AND unused);
-  /// "superseded" is every superseded image we can prove is unused. They
-  /// share a dialog because everything except the wording and the
-  /// membership rule is identical.
-  const [bulkOpen, setBulkOpen] = useState<null | "stale" | "superseded">(null);
+  /// A BOOLEAN, not `null | "stale" | "superseded"` (#852). It used to name
+  /// which set the dialog was for, and that is what came apart: `"stale"`
+  /// was written at its only call site, so the `"superseded"` member was
+  /// unreachable, while `bulkSet` followed the checkbox -- and the dialog's
+  /// title and reassurance keyed off this rather than off the expression
+  /// that decides the membership.
+  ///
+  /// Narrowed rather than left in place once the copy moved to
+  /// `includeWider`, for the reason the store's `panel` axis was removed in
+  /// the same issue: "a value still in the union is one a component can
+  /// set", so an unreachable member is a trap for the next caller who
+  /// believes setting it does something. WHICH set is being removed is
+  /// `includeWider`'s answer and only ever was; this is just open or closed.
+  const [bulkOpen, setBulkOpen] = useState(false);
   // Whether the confirmation is showing the WIDE set. Reset each time
   // the dialog opens, so a previous session's choice cannot silently
   // widen a later removal.
@@ -345,6 +369,20 @@ export function DockerPage() {
   const [removing, setRemoving] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [restartOpen, setRestartOpen] = useState<string[] | null>(null);
+  /// Whether the build-cache prune is awaiting confirmation (#852).
+  ///
+  /// This page asserts the invariant it was breaking, at `pendingVolume`
+  /// just above: "Every other destructive path on this page already uses
+  /// Dialog." The cache prune was reached from a bare text link that fired
+  /// `prune("168h")` on click.
+  ///
+  /// Recoverable, so not data loss -- but `reclaim.rs` is explicit about
+  /// the cost: "Cache is not waste, it is speed: real build durations went
+  /// 7m8s -> 1m20s -> 56.9s as the cache warmed… this is a trade the user
+  /// must make knowingly." A link you cannot un-click does not let anyone
+  /// make a trade knowingly, which is a miscalibrated affordance rather
+  /// than a missing safety gate -- and the remedy for both is the same.
+  const [pruning, setPruning] = useState(false);
 
   // Docker being off is NORMAL, not an error. An empty image list would
   // say "your machine is clean" when the truth is we could not ask.
@@ -448,7 +486,7 @@ export function DockerPage() {
             disabled={busy}
             onClick={() => {
               setIncludeWider(false);
-              setBulkOpen("stale");
+              setBulkOpen(true);
             }}
             className="rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#f85149] hover:bg-[#f85149]/10 disabled:opacity-50"
           >
@@ -470,26 +508,9 @@ export function DockerPage() {
         </button>
       </div>
 
-      <DiskSummary
-        builds={builds}
-        onPrune={() =>
-          // A week, not everything: the last day's cache is what makes
-          // today's builds fast, while a month-old entry is unlikely to
-          // be helping any current work.
-          prune("168h").then(
-            (freed) => toast.success(`Freed ${formatDockerSize(freed || null)} of build cache`),
-            (e: unknown) => {
-              // Silent when the user dismissed the biometric prompt:
-              // they declined, nothing was pruned, and reporting their
-              // own decision back as a failure is noise.
-              if (isCancelled(e)) return;
-              toast.error("Could not clear the build cache", {
-                description: typeof e === "string" ? e : undefined,
-              });
-            },
-          )
-        }
-      />
+      {/* ASKS, rather than pruning (#852). The handler is now `setState`;
+          the pruning itself moved into the dialog's confirm button. */}
+      <DiskSummary builds={builds} onPrune={() => setPruning(true)} />
 
       <div className="rounded-md border border-[#30363d]">
         {isLoading ? (
@@ -538,6 +559,82 @@ export function DockerPage() {
             </div>
           ))}
         </div>
+      ) : null}
+
+      {/* The build-cache prune's confirmation (#852).
+
+          Deliberately NOT styled as a destructive confirmation -- no red
+          title, no `#da3633` confirm. Nothing is lost that cannot be
+          rebuilt, and dressing a recoverable action in the colour reserved
+          for the unrecoverable ones would teach the user to discount both;
+          `WorktreesPage` makes exactly that argument about its unlock
+          dialog. The caution here is a DIFFERENT one -- the next build
+          will be slow -- and it is stated in those words.
+
+          What it does carry is the measurement from `reclaim.rs`: "real
+          build durations went 7m8s -> 1m20s -> 56.9s as the cache warmed".
+          A number the user can weigh is the difference between a knowing
+          trade and a click, which is what that file asks for. */}
+      {pruning ? (
+        <Dialog open onOpenChange={(o) => !o && setPruning(false)}>
+          <DialogContent className="max-w-lg">
+            <DialogTitle>Clear cache older than 7 days?</DialogTitle>
+            <ActingOnDesktop />
+            {/* Says the SCOPE, which the link could not. "clear" beside a
+                total invites reading it as "clear all of that", and the
+                call is `prune("168h")` -- the last week is deliberately
+                kept, because it is the part making today's builds fast. */}
+            <p className="mt-3 text-sm text-[#e6edf3]">
+              Entries from the last 7 days are kept — those are the ones making
+              today’s builds fast. Everything older goes.
+            </p>
+            <p className="mt-2 text-sm text-[#8b949e]">
+              Cache is not waste, it is speed. On a real project, build times fell
+              from 7m08s to 1m20s to 56.9s as the cache warmed; the next build after
+              clearing pays that back from cold. Nothing is lost — it is rebuilt.
+            </p>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setPruning(false)}
+                className="rounded border border-[#30363d] px-3 py-1.5 text-sm hover:bg-[#21262d]"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setPruning(false);
+                  // A week, not everything: the last day's cache is what
+                  // makes today's builds fast, while a month-old entry is
+                  // unlikely to be helping any current work.
+                  void prune("168h").then(
+                    (freed) =>
+                      toast.success(
+                        `Freed ${formatDockerSize(freed || null)} of build cache`,
+                      ),
+                    (e: unknown) => {
+                      // Silent when the user dismissed the biometric
+                      // prompt: they declined, nothing was pruned, and
+                      // reporting their own decision back as a failure is
+                      // noise.
+                      if (isCancelled(e)) return;
+                      toast.error("Could not clear the build cache", {
+                        description: typeof e === "string" ? e : undefined,
+                      });
+                    },
+                  );
+                }}
+                // The NEUTRAL confirm, matching the unlock dialog rather
+                // than the removals: this is the button for an action
+                // whose cost is time.
+                className="rounded border border-[#30363d] bg-[#21262d] px-3 py-1.5 text-sm font-medium text-[#e6edf3] hover:bg-[#30363d]"
+              >
+                Clear the older cache
+              </button>
+            </div>
+          </DialogContent>
+        </Dialog>
       ) : null}
 
       {pendingVolume ? (
@@ -645,21 +742,44 @@ export function DockerPage() {
       ) : null}
 
       {bulkOpen ? (
-        <Dialog open onOpenChange={(o) => !o && setBulkOpen(null)}>
+        <Dialog open onOpenChange={(o) => !o && setBulkOpen(false)}>
           <DialogContent className="max-w-2xl">
+            {/* Keyed off `includeWider`, NOT `bulkOpen` (#852).
+
+                `bulkOpen` is assigned `"stale"` at its ONLY call site, so
+                the `"superseded"` arm of both of these was dead code while
+                `bulkSet` -- the thing actually being removed -- follows the
+                checkbox below. Ticking "Also remove N superseded images
+                whose branch is still open" therefore widened the set and
+                left the title reading "Remove 3 stale images?" over a list
+                of 19, with the reassurance still claiming "its branch has
+                merged": false for exactly the images the checkbox added,
+                and the sentence beneath the checkbox already says so.
+
+                One expression decides the membership and the words now.
+                That is the point -- `bulkSet` is `includeWider ?
+                superseded : stale`, so keying the copy off anything else
+                is how the two came apart in the first place. `bulkOpen` is
+                now a plain boolean for the same reason the `panel` axis was
+                removed in this issue: once it stopped deciding the wording
+                it was read only for truthiness, and an unreachable union
+                member is a trap for the next caller who believes setting it
+                does something. */}
             <DialogTitle>
-              Remove {bulkSet.length}{" "}
-              {bulkOpen === "superseded" ? "superseded" : "stale"} image
+              Remove {bulkSet.length} {includeWider ? "superseded" : "stale"} image
               {bulkSet.length === 1 ? "" : "s"}?
             </DialogTitle>
             <ActingOnDesktop />
             {/* The wider set needs a DIFFERENT sentence, not a louder
                 one: some of its images belong to branches that are
                 still open, and the dialog has to say so plainly rather
-                than reuse the reassurance that fits the narrow set. */}
+                than reuse the reassurance that fits the narrow set.
+
+                `:656` already stated that requirement; what it lacked was
+                a condition that could ever be true. */}
             <p className="mt-2 text-sm text-[#8b949e]">
               Reclaims {formatDockerSize(bulkBytes || null)}.{" "}
-              {bulkOpen === "superseded"
+              {includeWider
                 ? "Each one has been replaced by a newer build and nothing is running it — but some belong to branches that are still open, so check the list."
                 : "Every one is superseded and its branch has merged, so nothing will want it again."}
             </p>
@@ -689,7 +809,7 @@ export function DockerPage() {
             <div className="mt-5 flex justify-end gap-2">
               <button
                 type="button"
-                onClick={() => setBulkOpen(null)}
+                onClick={() => setBulkOpen(false)}
                 className="rounded border border-[#30363d] px-3 py-1.5 text-sm hover:bg-[#21262d]"
               >
                 Cancel
@@ -699,7 +819,7 @@ export function DockerPage() {
                 onClick={() => {
                   const targets = bulkSet.map((i) => i.id);
                   const freed = bulkBytes;
-                  setBulkOpen(null);
+                  setBulkOpen(false);
                   setBusy(true);
                   removeImages(targets).then(
                     (outcomes) => {

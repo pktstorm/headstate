@@ -36,8 +36,33 @@ export function ArtifactSidebar({ reviewingCount }: { reviewingCount: number }) 
   // fetch rather than the sidebar triggering a second scan. Passing the
   // data down from App instead would mean lifting the whole artifacts
   // state out of the page for one label.
-  const { data: artifacts = [] } = useArtifacts(true);
-  const { data: venvs = [] } = useVenvs(true);
+  // `isLoading` and `isError` on BOTH scans (#846).
+  //
+  // This column had zero loading or error handling: the `= []` defaults
+  // made a rejected scan produce an empty `groups` map, so the sidebar
+  // rendered one row -- "Everything" -- and nothing else. Identical to a
+  // machine with no build output and no virtualenvs, and on a
+  // disk-cleanup tool that reads as "your machine is clean" when the
+  // truth is it could not look.
+  //
+  // Both scans, because this column is the only place the two appear
+  // together: the groups are artifact kinds PLUS the venv group, so a
+  // venv failure silently removes a row the page can still show and an
+  // artifact failure silently removes five. One arm reports whichever
+  // failed, by name, so the missing rows are accounted for rather than
+  // merely absent.
+  const {
+    data: artifacts = [],
+    isLoading: artifactsLoading,
+    isError: artifactsFailed,
+    refetch: refetchArtifacts,
+  } = useArtifacts(true);
+  const {
+    data: venvs = [],
+    isLoading: venvsLoading,
+    isError: venvsFailed,
+    refetch: refetchVenvs,
+  } = useVenvs(true);
   const { sizes } = useArtifactSizes(artifacts, artifacts.length > 0);
   const { sizes: venvSizes } = useVenvSizes(venvs, venvs.length > 0);
 
@@ -67,6 +92,17 @@ export function ArtifactSidebar({ reviewingCount }: { reviewingCount: number }) 
       active ? "bg-[#1f6feb] text-white" : "text-[#e6edf3] hover:bg-[#161b22]"
     }`;
 
+  /// `aria-current` for the selected row (#852). The blue was carrying the
+  /// selection alone, against the rule `StatsSidebar` states: "the
+  /// selection is navigation state, and a screen reader reading a list of
+  /// repository names has no other way to know which one is open."
+  ///
+  /// `"true"` rather than `"page"`: these rows SCOPE the artifacts view
+  /// rather than navigating to a different one. `undefined` on the
+  /// inactive rows, because absence is how "not current" is spelled and
+  /// `aria-current="false"` is announced by some readers.
+  const current = (active: boolean) => (active ? ("true" as const) : undefined);
+
   return (
     <nav className="flex w-64 shrink-0 flex-col border-r border-[#30363d] p-3">
       <ViewSwitcher counts={{ "to-review": reviewingCount }} />
@@ -74,6 +110,7 @@ export function ArtifactSidebar({ reviewingCount }: { reviewingCount: number }) 
         <button
           type="button"
           onClick={() => setFilter("repo", undefined)}
+          aria-current={current(!filters.repo)}
           className={rowClass(!filters.repo)}
         >
           <span className="flex items-center gap-2">
@@ -81,11 +118,54 @@ export function ArtifactSidebar({ reviewingCount }: { reviewingCount: number }) 
             Everything
           </span>
         </button>
+        {/* BETWEEN "Everything" and the groups, which is where the
+            missing rows would have been (#846).
+
+            Names WHICH scan failed rather than saying "something went
+            wrong": the two feed different rows, and a user told only that
+            a scan failed cannot tell whether the virtualenv group is
+            absent because it failed or because there are none. `failed`
+            is checked before `loading` because a retry leaves both true
+            for a moment, and flipping to "Looking…" mid-retry would read
+            as the error having resolved itself. */}
+        {artifactsFailed || venvsFailed ? (
+          <div className="px-3 py-2">
+            <p className="text-xs text-[#f85149]">
+              Could not scan for{" "}
+              {artifactsFailed && venvsFailed
+                ? "build output or virtualenvs"
+                : artifactsFailed
+                  ? "build output"
+                  : "virtualenvs"}
+              .
+            </p>
+            {/* Retries only what actually failed. Re-running a scan that
+                succeeded would throw away a result the page is still
+                rendering -- and the virtualenv scan is 26 seconds. */}
+            <button
+              type="button"
+              onClick={() => {
+                if (artifactsFailed) void refetchArtifacts();
+                if (venvsFailed) void refetchVenvs();
+              }}
+              className="mt-1 rounded border border-[#30363d] px-2 py-0.5 text-xs text-[#e6edf3] hover:bg-[#161b22]"
+            >
+              Try again
+            </button>
+          </div>
+        ) : artifactsLoading || venvsLoading ? (
+          // A HOLDING message, not a diagnosis. An empty group list
+          // before the scans answer is "we have not looked yet", and
+          // saying anything about the machine's contents here would be
+          // the `RepoPickerSidebar` mistake.
+          <p className="px-3 py-2 text-xs text-[#8b949e]">Looking for reclaimable space…</p>
+        ) : null}
         {entries.map(([kind, { count, bytes }]) => (
           <button
             type="button"
             key={kind}
             onClick={() => setFilter("repo", kind)}
+            aria-current={current(filters.repo === kind)}
             className={rowClass(filters.repo === kind)}
           >
             <span className="truncate">{GROUP_LABEL[kind]}</span>

@@ -283,6 +283,16 @@ const POLL_EVENTS: [string, () => unknown][] = [
   ["store-error", hooks.useStoreError],
   ["worktree-removal-progress", hooks.useRemovalProgress],
   ["reviewing-short", hooks.useReviewShortfall],
+  // Missing from this list until #850, which is the entry that showed
+  // why the list needed a completeness check at all rather than a
+  // careful author. `useUpdateProgress` does reach it through the seam,
+  // so there was no live bug -- but nothing here would have noticed if
+  // it did not, and the failure a missing row hides is silent and
+  // desktop-invisible: the phone's page never fills in, with no error.
+  // `mirroredConstants.test.ts` now asserts this list against
+  // `EVENT_NAMES` in `remote/events.rs`, the way the wrapper test below
+  // asserts its rows against `tauri.ts`' exports.
+  ["update-run-progress", hooks.useUpdateProgress],
   ["update-run-done", hooks.useUpdateRunOutcome],
   // The tenth allowlisted name (#657). It is here for the same reason
   // as the rest: the phone reaches it through this seam, so a hook that

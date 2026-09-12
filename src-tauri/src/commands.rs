@@ -2308,9 +2308,18 @@ pub async fn stats_count(
         .fetch_viewer_metered(&budget)
         .await
         .map_err(|e| e.to_string())?;
-    let key = q.cache_key(&viewer);
+    // `Kind::Count`, not a bare query key: #836 put boards and series in
+    // the same table, and a board in this scope has no subject at all, so
+    // its key would otherwise be byte-identical to a whole-scope count's.
+    let key = crate::store::stats::key(crate::store::stats::Kind::Count, &q.cache_key(&viewer));
 
     let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
+    // Before any read: if the token now belongs to someone else, the rows
+    // in this table are the previous user's (#840). Non-fatal -- the
+    // answer below is correct either way, and failing a stats load
+    // because a cache could not be tidied would be the tail wagging the
+    // dog.
+    note_stats_viewer(&conn, &viewer);
     if let Ok(Some(hit)) = crate::store::stats::get(&conn, &key, &window.from, &window.to, now) {
         if let Ok(mut cached) = serde_json::from_str::<crate::github::stats::Outcome>(&hit.payload)
         {
@@ -2534,6 +2543,26 @@ fn parse_scope_request(
     })
 }
 
+/// Note the current `@me` identity, dropping another user's cached rows.
+///
+/// A thin wrapper over `store::stats::note_viewer` so the three stats
+/// commands share one call site's error handling rather than each
+/// swallowing the `Result` its own way.
+///
+/// Failure is logged and swallowed for the reason every other cache
+/// interaction here is: the answer the command returns is correct
+/// regardless, and turning a tidy-up into a command failure would make an
+/// optimisation a liability. The cost of the failure is that a departed
+/// user's rows stay until the next successful call -- they are never
+/// SERVED, because keys resolve `@me` to a login (`Subject::cache_key`).
+fn note_stats_viewer(conn: &rusqlite::Connection, viewer: &str) {
+    match crate::store::stats::note_viewer(conn, viewer) {
+        Ok(0) => {}
+        Ok(n) => log::info!("the stats cache dropped {n} rows for a previous identity"),
+        Err(e) => log::warn!("could not record the stats viewer: {e}"),
+    }
+}
+
 /// Upper bound on what a board load will spend, in rate-limit points.
 ///
 /// # Why this is not `stats_count`'s figure
@@ -2620,19 +2649,44 @@ const MAX_PROBE_ROUNDS: u64 = 4;
 /// protected is the poll loop's standing obligation and a leaderboard is
 /// something the user asked for once.
 ///
-/// # Not cached, unlike `stats_count`
+/// # Cached for a CLOSED window, since #836
 ///
-/// `stats_count` memoises a closed window's total through `store::stats`,
-/// keyed on the question. A board is not a number: it is a row per person,
-/// and the cache's schema stores a total and a payload keyed on
-/// `StatsQuery::cache_key` -- which for a board has no subject at all, so
-/// every board in a scope would share one key. Caching it properly needs a
-/// migration of its own and a decision about whether a roster change
-/// invalidates a closed window's board; neither is in this PR's scope.
-/// TanStack Query's `staleTime` holds it for the session, which is the
-/// layer that stops a re-fetch per navigation.
+/// It was not, and the reason recorded here was scope: "a board is not a
+/// number… caching it properly needs a migration of its own". #836 is that
+/// follow-up, and no migration turned out to be needed -- migration 10's
+/// `payload` is already an opaque JSON blob and `complete` already carries
+/// partiality, so the only genuine blocker was the key. A board has no
+/// subject (it is about everyone), so `StatsQuery::cache_key` would have
+/// given it the same string as the scope's whole-population COUNT;
+/// `store::stats::Kind` is the discriminator that fixes it.
+///
+/// The asymmetry #836 objected to was that the cache covered the CHEAPEST
+/// query and skipped this one. `board_projection` bounds a 90-day board at
+/// ~45 points against `stats_count`'s ~26, and the node fetching is
+/// "seconds over a busy org" -- so a cold start was re-spending the full
+/// board cost for a leaderboard over a month that had already ended.
+///
+/// Two things it is careful NOT to do, both from #836's acceptance list:
+///
+/// - **An open window is not cached as if final.** `store::stats::get`
+///   already bounds an open window to `OPEN_WINDOW_TTL_SECS`, so the write
+///   is safe either way; it is still worth saying that the window here
+///   ends YESTERDAY (`parse_scope_request`), which is what makes most
+///   requests land on a closed window at all.
+/// - **A partial board is stored WITH its partiality.** `board.complete`
+///   goes into the `complete` column, so a read-back cannot launder a
+///   capped roster into a confident one.
+///
+/// The roster question the old comment raised -- whether a membership
+/// change should invalidate a closed window's board -- answers itself:
+/// the board is built from the pull requests merged in the window, not
+/// from a roster, so who is in the org TODAY cannot change who merged
+/// something in August. (That is not true of the reviews-GIVEN board,
+/// which takes its logins as an argument; `stats_reviewers` is not cached
+/// here for exactly that reason.)
 #[tauri::command]
 pub async fn stats_board(
+    app: AppHandle,
     client: State<'_, GhClient>,
     scope_kind: String,
     scope_value: Option<String>,
@@ -2666,6 +2720,53 @@ pub async fn stats_board(
         .await
         .map_err(|e| e.to_string())?;
 
+    // A board has no subject, so `cache_key` fills the subject slot with
+    // `*` and the key reads `board|merged|*|org:X`. `Kind::Board` is what
+    // keeps that out of the whole-scope COUNT's row, which is the same
+    // string bar the prefix.
+    //
+    // Note what this means and why it is safe: unlike `stats_count`'s key,
+    // this one does NOT carry the viewer's login -- there is no subject for
+    // it to be resolved into. Two accounts on one machine share this
+    // database (`Subject::cache_key`'s doc records that as a real case), so
+    // in principle one could read a board row the other wrote, and a
+    // `StatsBoard` payload carries the viewer it was split into Mine and
+    // Others against -- which would put the reader's own work under
+    // "Others" and show "no activity" for Mine.
+    //
+    // `note_stats_viewer` below is what closes it, and it has to run before
+    // the read for exactly this reason: a changed identity drops every row
+    // in the table, so the only rows this read can find were written by the
+    // account now asking. That ordering is load-bearing rather than tidy.
+    //
+    // The alternative -- putting the viewer in the key -- was rejected: it
+    // would give every account its own copy of an answer that is identical
+    // for all of them (a board is about everyone in the scope), so the
+    // second user would pay the full ~45-point load to recompute a
+    // leaderboard already on disk.
+    let q = crate::github::stats::StatsQuery::new(None, req.scope.clone(), measure);
+    let key = crate::store::stats::key(crate::store::stats::Kind::Board, &q.cache_key(&viewer));
+    let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
+    note_stats_viewer(&conn, &viewer);
+    if let Ok(Some(hit)) =
+        crate::store::stats::get(&conn, &key, &req.window.from, &req.window.to, now)
+    {
+        if let Ok(cached) = serde_json::from_str::<StatsBoard>(&hit.payload) {
+            crate::diag!(
+                "[diag] cmd stats_board cache hit authors={} complete={}",
+                cached.board.rows.len(),
+                cached.board.complete
+            );
+            return Ok(cached);
+        }
+        // Same handling as `stats_count`'s: a payload that will not parse
+        // is a shape change across an upgrade, dropped and re-fetched
+        // rather than erroring. A cache must never be able to break the
+        // feature it accelerates.
+        log::warn!("discarding an unreadable stats board cache row");
+    }
+
+    let budget = Budget::new();
     let projected = board_projection(clamp_days(days));
     if !budget.permits(projected) {
         return Err(format!(
@@ -2677,7 +2778,12 @@ pub async fn stats_board(
 
     crate::diag!("[diag] cmd stats_board start kind={scope_kind} days={days}");
     let started = std::time::Instant::now();
-    let out = crate::github::stats::load_board(&client, &req.scope, measure, req.window, &budget)
+    // `req.window` is CLONED rather than moved: the cache write below
+    // needs the same window the fetch was for, and re-deriving it from
+    // `days` there would be a second computation of the same dates that a
+    // midnight boundary could make disagree with this one.
+    let window = req.window.clone();
+    let out = crate::github::stats::load_board(&client, &req.scope, measure, window, &budget)
         .await
         .map(|board| StatsBoard { viewer, board })
         .map_err(|e| e.to_string());
@@ -2706,6 +2812,32 @@ pub async fn stats_board(
             Err(e) => format!("err: {e}"),
         }
     );
+
+    if let Ok(b) = &out {
+        // Cached on success only, and the board's OWN `complete` flag goes
+        // into the `complete` column -- a partial roster must not read
+        // back as a confident one. `store::stats::get` is what bounds an
+        // open window, so there is no separate is-it-closed check here:
+        // one decision, in one place, rather than two that can disagree.
+        //
+        // The whole `StatsBoard` is serialised, viewer login included,
+        // because the split has to travel with the board it was made
+        // against (see `StatsBoard`).
+        if let Ok(payload) = serde_json::to_string(b) {
+            if let Err(e) = crate::store::stats::put(
+                &conn,
+                &key,
+                &req.window.from,
+                &req.window.to,
+                b.board.total,
+                b.board.complete,
+                &payload,
+                now,
+            ) {
+                log::warn!("could not cache the stats board: {e}");
+            }
+        }
+    }
     out
 }
 
@@ -2743,8 +2875,29 @@ pub struct StatsBoard {
 /// is the point: a chart is about ONE line, so "this person's activity in
 /// this org" is a legitimate and cheap question, while a leaderboard is
 /// about everyone by definition. `None` means the whole scope.
+///
+/// # Cached, since #836
+///
+/// The third of the three, and the one whose answer is most obviously a
+/// constant: a chart of last month is a row of numbers about days that
+/// have ended. `store::stats::Kind::Series` keys it apart from the count
+/// and the board over the same scope and window.
+///
+/// `total` on the cached row is the sum of the daily MERGED counts. The
+/// column is part of `store::stats`' shape and the series has no single
+/// headline figure, so something has to go there; merged is the measure
+/// this command's own query defaults to, and nothing reads the column back
+/// -- `Cached::payload` is what the command deserialises. Stated here
+/// rather than left to a reader to infer, because a number in a column
+/// named `total` invites exactly that inference.
+///
+/// Partiality is `Series::is_complete()`, which is false when any day
+/// failed or any field was refused. A series missing two days of thirty is
+/// still worth drawing (see `load_series`) -- but it must not be cached as
+/// though it were whole, or the missing days become permanent.
 #[tauri::command]
 pub async fn stats_series(
+    app: AppHandle,
     client: State<'_, GhClient>,
     subject: Option<String>,
     scope_kind: String,
@@ -2789,6 +2942,42 @@ pub async fn stats_series(
     // there is no measure a caller can set here and have silently ignored.
     let q = StatsQuery::new(subject, req.scope, Measure::Merged);
 
+    // The viewer is needed for the KEY, not for the answer -- a series
+    // about a named subject does not otherwise care who is asking. It is
+    // the same one cheap request `stats_count` and `stats_board` make, and
+    // `cache_key` needs `@me` resolved for the reason those two record:
+    // two accounts on one machine share this database.
+    //
+    // The key's MEASURE slot reads `merged` for every series, and that is
+    // correct rather than a bug: `q` carries `Measure::Merged` only as the
+    // document's default, and `series_query` overrides it per alias to ask
+    // for both. So one cached row holds both measures -- there is no
+    // opened-only series for it to collide with. `stats_count` and
+    // `stats_board` DO vary by measure, and theirs is in the key because
+    // they pass the real one.
+    //
+    // The subject IS in the key, unlike the board's: a series draws one
+    // line, so "this person in this org" and "the whole org" are different
+    // charts and must not share a row.
+    let viewer = client
+        .fetch_viewer_metered(&budget)
+        .await.map_err(|e| e.to_string())?;
+    let key = crate::store::stats::key(crate::store::stats::Kind::Series, &q.cache_key(&viewer));
+    let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
+    note_stats_viewer(&conn, &viewer);
+    if let Ok(Some(hit)) =
+        crate::store::stats::get(&conn, &key, &req.window.from, &req.window.to, now)
+    {
+        if let Ok(cached) = serde_json::from_str::<crate::github::stats::Series>(&hit.payload) {
+            crate::diag!(
+                "[diag] cmd stats_series cache hit points={}",
+                cached.points.len()
+            );
+            return Ok(cached);
+        }
+        log::warn!("discarding an unreadable stats series cache row");
+    }
+
     crate::diag!("[diag] cmd stats_series start kind={scope_kind} days={days}");
     let started = std::time::Instant::now();
     let out = crate::github::stats::load_series(&client, &q, &req.days, &budget)
@@ -2809,6 +2998,25 @@ pub async fn stats_series(
             Err(e) => format!("err: {e}"),
         }
     );
+
+    if let Ok(series) = &out {
+        if let Ok(payload) = serde_json::to_string(series) {
+            // See the doc above for why `total` is the merged sum.
+            let total = series.points.iter().map(|p| p.merged).sum();
+            if let Err(e) = crate::store::stats::put(
+                &conn,
+                &key,
+                &req.window.from,
+                &req.window.to,
+                total,
+                series.is_complete(),
+                &payload,
+                now,
+            ) {
+                log::warn!("could not cache the stats series: {e}");
+            }
+        }
+    }
     out
 }
 
@@ -3037,6 +3245,158 @@ mod tests {
             assert!(
                 !src.contains(&format!("pub fn {name}(")),
                 "{name} still has a blocking signature"
+            );
+        }
+    }
+
+    /// Every stats command must WRITE its answer to `stats_cache`.
+    ///
+    /// # Why this test exists at the command level
+    ///
+    /// `store::stats::the_table_is_actually_written_to` is named for the
+    /// `merge_history` failure -- a table nothing writes to, implying a
+    /// feature that does not exist -- but #840 showed it does not actually
+    /// guard against it: it calls `store::stats::put` itself, so it passes
+    /// with every production caller deleted. The guard was weaker than its
+    /// name. This is the half that asserts the COMMAND path.
+    ///
+    /// # Why it reads the source rather than calling the commands
+    ///
+    /// Each of the three needs a `State<GhClient>` holding an
+    /// authenticated client and makes live GitHub requests, which CI has
+    /// neither a token nor a network budget for. Same trade-off, and the
+    /// same precedent, as `docker_builds_enriches_rather_than_returning_
+    /// bare_history` above: a source check is weak, but the alternative
+    /// here was a guard that could not fail.
+    ///
+    /// It is still stronger than a whole-file grep in the two ways that
+    /// matter: the `put` has to be inside THAT command's body, and the
+    /// `Kind` has to be the right one -- so deleting one command's caching
+    /// or copy-pasting another's discriminator both fail here.
+    #[test]
+    fn every_stats_command_writes_its_answer_to_the_cache() {
+        let src = include_str!("commands.rs");
+        for (name, kind) in [
+            ("stats_count", "Kind::Count"),
+            ("stats_board", "Kind::Board"),
+            ("stats_series", "Kind::Series"),
+        ] {
+            let start = src
+                .find(&format!("pub async fn {name}("))
+                .unwrap_or_else(|| panic!("{name} not found"));
+            // To the start of the NEXT command, so the window is this
+            // function's body and not its neighbour's. Every stats
+            // command is followed by another `#[tauri::command]` or by the
+            // test module, so the fallback is the end of the file.
+            let rest = &src[start + 1..];
+            let end = rest
+                .find("#[tauri::command]")
+                .map(|i| start + 1 + i)
+                .unwrap_or(src.len());
+            let body = &src[start..end];
+            assert!(
+                body.contains("store::stats::put("),
+                "{name} must cache its answer (#836); without it a closed \
+                 window's result is recomputed on every cold start"
+            );
+            assert!(
+                body.contains("store::stats::get("),
+                "{name} must READ the cache too -- a write nothing reads \
+                 is the `merge_history` shape with extra steps"
+            );
+            assert!(
+                body.contains(kind),
+                "{name} must key its rows with {kind}; sharing another \
+                 command's discriminator means one answer overwrites the \
+                 other, because `put` is INSERT OR REPLACE"
+            );
+            assert!(
+                body.contains("note_stats_viewer("),
+                "{name} must note the viewer (#840), or a token swap \
+                 leaves the previous user's rows forever"
+            );
+        }
+    }
+
+    /// The identity check must run BEFORE the cache is read.
+    ///
+    /// Not a style preference -- it is what makes `stats_board`'s key safe.
+    /// That key is `board|merged|*|org:X`: a board has no subject, so unlike
+    /// `stats_count`'s key it carries NO viewer login. Two accounts on one
+    /// machine share this database (`Subject::cache_key` records that as a
+    /// real case), so one could otherwise read a board row the other wrote
+    /// -- and a `StatsBoard` payload carries the viewer it was split into
+    /// Mine and Others against, which would put the reader's own work under
+    /// "Others" and show "no activity" for Mine.
+    ///
+    /// `note_stats_viewer` clears the whole table on an identity change, so
+    /// running it first means the only rows the read can find were written
+    /// by the account now asking. Reversed, the stale board is served and
+    /// THEN the table is cleared -- the wrong answer already returned.
+    ///
+    /// Checked by source position for the reason the sibling guards above
+    /// give: these commands need an authenticated client and live requests.
+    /// A position check is weak, but it is the property itself, and the
+    /// alternative was nothing.
+    #[test]
+    fn the_identity_check_precedes_every_cache_read() {
+        let src = include_str!("commands.rs");
+        for name in ["stats_count", "stats_board", "stats_series"] {
+            let start = src.find(&format!("pub async fn {name}(")).unwrap();
+            let rest = &src[start + 1..];
+            let end = rest
+                .find("#[tauri::command]")
+                .map(|i| start + 1 + i)
+                .unwrap_or(src.len());
+            let body = &src[start..end];
+            let note = body
+                .find("note_stats_viewer(")
+                .unwrap_or_else(|| panic!("{name} must call note_stats_viewer"));
+            let read = body
+                .find("store::stats::get(")
+                .unwrap_or_else(|| panic!("{name} must read the cache"));
+            assert!(
+                note < read,
+                "{name} reads the cache before checking whether the token \
+                 still belongs to the same person; on a board -- whose key \
+                 carries no login -- that serves another account's rows and \
+                 splits Mine/Others against the wrong viewer"
+            );
+        }
+    }
+
+    /// A partial answer must reach `put` as partial, in every command.
+    ///
+    /// #836's acceptance item, asserted where the decision is made. The
+    /// dangerous edit is passing a literal `true` -- it compiles, the
+    /// numbers look right, and a capped roster or a series missing two
+    /// days is cached forever as though it were whole. `store::stats`
+    /// cannot catch that: by the time the flag reaches it, it is just a
+    /// bool.
+    #[test]
+    fn no_stats_command_caches_a_partial_answer_as_complete() {
+        let src = include_str!("commands.rs");
+        for name in ["stats_count", "stats_board", "stats_series"] {
+            let start = src.find(&format!("pub async fn {name}(")).unwrap();
+            let rest = &src[start + 1..];
+            let end = rest
+                .find("#[tauri::command]")
+                .map(|i| start + 1 + i)
+                .unwrap_or(src.len());
+            let body = &src[start..end];
+            let put = body.find("store::stats::put(").unwrap();
+            // The argument list, generously bounded -- the call spans
+            // several lines and the flag is the sixth argument.
+            let call = &body[put..(put + 600).min(body.len())];
+            assert!(
+                call.contains("is_complete()") || call.contains(".complete"),
+                "{name} must pass the answer's own completeness flag to \
+                 `put`, not a literal: a partial result cached as complete \
+                 launders a sample into a fact"
+            );
+            assert!(
+                !call.contains("\n                true,"),
+                "{name} appears to hardcode `complete: true`"
             );
         }
     }

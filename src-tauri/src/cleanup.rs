@@ -159,11 +159,41 @@ pub fn max_per_run(prefs: &CleanupPrefs) -> usize {
     }
 }
 
-/// Append entries to the ledger.
+/// How many ledger rows are kept, newest first.
+///
+/// The ledger is read with a limit of 200 (`commands::cleanup_log`), so
+/// everything past the newest 200 rows is storage nothing can display.
+/// This bound is deliberately 10x that read limit: it leaves room for
+/// the read limit to grow several times over before the trim could ever
+/// remove a row the view would have shown, and it is still a hard
+/// ceiling instead of the unbounded growth #837 found.
+///
+/// Before this, `cleanup_log` was the only table in the store that was
+/// never pruned: `grep 'DELETE FROM cleanup_log'` returned nothing.
+/// Growth is one row per considered entry per run, and `max_per_run`
+/// clamps a run to 500 ([`max_per_run`]) -- so a daily run at the cap
+/// wrote ~180,000 rows a year, of which 200 were ever displayable.
+///
+/// Why a ROW count and not an age window, which is what
+/// `store::health::RETENTION_HOURS` uses: a health sample is written on
+/// a timer, so "the last 24 hours" is a predictable number of rows. A
+/// cleanup run is user-triggered and bursty -- a week of no runs then
+/// one run of 500 -- so an age window would either drop a ledger the
+/// user has not read yet (short window) or bound nothing in practice
+/// (long window). A row count bounds the table regardless of how the
+/// runs are spaced, which is the property #837 asked for.
+pub const MAX_ROWS: i64 = 2_000;
+
+/// Append entries to the ledger, then trim it to [`MAX_ROWS`].
 ///
 /// Failure is logged and swallowed: the ledger is a record of work, and
 /// losing a row must never take down the pass that produced it. Same
 /// reasoning as `notify_breakage` in `poll`.
+///
+/// The trim runs beside the insert rather than on a timer, for the
+/// reason `store::health::record` gives: a timer is a second thing to
+/// schedule and to get wrong, and deleting a handful of rows next to an
+/// insert costs nothing.
 pub fn record(conn: &Connection, entries: &[LedgerEntry]) {
     for e in entries {
         let r = conn.execute(
@@ -182,6 +212,48 @@ pub fn record(conn: &Connection, entries: &[LedgerEntry]) {
         if let Err(err) = r {
             log::warn!("could not record a cleanup entry: {err}");
         }
+    }
+    trim(conn);
+}
+
+/// Drop all but the newest [`MAX_ROWS`] ledger rows.
+///
+/// Ordered by `id`, not by `at`. `at` is supplied by the CALLER --
+/// `propose` stamps every entry in a run with the `now` string it was
+/// handed, and `record` does not check it -- so a clock change, a
+/// timezone-less write, or a caller passing a literal (the tests pass
+/// `"now"`) would make `at` non-monotonic and trim the wrong end.
+/// `id` is `INTEGER PRIMARY KEY`, so it is the rowid and strictly
+/// increasing per insert; newest-by-`id` is exactly newest-by-insert.
+///
+/// Note this means the trim does not use the `cleanup_log_at` index.
+/// It does not need to: the subquery orders by the rowid, which is the
+/// table's own physical order, and a `LIMIT`ed scan from the end of it
+/// needs no index at all.
+///
+/// The two orderings are therefore not identical -- [`recent`] reads
+/// `ORDER BY at DESC, id DESC`, putting `at` first. They agree whenever
+/// `at` is monotonic, which is every normal run. If a clock moved
+/// backwards they could disagree: a row with a later `id` but an earlier
+/// `at` is kept here while sorting late there. That cannot cost a
+/// displayable row at these numbers -- the trim keeps 2,000 and the read
+/// asks for 200, so the disagreement would have to span ten times the
+/// read limit to reach the boundary -- and the alternative, trimming by
+/// `at`, would hand the decision to the same untrusted clock rather than
+/// to insert order. Recorded rather than fixed, because the fix would be
+/// the worse of the two.
+///
+/// Failure is logged and swallowed for the same reason the insert's is:
+/// a ledger that cannot be trimmed is a table that grows, which is
+/// strictly better than a cleanup pass that fails.
+fn trim(conn: &Connection) {
+    let r = conn.execute(
+        "DELETE FROM cleanup_log WHERE id NOT IN
+           (SELECT id FROM cleanup_log ORDER BY id DESC LIMIT ?1)",
+        rusqlite::params![MAX_ROWS],
+    );
+    if let Err(err) = r {
+        log::warn!("could not trim the cleanup ledger: {err}");
     }
 }
 
@@ -285,11 +357,33 @@ pub fn propose(prefs: &CleanupPrefs, roots: &[String], now: &str) -> Vec<LedgerE
                 break;
             }
             let (bytes, idle) = crate::artifacts::measure(std::path::Path::new(&a.path));
-            // Skip anything a build may be writing to. Recorded as
-            // `skipped` rather than omitted: a directory that keeps
-            // being passed over is something the user should be able to
-            // see, not a silent gap in the list.
-            if idle.is_some_and(|secs| secs < ACTIVE_WINDOW_SECS) {
+            // Skip anything a build may be writing to, AND anything whose
+            // age could not be read at all. Recorded as `skipped` rather
+            // than omitted: a directory that keeps being passed over is
+            // something the user should be able to see, not a silent gap
+            // in the list.
+            //
+            // The None arm was missing (#841, same defect as
+            // `remove_artifact`'s delete gate). `idle.is_some_and(..)`
+            // maps None to false, so a directory nothing could measure
+            // was `proposed` for UNATTENDED removal. `measure` returns
+            // None when no mtime was readable anywhere in the tree, or
+            // when the newest mtime is in the future and `elapsed()`
+            // fails -- an NTP correction mid-build produces the latter.
+            //
+            // This is the same rule the venv branch above already
+            // applies to `VenvState::Unknown`, for the reason stated
+            // there: the unattended pass is the worst place to guess,
+            // because nobody is watching it decide (#747). The reasons
+            // are reported separately because they are different facts
+            // about the directory and a user acting on the ledger needs
+            // to know which one they are looking at.
+            let skip = match idle {
+                None => Some("could not tell when it was last written to"),
+                Some(secs) if secs < ACTIVE_WINDOW_SECS => Some("written to recently"),
+                Some(_) => None,
+            };
+            if let Some(reason) = skip {
                 out.push(LedgerEntry {
                     at: now.to_string(),
                     kind: "artifact".into(),
@@ -297,7 +391,7 @@ pub fn propose(prefs: &CleanupPrefs, roots: &[String], now: &str) -> Vec<LedgerE
                     detail: Some(a.kind.regenerated_by().to_string()),
                     bytes: Some(bytes),
                     action: "skipped".into(),
-                    error: Some("written to recently".into()),
+                    error: Some(reason.into()),
                 });
                 continue;
             }
@@ -317,6 +411,13 @@ pub fn propose(prefs: &CleanupPrefs, roots: &[String], now: &str) -> Vec<LedgerE
 }
 
 /// Mirrors the artifact view's rule, and the backend's delete-time one.
+///
+/// All three are now asserted equal by
+/// `src/lib/mirroredConstants.test.ts`, which reads this literal and
+/// `artifacts/mod.rs`' via Vite's `?raw` and compares both to
+/// `ArtifactsPage.tsx`' `ACTIVE_SECS`. This comment claimed the mirror
+/// while the UI's copy was an hour (#850); `artifacts/mod.rs` carries the
+/// argument for fifteen.
 const ACTIVE_WINDOW_SECS: u64 = 15 * 60;
 
 #[cfg(test)]
@@ -483,6 +584,64 @@ mod tests {
         assert!(e.error.is_some(), "and says why");
     }
 
+    /// The same fail-open hole as `remove_artifact`'s delete gate (#841),
+    /// on the pass where it matters more: an unattended one.
+    ///
+    /// `measure` returns `None` when no mtime was readable anywhere in
+    /// the tree, or when the newest mtime is in the FUTURE -- it ends in
+    /// `newest.and_then(|n| n.elapsed().ok())`, and `elapsed()` is `Err`
+    /// for a future timestamp, which an NTP correction during a build
+    /// produces. `idle.is_some_and(..)` mapped that None to false, so a
+    /// directory nothing could measure was `proposed` for removal with
+    /// nobody watching.
+    ///
+    /// This is the rule `an_unfinished_scan_proposes_nothing` already
+    /// states for venvs, asserted for artifacts: the unattended pass is
+    /// the worst place to guess (#747).
+    ///
+    /// `#[cfg(unix)]` because setting an mtime needs `touch -t` -- the
+    /// trade `artifacts::removal_tests::make_old` already documents, and
+    /// the status is asserted here rather than ignored so a silently-unset
+    /// mtime cannot leave this passing for the wrong reason. The guard it
+    /// covers is platform-independent.
+    #[test]
+    #[cfg(unix)]
+    fn a_directory_of_unreadable_age_is_skipped_not_proposed() {
+        let t = tempfile::TempDir::new().unwrap();
+        std::fs::write(t.path().join("Cargo.toml"), "[package]").unwrap();
+        let target = t.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("artifact.bin"), "x").unwrap();
+        // A future mtime, so `elapsed()` fails and the age is unreadable.
+        // Chosen over unreadable permissions because a permissions test
+        // cannot run as root and would be skipped in the CI that needs it.
+        let status = std::process::Command::new("touch")
+            .args(["-t", "209901010000"])
+            .arg(target.join("artifact.bin"))
+            .status()
+            .expect("touch should be available");
+        assert!(status.success(), "could not set a future mtime");
+        assert!(
+            crate::artifacts::measure(&target).1.is_none(),
+            "premise: a future mtime must make the age unreadable"
+        );
+
+        let out = propose(&on(), &[t.path().to_string_lossy().to_string()], "now");
+        let e = out
+            .iter()
+            .find(|e| e.target == target.to_string_lossy())
+            .expect("the directory must appear in the ledger, not vanish from it");
+        assert_eq!(
+            e.action, "skipped",
+            "an unmeasurable directory must not be proposed"
+        );
+        assert_eq!(
+            e.error.as_deref(),
+            Some("could not tell when it was last written to"),
+            "and says which of the two reasons it was skipped for"
+        );
+    }
+
     /// The cap bounds a run. It matters in Preview too: a ledger listing
     /// every directory on the machine is one nobody reads, which is the
     /// same as no ledger.
@@ -563,6 +722,74 @@ mod tests {
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].target, "/code/x/target");
         assert_eq!(back[0].bytes, Some(1234));
+    }
+
+    /// The ledger is bounded, so the table cannot grow without bound.
+    ///
+    /// #837: `cleanup_log` was the only table in the store never pruned.
+    /// The same property `health::samples_older_than_a_day_are_dropped`
+    /// pins for `health_samples`, by row count instead of by age -- see
+    /// [`MAX_ROWS`] for why that axis.
+    ///
+    /// Writes `MAX_ROWS + 50` in ONE `record` call rather than one per
+    /// call: the trim runs at the end of `record`, so a per-call loop
+    /// would only ever test the steady state where the table is already
+    /// at the bound. A single over-cap batch tests the case where the
+    /// trim has to remove more than one row, which is what a user who
+    /// upgrades with an already-large ledger hits.
+    #[test]
+    fn the_ledger_is_trimmed_to_its_bound() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let conn = crate::store::open_db(&dir.path().join("t.db")).unwrap();
+
+        let over = (MAX_ROWS + 50) as usize;
+        let entries: Vec<LedgerEntry> = (0..over)
+            .map(|i| LedgerEntry {
+                // Every row carries the SAME `at`, which is what a real
+                // run does -- `propose` stamps one `now` across the
+                // whole batch. If the trim ordered by `at` it would have
+                // no order to work with here and could keep any 2,000 of
+                // these; ordering by `id` makes "newest" well defined.
+                at: "2026-09-02T00:00:00Z".into(),
+                kind: "artifact".into(),
+                target: format!("/code/p{i}/target"),
+                detail: None,
+                bytes: Some(i as u64),
+                action: "proposed".into(),
+                error: None,
+            })
+            .collect();
+        record(&conn, &entries);
+
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cleanup_log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, MAX_ROWS, "the ledger must be bounded by MAX_ROWS");
+
+        // And the rows kept are the NEWEST ones, not an arbitrary
+        // 2,000: the last entry written must still be readable.
+        let back = recent(&conn, 1).unwrap();
+        assert_eq!(
+            back[0].target,
+            format!("/code/p{}/target", over - 1),
+            "the trim must drop the oldest rows, not the newest"
+        );
+
+        // The bound is comfortably above the 200 rows `cleanup_log`
+        // reads (`commands::cleanup_log`), so nothing displayable is
+        // ever trimmed. Pinned rather than left to the doc: a future
+        // edit that lowers MAX_ROWS below the read limit would start
+        // deleting rows the view was about to show.
+        //
+        // A `const` block, so it fails at COMPILE time rather than when
+        // this test runs -- both operands are constants, and clippy is
+        // right that an assertion over two constants belongs in one.
+        const { assert!(MAX_ROWS >= 200 * 5) };
+        assert_eq!(
+            recent(&conn, 200).unwrap().len(),
+            200,
+            "a full read must still be satisfiable after a trim"
+        );
     }
 }
 
