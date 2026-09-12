@@ -332,6 +332,9 @@ jobs:
   # run 34708843018 every other job finished inside its shadow, so only
   # changes to this job shorten CI at all. That makes duplicated work
   # here uniquely expensive, and two steps were pure duplication.
+  # Removing them measured 619s -> 562s on run 34712365398, all nine
+  # required checks green: -42s for the vitest step and -7s for the
+  # clippy narrowing, which is #890's prediction essentially exactly.
   #
   # The job keeps exactly what is target-DEPENDENT: `Rust tests`, because
   # ~11 of the suite is platform-gated (1213 tests on Ubuntu vs 1202 on

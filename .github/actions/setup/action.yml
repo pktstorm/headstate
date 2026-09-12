@@ -20,14 +20,30 @@ inputs:
     # `cd crates/headstate-stepup && cargo test`, which `test-rust`, both
     # `platform` legs and `lint` all run, compiled into a target/ that
     # rust-cache never saved or restored. It recompiled its whole tree on
-    # every job of every run: ~51 crates from cold, measured locally with
-    # `rm -rf target && cargo build`, for ~35s of the 221s Windows
-    # `Rust tests` step (#889).
+    # every job of every run: 52 crates, measured on Windows CI before
+    # this change (#889).
     #
     # The src-tauri cache was never broken -- it reports `full match:
     # true`. This was a SCOPE bug: the second lockfile was simply never
-    # named, which is why it cost the same 35s on a warm cache as on a
-    # cold one.
+    # named, which is why it cost the same on a warm cache as a cold one.
+    #
+    # WHAT THIS ACTUALLY BUYS, measured on run 34712365398 rather than
+    # estimated, because #889's headline number does not survive contact
+    # with a real warm run. The `Compiling` count in the Windows
+    # `Rust tests` step drops from 52 to exactly 1, which is the fix
+    # working as specified -- but the phase only goes ~30s to ~28s, NOT
+    # the ~35s to "under 5s" the issue predicts. rust-cache deliberately
+    # cleans the local workspace crate's own artifacts before saving
+    # ("... Cleaning .../crates/headstate-stepup/target ..."), so
+    # headstate-stepup itself recompiles every run, and on Windows that
+    # single crate is 21s of the 28s. Only its DEPENDENCIES were ever
+    # cacheable, and they were the cheap part.
+    #
+    # Net on the critical path this is roughly break-even (+8s restoring
+    # a second cache entry). It is kept because it is correct and removes
+    # 52 redundant compiles per job across three jobs -- which is real
+    # billed runner time and a much better no-cache worst case -- not
+    # because it shortens the wall clock. Do not cite #889's ~35s.
     #
     # The mobile jobs override this with `src-mobile` alone and must NOT
     # add the stepup line. Verified rather than assumed: stepup is a path
