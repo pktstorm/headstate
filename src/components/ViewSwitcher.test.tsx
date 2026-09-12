@@ -3,12 +3,33 @@ import { fireEvent, screen } from "@testing-library/react";
 import { renderWithQuery as render } from "@/test-utils";
 import { beforeEach, describe, expect, it } from "vitest";
 import { useFilters } from "../store/filters";
-import { ViewSwitcher } from "./ViewSwitcher";
+import { VIEWS, ViewSwitcher } from "./ViewSwitcher";
 
 const EMPTY = { "my-prs": {}, "to-review": {}, worktrees: {},
   branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} } as const;
 
 describe("ViewSwitcher", () => {
+  /// PR Stats leads the menu (#823).
+  ///
+  /// The v5.13.0 tracker asked for this and it was the one scope item that
+  /// did not land -- the rebuild shipped the org/member sidebar, the
+  /// Mine/Others views and the load gating, and left the entry ninth of
+  /// ten. Nothing asserted the position, so nothing noticed.
+  ///
+  /// Asserts the FIRST entry rather than "contains PR Stats": the latter
+  /// passed throughout the period the item was outstanding, which is the
+  /// difference between a test and a guard. `VIEWS` is the array the menu
+  /// renders, so this is the order the user sees -- `ALL_VIEWS` in
+  /// `store/filters.ts` is kept in step for readers, but only derives a
+  /// type.
+  it("offers PR Stats first", () => {
+    expect(VIEWS[0].id).toBe("pr-stats");
+    expect(VIEWS[0].label).toBe("PR Stats");
+    // And the non-pull-request view stays last, which is the other half of
+    // the ordering rule both lists record.
+    expect(VIEWS[VIEWS.length - 1].id).toBe("system-health");
+  });
+
   beforeEach(() =>
     useFilters.setState({ filtersByView: { ...EMPTY }, view: "my-prs" }),
   );

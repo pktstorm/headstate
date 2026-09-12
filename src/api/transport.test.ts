@@ -152,6 +152,7 @@ const ROWS: Row[] = [
   row(api.getPrDetail, [repo, number], "get_pr_detail", { repo, number }),
   row(api.sizeWorktrees, [repoPath], "size_worktrees", { repoPath }),
   row(api.pullCheckout, [path], "pull_checkout", { path }),
+  row(api.fetchRefs, [path], "fetch_refs", { path }),
   row(api.removeOrphan, [path], "remove_orphan", { path }),
   row(api.removeWorktree, [repoPath, worktreePath], "remove_worktree", { repoPath, worktreePath }),
   row(api.setViewNeedsGithub, [needs], "set_view_needs_github", { needs }),
