@@ -1585,6 +1585,69 @@ export function usePullCheckout() {
     });
 }
 
+/// How big ONE orphaned directory is, measured when asked (#845).
+///
+/// Every other size on the worktree page comes from `sizeWorktrees`,
+/// and an orphan is the one row that cannot use it: that command opens
+/// with `git worktree list` inside the repository, and an orphan's
+/// repository is exactly what is gone -- so it returns `Err` rather
+/// than a number. The Orphaned view therefore has NO size at all (the
+/// listing leaves `size_bytes: None`, and `useAllWorktreeSizes` is
+/// gated on the all-repositories view), which is why the confirmation
+/// this feeds had nothing to say about how much was about to go.
+///
+/// So it reuses `sizeArtifacts`, which takes EXPLICIT PATHS and walks
+/// them with no git involved -- the one existing command that can
+/// measure a directory nothing owns. The name is a misnomer here and
+/// that is deliberate: the command string is matched as a literal in
+/// two remote-surface allowlists, one of which ships in the phone app
+/// on its own release tag, so a clearer name would break a phone
+/// paired with an older desktop. `tauri.ts:874` records the same trade
+/// for the same reason. It is `Class::Read` in both surfaces, so this
+/// works from the companion as well as the desktop.
+///
+/// `enabled` is the dialog being open, not the row existing. A walk per
+/// orphan on mount would measure directories nobody asked about -- and
+/// on the machine that prompted #845 that is 2.5 GB across three trees.
+/// Measuring at the moment of the question is also what makes the
+/// number trustworthy: it describes the directory as it is now, not as
+/// it was when the page loaded.
+///
+/// `retry: false`, matching every other sizing query here. A failed
+/// walk is not a flaky network call, and the dialog has a BRANCH for
+/// "could not be measured" -- repeating an expensive walk three times
+/// to reach the same branch only delays the question.
+export function useOrphanSize(path: string | undefined, enabled: boolean) {
+  const query = useQuery({
+    queryKey: ["orphan-size", path],
+    queryFn: async () => {
+      const out = await sizeArtifacts([path as string]);
+      // The walk answers for the one path it was given, or for none.
+      // An empty result is NOT zero bytes: zero reads as "this tree is
+      // empty, delete it", which for an unmeasurable directory is the
+      // most damaging thing this dialog could say -- the same rule
+      // `size_worktrees` states about flattening its own nulls.
+      return out[0]?.[1] ?? null;
+    },
+    enabled: enabled && Boolean(path),
+    staleTime: 5 * 60 * 1000,
+    retry: false,
+  });
+  return {
+    /// The measured bytes, or null when the walk answered nothing.
+    bytes: query.data ?? null,
+    /// Still walking. Kept separate from a null result for the reason
+    /// `VenvSection` learned the hard way: "still measuring" and "there
+    /// is nothing to measure" are opposite answers, and one value for
+    /// both is how a dialog ends up stating a figure it does not have.
+    measuring: query.isFetching,
+    /// The walk REFUSED. Distinct from a null result again: this is the
+    /// case the dialog must name out loud, because it is the second
+    /// thing about an orphan that could not be checked.
+    failed: query.isError,
+  };
+}
+
 /// Delete an orphaned worktree directory.
 ///
 /// Invalidates rather than patching a row: an orphan's removal changes

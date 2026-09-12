@@ -65,6 +65,32 @@ export function targetsFor(selected: Branch[], scope: Scope): Targets {
   return { local, remote };
 }
 
+/// What a scope actually DOES, in one sentence, for a confirmation.
+///
+/// Lifted out of `BranchesPage`'s `DeleteScopeDialog` in #845, where it
+/// was a local `describe` closure. The PR detail view deletes a remote
+/// branch too -- `deleteBranch(..., true)` -- and shipped with no
+/// confirmation at all, so it needed this sentence and could not reach
+/// it. Copying the words into a second component is what lets the two
+/// surfaces disagree about the one operation a reflog cannot undo, which
+/// is the same argument `scopeLabel` below is here for: the warning is
+/// carried by the WORDS, so there has to be exactly one set of them.
+///
+/// Deliberately phrased for the OPERATION rather than for a selection
+/// size, so a single-branch confirmation and a 562-branch one read the
+/// same. The remote sentence is the load-bearing one: it is the only
+/// scope no local reflog can undo.
+export function scopeEffect(scope: Scope): string {
+  switch (scope) {
+    case "local":
+      return "Removes the branch here. Recoverable from the reflog.";
+    case "remote":
+      return "Pushes a deletion to the remote. Everyone loses it, and no local reflog can undo that.";
+    case "both":
+      return "Removes it here and on the remote. The remote half cannot be undone.";
+  }
+}
+
 /// Human wording for a scope, used on the confirm button.
 ///
 /// Remote deletion says so plainly: it pushes to a remote everyone

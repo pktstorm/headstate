@@ -6,7 +6,7 @@ import { useBranchDeleteProgress, useBranchScan, useBranches } from "@/api/hooks
 import { deleteBranches, deleteRemoteBranches } from "@/api/tauri";
 import { useActiveFilters } from "@/store/filters";
 import type { Branch, Deletable } from "@/types/pr";
-import { type Scope, scopeLabel, scopesFor, targetsFor } from "@/lib/branchDelete";
+import { type Scope, scopeEffect, scopeLabel, scopesFor, targetsFor } from "@/lib/branchDelete";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 
 /// Why a branch is or is not deletable, in words.
@@ -385,16 +385,14 @@ function DeleteScopeDialog({
       ? chosenScope
       : (scopes[0] ?? "local");
 
-  const describe = (s: Scope) => {
-    switch (s) {
-      case "local":
-        return "Removes the branch here. Recoverable from the reflog.";
-      case "remote":
-        return "Pushes a deletion to the remote. Everyone loses it, and no local reflog can undo that.";
-      case "both":
-        return "Removes it here and on the remote. The remote half cannot be undone.";
-    }
-  };
+  // `scopeEffect` from `lib/branchDelete`, not a local closure (#845).
+  //
+  // The PR detail view deletes a remote branch too and shipped with no
+  // confirmation at all; giving it one meant it needed this sentence,
+  // and a copy of it there would let the two surfaces drift about the
+  // one operation a reflog cannot undo. Same reason `scopeLabel` lives
+  // beside it: the warning is carried by the words.
+  const describe = scopeEffect;
 
   const targets = targetsFor(chosen, scope);
   const label = scopeLabel(scope, targets);
