@@ -46,6 +46,22 @@ OPT-IN: with no `--require` it reports what it found and exits 0 when it
 could not look. CI passes `--require`, where a token exists and an
 unreachable API is a real failure worth seeing.
 
+Why a CI guard rather than #787 option 1, the release workflow committing
+the mark back: it cannot. The `main` ruleset is `enforcement: active`
+with a `pull_request` rule, `bypass_actors: []` and
+`current_user_can_bypass: never`, so no token or App can push to main --
+such a step would fail AFTER TestFlight had taken the build. Nor can a
+bot open the PR instead: `can_approve_pull_request_reviews` is false, and
+`GITHUB_TOKEN` pushes do not trigger workflows, so its nine required
+checks (listed in ci.yml above `platform`) would never start and the PR
+could never merge. Read from the API, the way #853 established for this
+repo -- the branches/protection endpoint 404s here and says nothing about
+rulesets, so it is not the thing to check.
+
+This runs in `lint`, which IS one of those nine required contexts, so the
+check genuinely blocks rather than merely warning -- #787 proposed a
+warning, and six ignored chore PRs are what a warning is worth here.
+
 Usage:
   check-mobile-build-mark.py            advisory; skips if it cannot look
   check-mobile-build-mark.py --require  a failure to look is a failure
