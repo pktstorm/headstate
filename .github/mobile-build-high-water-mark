@@ -21,4 +21,20 @@
 #
 # Raise it when a build reaches TestFlight or Play. Non-contiguous is
 # correct: a rejected upload still consumes its number.
-28
+#
+# You no longer have to REMEMBER to raise it: scripts/check-mobile-build-mark.py
+# runs in CI's lint job and fails when this line is below the `build<N>`
+# of the newest published mobile asset, naming the value to write. It is
+# a comparison against the assets, not a replacement for this file --
+# this file is written before the upload, so it still records a number
+# consumed by a run whose `publish` never finished, which no asset can.
+#
+# Why a guard was needed when Preflight already reads this file: Preflight
+# only catches a DECREASE. BUILD_NUMBER climbs every run, so a mark
+# lagging by three still passes `BUILD_NUMBER > HIGH` -- run 29 cleared
+# 25 as easily as 28. Staleness was invisible to the only reader, which
+# is how it survived six chore PRs (#714, #731, #740, #768, #786, #867)
+# without one release failing. The cost was never a blocked release; it
+# was this file naming the wrong number to whoever is debugging a
+# rejected upload. See #787.
+29
