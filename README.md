@@ -1,15 +1,23 @@
 # Headstate
 
-Headstate is a macOS desktop app that shows you the real state of every open
-pull request you have across GitHub — one window, refreshed in the
-background — so you can see what's blocked on you, what's blocked on someone
-else, and what's ready to nudge, without opening a browser tab per repo.
+Headstate is a desktop app — macOS, Windows and Linux — that shows you the
+real state of the work on your machine and in your GitHub account: every
+open pull request, the worktrees and branches scattered across your
+checkouts, what Docker and stale build artifacts are costing you in disk,
+and whether the machine itself is healthy. One window, refreshed in the
+background, instead of a browser tab per repo and a terminal per question.
 
-It exists for one recurring moment: you want to ask a couple of colleagues
-for reviews, and writing that Slack message by hand means re-checking each
-PR's CI and merge status first. Headstate's nudge wizard turns "which PRs
-need a nudge, and what's their state" into a paste-ready list in a few
-clicks.
+It started from one recurring moment: you want to ask a couple of
+colleagues for reviews, and writing that Slack message by hand means
+re-checking each PR's CI and merge status first. The nudge wizard turns
+"which PRs need a nudge, and what's their state" into a paste-ready list in
+a few clicks. The rest grew from the same principle — the answer should
+already be on screen when you think to ask.
+
+There is also an **iOS companion** that pairs with your desktop over the
+local network and shows the same views on a phone. It holds no GitHub
+token of its own: every question it asks is forwarded to the paired
+desktop, which is the only thing that talks to GitHub.
 
 ![Headstate splash](public/splash.png)
 
@@ -24,6 +32,18 @@ Every write is an explicit action on a pull request you are looking at.
 Nothing is automated, nothing runs in the background, and every write is
 logged with its repo, number, and action. Reads and writes live in
 separate modules so the read path stays independently auditable.
+
+Local actions — removing a worktree, deleting a branch, reclaiming build
+output — are separated the same way, and the destructive ones confirm
+first. Anything the app cannot establish is safe is refused rather than
+attempted: a directory that may still be written to, a worktree with
+uncommitted work, a scan that could not complete. "We could not tell" is
+never reported as "nothing found".
+
+The iOS companion holds no token and reaches GitHub only through the
+paired desktop, which classifies every forwarded command as a read, a
+write, or a destructive action; destructive ones require a biometric
+step-up on the phone before the desktop will run them.
 
 ## Prerequisites
 
@@ -192,11 +212,33 @@ with admin access on that repository.
 nobody else — real merge conflicts or failing CI — so the thing you need to
 fix first doesn't get lost in a longer list. Quiet when nothing is blocked.
 
-**PR Stats.** A history view, chosen from the view menu at the top of the
-sidebar, answering what the open-PR list cannot: how much is actually getting
-done, and whether that is improving. Whole-account: the repository rows
-beside it do not narrow it. Desktop only — the companion app does not offer
-it.
+**PR Stats.** The first entry in the view menu, answering what the open-PR
+list cannot: how much is actually getting done, whether that is improving,
+and — for a team or org lead — how the team is doing.
+
+The sidebar is a GitHub hierarchy rather than a list of local checkouts,
+because this page is about GitHub activity and a local clone is neither
+necessary nor sufficient for it:
+
+```
+Organizations
+  <org>
+    Repos     -> All repos, or one line per repository
+    Members   -> one line per member, scoping the page to that person
+Personal
+  All repos, or one line per repository
+```
+
+Every scope offers two views. **Mine** is your own figures. **Others** is
+the same measures for everyone else in scope, plus leaderboards — top
+authors, top reviewers, top by code volume.
+
+Nothing queries until you ask. Each scope sits behind an explicit load,
+which is not merely a performance nicety: at organisation scale a
+render-on-navigate would issue tens of sequential requests per sidebar
+click.
+
+Available on the iOS companion as well as the desktop.
 
 - **Four headline figures** — merged and opened this week, merged this
   month, and median cycle time — each with its change against the previous
@@ -226,6 +268,50 @@ serially — so alias count drives elapsed time rather than being a limit of its
 own. Measured: every 502 landed at around eleven seconds regardless of shape,
 while 80 count-only aliases answered in under that and 48 node-heavy ones did
 not. Requests stay well under the deadline rather than retrying into it.
+
+**Worktrees.** Every git worktree across your checkout directories, with a
+safety verdict per row: merged, unmerged, uncommitted work, never pushed,
+or locked by an agent. The verdict is the point — "safe to remove" is only
+offered when it is actually safe, and uncommitted work outranks merge
+status, so a dirty worktree on a merged branch is never presented as
+disposable. Rows you can act on carry Remove; ones you cannot say why.
+Worktrees on unmerged branches can be handed to Claude Code for an
+assessment of whether the work is still wanted.
+
+**Branches.** Local branches and whether each is deletable, with the reason
+in words rather than a boolean — merged upstream, unmerged, or checked out
+somewhere. Deletions are batched and confirmed, because no reflog undoes a
+remote branch deletion.
+
+**Docker.** What Docker is costing you in disk: images, containers,
+volumes and build cache, with the dangling and reclaimable portions
+separated from what is actually in use. Build images accumulate silently
+and this is where that shows up.
+
+**Artifacts.** Stale build output — `target/`, `node_modules/`, virtualenvs
+and caches — found beside your checkouts rather than inside your worktrees,
+which is where it actually lives. On the machine this was built for, 108 GB
+of Rust build output sat next to main checkouts and 0.28 GB inside
+worktrees, so removing every worktree would not have touched 99.7% of it.
+Nothing is deleted without a confirmation, and a directory that may still
+be written to is refused rather than removed.
+
+**Package updates.** Outdated dependencies per repository, across npm,
+Cargo, pip and friends, so "is anything behind" is one glance rather than a
+command per repo.
+
+**CLAUDE.md.** The `CLAUDE.md` files across your repositories with
+estimated token counts, so instruction files that have quietly grown past
+useful are visible. The counts are estimates and every label says so.
+
+**System health.** CPU, memory, disk, network, GPU and battery for the
+machine itself, with drill-down pages that answer the "why" a summary can
+only raise — a panel says memory is at 88%, the Memory page says which
+processes. Conditions worth investigating appear at the top: a process
+holding a moderate amount of CPU for long enough to be suspicious, or a
+machine that has been oversubscribed for a while. The thresholds favour
+duration over level, because a compiler is hot and brief while an abandoned
+loop is neither.
 
 **Filters and repo sidebar.** A sidebar of repos with open PR counts, plus a
 filter bar for labels, review state, and drafts.
@@ -280,16 +366,21 @@ or `(CI running)`.
 
 ## Known limitations
 
-- **Unsigned build.** See the Gatekeeper step above. Signing and
-  notarization are tracked in
-  [#23](https://github.com/pktstorm/headstate/issues/23).
+- **Windows and Linux builds are unsigned.** The macOS build is signed and
+  notarized. On Windows, SmartScreen will warn on first run — choose "More
+  info" then "Run anyway". Linux ships a `.deb` and an `.AppImage`; mark the
+  AppImage executable with `chmod +x` before running it.
+- **A `.deb` install cannot self-update.** Tauri publishes no updater
+  signature for a `.deb`, so it is never advertised in the update manifest
+  and stays on the version you installed. The `.AppImage` is the
+  auto-updating Linux artifact; re-download the `.deb` per release.
+- **x86_64 only on Windows and Linux.** No arm64 builds are produced for
+  either, so there is nothing for the updater to offer an arm64 install.
+  macOS ships a universal binary.
 - **Merged history is a sample.** The insight cards and the repository
   breakdown are computed over your 100 most recently merged pull requests,
   not your whole history. The figures are labelled with that sample size;
   the daily chart and the headline counts are exact.
-- **Tray badge isn't live yet.** The menu bar icon can show a count badge,
-  but nothing currently feeds it a real "needs attention" number — it's
-  always unbadged today.
 
 ## Development
 
