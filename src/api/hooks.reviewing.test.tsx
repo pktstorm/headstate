@@ -2,12 +2,26 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, renderHook, waitFor } from "@testing-library/react";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import type { ReactNode } from "react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useReviewing, useReviewingCount } from "./hooks";
 
+// Fake timers, per the repo's template (`src/lib/countdown.test.tsx`,
+// `src/splash.test.ts`) with `shouldAdvanceTime` as in
+// `hooks.venvs.test.tsx` so `waitFor` and React Query still progress.
+//
+// #853: the "does not ask for the list" case below slept 50ms of REAL
+// time to show a fetch never fired. That is a deadline, not a negative --
+// it says nothing happened yet, and a queued fetch arriving at 51ms on a
+// loaded runner passes the test while being exactly the bug. Advancing a
+// fake clock runs everything scheduled inside the window, so the absence
+// becomes exact.
+beforeEach(() => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+});
 afterEach(() => {
   cleanup();
   clearMocks();
+  vi.useRealTimers();
 });
 
 function wrap() {
@@ -33,8 +47,10 @@ describe("the review queue is fetched only where it is shown", () => {
     });
 
     renderHook(() => useReviewing(false), { wrapper: wrap() });
-    // Give any queued fetch a chance to fire before asserting absence.
-    await new Promise((r) => setTimeout(r, 50));
+    // Run everything scheduled in the next 50ms, so "no fetch fired" is
+    // an exact negative rather than a deadline that a slow runner could
+    // beat (#853).
+    await vi.advanceTimersByTimeAsync(50);
     expect(calls).not.toContain("get_reviewing");
   });
 

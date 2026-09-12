@@ -589,11 +589,27 @@ mod tests {
     /// That is why `Collector` holds the instance rather than building
     /// one per call -- a fresh one every minute would report an idle
     /// machine forever.
+    /// # The sleep is sysinfo's constant, not a guess (#853)
+    ///
+    /// This slept a hard 250ms, which #853 lists among the host-dependent
+    /// tests. The number was a hand-rounded stand-in for
+    /// `sysinfo::MINIMUM_CPU_UPDATE_INTERVAL` -- the interval below which
+    /// sysinfo refuses to recompute a CPU delta at all, and therefore the
+    /// only figure that makes the second sample's `cpu_percent`
+    /// populated rather than `None`.
+    ///
+    /// Named directly instead. That removes the host dependence rather
+    /// than gating it: the assertion is structural (`is_some()`, "the
+    /// field is populated"), it is not a claim about machine speed, and
+    /// it now tracks upstream if the constant ever changes instead of
+    /// silently becoming a too-short sleep. No gate needed, and no
+    /// coverage lost -- the same reasoning as `read_twice`'s rewrite in
+    /// #834.
     #[test]
     fn the_collector_is_reused_so_cpu_is_a_real_delta() {
         let c = Collector::new();
         let _first = c.sample("2026-01-01T00:00:00Z");
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
         let second = c.sample("2026-01-01T00:01:00Z");
         // Not "greater than zero": a genuinely idle machine is a valid
         // answer. What matters is that the field is populated at all.
@@ -630,8 +646,33 @@ mod tests {
     /// a slow CI runner must not fail the build for being slow -- but
     /// it still catches a regression that made this seconds rather
     /// than milliseconds.
+    /// A wall-clock BUDGET, which is why it is gated (#853).
+    ///
+    /// The bound is not a property of this code, it is a property of the
+    /// machine: `gpu::read` shells out, and under CI's
+    /// `--test-threads=8` (ci.yml's race check runs the suite three times
+    /// over) a 1000ms budget is a claim about how contended the runner
+    /// is. It measures rather than verifies, so it follows the
+    /// `#[ignore]`-plus-env convention this repo already uses for
+    /// live-measurement tests (the model is
+    /// `worktrees/scan.rs::live_classifier_verdict_census`).
+    ///
+    /// Gated rather than fixed, deliberately: unlike the `tools.rs`
+    /// timing pair -- where the login-shell cache gave "no subprocess was
+    /// spawned" a direct observable form -- there is nothing here to
+    /// assert instead. The question genuinely is "how long does this take
+    /// on a real machine", and the only honest answers are to measure on
+    /// demand or to delete it. Kept and gated: it still catches someone
+    /// putting a directory walk on a 5s poll, when run.
+    ///
+    /// Run with: `HEADSTATE_LIVE_MEASUREMENT=1 cargo test -- --ignored`
     #[test]
+    #[ignore]
     fn reading_the_gpu_is_cheap_enough_for_the_sampler() {
+        if std::env::var("HEADSTATE_LIVE_MEASUREMENT").is_err() {
+            println!("set HEADSTATE_LIVE_MEASUREMENT=1 to run this timing measurement");
+            return;
+        }
         let start = std::time::Instant::now();
         let _ = super::super::gpu::read();
         let elapsed = start.elapsed();
@@ -700,8 +741,19 @@ mod tests {
     /// deliberately loose -- a slow CI runner must not fail the build
     /// for being slow -- but it still catches a regression that made
     /// this seconds rather than milliseconds.
+    /// The battery half of `reading_the_gpu_is_cheap_enough_for_the_sampler`,
+    /// gated for the same reason and on the same env var (#853): it
+    /// spawns `ioreg`, so the 1000ms budget describes the runner, not
+    /// this code.
+    ///
+    /// Run with: `HEADSTATE_LIVE_MEASUREMENT=1 cargo test -- --ignored`
     #[test]
+    #[ignore]
     fn reading_the_battery_is_cheap_enough_for_the_sampler() {
+        if std::env::var("HEADSTATE_LIVE_MEASUREMENT").is_err() {
+            println!("set HEADSTATE_LIVE_MEASUREMENT=1 to run this timing measurement");
+            return;
+        }
         let start = std::time::Instant::now();
         let _ = battery();
         let elapsed = start.elapsed();

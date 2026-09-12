@@ -23,6 +23,21 @@ Deliberately parses by indentation rather than importing PyYAML, the same
 tradeoff `check-workflow-shells.py` makes: the lint runner has no
 third-party Python packages, and a guard that needs its own install is a
 guard that gets dropped.
+
+The set of gated jobs is DERIVED, not listed. It was hardcoded as
+`("mobile-android", "mobile-ios")`, which meant a third gated job added
+later was not checked at all and this guard still printed success --
+a guard silently not covering the thing it exists to cover, which is the
+same failure shape as the bug it hunts (#853).
+
+`needs: mobile-changes` is the right thing to key off because it is
+exactly the load-bearing wire: a job that declares it is a job whose
+steps read `needs.mobile-changes.outputs.run`, and a job that drops it is
+the catastrophic case above. Deriving from `needs` cannot miss a new job,
+and cannot go stale. The floor below keeps the derivation itself honest:
+an empty result would otherwise pass vacuously, which is the same
+"scanned nothing, reported clean" failure the privacy guard aborts on
+(check-privacy.sh, 'Abort loudly instead').
 """
 
 import pathlib
@@ -31,8 +46,43 @@ import sys
 
 WORKFLOW = pathlib.Path(".github/workflows/ci.yml")
 GATE_JOB = "mobile-changes"
-GATED_JOBS = ("mobile-android", "mobile-ios")
 CONDITION = f"needs.{GATE_JOB}.outputs.run == 'true'"
+
+# The jobs known to be gated when this was written. Not the list that is
+# CHECKED -- `gated_jobs()` derives that -- but a floor: if the
+# derivation ever returns fewer than these, it has broken rather than
+# found a simpler workflow, and the guard says so instead of passing.
+KNOWN_GATED = frozenset({"mobile-android", "mobile-ios"})
+
+
+def gated_jobs(jobs: dict[str, list[str]]) -> list[str]:
+    """Job names declaring `needs: mobile-changes`, in file order.
+
+    Matches both YAML spellings of `needs` -- the scalar
+    (`needs: mobile-changes`) and the list (`needs: [a, mobile-changes]`
+    or a block sequence) -- because a job gaining a second dependency
+    would otherwise silently drop out of the checked set, which is the
+    hardcoding bug in a new costume.
+    """
+    found = []
+    for name, body in jobs.items():
+        if name == GATE_JOB:
+            continue
+        for i, line in enumerate(body):
+            if not re.match(r"^    needs:", line):
+                continue
+            # The scalar/flow-list form is on the `needs:` line itself;
+            # a block list follows it as `      - name` entries.
+            block = [line]
+            for nxt in body[i + 1 :]:
+                if re.match(r"^      - ", nxt):
+                    block.append(nxt)
+                else:
+                    break
+            if re.search(rf"\b{re.escape(GATE_JOB)}\b", "\n".join(block)):
+                found.append(name)
+            break
+    return found
 
 
 def jobs_of(text: str) -> dict[str, list[str]]:
@@ -80,22 +130,31 @@ def main() -> int:
         print("every step while reporting success.")
         return 1
 
-    for job in GATED_JOBS:
-        if job not in jobs:
-            problems.append(f"`{job}` is missing from {WORKFLOW}")
-            continue
+    checked = gated_jobs(jobs)
 
-        body = jobs[job]
-
-        # The load-bearing one. Without `needs`, the condition on every
-        # step below silently evaluates to the empty string.
-        needs = [l for l in body if re.match(r"^    needs:", l)]
-        if not any(GATE_JOB in l for l in needs):
+    # A job that was gated and no longer declares `needs` is the exact
+    # catastrophic case in this guard's docstring -- and deriving the set
+    # from `needs` means such a job vanishes from the checked set rather
+    # than failing in it. So the floor is asserted separately: the
+    # derivation must still find everything it found when written.
+    missing = sorted(KNOWN_GATED - set(checked))
+    for job in missing:
+        if job in jobs:
             problems.append(
-                f"`{job}` has no `needs: {GATE_JOB}`, so every step's "
-                f"`{CONDITION}` is false and the job would report green "
-                f"without running anything"
+                f"`{job}` no longer declares `needs: {GATE_JOB}`, so every "
+                f"step's `{CONDITION}` evaluates to the empty string and the "
+                f"job would report green without running anything"
             )
+        else:
+            problems.append(f"`{job}` is missing from {WORKFLOW}")
+
+    # `needs` is not re-checked per job here: `gated_jobs()` selected
+    # these BY having it, so the check would be a tautology. The
+    # load-bearing "a job lost its `needs`" case is what the KNOWN_GATED
+    # floor above catches, which is where it has to live once the set is
+    # derived rather than listed.
+    for job in checked:
+        body = jobs[job]
 
         for step in steps_of(body):
             step_body = "\n".join(step)
@@ -116,7 +175,7 @@ def main() -> int:
         print(f"`{GATE_JOB}` job in {WORKFLOW} for why.")
         return 1
 
-    print(f"The mobile path gate is wired correctly on {', '.join(GATED_JOBS)}.")
+    print(f"The mobile path gate is wired correctly on {', '.join(checked)}.")
     return 0
 
 

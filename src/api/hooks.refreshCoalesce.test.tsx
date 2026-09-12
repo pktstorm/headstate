@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
@@ -41,8 +41,25 @@ function client() {
 /// `refresh_now start` lines with no matching completion, every one of
 /// them preceded by a second action within seconds.
 describe("refreshPrs coalescing", () => {
+  // Fake timers, per the repo's own template (`src/lib/countdown.test.tsx`,
+  // `src/splash.test.ts`), and `shouldAdvanceTime` as in
+  // `hooks.venvs.test.tsx` so React Query's internals and `waitFor` still
+  // make progress on their own.
+  //
+  // #853: the negative assertion below used 20ms of REAL slack to show
+  // that no second refresh started. Real slack cannot prove a negative --
+  // it only says nothing happened YET, and on a loaded runner (CI's
+  // vitest shares the box with nothing else here, but the race check
+  // runs the Rust suite at eight threads beside it) a second call can
+  // land at 21ms and the test still passes. Advancing a fake clock makes
+  // the window exact: everything scheduled within it has run, so "the
+  // count did not climb" is a real negative rather than a deadline.
   beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     invoke.mockReset();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it("joins a refresh already in flight instead of starting a rival", async () => {
@@ -68,8 +85,10 @@ describe("refreshPrs coalescing", () => {
     void result.current("id2", "o/r", 7, "enqueue" as never);
 
     // Room for the second action to reach its refresh. If it started one
-    // of its own, this is where the count would climb.
-    await new Promise((r) => setTimeout(r, 20));
+    // of its own, this is where the count would climb. Advancing the fake
+    // clock runs everything scheduled in that window, so the unchanged
+    // count is an exact negative rather than a 20ms deadline (#853).
+    await vi.advanceTimersByTimeAsync(20);
     expect(refreshCalls).toBe(1);
 
     slow.resolve([]);

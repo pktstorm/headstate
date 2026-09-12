@@ -283,12 +283,28 @@ jobs:
   # A `matrix` on `test-rust` would rename it to `test-rust (macos-latest)`,
   # and the branch protection ruleset requires the bare names -- every PR
   # would become unmergeable the moment this landed. Separate jobs keep the
-  # five required checks exactly as they are.
+  # required check names exactly as they are.
   #
-  # Also NOT required checks yet, on purpose. These platforms have never
-  # been built, so the first honest thing they can do is report. Promote
-  # them in the ruleset once they are reliably green -- adding them as
-  # required while red would block all work behind a port.
+  # These ARE required checks. The comment here used to say they were not
+  # "yet", which was true when the jobs were first added and is now the
+  # opposite of the live configuration -- corrected in #853 after reading
+  # the ruleset rather than the comment.
+  #
+  # Verified against the API (`gh api repos/<owner>/<repo>/rulesets/<id>`),
+  # which lists NINE required contexts on `main`:
+  #   lint, test-frontend, test-rust, build, supply-chain,
+  #   platform (ubuntu-latest), platform (windows-latest),
+  #   mobile-android, mobile-ios
+  #
+  # Why this matters beyond tidiness, and why it is worth the words: a
+  # required check that does not RUN blocks a merge forever. So anyone
+  # adding a `paths:` filter to one of these jobs on the strength of the
+  # old comment -- "not required, a skip is safe" -- would make every PR
+  # that misses the filter unmergeable. The mobile jobs solve that
+  # correctly and are the pattern to copy: the JOB always runs and
+  # reports under its required name, and only its STEPS are conditional
+  # (see `mobile-changes`, and `scripts/check-mobile-gate.py`, which is
+  # the guard that keeps that wiring honest).
   platform:
     name: platform (${{ matrix.os }})
     strategy:

@@ -251,9 +251,46 @@ pub async fn load_count(
     window: Slice,
     budget: &Budget,
 ) -> Result<Outcome, ClientError> {
+    let started = std::time::Instant::now();
+    // Captured before the move: `window` goes into the inner future, and
+    // the log below runs after that future has been dropped.
+    let (from, to) = (window.from.clone(), window.to.clone());
     match tokio::time::timeout(LOAD_TIMEOUT, load_count_inner(client, q, window, budget)).await {
         Ok(r) => r,
-        Err(_) => Err(ClientError::Timeout(LOAD_TIMEOUT.as_secs())),
+        Err(_) => {
+            // What the timeout looked like from inside, because the error
+            // alone cannot say (#853).
+            //
+            // `ClientError::Timeout` carries only the ceiling -- the same
+            // "60" on every expiry -- so the log showed N
+            // indistinguishable `graphql POST` lines and nothing tying
+            // them to a round, a slice, or a window. With adaptive
+            // slicing N is not even a fixed number, so "the stats view
+            // hangs" arrived with no way to tell a slow network from a
+            // scope too large to ever finish. That is the #790 situation
+            // in new code, and the degradation ladder below is the
+            // counter-example done right: it logs the chunk and page it
+            // drops to.
+            //
+            // Read off the `Budget`, which is `Arc`-shared and therefore
+            // still readable after the future is dropped -- so these are
+            // measured counters rather than a guess at what got done.
+            // `diag!` rather than `warn!`: a timeout is already reported
+            // to the user through the error, and this is the detail only
+            // someone diagnosing wants.
+            crate::diag!(
+                "[diag] stats load_count TIMEOUT after {:?} (ceiling {}s): \
+                 window {}..{}, {} requests, {} points spent, {} unmetered",
+                started.elapsed(),
+                LOAD_TIMEOUT.as_secs(),
+                from,
+                to,
+                budget.requests(),
+                budget.spent(),
+                budget.unmetered()
+            );
+            Err(ClientError::Timeout(LOAD_TIMEOUT.as_secs()))
+        }
     }
 }
 
@@ -605,6 +642,7 @@ pub async fn load_detail_chunked(
     // -- and the ceiling exists precisely because a reviewer cannot see
     // either failure in a diff.
     let chunk = chunk.clamp(1, ALIAS_CEILING);
+    let started = std::time::Instant::now();
     match tokio::time::timeout(
         LOAD_TIMEOUT,
         detail_with_ladder(client, q, slices, budget, chunk, SLICE_PAGE_FULL),
@@ -612,7 +650,37 @@ pub async fn load_detail_chunked(
     .await
     {
         Ok(r) => r,
-        Err(_) => Err(ClientError::Timeout(LOAD_TIMEOUT.as_secs())),
+        Err(_) => {
+            // The detail half of the same gap (#853), and the one that
+            // needs it more: this path is ADAPTIVE. The ladder may have
+            // degraded the document several times before the deadline
+            // expired, so "how far did it get" cannot be inferred from
+            // the call site -- the starting chunk is not the chunk it
+            // died on.
+            //
+            // How many SLICES were planned is the number that was missing
+            // most: it is what distinguishes a slow network from a scope
+            // whose window was cut into more pieces than 60s can ever
+            // cover, and the two want opposite responses from the user.
+            // `requests` against `slices.len()` gives that directly.
+            //
+            // The chunk logged is the one this call STARTED at;
+            // `detail_with_ladder` already logs each degradation step at
+            // `warn!`, so the pair reconstructs the descent.
+            crate::diag!(
+                "[diag] stats load_detail_chunked TIMEOUT after {:?} (ceiling {}s): \
+                 {} slices planned, start chunk {}, {} requests completed, \
+                 {} points spent, {} unmetered",
+                started.elapsed(),
+                LOAD_TIMEOUT.as_secs(),
+                slices.len(),
+                chunk,
+                budget.requests(),
+                budget.spent(),
+                budget.unmetered()
+            );
+            Err(ClientError::Timeout(LOAD_TIMEOUT.as_secs()))
+        }
     }
 }
 

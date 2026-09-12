@@ -56,9 +56,33 @@ make lint     # cargo fmt --check, clippy, tsc, eslint, knip
 make fmt      # cargo fmt (writes, doesn't just check)
 ```
 
-Run `make lint` and `make test` before opening a PR — CI runs the same
-checks (plus a build and a supply-chain scan) and every one of them must be
-green before merge. There's no fast-tracking a red check.
+Run `make lint` and `make test` before opening a PR. Every CI check must be
+green before merge — there's no fast-tracking a red check.
+
+These targets are not the same thing as CI, and it's worth knowing where
+they stop. `make lint` and `make test` cover the checks that answer in
+seconds; CI additionally runs:
+
+| What CI adds | Run it locally with |
+| --- | --- |
+| Race check — the Rust suite **three times** at `--test-threads=8` | `make test-race` |
+| `cargo deny check` for `src-tauri` (supply chain) | `make deny` |
+| `cargo check` for the Intel target the release also builds | `make check-intel` |
+| `yarn npm audit` | *(no target — needs the npm advisories service)* |
+| A full `tauri build`, and the Windows/Linux `platform` jobs | *(CI only)* |
+
+The race check is the one to reach for when a test passes locally and fails
+in CI: **one green run does not prove a race is absent**, which is exactly
+why CI repeats the suite. The other two are cheap insurance before a
+release, since an arch-gated link failure or a new advisory would otherwise
+first appear at tag time.
+
+Two guards that used to be CI-only now run in `make lint` (via
+`lint-deps`): `scripts/check-privacy.sh` and
+`scripts/check-workflow-shells.py`. The privacy one matters most, because
+it scans **commit messages** as well as files — catching it locally means
+an edit, and catching it in CI means an amend or an interactive rebase
+after the content has already reached a public remote.
 
 Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/)
 (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`, etc.) — look at
