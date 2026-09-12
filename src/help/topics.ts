@@ -400,8 +400,35 @@ can be recovered afterwards.`,
   },
 
   "update-checkout": {
-    title: "Fast-forward limits",
-    body: `Fast-forwards the repository's main checkout to its upstream.
+    title: "Two buttons, two questions",
+    body: `Two buttons, because they answer different questions.
+
+### Fetch — *is my answer still true?*
+
+Refreshes this repository's view of its remote and **moves nothing**. No
+branch advances, no file changes, nothing is deleted. It only makes the
+comparisons on this page current.
+
+Worth knowing why it exists: the scan that fills this page never goes to
+the network. Every verdict here — merged, unmerged, ahead, behind — is
+computed against the \`origin/*\` refs already on disk, because fetching
+every remote would turn a one-second view into a thirty-second one and
+would hang on a remote that is unreachable.
+
+The consequence is that "up to date with upstream" means *your branch
+agrees with the last \`origin\` we saw*, which can both be behind
+together. That is why the row prints the age beside it — \`up to date ·
+as of 9h ago\` — and why it greys rather than greens once the refs are
+more than an hour old. Fetch is how you turn that grey back to green
+without changing anything.
+
+Available even on a dirty checkout, which is exactly where it matters:
+that is the one case Update refuses.
+
+### Update to latest — *make me current*
+
+Fast-forwards the main checkout to its upstream. This one does move your
+branch.
 
 Two deliberate limits:
 

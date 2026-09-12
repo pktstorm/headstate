@@ -15,6 +15,7 @@ import {
   useWorktreeSizes,
   useWorktrees,
   usePullCheckout,
+  useFetchRefs,
   useRemoveOrphan,
   useOrphanSize,
   useAllWorktreeSizes,
@@ -38,9 +39,10 @@ import {
   forceWarning,
   safetyReason,
   safetyTone,
-  upstreamReason,
+  upstreamReasonAged,
   upstreamShort,
   upstreamTone,
+  upstreamToneAged,
   refAge,
   lockAge,
   lockHolderNote,
@@ -115,6 +117,10 @@ function Row({
   onRemoveOrphan,
   onPull,
   pulling = false,
+  onFetch,
+  fetching = false,
+  fetchedAt = null,
+  scannedAt,
 }: {
   wt: Worktree;
   /// The open pull request for this worktree, when there is one.
@@ -156,6 +162,39 @@ function Row({
   onPull: (wt: Worktree) => void;
   /// This row's pull is in flight. Per row, like `removing`.
   pulling?: boolean;
+  /// Refresh this repository's remote refs, moving nothing (#788). Only
+  /// ever called for the main checkout, like `onPull`.
+  onFetch: (wt: Worktree) => void;
+  /// This row's fetch is in flight. Tracked SEPARATELY from `pulling`,
+  /// not folded into one "busy" flag: the two actions are independently
+  /// available -- Fetch works on a dirty tree where Update is refused --
+  /// so one flag would disable a button that is not actually blocked.
+  fetching?: boolean;
+  /// When this worktree's REPOSITORY last fetched, RFC 3339, or null
+  /// (#788).
+  ///
+  /// A repository-level fact on a per-worktree prop, because that is
+  /// where it is needed: `fetched_at` lives on `WorktreeRepo` and the
+  /// claim it qualifies -- "up to date with upstream" -- is rendered on
+  /// this row. Until now it was rendered only on the page header, while
+  /// the badge it qualifies is here, so a reader looking at the row saw
+  /// green and never looked up. That separation IS the bug #788 reports.
+  ///
+  /// Defaults to null rather than being required, and null means "we do
+  /// not know", never "fresh". The Orphaned view below passes no value at
+  /// all and correctly cannot: an orphan's repository is the thing that is
+  /// gone, so there is nothing to have fetched.
+  fetchedAt?: string | null;
+  /// The instant `fetchedAt` is measured against, in the caller's hands.
+  ///
+  /// `Date.now()` must not be called during render -- eslint enforces it,
+  /// `Sparkline` in `SystemHealthPage.tsx` documents why, and with
+  /// hundreds of these rows on screen a per-row clock read would also
+  /// make no two rows agree about what time it is. `WorktreesPage` takes
+  /// one anchor from the scan's own `dataUpdatedAt` and hands the same
+  /// `Date` to every row; see its doc for why that instant is the
+  /// truthful one rather than merely the pure one.
+  scannedAt: Date;
 }) {
   const safe = isSafe(wt.safety);
   const orphaned = isOrphaned(wt.safety);
@@ -224,7 +263,7 @@ function Row({
   const safetyTitle = [
     pending ? null : safetyReason(wt.safety),
     wt.merged_at ? `merged ${wt.merged_at}` : null,
-    wt.upstream && wt.is_main ? upstreamReason(wt.upstream) : null,
+    wt.upstream && wt.is_main ? upstreamReasonAged(wt.upstream, fetchedAt, scannedAt) : null,
     wt.upstream && !wt.is_main ? upstreamShort(wt.upstream) : null,
     pr ? `#${pr.number}` : null,
     signal ? signal.label : null,
@@ -301,12 +340,46 @@ function Row({
         {/* The main checkout gets the long prose -- it is the only thing
             that line says. Every other row gets the compact arrow form,
             since it already carries name, branch, safety, and size. */}
+        {/* The age of the refs rides WITH the verdict, in one span, and
+            the verdict's colour is chosen knowing that age (#788).
+
+            Both halves of #788's complaint are here. The age was
+            previously only on the page header -- `refAge` at the top of
+            this component's render, 1400 lines from this line in the
+            markup -- so the reader looked at the ROW, read green, and
+            never looked up. And the green meant two opposite things:
+            "verified current" and "agreed with a ref nobody has checked
+            for two days". `upstreamToneAged` greys the second.
+
+            One span, not the verdict in one colour and the age appended
+            in another. They are one claim: "these agree, as far as we
+            last looked". Splitting the colour would say the agreement is
+            solid and only its timestamp is doubtful, which is backwards
+            -- it is the agreement that is in question. */}
         {wt.upstream && wt.is_main ? (
-          <span className={upstreamTone(wt.upstream)}>
+          <span className={upstreamToneAged(wt.upstream, fetchedAt, scannedAt)}>
             {" · "}
-            {upstreamReason(wt.upstream)}
+            {upstreamReasonAged(wt.upstream, fetchedAt, scannedAt)}
           </span>
         ) : null}
+        {/* The compact arrow form keeps `upstreamTone`, NOT the
+            age-aware one, and that is deliberate rather than an
+            oversight (#788).
+
+            `upstreamShort` returns null for `current` -- an up-to-date
+            branch adds noise, not information, on a row that already
+            carries name, branch, safety and size -- so there is no green
+            "up to date" badge here for a stale ref to be resting on.
+            The bug #788 reports cannot occur on these rows.
+
+            What it does render is exactly the set whose colour must not
+            move with the fetch age: `↑`/`↓`/`↑↓`, where staleness can
+            only understate a real divergence, and `local only`, which
+            does not consult `origin/*` at all. Greying any of them would
+            hide a claim staleness cannot falsify. `upstreamToneAged`
+            would in fact return the same string for every one of these
+            kinds -- it only diverges on `current` -- so this is the same
+            value said plainly rather than a second behaviour. */}
         {wt.upstream && !wt.is_main && upstreamShort(wt.upstream) ? (
           <span className={upstreamTone(wt.upstream)}>
             {" · "}
@@ -537,8 +610,49 @@ function Row({
           {pulling ? "Updating…" : "Update to latest"}
         </button>
       ) : null}
+      {/* Fetch: makes the COMPARISON true without moving the branch
+          (#788).
+
+          The closing half of #788. Saying "as of 2 days ago" beside the
+          verdict tells the user their answer is old and leaves them only
+          one way to get a new one -- Update, which performs the merge.
+          So finding out whether you were behind required ceasing to be
+          behind, and a user who only wanted to know had to accept a
+          change to their working tree to find out. This separates the
+          question from the answer.
+
+          NOT disabled on a dirty tree, unlike Update beside it, and that
+          difference is the whole point: `git fetch` writes only
+          remote-tracking refs, so uncommitted work is not at risk and
+          there is nothing for it to conflict with. A dirty main checkout
+          is in fact the case where this matters most -- it is the one
+          where Update is refused outright, which until now left the row
+          with no way to refresh its own verdict at all.
+
+          Placed BEFORE Update rather than after, because it is the
+          cheaper and more reversible of the two and reads as the step you
+          take first. A row's one-action rule is not broken here: Update
+          is still the primary action and this renders only on the main
+          checkout, the same single row Update does. */}
+      {wt.is_main ? (
+        <button
+          type="button"
+          disabled={fetching}
+          onClick={() => onFetch(wt)}
+          title="Refresh this repository's view of its remote. Moves no branch and touches no file — it only makes the comparisons on this page current."
+          className={`shrink-0 rounded border px-2 py-0.5 text-xs ${
+            fetching
+              ? "border-[#30363d] text-[#8b949e] opacity-50"
+              : "border-[#30363d] text-[#e6edf3] hover:bg-[#161b22]"
+          }`}
+        >
+          {fetching ? "Fetching…" : "Fetch"}
+        </button>
+      ) : null}
       {/* Beside the action, since its two limits -- refuses on a dirty
-          tree, never merges -- are not guessable from the label. */}
+          tree, never merges -- are not guessable from the label. Now also
+          the place that explains how Fetch differs from Update, which is
+          the distinction a user meeting two buttons needs (#788). */}
       {wt.is_main ? (
         <HelpButton topic="update-checkout" />
       ) : null}
@@ -836,12 +950,56 @@ function useFirstSizingSettled(repoPath: string | undefined, sizing: boolean): n
 }
 
 export function WorktreesPage() {
-  const { data: repos, isLoading, isError, error, refetch } = useWorktrees();
+  const {
+    data: repos,
+    isLoading,
+    isError,
+    error,
+    refetch,
+    dataUpdatedAt,
+  } = useWorktrees();
   const filters = useActiveFilters();
   const { setFilter } = useFilters();
   const isMobile = useIsMobile();
 
   const selected = repos?.find((r) => r.path === filters.repo) ?? repos?.[0];
+  /// The instant every ref age on this page is measured against (#788).
+  ///
+  /// `Date.now()` is NOT called here, and that is not a stylistic
+  /// preference -- eslint's impure-render rule would reject it, and the
+  /// rule is right. `Sparkline` and `HealthConditions` in
+  /// `SystemHealthPage.tsx` both document this same constraint and both
+  /// take their `now` as a prop for the same two reasons.
+  ///
+  /// `dataUpdatedAt` is also the more HONEST anchor, not merely the pure
+  /// one. `fetched_at` is `FETCH_HEAD`'s mtime, stat'd by the scan; this
+  /// is the moment that scan's answer arrived. Measuring between them
+  /// gives the age of the evidence as of when the evidence was read,
+  /// which is what "as of 4h ago" claims. Anchoring on paint time instead
+  /// would let a tab left open overnight count its own idleness as
+  /// staleness in the repository, and a row would drift from "as of 2h
+  /// ago" to "as of 14h ago" without anything about the repository having
+  /// changed -- a number that moves on its own being exactly the kind
+  /// nobody trusts.
+  ///
+  /// NO `|| Date.now()` fallback, and that is load-bearing rather than
+  /// lint appeasement -- eslint rejects the call even inside this
+  /// `useMemo`, and it is right to: a fallback clock would make the value
+  /// differ between two renders with identical inputs.
+  ///
+  /// Before the first scan settles `dataUpdatedAt` is 0, so this is the
+  /// 1970 epoch. Every real `fetched_at` is then in the FUTURE relative to
+  /// it, which `refAge` answers by going silent -- "we cannot tell how
+  /// stale this is" -- rather than by printing a negative age or a
+  /// 20,000-day one. That is the correct answer for "no scan has landed
+  /// yet", and it beats a present-time fallback, which would confidently
+  /// report an age computed against a clock the data never came from.
+  ///
+  /// Unreachable in practice regardless: `isLoading` is true until the
+  /// first scan settles, and that branch returns the scanning skeleton
+  /// below without rendering a row. The epoch is the safe floor under a
+  /// path nothing takes, not a case being relied on.
+  const scannedAt = useMemo(() => new Date(dataUpdatedAt), [dataUpdatedAt]);
   // `data` is deliberately NOT read here. `partial` already contains the
   // settled set -- the hook merges `data` over the stream, so a row's
   // authoritative verdict wins on any path it has -- and reading both
@@ -1189,6 +1347,11 @@ export function WorktreesPage() {
   const [pruning, setPruning] = useState(false);
   const prune = usePruneWorktrees();
   const [pullingPath, setPullingPath] = useState<string | null>(null);
+  /// The row whose Fetch is in flight (#788). A SECOND path rather than
+  /// a shared "busy" one: Fetch is available on a dirty main checkout
+  /// where Update is refused, so collapsing them would grey out a button
+  /// that is not blocked.
+  const [fetchingPath, setFetchingPath] = useState<string | null>(null);
   const removeOrphanFn = useRemoveOrphan();
   // Every repository's sizes, only on the all-repositories view. One
   // query per repository so results land progressively -- the full set
@@ -1313,6 +1476,50 @@ export function WorktreesPage() {
     );
   };
 
+  const fetchRefsFn = useFetchRefs();
+
+  /// Refresh the repository's remote refs, moving no branch (#788).
+  ///
+  /// The success toast is WRITTEN HERE rather than echoing git, which is
+  /// the one place this differs structurally from `runPull` above. `git
+  /// pull` narrates itself -- a diffstat, or "Already up to date." --
+  /// which is why `summarisePull` exists to trim it. `git fetch` writes
+  /// its progress to stderr and NOTHING to stdout, so the resolved value
+  /// is routinely the empty string; passing it to a toast would show a
+  /// blank one, and passing it through `summarisePull` would be worse,
+  /// inventing a verdict about commits from a string that mentions none.
+  ///
+  /// So the toast says what the app knows: the refs were refreshed, and
+  /// the rows are about to re-answer. It does NOT say whether anything
+  /// new arrived -- the rows themselves say that a moment later, from the
+  /// re-classification the hook invalidates, and a toast that guessed
+  /// "up to date" here could contradict the row it appeared over.
+  ///
+  /// The hook's invalidation is what repaints; nothing is patched
+  /// locally. A ref age patched optimistically would be the page
+  /// claiming freshness it had not verified, on the one feature whose
+  /// entire purpose is not doing that.
+  const runFetch = (wt: Worktree) => {
+    setFetchingPath(wt.path);
+    fetchRefsFn(wt.path).then(
+      () => {
+        setFetchingPath(null);
+        toast.success(`Refreshed ${pathBasename(wt.path)} from its remote`, {
+          description: "The rows below are re-checking against the new refs.",
+        });
+      },
+      (e: unknown) => {
+        setFetchingPath(null);
+        // Git's own words, same rule `runPull` follows: a fetch failure
+        // usually names the host, the permission or the ref, and
+        // "could not fetch" names none of them.
+        toast.error(`Could not reach ${pathBasename(wt.path)}'s remote`, {
+          description: typeof e === "string" ? e : undefined,
+        });
+      },
+    );
+  };
+
   /// The orphan confirmation, as ONE element rendered on two paths
   /// (#845).
   ///
@@ -1421,6 +1628,15 @@ export function WorktreesPage() {
             onUnlock={setUnlocking}
             onRemoveOrphan={setPendingOrphan}
             onPull={runPull}
+            onFetch={runFetch}
+            // No `fetchedAt`, and it cannot have one: an orphan's
+            // repository is precisely what is gone, so there is nothing
+            // left to have fetched. The prop's default of null is the
+            // honest value. Neither button reaches these rows anyway --
+            // both are gated on `is_main`, and an orphan is not a main
+            // checkout -- and `upstreamReasonAged` is likewise only
+            // rendered for `is_main`, so nothing here prints an age.
+            scannedAt={scannedAt}
             onRemove={setPending}
             onClaudify={claudify}
               onForget={forget}
@@ -1613,19 +1829,34 @@ export function WorktreesPage() {
         <span className="text-[#8b949e]">
           {shown.length} worktree{shown.length === 1 ? "" : "s"}
         </span>
-        {/* How old these answers are.
-            
+        {/* How old these answers are, for the whole repository.
+
             Every verdict on the rows below is computed against refs on
-            disk; the scan never fetches, on purpose. Saying nothing
-            made a fortnight-old answer read like the present tense
-            (#702). Silent under a day, because a caveat shown always is
-            a caveat nobody reads. */}
-        {refAge(selected?.fetched_at ?? null) === null ? null : (
+            disk; the scan never fetches, on purpose. Saying nothing made
+            a fortnight-old answer read like the present tense (#702).
+            Silent under an HOUR since #815 -- not under a day, which was
+            silent through the whole window the bug lives in -- because a
+            caveat shown always is a caveat nobody reads.
+
+            KEPT, now that the main checkout's row carries the same age
+            (#788). It is not a duplicate: this qualifies every row
+            including the MERGE verdicts, which have no per-row age note
+            and are the reason #702 and #815 were filed, while the row's
+            note qualifies the one claim -- "up to date with upstream" --
+            that a reader takes at face value. Removing this would
+            un-fix #702 to fix #788.
+
+            `scannedAt`, not an implicit `Date.now()`. That call was here
+            and was an impure read during render; it also let the number
+            drift upward on a tab left open, so a repository looked
+            staler the longer you looked at it. See `scannedAt`'s own
+            doc. */}
+        {refAge(selected?.fetched_at ?? null, scannedAt) === null ? null : (
           <span
             className="text-xs text-[#d29922]"
-            title="Merge and upstream verdicts are computed from the refs on disk, which are only as current as the last fetch."
+            title="Merge and upstream verdicts are computed from the refs on disk, which are only as current as the last fetch. Fetch on the main checkout's row refreshes them without moving a branch."
           >
-            {refAge(selected?.fetched_at ?? null)}
+            {refAge(selected?.fetched_at ?? null, scannedAt)}
           </span>
         )}
         {/* The count is withheld, not shown as a growing number: a
@@ -2473,6 +2704,15 @@ export function WorktreesPage() {
               onRemoveOrphan={setPendingOrphan}
               onPull={runPull}
               pulling={pullingPath === wt.path}
+              onFetch={runFetch}
+              fetching={fetchingPath === wt.path}
+              // `?? null`, not `??  ""` or a fallback date. The Rust side
+              // always sends the key, but a repository that has never
+              // fetched sends null -- and null must stay null all the way
+              // to `refStaleness`, which reports it as `unknown` rather
+              // than as an age of zero.
+              fetchedAt={selected?.fetched_at ?? null}
+              scannedAt={scannedAt}
               onRemove={setPending}
               onClaudify={claudify}
               onForget={forget}
