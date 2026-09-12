@@ -303,6 +303,19 @@ verdict(
 # every workflow ever written.
 verdict("an empty REQUIRED_CONTEXTS fails", GOOD, False, contexts=())
 
+# The duplicate check, which is the floor's blind spot and therefore needs
+# its own case: nine entries covering only eight contexts. The count check
+# is satisfied -- `len` is still 9 -- and every listed entry matches the
+# workflow, so neither the floor nor the mismatch scan would object. Only
+# the uniqueness check stands between this and a guard that silently stops
+# asserting one of the nine.
+verdict(
+    "a duplicate entry fails even though the count still reads nine",
+    GOOD,
+    False,
+    contexts=NINE[:8] + (NINE[0],),
+)
+
 # One MORE than nine, matching the workflow, must also fail: the count is
 # a contract with the ruleset, not a minimum. A tenth context added to
 # `ci.yml` and to this list but never to the ruleset is not a lockout, but
