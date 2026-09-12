@@ -13,6 +13,31 @@
 # `read/write`, and `5000/hour` -- a gate that cries wolf gets disabled, so
 # anchoring is load-bearing, not tidiness. The patterns themselves live at
 # the scan() calls below.
+#
+# WHAT THIS GUARD DOES NOT CATCH: a BARE LOGIN. Every pattern below keys
+# off a syntactic marker -- a URL scheme, an `@` host, a `#N` suffix, a
+# known SaaS domain, a `code/`-style parent. A real colleague's login
+# written on its own ("reviewed by jdoe", `reviewers: ["jdoe"]`) carries
+# no such marker, so it passes silently. Green here means "no MARKED
+# private reference", never "no identities committed".
+#
+# That gap is accepted as a REVIEW responsibility, deliberately, and the
+# alternative was considered and rejected rather than overlooked. A bare
+# login is lexically a bare word: `jdoe` is indistinguishable from prose,
+# from a variable name, and from the synthetic logins fixtures are
+# supposed to use. Any pattern broad enough to catch one matches every
+# identifier in the repo, which is the unanchored-`owner/repo` mistake
+# recorded above -- ~40 false positives, and a gate that cries wolf is a
+# gate someone disables. Narrowing it instead to a deny-list of real
+# logins would print those logins in a public file, which is the same
+# self-defeat the allow-list design above exists to avoid.
+#
+# So the rule lives in CONTRIBUTING.md ("The privacy rule", which names
+# the synthetic set: octocat/hello-world, octocat/spoon-knife) and is
+# enforced by a human reading the diff. #833 found real colleague logins
+# in test fixtures precisely this way. If you are reviewing: fixtures
+# and `*.test.*` files naming a person are the place to look, because
+# that is where the found instances were.
 set -euo pipefail
 
 # The only repository owners this project legitimately references.

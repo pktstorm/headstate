@@ -148,6 +148,21 @@ lint-deps:
 	# cheapest place to ask is here, before anything installs.
 	python3 scripts/check-symlinks.test.py
 	python3 scripts/check-symlinks.py
+	# The leak guard, LAST in this target: it is the only check here that
+	# scans commit messages, so it is the only one whose failure means an
+	# amend or an interactive rebase rather than an edit. Running it
+	# locally at all is the point of #833 -- it was CI-only, so the
+	# feedback arrived after the content was already pushed to a public
+	# remote, which is one step too late for a guard whose whole purpose
+	# is to stop sensitive strings reaching one.
+	#
+	# Runnable locally only since #848 gitignored the vendored Tauri iOS
+	# API; before that this line would have exited 2 for every developer
+	# who had ever built for iOS.
+	#
+	# Local checks are advisory, CI remains the gate (ci.yml) -- this
+	# closes the feedback gap, it does not move the gate.
+	./scripts/check-privacy.sh
 
 # The shared step-up crate again: a path dependency is compiled by the
 # desktop's clippy but its own tests are not, and `cargo fmt --check`
