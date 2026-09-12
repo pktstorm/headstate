@@ -420,9 +420,9 @@ jobs:
       # suite is jsdom-only: jsdom is a JavaScript DOM implementation, so
       # it has no platform behaviour for another OS to disagree about.
       # Running it here proved nothing and cost 42s on Windows and 30s on
-      # Linux (#890). The frontend's one genuinely
-      # per-target build, the `VITE_TARGET=mobile` bundle, is covered by
-      # `mobile-ios`, not by vitest.
+      # Linux (#890). The frontend's one genuinely per-target build, the
+      # `VITE_TARGET=mobile` bundle, is covered by `mobile-ios`, not by
+      # vitest.
       #
       # `Build the app` below still runs `tauri build`, which runs the
       # real `vite build` on each platform -- so a frontend change that
