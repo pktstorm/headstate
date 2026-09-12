@@ -125,6 +125,14 @@ runs:
         # every hit it gets today; it just stops paying to write a copy
         # only it can read.
         #
+        # One case this does NOT change, noted so it is not mistaken for a
+        # regression from this line: a pull request from a FORK cannot read
+        # the base repository's caches at all, which is GitHub's token
+        # scoping and was already true. It is theoretical here -- the last
+        # sixty pull requests were all from in-repo branches or dependabot,
+        # which also pushes in-repo -- but a fork PR was cold before this
+        # change and is cold after it.
+        #
         # It also removes the self-eviction that produced #901's symptom:
         # in that run the two jobs that MISSED (`build`, `platform
         # (windows-latest)`) missed a hash the same PR had written
