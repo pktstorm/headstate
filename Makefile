@@ -207,6 +207,20 @@ lint-deps:
 	# prevent. No dependencies, so there is no reason it was not here
 	# (#848, #853).
 	python3 scripts/check-workflow-shells.py
+	# The mobile build high-water mark drifts because nothing reads it
+	# except a Preflight check that only catches a DECREASE -- so a mark
+	# lagging by three still passes, and it went stale before six
+	# consecutive releases (#787). The self-test runs first: this guard's
+	# "cannot look" path exits 0 on purpose, so a bug that always took it
+	# would leave the mark unguarded while printing something reassuring.
+	#
+	# NOT passed --require here. Unlike everything above it, this one
+	# needs the network and a `gh` token, and `lint-deps` is the target
+	# whose comment promises answers in a second. Locally it reports what
+	# it found and skips when it cannot look; ci.yml passes --require,
+	# where a token exists and an unreachable API is worth seeing.
+	python3 scripts/check-mobile-build-mark.test.py
+	python3 scripts/check-mobile-build-mark.py
 	# The leak guard, LAST in this target: it is the only check here that
 	# scans commit messages, so it is the only one whose failure means an
 	# amend or an interactive rebase rather than an edit. Running it
