@@ -20,6 +20,21 @@ import type { Filters } from "../lib/derive";
 /// names. A hardcoded second list is one that gets edited to match
 /// whatever the code does and stops checking anything.
 export const ALL_VIEWS = [
+  // FIRST, per #823. Promoted out of `panel` in #794 -- it was a sub-page
+  // of My PRs pinned to the sidebar's bottom -- and #794 then placed it
+  // here in the middle, which is where #823 asked for it to stop being.
+  //
+  // The v5.13.0 rebuild is the reason: the page answers "how am I doing"
+  // and "how is my team doing" across every organisation and member, not
+  // just this machine's checkouts. That is a thing someone opens the app
+  // TO SEE, so it leads rather than sitting ninth of ten.
+  //
+  // This list's order is only cosmetic -- `View` is derived from it and
+  // nothing else reads the sequence. `ViewSwitcher`'s own `VIEWS` array
+  // is what the menu renders, so the two are kept in the same order
+  // deliberately: a reader comparing them should not have to wonder which
+  // one the user sees.
+  "pr-stats",
   "my-prs",
   "to-review",
   "worktrees",
@@ -28,12 +43,7 @@ export const ALL_VIEWS = [
   "artifacts",
   "packages",
   "claude-md",
-  // Promoted out of `panel` in #794. It was a sub-page of My PRs,
-  // pinned to the sidebar's bottom; it is now a peer view reached from
-  // the switcher. Placed before `system-health` because it is still
-  // about the user's pull requests, and that entry is deliberately last
-  // as the only one that is not.
-  "pr-stats",
+  // Last, deliberately: the only entry that is not about pull requests.
   "system-health",
 ] as const;
 
