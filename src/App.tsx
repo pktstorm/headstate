@@ -103,8 +103,8 @@ import { MOBILE_HIDDEN_VIEWS, useActiveFilters, useFilters } from "./store/filte
 /// rather than merely fetched late. Before the split that code was in the
 /// one chunk every phone launch parsed, for a view the phone does not
 /// ship. System Health is NOT hidden, so its chunk is still reachable on
-/// a phone; it is 51 kB and carries no charting library (see the
-/// correction below).
+/// a phone; it is 51 kB and carries no charting library, per the
+/// correction above.
 ///
 /// Verified on the mobile build rather than assumed: `VITE_TARGET=mobile
 /// yarn build` produces the same three chunks.
