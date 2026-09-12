@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { upstreamReasonAged, upstreamToneAged } from "./worktrees";
+import { upstreamReasonAged, upstreamTone, upstreamToneAged } from "./worktrees";
 import type { Upstream } from "@/types/pr";
 
 /// #788: a `main` row read "up to date with upstream" in green, and
@@ -217,6 +217,33 @@ describe("the row's upstream claim, qualified by how old the refs are", () => {
         upstreamToneAged(u, hoursAgo(0), now),
       );
     }
+  });
+
+  /// `current` is the ONLY kind whose colour the fetch age changes, and
+  /// this pins that down rather than leaving it as a claim in a comment.
+  ///
+  /// It is load-bearing for the non-main rows on the page, which keep
+  /// plain `upstreamTone` for their compact `↑3` / `↓40` / `local only`
+  /// form. That is only safe while the two functions agree on every kind
+  /// those rows can render -- `upstreamShort` returns null for `current`,
+  /// so the one divergent kind never reaches them. If a second kind ever
+  /// started depending on the age, this fails and sends the reader to
+  /// that call site instead of letting the page quietly disagree with
+  /// itself.
+  it("diverges from the plain tone on `current` and on nothing else", () => {
+    const kinds: Upstream[] = [
+      { kind: "current" },
+      { kind: "ahead", n: 3 },
+      { kind: "behind", n: 40 },
+      { kind: "diverged", n: [1, 2] },
+      { kind: "untracked" },
+      { kind: "detached" },
+      { kind: "unknown", n: "git said no" },
+    ];
+    const diverging = kinds
+      .filter((u) => upstreamToneAged(u, daysAgo(9), now) !== upstreamTone(u))
+      .map((u) => u.kind);
+    expect(diverging).toEqual(["current"]);
   });
 
   /// The row's note has to survive a cell that TRUNCATES. The verdict

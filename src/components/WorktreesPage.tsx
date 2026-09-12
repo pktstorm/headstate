@@ -362,6 +362,24 @@ function Row({
             {upstreamReasonAged(wt.upstream, fetchedAt, scannedAt)}
           </span>
         ) : null}
+        {/* The compact arrow form keeps `upstreamTone`, NOT the
+            age-aware one, and that is deliberate rather than an
+            oversight (#788).
+
+            `upstreamShort` returns null for `current` -- an up-to-date
+            branch adds noise, not information, on a row that already
+            carries name, branch, safety and size -- so there is no green
+            "up to date" badge here for a stale ref to be resting on.
+            The bug #788 reports cannot occur on these rows.
+
+            What it does render is exactly the set whose colour must not
+            move with the fetch age: `↑`/`↓`/`↑↓`, where staleness can
+            only understate a real divergence, and `local only`, which
+            does not consult `origin/*` at all. Greying any of them would
+            hide a claim staleness cannot falsify. `upstreamToneAged`
+            would in fact return the same string for every one of these
+            kinds -- it only diverges on `current` -- so this is the same
+            value said plainly rather than a second behaviour. */}
         {wt.upstream && !wt.is_main && upstreamShort(wt.upstream) ? (
           <span className={upstreamTone(wt.upstream)}>
             {" · "}
