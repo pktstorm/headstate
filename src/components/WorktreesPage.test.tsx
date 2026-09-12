@@ -9,6 +9,19 @@ const state = vi.hoisted(() => ({
   repos: undefined as WorktreeRepo[] | undefined,
   isLoading: false,
   isError: false,
+  /// The scan's own `dataUpdatedAt`, epoch ms, which is the instant every
+  /// ref age on the page is measured against (#788).
+  ///
+  /// Settable so a test can state "the refs are 9 hours old" as a fact
+  /// rather than against a moving clock. The page deliberately does not
+  /// call `Date.now()` during render -- eslint forbids it, and anchoring
+  /// on paint time would also make a row look staler the longer a tab
+  /// stayed open -- so this is the only clock there is.
+  ///
+  /// Defaults to 0, which is what TanStack reports before any fetch has
+  /// settled, so every test that does not care keeps the page's
+  /// first-render fallback path rather than a fabricated timestamp.
+  dataUpdatedAt: 0,
   classified: undefined as Worktree[] | undefined,
   classifying: false,
   // The whole repository's classification rejected. The page has read
@@ -74,6 +87,17 @@ const removeOrphanFn = vi.hoisted(() =>
 const pullFn = vi.hoisted(() =>
   vi.fn<(path: string) => Promise<string>>(() => Promise.resolve("Already up to date.")),
 );
+/// The Fetch action's hook (#788).
+///
+/// Resolves to the EMPTY STRING, which is what `git fetch` actually
+/// gives: it writes its progress to stderr and nothing to stdout. The
+/// mock says so deliberately rather than returning friendly prose,
+/// because the page must phrase its own success line -- a fixture that
+/// handed back "Fetched." would let a bug where the toast echoes git's
+/// output pass as a blank toast nobody noticed.
+const fetchRefsFn = vi.hoisted(() =>
+  vi.fn<(path: string) => Promise<string>>(() => Promise.resolve("")),
+);
 // Typed so the call arguments can be asserted on: the untyped form
 // infers an empty tuple, and indexing it is a compile error.
 const removeImagesFn = vi.hoisted(() =>
@@ -93,6 +117,7 @@ vi.mock("../api/hooks", () => ({
   // page now reads Docker state -- but only while the confirmation is
   // open, which is why the default here is an empty list.
   usePullCheckout: () => pullFn,
+  useFetchRefs: () => fetchRefsFn,
   useRemoveOrphan: () => removeOrphanFn,
   // The orphan confirmation's size (#845). Three states, because the
   // dialog renders a different sentence for each and a mock that only
@@ -137,6 +162,7 @@ vi.mock("../api/hooks", () => ({
     isError: state.isError,
     error: "boom",
     refetch: vi.fn(),
+    dataUpdatedAt: state.dataUpdatedAt,
   }),
   // Mirrors the real hook (#830): verdicts stream in per worktree, so
   // `partial` is what the page renders from and the settled `data` wins
@@ -276,6 +302,9 @@ describe("WorktreesPage on a phone", () => {
       repos: [{ identity: null, name: "proj", path: "/code/proj", worktrees: [wt({})] }],
       isLoading: false,
       isError: false,
+      // Reset like every other field, so a test that pins the scan
+      // instant cannot leak its clock into the next one (#788).
+      dataUpdatedAt: 0,
       classified: [wt({ safety: { kind: "safe" } })],
       classifying: false,
       // #830. Leaked either way these are confusing: a stale
@@ -357,11 +386,16 @@ describe("WorktreesPage", () => {
     // than in that test, so every test starts from the same state.
     removeManyFn.mockClear();
     pullFn.mockClear();
+    fetchRefsFn.mockClear();
+    fetchRefsFn.mockResolvedValue("");
     removeOrphanFn.mockClear();
     Object.assign(state, {
       repos: [{ identity: null, name: "proj", path: "/code/proj", worktrees: [wt({})] }],
       isLoading: false,
       isError: false,
+      // Reset like every other field, so a test that pins the scan
+      // instant cannot leak its clock into the next one (#788).
+      dataUpdatedAt: 0,
       classified: undefined,
       classifying: false,
       // #830, and the same reasoning as `sizingFailed` below: a leaked
@@ -1445,6 +1479,181 @@ describe("WorktreesPage", () => {
       await waitFor(() => expect(toastError).toHaveBeenCalled());
       expect(toastError.mock.calls[0][1]).toMatchObject({
         description: "divergent branches",
+      });
+    });
+  });
+
+  /// #788: a `main` row read "up to date with upstream" in green, then
+  /// Update pulled in a large number of commits.
+  ///
+  /// Not a comparison bug. The scan never fetches -- deliberately, and it
+  /// still does not -- so the badge compares local `main` against a
+  /// possibly-stale on-disk `origin/main`, while the Update button DOES
+  /// fetch via `git pull`. Both refs can be behind together and the row
+  /// honestly reports that they agree.
+  ///
+  /// Two mechanisms already existed and neither reached the reader. The
+  /// row's "(as of last fetch)" has no magnitude. And the age note
+  /// rendered on the page HEADER while the badge it qualifies is per ROW,
+  /// so a reader looking at the row saw green and never looked up. These
+  /// tests are about the ROW.
+  describe("how old the row's upstream answer is", () => {
+    const SCAN_AT = Date.parse("2026-09-12T12:00:00Z");
+    const hoursBefore = (n: number) =>
+      new Date(SCAN_AT - n * 3_600_000).toISOString();
+
+    /// One main checkout reporting `current`, with the repository's
+    /// `fetched_at` pinned. The scan instant is pinned too: the page
+    /// measures against `dataUpdatedAt` rather than `Date.now()`, so a
+    /// test can state an age as a fact.
+    const pinned = (fetchedAt: string | null) => {
+      state.dataUpdatedAt = SCAN_AT;
+      state.repos = [
+        {
+          identity: null,
+          name: "proj",
+          path: "/code/proj",
+          worktrees: [wt({ path: "/code/proj", is_main: true })],
+          fetched_at: fetchedAt,
+        },
+      ];
+      state.classified = [
+        wt({
+          path: "/code/proj",
+          is_main: true,
+          safety: { kind: "main_checkout" },
+          upstream: { kind: "current" },
+        }),
+      ];
+    };
+
+    /// THE BUG, at the magnitude it was actually reported at.
+    ///
+    /// Hours, not days. A test that only covered the multi-day case would
+    /// pass over exactly the complaint: a row that looks current while
+    /// being hours behind, which on a repository landing PRs hourly is
+    /// easily "lots of new changes".
+    it("puts the age on the ROW beside the claim, in hours", () => {
+      pinned(hoursBefore(9));
+      render(<WorktreesPage />);
+      // On the row, not only in the header. Found by its own text so a
+      // header-only fix cannot satisfy this.
+      expect(
+        screen.getByText(/up to date with upstream · as of 9h ago/),
+      ).toBeTruthy();
+    });
+
+    /// Green meant two opposite things: "verified current" and
+    /// "unverified for a day". The second goes grey -- this page's shade
+    /// for bookkeeping rather than a verdict about your work -- and
+    /// deliberately NOT amber, which here means "you may want to act".
+    it("stops painting an unverified up-to-date green", () => {
+      pinned(hoursBefore(9));
+      render(<WorktreesPage />);
+      const el = screen.getByText(/up to date with upstream · as of 9h ago/);
+      expect(el.className).toContain("#8b949e");
+      expect(el.className).not.toContain("#3fb950");
+    });
+
+    /// And a genuinely fresh answer keeps its green AND loses the hedge.
+    /// A caveat shown always is a caveat nobody reads, which is the
+    /// failure the original day-long threshold was guarding against.
+    it("keeps green, with no hedge at all, when the refs really are current", () => {
+      pinned(hoursBefore(0));
+      render(<WorktreesPage />);
+      const el = screen.getByText(/up to date with upstream/);
+      expect(el.textContent).not.toContain("as of");
+      expect(el.className).toContain("#3fb950");
+    });
+
+    /// ABSENT IS NOT ZERO, and absent is not success.
+    ///
+    /// The characteristic bug of this codebase: #769 summed a
+    /// never-measured tree to 0 bytes and rendered "empty"; #841 read a
+    /// missing health sample as healthy. Here it would be "up to date ·
+    /// as of 0h ago" in green on a repository that has never contacted
+    /// its remote.
+    it("does not render a missing fetch time as fresh, as zero, or as green", () => {
+      pinned(null);
+      render(<WorktreesPage />);
+      const el = screen.getByText(/up to date with upstream/);
+      expect(el.textContent).toContain("never fetched");
+      expect(el.textContent).not.toContain("0h");
+      expect(el.className).not.toContain("#3fb950");
+    });
+  });
+
+  /// #788's second half: an explicit Fetch, so a user who wants a live
+  /// answer can get one without a pull that also moves their branch.
+  ///
+  /// Until now the only way to refresh the comparison was to perform the
+  /// merge -- finding out whether you were behind required ceasing to be
+  /// behind.
+  describe("fetching without pulling", () => {
+    const withMain = (safety: unknown = { kind: "main_checkout" }) => [
+      wt({ path: "/code/proj", is_main: true, safety: safety as never }),
+      wt({ path: "/code/proj-feature", safety: { kind: "safe" } }),
+    ];
+
+    it("offers the fetch only on the main checkout", () => {
+      state.classified = withMain();
+      render(<WorktreesPage />);
+      expect(screen.getAllByRole("button", { name: /^fetch$/i })).toHaveLength(1);
+    });
+
+    it("fetches that repository", async () => {
+      state.classified = withMain();
+      render(<WorktreesPage />);
+      fireEvent.click(screen.getByRole("button", { name: /^fetch$/i }));
+      await waitFor(() => expect(fetchRefsFn).toHaveBeenCalledWith("/code/proj"));
+    });
+
+    /// The DECISIVE difference from Update, and the reason this is a
+    /// second button rather than a rename of the first: a dirty checkout
+    /// is exactly where Update is refused, so it is where a user has no
+    /// other way to refresh the row's own verdict. `git fetch` writes
+    /// only remote-tracking refs, so there is nothing for uncommitted
+    /// work to conflict with.
+    it("stays available on a dirty checkout, where Update is refused", () => {
+      state.classified = withMain({ kind: "dirty", detail: 3 });
+      render(<WorktreesPage />);
+      expect(
+        screen.getByRole("button", { name: /update to latest/i }),
+      ).toHaveProperty("disabled", true);
+      expect(screen.getByRole("button", { name: /^fetch$/i })).toHaveProperty(
+        "disabled",
+        false,
+      );
+    });
+
+    /// `git fetch` writes its progress to stderr and nothing to stdout,
+    /// so the resolved value is routinely the EMPTY STRING (the mock says
+    /// so). The toast must therefore be the app's own sentence. Echoing
+    /// git here would show a blank toast -- a success the user cannot
+    /// see, which reads as a button that did nothing.
+    it("phrases its own success rather than echoing git's empty output", async () => {
+      state.classified = withMain();
+      render(<WorktreesPage />);
+      fireEvent.click(screen.getByRole("button", { name: /^fetch$/i }));
+      await waitFor(() => expect(toastSuccess).toHaveBeenCalled());
+      const shown = toastSuccess.mock.calls[0][0] as string;
+      expect(shown.trim()).not.toBe("");
+      expect(shown).toMatch(/refreshed/i);
+    });
+
+    /// Git's own words on failure, the rule `runPull` already follows: a
+    /// fetch refusal names the host, the permission or the ref, and
+    /// "could not fetch" names none of them.
+    it("reports git's own refusal on failure", async () => {
+      state.classified = withMain();
+      fetchRefsFn.mockRejectedValueOnce(
+        "fatal: could not read Username for 'https://github.com'",
+      );
+      render(<WorktreesPage />);
+      fireEvent.click(screen.getByRole("button", { name: /^fetch$/i }));
+      await waitFor(() => expect(toastError).toHaveBeenCalled());
+      expect(toastError.mock.calls[0][1]).toMatchObject({
+        description: "fatal: could not read Username for 'https://github.com'",
       });
     });
   });

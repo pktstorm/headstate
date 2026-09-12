@@ -1406,6 +1406,35 @@ pub async fn pull_checkout(path: String) -> Result<String, String> {
     result
 }
 
+/// Refresh one repository's remote refs without moving a branch (#788).
+///
+/// The counterpart to `pull_checkout`, and the reason it is a separate
+/// command rather than a flag on that one: the two answer different
+/// questions. `pull_checkout` MOVES the checkout, which is what you want
+/// once you know you are behind; this only makes the page's comparison
+/// true again, which is what you want before you know anything. Until
+/// now the only way to refresh `origin/*` from inside the app was to
+/// perform the merge, so finding out whether you were behind required
+/// ceasing to be behind.
+///
+/// Does no rescan of its own. The invalidation that repaints the rows
+/// belongs to the frontend hook, which already owns the query keys --
+/// emitting a scan from here would race the one the hook triggers and
+/// double the work for one click.
+#[tauri::command]
+pub async fn fetch_refs(path: String) -> Result<String, String> {
+    let p = path.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || crate::worktrees::fetch_refs(&p))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match &result {
+        Ok(_) => log::info!("fetched refs for {path}"),
+        Err(e) => log::warn!("could not fetch refs for {path}: {e}"),
+    }
+    result
+}
+
 /// Delete an orphaned worktree directory.
 ///
 /// Separate from `remove_worktree` because git cannot do it: the

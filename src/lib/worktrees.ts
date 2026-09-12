@@ -520,7 +520,7 @@ export function isPending(s: Safety): boolean {
 /// meaning: "behind 40" invites a pull, and the user should know the
 /// number could itself be stale. "Up to date" carries the same caveat
 /// and is the one most likely to mislead.
-export function upstreamReason(u: Upstream): string {
+function upstreamReason(u: Upstream): string {
   const commits = (n: number) => `${n} commit${n === 1 ? "" : "s"}`;
   switch (u.kind) {
     case "current":
@@ -779,6 +779,196 @@ export function refAge(fetchedAt: string | null, now = new Date()): string | nul
   if (hours < 24) return `as of a fetch ${hours} hour${hours === 1 ? "" : "s"} ago`;
   const days = Math.floor(hours / 24);
   return `as of a fetch ${days} day${days === 1 ? "" : "s"} ago`;
+}
+
+/// How much a row's upstream claim is resting on refs nobody has
+/// checked, as ONE decision the text and the colour both read (#788).
+///
+/// `refAge` already says the age in prose and already says it in hours
+/// (#815 lowered the threshold from a calendar day, which is the defect
+/// #788 describes but which was fixed before #788 was filed -- see the
+/// threshold note below). What #788 adds is that the age belongs on the
+/// ROW, beside the claim it qualifies, and that the claim should not
+/// stay the same colour either way.
+///
+/// ### Why a discriminated result rather than two functions
+///
+/// The bug #788 reports is two mechanisms disagreeing: a green badge
+/// saying "up to date with upstream" and a header note, 1400 lines away
+/// in the markup and silent most of the time, saying the refs are two
+/// days old. Splitting the answer into `rowAgeText()` and `rowAgeTone()`
+/// would rebuild that disagreement inside one file -- two thresholds to
+/// keep in step, and nothing failing when they drift. One value, read
+/// twice, cannot drift.
+///
+/// ### The three states, and why `unknown` is not `stale`
+///
+/// - `fresh` -- fetched within the hour. Nothing to say; the green
+///   badge means what it looks like.
+/// - `stale` -- fetched, and we know how long ago. Carries the age, so
+///   the row can print a number rather than a hedge.
+/// - `unknown` -- never fetched, or a timestamp that will not parse.
+///
+/// `unknown` is separate from `stale` because it is a different claim
+/// and the page must not flatten it into one. This codebase's
+/// characteristic bug is absent-read-as-success: #769's sizes summed a
+/// never-measured tree to `0` bytes and rendered it as "empty", #841
+/// read a missing health sample as healthy. The same mistake here would
+/// be treating a null `fetched_at` as age zero -- "up to date · as of 0h
+/// ago" on a repository that has NEVER contacted its remote, which is
+/// the single most wrong sentence this page could print. It is also not
+/// `fresh`: silence on a repository whose refs have no known provenance
+/// is the reassurance with the least behind it.
+///
+/// ### The threshold is `refAge`'s, not a new one
+///
+/// An hour, inherited by CALLING `refAge` rather than re-deriving it.
+/// #815 chose that figure against a measurement -- an hour is the
+/// shortest window in which this repository's `main` can actually move --
+/// and #788 asks for "near where the claim starts being wrong", which is
+/// the same quantity. A second threshold here would mean the row and the
+/// header could disagree about whether a repository is stale at all,
+/// which is the class of bug being fixed, not a refinement of it.
+///
+/// So #788's "lower the threshold" is already done. Its diagnosis quotes
+/// a `days < 1` early return that no longer exists; what remains of the
+/// complaint, and what this serves, is placement and tone.
+type RefStaleness =
+  | { kind: "fresh" }
+  /// `age` is `refAge`'s prose, e.g. "as of a fetch 4 hours ago".
+  | { kind: "stale"; age: string }
+  | { kind: "unknown" };
+
+function refStaleness(fetchedAt: string | null, now = new Date()): RefStaleness {
+  // Checked BEFORE the arithmetic, exactly as `refAge` does, so that a
+  // null or unparseable timestamp can never reach a subtraction and come
+  // back as a duration.
+  const age = refAge(fetchedAt, now);
+  if (age === null) return { kind: "fresh" };
+  // `refAge` returns this literal for both a null time and one that will
+  // not parse, which are the two "we do not know" cases. Compared as a
+  // string because `refAge` is the single definition of what counts as
+  // unknown -- duplicating its null-and-NaN checks here is how the two
+  // would later disagree about a malformed timestamp.
+  if (age === "never fetched") return { kind: "unknown" };
+  return { kind: "stale", age };
+}
+
+/// The row-sized version of `refAge`'s prose (#788).
+///
+/// "as of a fetch 4 hours ago" is right for the page header, where it is
+/// the only thing on the line. A worktree row already carries a name, a
+/// branch, a safety sentence, an upstream verdict, a PR number, a signal,
+/// a date and a size, and on the desktop that line TRUNCATES -- the
+/// verdict cell is deliberately the first to clip (#818). So the note
+/// that qualifies the verdict has to be short enough to survive beside
+/// it, or the fix ships as a tooltip nobody opens.
+///
+/// `as of 4h ago`, then. "as of" is kept because it is the word that does
+/// the work -- it marks the number as the age of the EVIDENCE rather than
+/// the age of the branch, which the same row already shows two cells away
+/// via `relativeTime`. Dropping it to `4h ago` would put two unlabelled
+/// durations on one line meaning different things.
+///
+/// `never fetched` is not abbreviated. It is three words rather than a
+/// number because it is a different KIND of statement, and shortening it
+/// to something like "age unknown" would make the stalest state on the
+/// page read as a minor gap in our bookkeeping.
+///
+/// Returns null when the refs are fresh, so a caller can render nothing
+/// at all rather than a reassurance on every row of every repository --
+/// the failure #815's threshold note is explicit about.
+function refAgeShort(fetchedAt: string | null, now = new Date()): string | null {
+  const s = refStaleness(fetchedAt, now);
+  if (s.kind === "fresh") return null;
+  if (s.kind === "unknown") return "never fetched";
+  // Re-measured from the timestamp rather than parsed back out of
+  // `s.age`'s prose: a regex over "as of a fetch 4 hours ago" would be a
+  // second reader of `refAge`'s wording, and changing that wording would
+  // then silently return null here instead of failing a test.
+  const hours = Math.floor((now.getTime() - Date.parse(fetchedAt as string)) / 3_600_000);
+  return hours < 24 ? `as of ${hours}h ago` : `as of ${Math.floor(hours / 24)}d ago`;
+}
+
+/// Tailwind colour for an upstream state, given how old the refs behind
+/// it are (#788).
+///
+/// `upstreamTone` colours the VERDICT. This colours the verdict together
+/// with its provenance, which is a different question for exactly one
+/// state: `current`.
+///
+/// Green on this page means "verified current". Until #788 it also meant
+/// "agreed with a ref nobody has checked for two days", and those are
+/// opposite claims wearing one colour -- the green dot actively argued
+/// against the "(as of last fetch)" parenthetical beside it, and the
+/// parenthetical lost. A user read green, clicked Update, and got a large
+/// number of commits.
+///
+/// So a `current` verdict resting on stale or unknown refs goes GREY, and
+/// only grey. Not amber: amber on this page means "you may want to act on
+/// this" (`behind`, `diverged`, a live lock), and an unverified up-to-date
+/// is not a call to action -- it may well be perfectly current, and
+/// painting it as a problem on every repository anyone has not fetched
+/// this hour is how a caveat stops being read. Grey is already this
+/// page's shade for "this is bookkeeping, not a verdict about your work"
+/// (`untracked`, `prunable`, a dead lock), which is precisely what an
+/// unverified comparison is.
+///
+/// Every OTHER state keeps its own colour whatever the age. A `behind 40`
+/// is still amber when the refs are old -- if anything the real number is
+/// larger, so the call to action holds -- and greying it would hide a
+/// claim that staleness cannot falsify, only understate. `ahead`,
+/// `untracked` and `detached` do not read `origin/*` for their verdict at
+/// all, so the fetch age is not evidence about them.
+export function upstreamToneAged(u: Upstream, fetchedAt: string | null, now = new Date()): string {
+  if (u.kind === "current" && refStaleness(fetchedAt, now).kind !== "fresh") {
+    return "text-[#8b949e]";
+  }
+  return upstreamTone(u);
+}
+
+/// Display-ready prose for a checkout's upstream state, with the age of
+/// the refs it was computed from (#788).
+///
+/// `upstreamReason` alone says "up to date with upstream (as of last
+/// fetch)". The qualifier was already there and still did not land,
+/// because it has no MAGNITUDE: "as of last fetch" reads identically
+/// whether the fetch was 30 seconds or 30 days ago, and a reader who
+/// cannot tell those apart reasonably treats it as boilerplate. This
+/// replaces the constant phrase with the number.
+///
+/// `up to date with upstream · as of 4h ago`, and the parenthetical is
+/// DROPPED when the number appears -- saying both would be "up to date
+/// with upstream (as of last fetch) · as of 4h ago", which is the same
+/// caveat twice and pushes the one that carries information off the end
+/// of a cell that truncates.
+///
+/// Below the threshold the parenthetical is dropped too, and nothing
+/// replaces it: refs fetched inside the hour make "up to date" simply
+/// true, and that is the one case where a hedge costs more than it
+/// pays. `never fetched` is the loud case and reads
+/// `up to date with upstream · never fetched`, which is deliberately a
+/// jarring sentence -- it is a jarring situation.
+///
+/// `behind` keeps its own "(as of last fetch)" via `upstreamReason` and
+/// gains the number beside it, because staleness means something
+/// different there: "40 behind" can only be an UNDERSTATEMENT when the
+/// refs are old, so the caveat is about the size of a real problem
+/// rather than about whether there is one.
+export function upstreamReasonAged(u: Upstream, fetchedAt: string | null, now = new Date()): string {
+  const short = refAgeShort(fetchedAt, now);
+  if (short === null) {
+    // Fresh refs: strip the now-redundant hedge from `current`, leaving
+    // the other states' wording exactly as it was. `upstreamReason`
+    // keeps the parenthetical because it is also used where no
+    // `fetched_at` is in hand (the force-removal dialog, the tooltip
+    // fallback), and there a hedge with no number is still better than
+    // a bare claim.
+    return u.kind === "current" ? "up to date with upstream" : upstreamReason(u);
+  }
+  const base =
+    u.kind === "current" ? "up to date with upstream" : upstreamReason(u);
+  return `${base} · ${short}`;
 }
 
 /// The orderings the worktree list offers (#771).

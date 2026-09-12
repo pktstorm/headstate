@@ -540,6 +540,21 @@ export const sizeWorktrees = (repoPath: string) =>
 /// fast-forwards only; returns git's own output or its own refusal.
 export const pullCheckout = (path: string) => call<string>("pull_checkout", { path });
 
+/// Refresh one repository's remote refs, moving no branch (#788).
+///
+/// The counterpart to `pullCheckout` and deliberately not a flag on it:
+/// a pull answers "make me current", this answers "tell me the truth".
+/// Every verdict on the Worktrees page is computed against `origin/*` on
+/// disk and the scan never fetches, so a repository nothing has fetched
+/// lately reports local `main` and a frozen `origin/main` as agreeing --
+/// green, honestly, about two refs that are both behind.
+///
+/// Resolves to git's own output, which for a successful fetch is usually
+/// the EMPTY STRING: git writes its progress to stderr and says nothing
+/// on stdout when there was nothing new. A caller must phrase its own
+/// success line rather than showing this.
+export const fetchRefs = (path: string) => call<string>("fetch_refs", { path });
+
 /// Delete an orphaned worktree directory.
 ///
 /// Separate from `removeWorktree` because git cannot remove it -- the
