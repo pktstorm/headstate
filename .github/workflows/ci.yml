@@ -57,8 +57,48 @@ jobs:
           rust-components: clippy, rustfmt
       - name: Privacy guard
         run: ./scripts/check-privacy.sh
+      # The self-test first, as the symlink and mobile-gate guards do.
+      # #892 recorded this script as already having one; it did not, and
+      # writing it found a live bug -- the platform test matched the label
+      # inside a COMMENT, so a job that merely discussed Windows had every
+      # later `run:` step reported (eleven at once, in this macos-only
+      # job). A guard whose failure mode is a silent pass needs something
+      # watching it fail.
       - name: Workflow shells
-        run: python3 scripts/check-workflow-shells.py
+        run: |
+          python3 scripts/check-workflow-shells.test.py
+          python3 scripts/check-workflow-shells.py
+      # actionlint, NOT a replacement for the step above. #892 proposed it
+      # as one; that was tested and is false. Given a `windows-latest` job
+      # whose `run:` declares no `shell:` and whose body is a heredoc plus
+      # `${VAR#prefix}`, actionlint exits 0 -- it assumes bash and
+      # shellchecks the body AS bash, so the single fact that matters (the
+      # runner will use PowerShell) is the one thing it never asks. The
+      # two checks overlap in appearance only, so both are here.
+      #
+      # What it does add: `uses:` that cannot resolve, expression typos
+      # inside `${{ }}`, unknown `runs-on` labels, and shellcheck across
+      # every `run:` body. That is the class that is invisible until CI
+      # runs, which is what #848 and #853 each cost a cycle to learn. A
+      # mistyped `runs-on` label was confirmed caught here, and nothing
+      # else in this repo asks that question.
+      #
+      # Measured before being turned on, per #853's rule that a gate which
+      # cries wolf gets disabled: ONE finding across 128 KB of workflow
+      # YAML, an SC2001 style nit in the mobile-path filter below, fixed
+      # in the same commit. The lowest false-positive rate of anything
+      # #892's audit evaluated.
+      #
+      # Installed via brew rather than added as an action: it is a single
+      # static Go binary, so there is no new third-party action and no new
+      # pinned SHA to audit. shellcheck arrives as its dependency and is
+      # what makes the `run:` bodies checkable. Runs in about 0.2s; the
+      # install is the only cost, and it is paid in `lint` (~2m) rather
+      # than anywhere near the 10m Windows critical path.
+      - name: Install actionlint
+        run: brew install actionlint
+      - name: Workflow lint
+        run: actionlint
       # Asked BEFORE the heavy jobs, and asked at all because the ignore
       # rule alone cannot enforce this. A committed symlink whose target
       # is absolute or climbs out of the tree resolves only on the
@@ -513,7 +553,12 @@ jobs:
           fi
 
           echo "Files changed:"
-          echo "$CHANGED" | sed 's/^/  /'
+          # Indented with a parameter expansion rather than `sed` -- the
+          # one finding actionlint's shellcheck pass reported on this tree
+          # (SC2001, #892). Exactly equivalent here: the leading "  " is
+          # the first line's indent and every embedded newline gains one,
+          # which is what `s/^/  /` does. One fewer subprocess.
+          echo "  ${CHANGED//$'\n'/$'\n'  }"
 
           # WHAT COUNTS AS MOBILE CODE. Each line is here for a reason
           # that was checked by reading, not assumed. A false negative --

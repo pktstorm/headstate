@@ -501,7 +501,20 @@ export function DockerPage() {
             difference the reader had to work out by subtraction. */}
         <button
           type="button"
-          onClick={() => dockerRunningContainers().then(setRestartOpen)}
+          // The rejection branch matters rather than being a formality,
+          // which is why `no-misused-promises` flagging this was worth
+          // acting on (#892). Listing what a restart would stop is how
+          // this button asks for confirmation; if the query fails the
+          // dialog silently never opens and the click reads as dead, so
+          // the failure has to be said out loud. Reported the way every
+          // other failure on this page is.
+          onClick={() => {
+            dockerRunningContainers().then(setRestartOpen, (e: unknown) => {
+              toast.error("Could not check what is running", {
+                description: typeof e === "string" ? e : undefined,
+              });
+            });
+          }}
           className="ml-auto text-xs text-[#8b949e] hover:text-[#e6edf3]"
         >
           Restart Docker

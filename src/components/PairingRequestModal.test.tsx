@@ -87,7 +87,9 @@ describe("PairingRequestDialog", () => {
   it("counts down and denies on its own at two minutes", async () => {
     show();
     expect(screen.getByText(/denied automatically in/i).textContent).toMatch(/2:00$/);
-    act(() => vi.advanceTimersByTime(1000));
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
     expect(screen.getByText(/denied automatically in/i).textContent).toMatch(/1:59$/);
     expect(respond).not.toHaveBeenCalled();
     await act(async () => {

@@ -777,13 +777,19 @@ mod tests {
     #[test]
     fn a_falling_percentage_is_still_one_alert() {
         let mut fired = Fired::default();
-        for percent in [24.0, 23.0, 22.0, 21.0] {
+        // Enumerated rather than matched on the value. What the assertion
+        // below is actually about is the FIRST crossing versus every one
+        // after it, and `percent == 24.0` said that by comparing an f64
+        // against a literal -- which is what clippy::float_cmp now
+        // rejects repo-wide (#892). The index says the same thing without
+        // the float equality, and says it more directly.
+        for (i, percent) in [24.0, 23.0, 22.0, 21.0].into_iter().enumerate() {
             let alert = vec![Alert::Low {
                 percent,
                 threshold: 25,
             }];
             let new = fired.take_new(&alert, Some(percent));
-            if percent == 24.0 {
+            if i == 0 {
                 assert_eq!(new.len(), 1);
             } else {
                 assert!(new.is_empty(), "{percent}% re-notified");

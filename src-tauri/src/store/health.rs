@@ -192,6 +192,13 @@ mod tests {
     /// transposed pair would render a three-year-old battery at 84%
     /// charge as one at 84% capacity, or worse the reverse. Asserted
     /// with deliberately different values so a swap cannot pass.
+    //
+    // `assert_eq!` on an f64 expands to `==` and so trips float_cmp
+    // (#892). Exact equality is the assertion: this test is about a
+    // SQLite round trip, where the value read back must be the value
+    // written bit for bit. A margin would let a lossy column type pass,
+    // which is the failure being checked for.
+    #[allow(clippy::float_cmp)]
     #[test]
     fn charge_and_capacity_round_trip_without_being_confused() {
         let c = conn();
