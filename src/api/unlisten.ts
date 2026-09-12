@@ -21,6 +21,20 @@ import type { UnlistenFn } from "./transport";
 /// already gone -- the desired end state. There is no partial outcome to
 /// report and nothing a caller could do differently.
 ///
+/// THE SUBSCRIBE SIDE, since the bare `() => {}` rejection handlers beside
+/// every `listen(...).then(...)` in `hooks.ts` point here. A `listen()` that
+/// REJECTS (IPC transport gone, webview torn down mid-call) is the mirror
+/// of the above: no listener was created, which is the state the effect's
+/// cleanup wants anyway, and there is nothing a caller could do
+/// differently -- so it is swallowed for the same reason. What is not
+/// acceptable is leaving it unhandled, because an unhandled rejection is
+/// indistinguishable from a bug at the console, which is the whole
+/// complaint this file opens with. Eleven of the seventeen such sites had
+/// no rejection handler at all until
+/// `@typescript-eslint/no-floating-promises` was measured and turned on
+/// (#892); the other six already had one, which is why the fix was to
+/// match the existing shape rather than invent a helper.
+///
 /// The `catch` on the return value is not redundant with the try/catch.
 /// Tauri's `unlisten` is sync in its current shape, but the observed dev
 /// error arrived as an UNHANDLED REJECTION, so the failure crossed a

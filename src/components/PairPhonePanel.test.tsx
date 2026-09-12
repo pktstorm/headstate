@@ -66,14 +66,18 @@ describe("PairPhonePanel", () => {
     issue.mockImplementation(() => Promise.resolve(payload(NOW / 1000 + 90)));
     await start();
     expect(screen.getByText(/expires in/i).textContent).toMatch(/1:30$/);
-    act(() => vi.advanceTimersByTime(1000));
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
     expect(screen.getByText(/expires in/i).textContent).toMatch(/1:29$/);
   });
 
   it("blanks the code on expiry and offers Regenerate", async () => {
     await start();
     expect(screen.getByText(/expires in/i).textContent).toMatch(/2:00$/);
-    act(() => vi.advanceTimersByTime(120_000));
+    act(() => {
+      vi.advanceTimersByTime(120_000);
+    });
     expect(qr()).toBeNull();
     expect(screen.getByText(/this code has expired/i)).toBeTruthy();
     expect(screen.queryByText(/expires in/i)).toBeNull();
@@ -82,7 +86,9 @@ describe("PairPhonePanel", () => {
 
   it("Regenerate mints a new token and restarts the countdown", async () => {
     await start();
-    act(() => vi.advanceTimersByTime(120_000));
+    act(() => {
+      vi.advanceTimersByTime(120_000);
+    });
     issue.mockImplementation(() =>
       Promise.resolve({ ...payload(Date.now() / 1000 + 120), token: "c2Vjb25k" }),
     );
@@ -96,7 +102,9 @@ describe("PairPhonePanel", () => {
 
   it("Regenerate works before expiry too", async () => {
     await start();
-    act(() => vi.advanceTimersByTime(30_000));
+    act(() => {
+      vi.advanceTimersByTime(30_000);
+    });
     issue.mockImplementation(() =>
       Promise.resolve({ ...payload(Date.now() / 1000 + 120), token: "c2Vjb25k" }),
     );

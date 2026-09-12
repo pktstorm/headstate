@@ -1371,6 +1371,13 @@ mod tests {
         assert_eq!(map_search(&v).len(), 0);
     }
 
+    // `assert_eq!` on an f64 expands to `==`, which is what float_cmp
+    // sees (#892). Exact equality is the right assertion here and a
+    // margin would weaken it: both sides are whole hours this test chose,
+    // arrived at by dividing a difference of whole seconds, so an exact
+    // 2.0 is reachable and a 2.0000001 would mean the median picked a
+    // different sample -- precisely what this test exists to catch.
+    #[allow(clippy::float_cmp)]
     #[test]
     fn cycle_trend_takes_the_nearest_rank_median() {
         // 4 samples: ceil(4*0.5)-1 = index 1.
@@ -1408,6 +1415,11 @@ mod tests {
         assert!(map_cycle_trend(&v).sampled);
     }
 
+    // Same as above, and the stronger case for exactness: the figure
+    // asserted is 0.0, and "absent is not zero" runs through this
+    // codebase -- a margin here would accept a near-zero that came from
+    // having silently mapped a missing timestamp onto a real duration.
+    #[allow(clippy::float_cmp)]
     #[test]
     fn cycle_trend_survives_missing_timestamps() {
         let v = json!({
