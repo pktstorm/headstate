@@ -1,10 +1,23 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stubViewport } from "@/test-utils";
 
 const repos = vi.hoisted(() => vi.fn<() => unknown>(() => []));
+// #846: the scan's STATE, not just its data. On a failure `data` is
+// `undefined` -- which is also what it is before the scan runs -- so the
+// column could not distinguish "we have not looked" from "we looked and
+// could not" from "we looked and there is nothing".
+const scan = vi.hoisted(() => ({ loading: false, failed: false }));
+const refetchFn = vi.hoisted(() => vi.fn());
 
-vi.mock("../api/hooks", () => ({ useWorktrees: () => ({ data: repos() }) }));
+vi.mock("../api/hooks", () => ({
+  useWorktrees: () => ({
+    data: repos(),
+    isLoading: scan.loading,
+    isError: scan.failed,
+    refetch: refetchFn,
+  }),
+}));
 vi.mock("./ViewSwitcher", () => ({ ViewSwitcher: () => null }));
 
 import { WorktreeSidebar } from "./WorktreeSidebar";
@@ -72,6 +85,12 @@ const orphanRepo = (name: string) => ({
 
 beforeEach(() => {
   repos.mockReturnValue([]);
+  // #846. Leaked either way these are confusing: a stale `failed` replaces
+  // the column's head with an error, and a stale `loading` silences the
+  // "No repositories found" diagnosis every other test expects.
+  scan.loading = false;
+  scan.failed = false;
+  refetchFn.mockClear();
   useFilters.setState({
     filtersByView: { "my-prs": {}, "to-review": {}, worktrees: {},
   branches: {}, docker: {}, artifacts: {}, packages: {}, "claude-md": {}, "pr-stats": {}, "system-health": {} },
@@ -157,6 +176,66 @@ describe("WorktreeSidebar", () => {
       const all = screen.getByText("All repositories").closest("button");
       // 2 removable in `busy`, plus the 1 orphan = 3.
       expect(all?.textContent).toContain("3");
+    });
+  });
+
+  /// #846: this column had ZERO loading or error handling.
+  ///
+  /// On a failed `useWorktrees`, `repos` is `undefined`, so both guards at
+  /// the bottom of the list fail (`repos !== undefined && …` and
+  /// `repos?.length === 0`), `allCount` reduces over `[]`, and the column
+  /// rendered exactly one thing: "All repositories  0". A failure as a
+  /// confident zero, in the one place the user looks to ask where the disk
+  /// went. `RepoPickerSidebar` -- the plain list this is a decorated
+  /// version of -- has always distinguished the two.
+  describe("when the scan fails", () => {
+    /// The defect in one assertion: the count was a confident zero.
+    ///
+    /// An em dash, never a number, which is the rule the size cells on
+    /// the worktree page already follow -- zero is an ANSWER and a failed
+    /// scan has none.
+    it("shows no count rather than a confident zero", () => {
+      scan.failed = true;
+      repos.mockReturnValue(undefined);
+      render(<WorktreeSidebar />);
+      const all = screen.getByText("All repositories").closest("button");
+      expect(all?.textContent).toContain("—");
+      expect(all?.textContent).not.toContain("0");
+    });
+
+    it("says the scan failed, and offers a retry", () => {
+      scan.failed = true;
+      repos.mockReturnValue(undefined);
+      render(<WorktreeSidebar />);
+      expect(screen.getByText(/could not scan for worktrees/i)).toBeTruthy();
+      fireEvent.click(screen.getByRole("button", { name: /try again/i }));
+      expect(refetchFn).toHaveBeenCalled();
+    });
+
+    /// "No repositories found. Check the scanned directories in Settings"
+    /// is a DIAGNOSIS -- it points at the user's configuration. On a
+    /// failure it would send someone to fix something that is not broken,
+    /// which is the rule `RepoPickerSidebar` states. The `repos?.length
+    /// === 0` chain is false on `undefined`, so this was already right;
+    /// the test pins it against a future change to that guard.
+    it("does not send the user to Settings over a failure", () => {
+      scan.failed = true;
+      repos.mockReturnValue(undefined);
+      render(<WorktreeSidebar />);
+      expect(screen.queryByText(/check the scanned directories/i)).toBeNull();
+    });
+  });
+
+  /// A holding message, not a diagnosis -- the other half of the same rule.
+  describe("while the scan is running", () => {
+    it("says it is looking rather than naming a number or a fault", () => {
+      scan.loading = true;
+      repos.mockReturnValue(undefined);
+      render(<WorktreeSidebar />);
+      expect(screen.getByText(/looking for repositories/i)).toBeTruthy();
+      expect(screen.queryByText(/no repositories found/i)).toBeNull();
+      const all = screen.getByText("All repositories").closest("button");
+      expect(all?.textContent).toContain("—");
     });
   });
 });

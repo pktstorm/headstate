@@ -18,11 +18,27 @@ const state = vi.hoisted(() => ({
   pending: 0,
   total: 0,
   loading: false,
+  // #846: a REJECTED scan. The sharpest case in that issue, because the
+  // `isLoading` half was already fixed here for the adjacent bug and
+  // `isError` was not -- so a rejection still removed the entire section.
+  failed: false,
 }));
+
+// The explicit retry the `retry: false` on `useVenvs` is paired with. The
+// hook's `staleTime: 30 * 60 * 1000` and `refetchOnWindowFocus: false`
+// are right for data and pinned a FAILURE for half an hour, so a retry
+// the user can press is the only thing that ends it.
+const refetchFn = vi.hoisted(() => vi.fn());
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 vi.mock("../api/hooks", () => ({
-  useVenvs: () => ({ data: state.venvs, isLoading: state.loading }),
+  useVenvs: () => ({
+    data: state.venvs,
+    isLoading: state.loading,
+    isError: state.failed,
+    error: "scan refused: operation not permitted",
+    refetch: refetchFn,
+  }),
   useVenvSizes: () => ({
     sizes: state.sizes,
     idle: state.idle,
@@ -47,11 +63,14 @@ const venv = (over: Partial<Venv> = {}): Venv => ({
 
 beforeEach(() => {
   removeFn.mockClear();
+  refetchFn.mockClear();
   state.venvs = [];
   state.loading = false;
   state.sizes = new Map();
   state.idle = new Map();
   state.measuring = false;
+  // #846. Leaked, this replaces every test's section with an error panel.
+  state.failed = false;
 });
 
 describe("VenvSection on a phone", () => {
@@ -493,5 +512,83 @@ describe("a project scan that did not finish", () => {
     state.venvs = [venv({ state: "orphaned" })];
     render(<VenvSection />);
     expect(screen.queryByRole("status")).toBeNull();
+  });
+});
+
+/// #846: the sharpest case in the issue, because it was already fixed
+/// once here and the fix did not carry.
+///
+/// The comment on `useVenvs`' destructure above records separating
+/// `isLoading` from empty, on a scan measured at 26 seconds walking 28,144
+/// directories. `isError` was not separated, so a rejection still left
+/// `venvs` at `[]` and the `return null` below still removed the entire
+/// section -- its orphan count, its bulk-remove button, all of it. Worse
+/// than the 26-second wait that comment is about, because a wait ends:
+/// `staleTime: 30 * 60 * 1000` with `refetchOnWindowFocus: false` pinned
+/// the failure for HALF AN HOUR with nothing re-running it.
+describe("VenvSection when the scan fails", () => {
+  /// The negative assertion is the defect. The section did not say
+  /// anything wrong -- it ceased to exist.
+  it("does not vanish", () => {
+    state.failed = true;
+    state.venvs = [];
+    const { container } = render(<VenvSection />);
+    expect(container.querySelector("section")).toBeTruthy();
+    expect(screen.getByRole("alert")).toBeTruthy();
+    expect(screen.getByText(/could not look for Poetry virtualenvs/i)).toBeTruthy();
+  });
+
+  /// Keeps the HEADING, unlike the empty case. A bare error panel floating
+  /// under the artifact list would not say what failed; the section is how
+  /// the reader knows this is about virtualenvs and not about the build
+  /// output above it.
+  it("still names itself, so the failure is attributable", () => {
+    state.failed = true;
+    render(<VenvSection />);
+    expect(screen.getByText("Poetry virtualenvs")).toBeTruthy();
+  });
+
+  it("reports the scan's own refusal", () => {
+    state.failed = true;
+    render(<VenvSection />);
+    expect(screen.getByText(/operation not permitted/i)).toBeTruthy();
+  });
+
+  /// The pairing that makes `retry: false` acceptable, and the only thing
+  /// that can end a 30-minute pinned failure.
+  it("offers a retry the user can press", () => {
+    state.failed = true;
+    render(<VenvSection />);
+    fireEvent.click(screen.getByRole("button", { name: /try again/i }));
+    expect(refetchFn).toHaveBeenCalled();
+  });
+
+  /// The orphan count is the number the user acts on, and its absence is
+  /// not a zero. Said out loud because "could not scan" invites reading
+  /// the missing count as nothing to do.
+  it("says the orphan count is unknown rather than zero", () => {
+    state.failed = true;
+    render(<VenvSection />);
+    expect(screen.getByText(/unknown — not zero/i)).toBeTruthy();
+    expect(screen.queryByText(/0 orphaned/)).toBeNull();
+  });
+
+  /// Offers no removal. A bulk-remove button over a scan that refused
+  /// would act on a selection assembled from nothing.
+  it("offers no removal over a set it could not read", () => {
+    state.failed = true;
+    render(<VenvSection />);
+    expect(screen.queryByRole("button", { name: /^Remove/ })).toBeNull();
+    expect(screen.queryByRole("checkbox")).toBeNull();
+  });
+
+  /// The error arm must come BEFORE the `return null`, because a rejection
+  /// leaves `venvs` at `[]` and that line was reached first. This gives
+  /// the component exactly the state that used to take the wrong branch.
+  it("prefers the error to the silent empty return", () => {
+    state.failed = true;
+    state.venvs = [];
+    const { container } = render(<VenvSection />);
+    expect(container.textContent).not.toBe("");
   });
 });

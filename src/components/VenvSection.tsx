@@ -9,6 +9,7 @@ import { relativeSeconds } from "@/lib/time";
 import { useIsMobile } from "@/lib/useIsMobile";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 import { HelpButton } from "./HelpButton";
+import { QueryError, errorMessage } from "./QueryError";
 
 /// How long idle counts as stale, mirroring `STALE_SECS` in Rust.
 ///
@@ -85,7 +86,22 @@ export function VenvSection() {
   // the scan takes 26 SECONDS -- measured, walking 28,144 directories --
   // so the page was indistinguishable from one with no virtualenvs for
   // almost half a minute, which is exactly how it was reported.
-  const { data: venvs = [], isLoading } = useVenvs(true);
+  //
+  // And `isError` too (#846). This is the sharpest case in that issue,
+  // because it was ALREADY FIXED ONCE for the adjacent bug and the fix
+  // did not carry: `isLoading` was separated from empty, `isError` was
+  // not. So a rejected scan still left `venvs` at `[]` and the
+  // `venvs.length === 0` return below still removed the entire section --
+  // its orphan count, its bulk-remove button, all of it -- with no error
+  // and nothing to retry. Worse than the 26-second wait this comment was
+  // written about, because a wait ends.
+  //
+  // Aggravated by the hook's own settings: `staleTime: 30 * 60 * 1000`
+  // and `refetchOnWindowFocus: false` are right for data and pinned a
+  // FAILURE for half an hour. `useVenvs` now carries `retry: false` and
+  // this renders an explicit retry, which is the pairing
+  // `useStatsBoard`'s rule requires.
+  const { data: venvs = [], isLoading, isError, error, refetch } = useVenvs(true);
   const { sizes, idle, measuring, pending, total } = useVenvSizes(venvs, venvs.length > 0);
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [confirming, setConfirming] = useState(false);
@@ -99,6 +115,38 @@ export function VenvSection() {
       <p className="px-1 py-2 text-xs text-[#8b949e]" aria-live="polite">
         Looking for Poetry virtualenvs…
       </p>
+    );
+  }
+  // BEFORE the `return null` below, which is what used to swallow it
+  // (#846). An error arm placed after that line would be unreachable in
+  // exactly the case it exists for, since a rejection leaves `venvs` at
+  // `[]`.
+  //
+  // Keeps the section's HEADING, unlike the empty case. A bare error
+  // panel floating under the artifact list would not say what failed; the
+  // section is how the reader knows this is about virtualenvs and not
+  // about the build output above it. Absence is what the empty state is
+  // for, and a failure is not an absence.
+  if (isError) {
+    return (
+      <section className="mt-6">
+        <div className="mb-3 flex items-center gap-2 text-sm">
+          <span className="font-semibold text-[#e6edf3]">Poetry virtualenvs</span>
+          <HelpButton topic="poetry-venvs" />
+        </div>
+        <QueryError
+          title="Could not look for Poetry virtualenvs"
+          message={errorMessage(error)}
+          onRetry={() => void refetch()}
+        >
+          {/* Says what the failure COSTS, which matters more here than
+              anywhere else on the page: the orphan count is the number the
+              user acts on, and its absence is not a zero. */}
+          <p className="mx-auto mt-2 max-w-lg text-sm text-[#8b949e]">
+            Nothing was scanned, so the orphan count is unknown — not zero.
+          </p>
+        </QueryError>
+      </section>
     );
   }
   // Only once the scan has ANSWERED does an empty list mean "none".

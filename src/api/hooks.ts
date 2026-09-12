@@ -717,6 +717,19 @@ export function useArtifacts(enabled: boolean) {
     enabled,
     // The set changes when someone builds or clones, not on a timer.
     staleTime: 60 * 1000,
+    // `retry: false`, against the default `retry: 3` (#846).
+    //
+    // This is a filesystem walk, not a network call. The default turned
+    // one rejection into FOUR sequential walks of the whole code tree --
+    // measured at ~1.5s for 178 directories on a 221 GB tree, longer on
+    // a cold cache -- and then `ArtifactsPage` reported "No build output
+    // found in the scanned directories": a clean machine, after silently
+    // trying three times to look at a dirty one. `useWorktreeSizes`
+    // records the same reasoning for the same class of query.
+    //
+    // Acceptable only because the page now has an explicit retry, which
+    // is the rule `useStatsBoard` states.
+    retry: false,
   });
 }
 
@@ -843,6 +856,25 @@ export function useVenvs(enabled: boolean) {
     // A background refetch mid-session restarts the whole cycle for no
     // benefit -- the data is minutes old at worst.
     refetchOnWindowFocus: false,
+    // `retry: false`, and the pairing with an explicit retry is what
+    // makes that acceptable (#846).
+    //
+    // The two settings above are correct for DATA and were a trap for a
+    // FAILURE: `staleTime: 30 * 60 * 1000` with `refetchOnWindowFocus:
+    // false` meant a rejected scan sat there for half an hour with
+    // nothing re-running it and nothing offering to. `VenvSection` read
+    // only `isLoading`, so the whole section -- its orphan count, its
+    // bulk-remove button -- silently ceased to exist for thirty minutes
+    // on a machine that might hold 78 removable virtualenvs.
+    //
+    // The default `retry: 3` made it worse, not better: three silent
+    // re-runs of a scan measured at 26 SECONDS (walking 28,144
+    // directories) is over a minute of looking broken before the section
+    // vanishes. `hooks.ts` states the governing rule on `useStatsBoard`
+    // -- `retry: false` is acceptable "because the view has an explicit
+    // retry that tells the user it is trying again" -- and the section
+    // now renders `QueryError` with exactly that.
+    retry: false,
   });
 }
 
@@ -984,12 +1016,19 @@ export function usePackages(repoPath: string | undefined) {
 }
 
 /// CLAUDE.md files in one repository, with import trees resolved.
+///
+/// `retry: false`, paired with the page's explicit retry (#846). A
+/// rejected scan used to leave `data` at its `[]` default and the page
+/// then said "No CLAUDE.md files in this repository" -- a confident,
+/// wrong answer to a question it could not answer, which is the exact
+/// defect `QueryError` was written to diagnose.
 export function useClaudeMd(repoPath: string | undefined) {
   return useQuery({
     queryKey: ["claude-md", repoPath],
     queryFn: () => scanClaudeMd(repoPath as string),
     enabled: Boolean(repoPath),
     staleTime: 30_000,
+    retry: false,
   });
 }
 
@@ -997,12 +1036,21 @@ export function useClaudeMd(repoPath: string | undefined) {
 ///
 /// Fetched separately from the scan: holding every file's contents to
 /// display one is a lot of bytes across the bridge for nothing.
+///
+/// `retry: false` and an explicit retry in the pane (#846). A file
+/// renamed or deleted between the scan and the click -- a real
+/// possibility at `staleTime: 30_000` -- is a settled refusal, not a
+/// flaky call, so three silent re-reads only delay saying so. The pane
+/// used to render NOTHING on a rejection: `textLoading` false, `text`
+/// undefined, both arms of its chain failing and the chain ending at
+/// `null`.
 export function useClaudeMdText(path: string | undefined) {
   return useQuery({
     queryKey: ["claude-md-text", path],
     queryFn: () => readClaudeMd(path as string),
     enabled: Boolean(path),
     staleTime: 30_000,
+    retry: false,
   });
 }
 

@@ -13,6 +13,7 @@ import { toast } from "sonner";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 import { formatSize } from "@/lib/worktrees";
 import { HelpButton } from "./HelpButton";
+import { QueryError, errorMessage } from "./QueryError";
 import { VenvSection } from "./VenvSection";
 import { CleanupLog } from "./CleanupLog";
 
@@ -101,7 +102,23 @@ export function ArtifactsPage() {
   // holds an artifact KIND rather than a path. Reusing it keeps one
   // selection mechanism instead of a second parallel one.
   const group = filters.repo;
-  const { data: allArtifacts = [], isLoading } = useArtifacts(true);
+  // `isError`, `error` and `refetch` as well as the data (#846).
+  //
+  // The `= []` default made a REJECTED scan indistinguishable from an
+  // empty machine: the page fell through to "No {label} found in the
+  // scanned directories", which on a disk-cleanup tool reads as "your
+  // machine is clean" when the truth is it could not look. Nobody
+  // investigates good news, and there was nothing red and no retry, so
+  // the failure was not merely unreported -- it was actively reassuring.
+  // `QueryError`'s own doc comment diagnoses exactly this: "An error has
+  // to look like an error."
+  const {
+    data: allArtifacts = [],
+    isLoading,
+    isError,
+    error,
+    refetch,
+  } = useArtifacts(true);
   // Read here only to decide the empty state; VenvSection owns the rest.
   const { data: venvList = [] } = useVenvs(true);
   const venvCount = venvList.length;
@@ -181,6 +198,37 @@ export function ArtifactsPage() {
     return <p className="p-4 text-sm text-[#8b949e]">Looking for build output…</p>;
   }
 
+  /// The failed artifact scan, as a panel rather than a page (#846).
+  ///
+  /// A `const` mounted inside the layout below, NOT an early return. An
+  /// early return would take the virtualenv section with it, and on
+  /// "Everything" that section can be perfectly healthy -- hiding 78
+  /// removable virtualenvs behind a failure about build output would
+  /// replace one silent loss with another. The page's own empty state
+  /// already reasons this way: "an empty artifact list beside 78
+  /// virtualenvs is not an empty page".
+  ///
+  /// Gated on `showArtifacts` for the same reason the loading arm is: on
+  /// the virtualenv group page the artifact scan is not the subject.
+  const artifactsError =
+    isError && showArtifacts ? (
+      <QueryError
+        title="Could not scan for build output"
+        message={errorMessage(error)}
+        onRetry={() => void refetch()}
+      >
+        {/* What the failure actually COSTS, which the message cannot say:
+            this page's whole claim is a total, and a scan that refused
+            has no total -- not a zero. Stated rather than left implicit,
+            because "could not scan" invites reading the last number the
+            user saw as still true. */}
+        <p className="mx-auto mt-2 max-w-lg text-sm text-[#8b949e]">
+          Nothing was measured, so there is no total — this is not a report that
+          your directories are clean.
+        </p>
+      </QueryError>
+    ) : null;
+
   // Named by the group the user chose, so an empty Terraform page does
   // not claim there is no build output at all.
   const label =
@@ -192,7 +240,13 @@ export function ArtifactsPage() {
   // that means no artifacts AND no virtualenvs -- an empty artifact list
   // beside 78 virtualenvs is not an empty page, and saying so would be
   // wrong in the one place the user is looking for the total.
-  if (artifacts.length === 0 && (!showVenvs || venvCount === 0)) {
+  //
+  // And only when the scan actually ANSWERED (#846). `artifacts.length
+  // === 0` is true on a rejection too -- `data` is left at its `[]`
+  // default -- so without the `!isError` guard this branch was reached
+  // first and reported a clean machine. It is the branch the whole issue
+  // is about, and `artifactsError` below is unreachable without this.
+  if (!isError && artifacts.length === 0 && (!showVenvs || venvCount === 0)) {
     return (
       <p className="p-4 text-sm text-[#8b949e]">
         No {label} found in the scanned directories.
@@ -202,7 +256,15 @@ export function ArtifactsPage() {
 
   return (
     <div className="p-4">
-      {showArtifacts ? (
+      {/* IN PLACE OF the toolbar and the list, not above them (#846).
+
+          A failed scan has no count, no total and no rows, so rendering
+          "0 directories · 0 B" beside an error would state two things at
+          once and let the eye take the reassuring one. The virtualenv
+          section below is untouched and still renders, which is the whole
+          reason this is a panel rather than an early return. */}
+      {artifactsError}
+      {showArtifacts && !isError ? (
       // Wraps on the phone: six items on one 390px line broke "3
       // directories" and "4.8 GB" across lines mid-phrase.
       <div className={isMobile ? "mb-3 flex flex-wrap items-center gap-2 text-sm" : "mb-3 flex items-center gap-2 text-sm"}>
@@ -392,7 +454,12 @@ export function ArtifactsPage() {
         </Dialog>
       ) : null}
 
-      {showArtifacts ? (
+      {/* `!isError` as well (#846). `rows` is empty on a rejection so
+          this renders nothing either way, but an empty `<ul>` under an
+          error panel is a list asserting there are no rows -- and the
+          gate should say what it means rather than rely on the data
+          happening to be empty. */}
+      {showArtifacts && !isError ? (
       <ul className="flex flex-col gap-1">
         {rows.map((a) => (
           <ArtifactRow

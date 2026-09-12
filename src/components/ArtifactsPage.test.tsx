@@ -6,6 +6,10 @@ import { stubViewport } from "@/test-utils";
 const state = vi.hoisted(() => ({
   artifacts: [] as Artifact[],
   loading: false,
+  // #846: a REJECTED scan, which the `= []` default made
+  // indistinguishable from a clean machine.
+  failed: false,
+  venvsFailed: false,
   venvs: [] as unknown[],
   sizes: new Map<string, number>(),
   ages: new Map<string, number>(),
@@ -20,6 +24,11 @@ const removeFn = vi.hoisted(() =>
     Promise.resolve([]),
   ),
 );
+// The explicit retry the `retry: false` on `useArtifacts` is paired with
+// (#846). `useStatsBoard` states the rule: no silent retries, but only
+// because the view has one the user can see.
+const refetchFn = vi.hoisted(() => vi.fn());
+const refetchVenvsFn = vi.hoisted(() => vi.fn());
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
@@ -28,13 +37,25 @@ vi.mock("../api/hooks", () => ({
   // The page renders VenvSection, which has its own hooks. Stubbed to
   // empty here rather than exercised: that component has its own test
   // file, and duplicating its fixtures would make both harder to change.
-  useVenvs: () => ({ data: state.venvs ?? [] }),
+  useVenvs: () => ({
+    data: state.venvs ?? [],
+    isLoading: false,
+    isError: state.venvsFailed,
+    error: "venv scan refused",
+    refetch: refetchVenvsFn,
+  }),
   useVenvSizes: () => ({ sizes: new Map(), idle: new Map(), measuring: false }),
   useRemoveVenvs: () => vi.fn(),
   // The page renders CleanupLog on "Everything"; it has its own test
   // file, so this is stubbed empty rather than exercised here.
   useCleanupLog: () => ({ entries: [], isLoading: false, run: () => Promise.resolve([]) }),
-  useArtifacts: () => ({ data: state.artifacts, isLoading: state.loading }),
+  useArtifacts: () => ({
+    data: state.artifacts,
+    isLoading: state.loading,
+    isError: state.failed,
+    error: "scan refused: permission denied",
+    refetch: refetchFn,
+  }),
   useArtifactSizes: () => ({
     sizes: state.sizes,
     ages: state.ages,
@@ -474,5 +495,110 @@ describe("selection during removal", () => {
     state.pending = 0;
     render(<ArtifactsPage />);
     expect(screen.getByRole("option", { name: /Least recently written/i })).toBeTruthy();
+  });
+});
+
+/// #846: a failed scan must not read as a clean machine.
+///
+/// `QueryError`'s own doc comment diagnoses this exact defect -- "A
+/// rejected query left `data` at its `[]` default, and the empty-list
+/// copy then told the user 'no pull requests match these filters' -- a
+/// confident, wrong answer to a question the app could not actually
+/// answer. An error has to look like an error." This page still carried
+/// the pre-fix idiom.
+describe("ArtifactsPage when the scan fails", () => {
+  beforeEach(() => {
+    refetchFn.mockClear();
+    refetchVenvsFn.mockClear();
+    state.artifacts = [];
+    state.venvs = [];
+    state.failed = false;
+    state.venvsFailed = false;
+    state.loading = false;
+    state.sizes = new Map();
+    state.ages = new Map();
+    state.pending = 0;
+  });
+  afterEach(() => stubViewport(null));
+
+  /// The assertion that matters is the NEGATIVE one. The page used to
+  /// fall through to "No build output found in the scanned directories":
+  /// a disk-cleanup tool reporting a clean machine when it could not
+  /// look, with nothing red and nothing to retry -- so the failure was
+  /// not merely unreported, it was actively reassuring.
+  it("does not claim the scanned directories are clean", () => {
+    state.failed = true;
+    render(<ArtifactsPage />);
+    expect(screen.queryByText(/no build output found/i)).toBeNull();
+    expect(screen.getByRole("alert")).toBeTruthy();
+    expect(screen.getByText(/could not scan for build output/i)).toBeTruthy();
+  });
+
+  /// The rejection's own words, which a generic "something went wrong"
+  /// would throw away -- a permission-denied root is a different remedy
+  /// from a missing directory.
+  it("reports the scan's own refusal", () => {
+    state.failed = true;
+    render(<ArtifactsPage />);
+    expect(screen.getByText(/permission denied/i)).toBeTruthy();
+  });
+
+  /// The pairing that makes `retry: false` acceptable. Without it the
+  /// page had no retry affordance at all, and the hook's default
+  /// `retry: 3` meant three silent walks of the whole code tree first.
+  it("offers a retry the user can see", () => {
+    state.failed = true;
+    render(<ArtifactsPage />);
+    fireEvent.click(screen.getByRole("button", { name: /try again/i }));
+    expect(refetchFn).toHaveBeenCalled();
+  });
+
+  /// Says the total is ABSENT, not zero. "Could not scan" invites reading
+  /// the last number the user saw as still true, and this page's entire
+  /// claim is a total.
+  it("says nothing was measured rather than letting a total stand", () => {
+    state.failed = true;
+    render(<ArtifactsPage />);
+    expect(screen.getByText(/not a report that your directories are clean/i)).toBeTruthy();
+  });
+
+  /// The error arm has to come BEFORE the empty-state arm, because with
+  /// `data = []` on a rejection the empty arm is reached first. This
+  /// pins the ordering by giving the page the exact state that used to
+  /// take the wrong branch: failed scan, no artifacts, no virtualenvs.
+  it("prefers the error to the empty state when both would apply", () => {
+    state.failed = true;
+    state.artifacts = [];
+    state.venvs = [];
+    render(<ArtifactsPage />);
+    expect(screen.queryByText(/found in the scanned directories/i)).toBeNull();
+    expect(screen.getByRole("alert")).toBeTruthy();
+  });
+
+  /// The artifact failure is a PANEL, not a page (#846).
+  ///
+  /// An early return would take the virtualenv section with it, replacing
+  /// one silent loss with another: 78 removable virtualenvs hidden behind
+  /// a failure about build output. The page's own empty state reasons the
+  /// same way -- "an empty artifact list beside 78 virtualenvs is not an
+  /// empty page".
+  it("still shows the virtualenvs a healthy scan found", () => {
+    state.failed = true;
+    state.venvs = [
+      { path: "/cache/p-AAAAAAAA-py3.13", project: "p", state: "orphaned", source: null },
+    ];
+    render(<ArtifactsPage />);
+    expect(screen.getByText(/could not scan for build output/i)).toBeTruthy();
+    expect(screen.getByText(/poetry virtualenvs/i)).toBeTruthy();
+  });
+
+  /// A count and a total beside an error would state two things at once
+  /// and let the eye take the reassuring one. A failed scan has no count,
+  /// so the toolbar goes rather than printing "0 directories · 0 B".
+  it("prints no count or total beside the failure", () => {
+    state.failed = true;
+    render(<ArtifactsPage />);
+    expect(screen.queryByText(/0 directories/i)).toBeNull();
+    expect(screen.queryByRole("combobox", { name: /sort artifacts/i })).toBeNull();
   });
 });

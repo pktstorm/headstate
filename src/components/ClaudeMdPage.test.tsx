@@ -8,11 +8,33 @@ const state = vi.hoisted(() => ({
   files: [] as ClaudeFile[],
   loading: false,
   text: "# hello" as string | undefined,
+  // #846: the two queries fail independently. The scan failing means the
+  // LIST is unknown; the read failing means one file could not be opened
+  // while the list beside it is fine.
+  failed: false,
+  textFailed: false,
 }));
 
+// The explicit retries the `retry: false` on both hooks is paired with
+// (#846) -- the rule `useStatsBoard` states.
+const refetchFn = vi.hoisted(() => vi.fn());
+const refetchTextFn = vi.hoisted(() => vi.fn());
+
 vi.mock("../api/hooks", () => ({
-  useClaudeMd: () => ({ data: state.files, isLoading: state.loading }),
-  useClaudeMdText: () => ({ data: state.text, isLoading: false }),
+  useClaudeMd: () => ({
+    data: state.files,
+    isLoading: state.loading,
+    isError: state.failed,
+    error: "could not read the repository",
+    refetch: refetchFn,
+  }),
+  useClaudeMdText: () => ({
+    data: state.text,
+    isLoading: false,
+    isError: state.textFailed,
+    error: "no such file or directory",
+    refetch: refetchTextFn,
+  }),
 }));
 vi.mock("../store/filters", () => ({ useActiveFilters: () => ({ repo: state.repo }) }));
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
@@ -46,6 +68,10 @@ beforeEach(() => {
   state.files = [];
   state.loading = false;
   state.text = "# hello";
+  state.failed = false;
+  state.textFailed = false;
+  refetchFn.mockClear();
+  refetchTextFn.mockClear();
 });
 
 describe("ClaudeMdPage", () => {
@@ -163,5 +189,91 @@ describe("ClaudeMdPage browser", () => {
     fireEvent.click(screen.getByRole("button", { name: "Close menu" }));
     expect(screen.queryByRole("menuitem")).toBeNull();
     expect(copyFn).not.toHaveBeenCalled();
+  });
+});
+
+/// #846: neither query may fail silently.
+///
+/// This page's own doc comment stakes its design on "a wrong render costs
+/// a confused reader", and it carried two of the issue's four surfaces --
+/// a scan reported as "No CLAUDE.md files in this repository", and a read
+/// reported as an entirely blank pane.
+describe("ClaudeMdPage when a query fails", () => {
+  /// The negative assertion is the defect. With `data = []` on a
+  /// rejection the empty-state branch was reached first and claimed the
+  /// repository had none -- so an error arm placed after it would be
+  /// unreachable in exactly the case it exists for.
+  it("does not claim the repository has no CLAUDE.md files", () => {
+    state.failed = true;
+    state.files = [];
+    render(<ClaudeMdPage />);
+    expect(screen.queryByText(/no CLAUDE\.md files in this repository/i)).toBeNull();
+    expect(screen.getByRole("alert")).toBeTruthy();
+    expect(screen.getByText(/could not look for CLAUDE\.md files/i)).toBeTruthy();
+  });
+
+  it("reports the scan's own words and offers a retry", () => {
+    state.failed = true;
+    render(<ClaudeMdPage />);
+    expect(screen.getByText(/could not read the repository/i)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /try again/i }));
+    expect(refetchFn).toHaveBeenCalled();
+  });
+
+  /// The worst single state in #846: not a wrong message but NO message.
+  ///
+  /// The content pane was two arms and a `null`. On a rejected read
+  /// `textLoading` is false and `text` is undefined, so both arms failed
+  /// and the chain ended at `null` -- the file browser on the left, the
+  /// correct file highlighted blue, and an entirely empty pane on the
+  /// right. No error, no retry. A file renamed between the scan and the
+  /// click (`staleTime: 30_000` makes that a real window) presented as an
+  /// app that had failed to draw.
+  it("never renders a blank pane when the read fails", () => {
+    state.files = [file({ path: "/code/app/CLAUDE.md" })];
+    state.text = undefined;
+    state.textFailed = true;
+    render(<ClaudeMdPage />);
+    expect(screen.getByRole("alert")).toBeTruthy();
+    expect(screen.getByText(/could not read this file/i)).toBeTruthy();
+    expect(screen.getByText(/no such file or directory/i)).toBeTruthy();
+  });
+
+  /// NAMES the file, because the list beside this pane is still correct
+  /// and still highlighting a row: without the path, an error here reads
+  /// as though the whole page failed rather than this one read.
+  it("names the file it could not read, and keeps the list beside it", () => {
+    state.files = [
+      file({ path: "/code/app/CLAUDE.md" }),
+      file({ path: "/code/app/services/api/CLAUDE.md" }),
+    ];
+    state.text = undefined;
+    state.textFailed = true;
+    render(<ClaudeMdPage />);
+    const alert = screen.getByRole("alert");
+    expect(alert.textContent).toContain("/code/app/CLAUDE.md");
+    // Both browser rows survive: the scan worked, only the read failed.
+    expect(screen.getAllByRole("button", { name: /CLAUDE\.md/ }).length).toBe(2);
+  });
+
+  it("retries only the read, not the whole scan", () => {
+    state.files = [file({ path: "/code/app/CLAUDE.md" })];
+    state.text = undefined;
+    state.textFailed = true;
+    render(<ClaudeMdPage />);
+    fireEvent.click(screen.getByRole("button", { name: /try again/i }));
+    expect(refetchTextFn).toHaveBeenCalled();
+    expect(refetchFn).not.toHaveBeenCalled();
+  });
+
+  /// The chain's FINAL arm is a real state, not a fallback. Pinned
+  /// separately from the error arm because "no text, no error" is the
+  /// combination that used to reach the bare `null`.
+  it("says what to do rather than rendering nothing when there is no text", () => {
+    state.files = [file({ path: "/code/app/CLAUDE.md" })];
+    state.text = undefined;
+    state.textFailed = false;
+    render(<ClaudeMdPage />);
+    expect(screen.getByText(/choose a file to read it/i)).toBeTruthy();
   });
 });
