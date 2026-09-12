@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { errorMessage, isCancelled } from "./cancelled";
+import { CANCELLED, errorMessage, isCancelled } from "./cancelled";
 
 /// Every destructive command on the phone is gated by Face ID or the
 /// Android biometric prompt, and dismissing that sheet is a decision --
@@ -9,8 +9,16 @@ import { errorMessage, isCancelled } from "./cancelled";
 /// `AuthFailed` and `Malformed` into one `Crypto` variant and kept only
 /// the string.
 
-/// Must match `CANCELLED` in `src-mobile/src/companion.rs`.
-const MARKER = "headstate:cancelled";
+/// The module's own constant, not a fourth copy of the string.
+///
+/// This was a hand-written third copy (#850), compared against
+/// `cancelled.ts`' second copy -- which made these tests pass whatever
+/// `companion.rs` said, since neither side of the comparison was the
+/// Rust one. The cross-language assertion now lives in
+/// `mirroredConstants.test.ts`, which reads `companion.rs` directly;
+/// these tests are about the MATCHING behaviour, so they take the marker
+/// from the module under test and assert nothing about its spelling.
+const MARKER = CANCELLED;
 
 describe("isCancelled", () => {
   it("recognises the companion's cancel marker", () => {

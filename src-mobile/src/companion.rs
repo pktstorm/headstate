@@ -40,6 +40,15 @@ struct Live {
 /// differently from a real error. A Tauri command's error crosses the
 /// IPC boundary as a `String`, which is why this is a marker and not a
 /// variant; the frontend matches it exactly and swallows it.
+///
+/// The frontend's copy is `CANCELLED` in `src/lib/cancelled.ts`, and the
+/// two are asserted equal by `src/lib/mirroredConstants.test.ts`, which
+/// reads this literal via Vite's `?raw`. Until #850 the string existed in
+/// THREE hand-written copies -- this one, `cancelled.ts`', and a third
+/// inside `cancelled.test.ts` that compared copies two and three -- so
+/// changing this one left every test on both sides passing while each
+/// dismissed Face ID prompt showed the user a toast reading
+/// `headstate:cancelled`: their own decision reported back as an error.
 pub const CANCELLED: &str = "headstate:cancelled";
 
 pub struct Companion {

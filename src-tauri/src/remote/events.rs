@@ -72,6 +72,19 @@ pub const PATH: &str = "/v1/events";
 /// The Tauri events a phone receives, under these exact names. The
 /// spec's list; the frontend's hooks in `src/api/hooks.ts` listen for
 /// the same names on both builds.
+///
+/// COMPLETENESS against the frontend is asserted by
+/// `src/lib/mirroredConstants.test.ts`, which reads this list via Vite's
+/// `?raw` and requires a `POLL_EVENTS` row in `src/api/transport.test.ts`
+/// for every name here, and no row for a name absent here. Nothing tied
+/// the two together before #850, and `POLL_EVENTS` had in fact lost
+/// `"update-run-progress"`.
+///
+/// The check is worth its weight because the failure it catches is
+/// silent and desktop-invisible: a hook that imports Tauri's `listen`
+/// directly instead of going through the transport seam works perfectly
+/// on the desktop and never fires on the phone, so the page simply never
+/// fills in, with no error anywhere.
 pub const EVENT_NAMES: &[&str] = &[
     "prs-updated",
     "poll-state",

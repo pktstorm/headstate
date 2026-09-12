@@ -285,11 +285,33 @@ pub fn propose(prefs: &CleanupPrefs, roots: &[String], now: &str) -> Vec<LedgerE
                 break;
             }
             let (bytes, idle) = crate::artifacts::measure(std::path::Path::new(&a.path));
-            // Skip anything a build may be writing to. Recorded as
-            // `skipped` rather than omitted: a directory that keeps
-            // being passed over is something the user should be able to
-            // see, not a silent gap in the list.
-            if idle.is_some_and(|secs| secs < ACTIVE_WINDOW_SECS) {
+            // Skip anything a build may be writing to, AND anything whose
+            // age could not be read at all. Recorded as `skipped` rather
+            // than omitted: a directory that keeps being passed over is
+            // something the user should be able to see, not a silent gap
+            // in the list.
+            //
+            // The None arm was missing (#841, same defect as
+            // `remove_artifact`'s delete gate). `idle.is_some_and(..)`
+            // maps None to false, so a directory nothing could measure
+            // was `proposed` for UNATTENDED removal. `measure` returns
+            // None when no mtime was readable anywhere in the tree, or
+            // when the newest mtime is in the future and `elapsed()`
+            // fails -- an NTP correction mid-build produces the latter.
+            //
+            // This is the same rule the venv branch above already
+            // applies to `VenvState::Unknown`, for the reason stated
+            // there: the unattended pass is the worst place to guess,
+            // because nobody is watching it decide (#747). The reasons
+            // are reported separately because they are different facts
+            // about the directory and a user acting on the ledger needs
+            // to know which one they are looking at.
+            let skip = match idle {
+                None => Some("could not tell when it was last written to"),
+                Some(secs) if secs < ACTIVE_WINDOW_SECS => Some("written to recently"),
+                Some(_) => None,
+            };
+            if let Some(reason) = skip {
                 out.push(LedgerEntry {
                     at: now.to_string(),
                     kind: "artifact".into(),
@@ -297,7 +319,7 @@ pub fn propose(prefs: &CleanupPrefs, roots: &[String], now: &str) -> Vec<LedgerE
                     detail: Some(a.kind.regenerated_by().to_string()),
                     bytes: Some(bytes),
                     action: "skipped".into(),
-                    error: Some("written to recently".into()),
+                    error: Some(reason.into()),
                 });
                 continue;
             }
@@ -317,6 +339,13 @@ pub fn propose(prefs: &CleanupPrefs, roots: &[String], now: &str) -> Vec<LedgerE
 }
 
 /// Mirrors the artifact view's rule, and the backend's delete-time one.
+///
+/// All three are now asserted equal by
+/// `src/lib/mirroredConstants.test.ts`, which reads this literal and
+/// `artifacts/mod.rs`' via Vite's `?raw` and compares both to
+/// `ArtifactsPage.tsx`' `ACTIVE_SECS`. This comment claimed the mirror
+/// while the UI's copy was an hour (#850); `artifacts/mod.rs` carries the
+/// argument for fifteen.
 const ACTIVE_WINDOW_SECS: u64 = 15 * 60;
 
 #[cfg(test)]
@@ -481,6 +510,64 @@ mod tests {
             "removing the active check would propose a directory a build may be writing to"
         );
         assert!(e.error.is_some(), "and says why");
+    }
+
+    /// The same fail-open hole as `remove_artifact`'s delete gate (#841),
+    /// on the pass where it matters more: an unattended one.
+    ///
+    /// `measure` returns `None` when no mtime was readable anywhere in
+    /// the tree, or when the newest mtime is in the FUTURE -- it ends in
+    /// `newest.and_then(|n| n.elapsed().ok())`, and `elapsed()` is `Err`
+    /// for a future timestamp, which an NTP correction during a build
+    /// produces. `idle.is_some_and(..)` mapped that None to false, so a
+    /// directory nothing could measure was `proposed` for removal with
+    /// nobody watching.
+    ///
+    /// This is the rule `an_unfinished_scan_proposes_nothing` already
+    /// states for venvs, asserted for artifacts: the unattended pass is
+    /// the worst place to guess (#747).
+    ///
+    /// `#[cfg(unix)]` because setting an mtime needs `touch -t` -- the
+    /// trade `artifacts::removal_tests::make_old` already documents, and
+    /// the status is asserted here rather than ignored so a silently-unset
+    /// mtime cannot leave this passing for the wrong reason. The guard it
+    /// covers is platform-independent.
+    #[test]
+    #[cfg(unix)]
+    fn a_directory_of_unreadable_age_is_skipped_not_proposed() {
+        let t = tempfile::TempDir::new().unwrap();
+        std::fs::write(t.path().join("Cargo.toml"), "[package]").unwrap();
+        let target = t.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("artifact.bin"), "x").unwrap();
+        // A future mtime, so `elapsed()` fails and the age is unreadable.
+        // Chosen over unreadable permissions because a permissions test
+        // cannot run as root and would be skipped in the CI that needs it.
+        let status = std::process::Command::new("touch")
+            .args(["-t", "209901010000"])
+            .arg(target.join("artifact.bin"))
+            .status()
+            .expect("touch should be available");
+        assert!(status.success(), "could not set a future mtime");
+        assert!(
+            crate::artifacts::measure(&target).1.is_none(),
+            "premise: a future mtime must make the age unreadable"
+        );
+
+        let out = propose(&on(), &[t.path().to_string_lossy().to_string()], "now");
+        let e = out
+            .iter()
+            .find(|e| e.target == target.to_string_lossy())
+            .expect("the directory must appear in the ledger, not vanish from it");
+        assert_eq!(
+            e.action, "skipped",
+            "an unmeasurable directory must not be proposed"
+        );
+        assert_eq!(
+            e.error.as_deref(),
+            Some("could not tell when it was last written to"),
+            "and says which of the two reasons it was skipped for"
+        );
     }
 
     /// The cap bounds a run. It matters in Preview too: a ledger listing
