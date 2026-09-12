@@ -373,6 +373,63 @@ describe("WorktreesPage on a phone", () => {
     expect(within(row).getByText("proj-a")).toBeTruthy();
     expect(within(row).getByText("1.0 KB")).toBeTruthy();
   });
+
+  /// `src/` is bundled into the iOS companion and Worktrees is one of the
+  /// views the phone shows, so #788's two additions ship to a 390px
+  /// screen: a longer verdict sentence and a second button on the main
+  /// checkout's row.
+  ///
+  /// Neither can overflow, and the assertions say WHY rather than
+  /// measuring pixels jsdom does not compute. The verdict is on its own
+  /// stacked line where it WRAPS -- it carries no `truncate`, unlike the
+  /// desktop cell that deliberately clips (#818) -- and the actions sit
+  /// in a `flex-wrap` row, so Fetch moves to a second line rather than
+  /// pushing Update off the edge.
+  it("fits the row's ref age and its second button at phone width", () => {
+    stubViewport(390);
+    state.dataUpdatedAt = Date.parse("2026-09-12T12:00:00Z");
+    state.repos = [
+      {
+        identity: null,
+        name: "proj",
+        path: "/code/proj",
+        worktrees: [wt({ path: "/code/proj", is_main: true })],
+        fetched_at: "2026-09-12T03:00:00Z",
+      },
+    ];
+    state.classified = [
+      wt({
+        path: "/code/proj",
+        is_main: true,
+        safety: { kind: "main_checkout" },
+        upstream: { kind: "current" },
+      }),
+    ];
+    render(<WorktreesPage />);
+
+    // The age is stated on the row, in full -- the phone stacks the
+    // verdict onto its own line precisely so it wraps instead of being
+    // cut, so nothing here is hidden behind a `title` the touch screen
+    // cannot reach.
+    const verdict = screen.getByText(/up to date with upstream · as of 9h ago/);
+    // The CELL, not the inner coloured span: the upstream text lives in
+    // its own span inside the verdict cell, and it is the cell that
+    // carries the layout classes. Asserting on the inner span would pass
+    // over a `truncate` added to the cell, which is exactly the failure
+    // this is guarding.
+    const cell = verdict.parentElement as HTMLElement;
+    expect(cell.textContent).toContain("main checkout");
+    expect(cell.className).not.toContain("truncate");
+
+    // Both buttons are present and in a container that is allowed to
+    // wrap, which is what keeps a second action from pushing the first
+    // off a 390px row.
+    const fetchBtn = screen.getByRole("button", { name: /^fetch$/i });
+    const updateBtn = screen.getByRole("button", { name: /update to latest/i });
+    const actions = fetchBtn.parentElement as HTMLElement;
+    expect(actions.className).toContain("flex-wrap");
+    expect(updateBtn.parentElement).toBe(actions);
+  });
 });
 
 describe("WorktreesPage", () => {
