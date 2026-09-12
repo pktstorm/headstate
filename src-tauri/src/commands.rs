@@ -3810,6 +3810,26 @@ pub async fn health_alerts(app: AppHandle) -> Result<Vec<crate::health::AlertRep
                     body: a.body(),
                 }),
         );
+
+        // #865's watch notices: processes holding a moderate amount of
+        // CPU for long enough to be worth a human glance. Read from the
+        // poll loop's shared result rather than recomputed, because the
+        // duration half of the rule lives in its long-running `Watcher`
+        // -- a fresh `Table` here would see every process at 0.0 minutes
+        // and surface nothing. See `runaway::Watched`.
+        //
+        // Appended after the alerts, so anything that would interrupt
+        // the user sorts above anything that merely wants a look.
+        out.extend(
+            app.state::<std::sync::Arc<crate::health::runaway::Watched>>()
+                .get()
+                .into_iter()
+                .map(|n| crate::health::AlertReport {
+                    key: n.key(),
+                    title: n.title(),
+                    body: n.body(),
+                }),
+        );
         Ok(out)
     })
     .await
