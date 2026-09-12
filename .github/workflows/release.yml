@@ -4,15 +4,31 @@ on:
   push:
     tags: ["v*"]
 
-# Least privilege: only the release job runs, and it needs contents:write
-# solely to create the GitHub Release and upload assets.
+# Least privilege, per job rather than per workflow (#886).
+#
+# This block used to say "only the release job runs, and it needs
+# contents:write" while granting it at WORKFLOW level -- so `gate` and all
+# three `build` legs held it too. The comment stated the intent correctly
+# and the code was broader, which is the shape #886 was filed about.
+#
+# It matters because the build legs run `yarn install` and `cargo build`
+# over the whole dependency tree. A compromised build dependency holding
+# contents:write can push to this repository; the same dependency under
+# contents:read cannot. That is the blast-radius argument this file
+# already makes for pinning every action to a full commit SHA, applied to
+# token scope.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # CI runs independently on the tag (see ci.yml's `tags:` trigger). This
-  # job waits for it to go green before anything is built or published, so
-  # a tag on broken code fails here instead of shipping.
+  # job waits for EVERY check run on the tagged commit to conclude
+  # `success` before anything is built or published, so a tag on broken
+  # code fails here instead of shipping.
+  #
+  # "Every check run" and not "every check name" is the whole point, and
+  # getting it wrong is how this gate was hollow until #883. Read
+  # `wait-for-duplicates` below before changing anything here.
   #
   # Deliberately a wait rather than duplicating the test steps: one
   # definition of "green" means the release cannot pass a gate that CI
@@ -46,7 +62,65 @@ jobs:
   #
   # Everything not listed here must still conclude `success`, so this
   # stays as strict as it was for everything CI actually runs.
+  #
+  # `wait-for-duplicates: true` is what makes the claim at the top of
+  # this job TRUE, and without it the gate could be satisfied entirely by
+  # a CI run that never tested the tag (#883). Every release tag points at
+  # a commit that was ALSO pushed to `main`, so the commit carries two
+  # suites with identical job names: v5.14.0 (097a1af) had 25 check runs,
+  # 10 names appearing twice. Read from the pinned action's source
+  # (app/services/github_checks_verifier.rb at 3697690):
+  #
+  #   checks = keep_latest_per_name(checks) unless wait_for_duplicates
+  #   ...
+  #   checks.group_by(&:name).map { |_n, runs| runs.max_by { |r| r.started_at.to_s } }
+  #
+  # so by default each name collapses to ONE run -- and a tag-suite check
+  # that has not registered yet cannot be the max, leaving the already
+  # green `main`-push run to answer for it. The usual backstop does not
+  # apply: `fail_if_requested_check_never_run` returns early unless
+  # `check_name` or `check_regexp` is set (`filters_present?`), and we set
+  # neither, so it is inert here.
+  #
+  # Measured, not hypothetical. On v5.12.0 (7ad496d) the main-push suite
+  # completed at 17:25:35Z, 7.5 minutes before `gate` first polled at
+  # 17:33:08Z, and 9 of 10 names resolved to that stale suite; the gate
+  # was saved only because tag-suite `platform (ubuntu-latest)` had
+  # registered by that same second and still read `in_progress`. v5.11.0
+  # survived for the same accidental reason. Tag a commit whose `main` CI
+  # finished a few minutes earlier and the gate passes in ~15s having
+  # waited for nothing.
+  #
+  # `true` also sets the API's `filter` to `all` rather than `latest`
+  # (`options[:filter] = 'all' if wait_for_duplicates`), but that part is
+  # belt-and-braces rather than the fix: `filter=latest` deduplicates only
+  # WITHIN one check suite, as the action's own comment above
+  # `keep_latest_per_name` says, so our cross-suite duplicates survive it
+  # either way. Measured on 097a1af, which returns the same 25 runs under
+  # `filter=latest` and `filter=all`. The load-bearing half is skipping
+  # `keep_latest_per_name`, which is what actually collapsed the two
+  # suites to one run per name.
+  #
+  # Zero false positives: the two suites are the same jobs on the same
+  # commit, so requiring both green adds no new way to fail -- it only
+  # removes a way to pass without being tested. `ignore-checks` is applied
+  # after the fetch and matches by name, so both suites' copies of
+  # `publish` and the mobile jobs are still dropped.
+  #
+  # NOT `check-regexp` to activate the never-run guard instead: a name
+  # that never reports is the permanently-unmergeable class ci.yml:388-412
+  # warns about.
   gate:
+    # 1-8m measured. A gate waiting on a status that never arrives is the
+    # exact hang this ceiling exists for -- without it, six hours of a
+    # runner (#885).
+    timeout-minutes: 30
+    # Reads check runs on the tag's commit. `checks: read` is explicit
+    # rather than inherited, so tightening the workflow default above
+    # cannot silently blind the gate.
+    permissions:
+      contents: read
+      checks: read
     runs-on: ubuntu-latest
     steps:
       - name: Wait for CI to pass on this commit
@@ -58,9 +132,20 @@ jobs:
           wait-interval: 15
           allowed-conclusions: success
           ignore-checks: ios-release,android-release,publish
+          # See the long note above: without this the gate can be answered
+          # by the `main`-push suite and never wait for the tag's own CI.
+          wait-for-duplicates: true
 
   build:
     needs: gate
+    # Up to ~20m measured for a signed, notarized macOS bundle; 60 leaves
+    # room for a slow notarization queue without ever sitting for six
+    # hours (#885).
+    timeout-minutes: 60
+    # Builds and uploads artifacts for `publish` to collect. It creates
+    # nothing in the repository, so it does not need write (#886).
+    permissions:
+      contents: read
     strategy:
       # One platform failing must not cancel the others: a release that
       # advertises three platforms and ships one is worse than a release
@@ -435,6 +520,13 @@ jobs:
   # no release. It also avoids three parallel jobs racing to create the
   # same tag.
   publish:
+    # 5-15m measured: it downloads three platforms' artifacts, builds the
+    # manifest and uploads. 30 is ample (#885).
+    timeout-minutes: 30
+    # The ONE job that needs write: it creates the GitHub Release and
+    # uploads its assets (#886).
+    permissions:
+      contents: write
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -580,6 +672,54 @@ jobs:
 
           if [ -z "$MANIFEST_PLATFORMS" ]; then
             echo "No signed updater bundles; not publishing a manifest." >&2
+            exit 1
+          fi
+
+          # Every platform the matrix builds must reach the manifest (#884).
+          #
+          # `add_platform` is asymmetric in the dangerous direction: a
+          # missing SIGNATURE hard-fails (correctly -- see above), but a
+          # missing BUNDLE does `return 0` and the platform is simply
+          # omitted. The `-z` check above is no backstop, since it passes
+          # as long as any ONE platform made it. So `latest.json` can be
+          # published advertising two platforms out of three with every
+          # build leg green, and the third platform's installs then find no
+          # matching entry and never update again -- no error, no log, no
+          # prompt. Identical in effect to the `.deb` gap described above,
+          # except unintended and unannounced.
+          #
+          # The realistic trigger is a bundle NAME change, not a build
+          # failure: Tauri's NSIS output picking up an `en-US` locale infix
+          # or an arch suffix, or an AppImage rename on upgrade. `Collect
+          # artifacts` globs `*.exe`, so it still copies the file and
+          # upload-artifact still succeeds; only the narrower
+          # `*_x64-setup.exe` glob here stops matching. Absent silently
+          # read as success is this pipeline's characteristic bug class.
+          #
+          # Zero false positives (the bar #853 set): `needs: build` means
+          # all three matrix legs concluded success, and each leg is what
+          # produces its own bundle. This asserts exactly what `needs`
+          # already guarantees -- the point being that today that guarantee
+          # is not carried through to the manifest. The only way to trip it
+          # is a real defect: a renamed bundle, or a matrix leg removed
+          # without updating this list. macOS contributes two keys from one
+          # universal bundle, so both appear or neither does.
+          #
+          # Collects the whole set before failing rather than dying on the
+          # first: if a Tauri upgrade renames two bundles, one run should
+          # say so once.
+          MANIFEST_MISSING=""
+          for key in darwin-aarch64 darwin-x86_64 windows-x86_64 linux-x86_64; do
+            case "$MANIFEST_PLATFORMS" in
+              *"\"${key}\":"*) ;;
+              *) MANIFEST_MISSING="${MANIFEST_MISSING} ${key}" ;;
+            esac
+          done
+          if [ -n "$MANIFEST_MISSING" ]; then
+            echo "latest.json would omit:${MANIFEST_MISSING}" >&2
+            echo "Every platform the matrix builds must reach the manifest." >&2
+            echo "Bundles actually downloaded:" >&2
+            ls -1 release-assets >&2
             exit 1
           fi
 
