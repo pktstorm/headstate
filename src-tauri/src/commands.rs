@@ -2918,6 +2918,18 @@ pub async fn stats_series(
     // the same one cheap request `stats_count` and `stats_board` make, and
     // `cache_key` needs `@me` resolved for the reason those two record:
     // two accounts on one machine share this database.
+    //
+    // The key's MEASURE slot reads `merged` for every series, and that is
+    // correct rather than a bug: `q` carries `Measure::Merged` only as the
+    // document's default, and `series_query` overrides it per alias to ask
+    // for both. So one cached row holds both measures -- there is no
+    // opened-only series for it to collide with. `stats_count` and
+    // `stats_board` DO vary by measure, and theirs is in the key because
+    // they pass the real one.
+    //
+    // The subject IS in the key, unlike the board's: a series draws one
+    // line, so "this person in this org" and "the whole org" are different
+    // charts and must not share a row.
     let viewer = client.fetch_viewer().await.map_err(|e| e.to_string())?;
     let key = crate::store::stats::key(crate::store::stats::Kind::Series, &q.cache_key(&viewer));
     let conn = open_db(&db_path(&app)).map_err(|e| e.to_string())?;
