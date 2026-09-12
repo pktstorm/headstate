@@ -37,7 +37,7 @@ describe("needsMyReview", () => {
 
 describe("ReviewChips", () => {
   beforeEach(() =>
-    useFilters.setState({ filtersByView: { ...EMPTY }, view: "to-review", panel: "list" }),
+    useFilters.setState({ filtersByView: { ...EMPTY }, view: "to-review" }),
   );
 
   it("counts only PRs still awaiting my verdict", () => {
@@ -62,7 +62,7 @@ describe("ReviewChips", () => {
       fireEvent.click(btn);
       const s = useFilters.getState();
       expect(applyFilters(PRS, s.filtersByView[s.view]).length).toBe(shown);
-      useFilters.setState({ filtersByView: { ...EMPTY }, view: "to-review", panel: "list" });
+      useFilters.setState({ filtersByView: { ...EMPTY }, view: "to-review" });
     }
   });
 

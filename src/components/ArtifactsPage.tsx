@@ -13,6 +13,7 @@ import { toast } from "sonner";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 import { formatSize } from "@/lib/worktrees";
 import { HelpButton } from "./HelpButton";
+import { QueryError, errorMessage } from "./QueryError";
 import { VenvSection } from "./VenvSection";
 import { CleanupLog } from "./CleanupLog";
 
@@ -101,7 +102,23 @@ export function ArtifactsPage() {
   // holds an artifact KIND rather than a path. Reusing it keeps one
   // selection mechanism instead of a second parallel one.
   const group = filters.repo;
-  const { data: allArtifacts = [], isLoading } = useArtifacts(true);
+  // `isError`, `error` and `refetch` as well as the data (#846).
+  //
+  // The `= []` default made a REJECTED scan indistinguishable from an
+  // empty machine: the page fell through to "No {label} found in the
+  // scanned directories", which on a disk-cleanup tool reads as "your
+  // machine is clean" when the truth is it could not look. Nobody
+  // investigates good news, and there was nothing red and no retry, so
+  // the failure was not merely unreported -- it was actively reassuring.
+  // `QueryError`'s own doc comment diagnoses exactly this: "An error has
+  // to look like an error."
+  const {
+    data: allArtifacts = [],
+    isLoading,
+    isError,
+    error,
+    refetch,
+  } = useArtifacts(true);
   // Read here only to decide the empty state; VenvSection owns the rest.
   const { data: venvList = [] } = useVenvs(true);
   const venvCount = venvList.length;
@@ -181,6 +198,37 @@ export function ArtifactsPage() {
     return <p className="p-4 text-sm text-[#8b949e]">Looking for build output…</p>;
   }
 
+  /// The failed artifact scan, as a panel rather than a page (#846).
+  ///
+  /// A `const` mounted inside the layout below, NOT an early return. An
+  /// early return would take the virtualenv section with it, and on
+  /// "Everything" that section can be perfectly healthy -- hiding 78
+  /// removable virtualenvs behind a failure about build output would
+  /// replace one silent loss with another. The page's own empty state
+  /// already reasons this way: "an empty artifact list beside 78
+  /// virtualenvs is not an empty page".
+  ///
+  /// Gated on `showArtifacts` for the same reason the loading arm is: on
+  /// the virtualenv group page the artifact scan is not the subject.
+  const artifactsError =
+    isError && showArtifacts ? (
+      <QueryError
+        title="Could not scan for build output"
+        message={errorMessage(error)}
+        onRetry={() => void refetch()}
+      >
+        {/* What the failure actually COSTS, which the message cannot say:
+            this page's whole claim is a total, and a scan that refused
+            has no total -- not a zero. Stated rather than left implicit,
+            because "could not scan" invites reading the last number the
+            user saw as still true. */}
+        <p className="mx-auto mt-2 max-w-lg text-sm text-[#8b949e]">
+          Nothing was measured, so there is no total — this is not a report that
+          your directories are clean.
+        </p>
+      </QueryError>
+    ) : null;
+
   // Named by the group the user chose, so an empty Terraform page does
   // not claim there is no build output at all.
   const label =
@@ -192,7 +240,13 @@ export function ArtifactsPage() {
   // that means no artifacts AND no virtualenvs -- an empty artifact list
   // beside 78 virtualenvs is not an empty page, and saying so would be
   // wrong in the one place the user is looking for the total.
-  if (artifacts.length === 0 && (!showVenvs || venvCount === 0)) {
+  //
+  // And only when the scan actually ANSWERED (#846). `artifacts.length
+  // === 0` is true on a rejection too -- `data` is left at its `[]`
+  // default -- so without the `!isError` guard this branch was reached
+  // first and reported a clean machine. It is the branch the whole issue
+  // is about, and `artifactsError` below is unreachable without this.
+  if (!isError && artifacts.length === 0 && (!showVenvs || venvCount === 0)) {
     return (
       <p className="p-4 text-sm text-[#8b949e]">
         No {label} found in the scanned directories.
@@ -202,7 +256,15 @@ export function ArtifactsPage() {
 
   return (
     <div className="p-4">
-      {showArtifacts ? (
+      {/* IN PLACE OF the toolbar and the list, not above them (#846).
+
+          A failed scan has no count, no total and no rows, so rendering
+          "0 directories · 0 B" beside an error would state two things at
+          once and let the eye take the reassuring one. The virtualenv
+          section below is untouched and still renders, which is the whole
+          reason this is a panel rather than an early return. */}
+      {artifactsError}
+      {showArtifacts && !isError ? (
       // Wraps on the phone: six items on one 390px line broke "3
       // directories" and "4.8 GB" across lines mid-phrase.
       <div className={isMobile ? "mb-3 flex flex-wrap items-center gap-2 text-sm" : "mb-3 flex items-center gap-2 text-sm"}>
@@ -218,14 +280,10 @@ export function ArtifactsPage() {
           {pending > 0 ? "at least " : ""}
           {formatSize(totalBytes)}
         </span>
-        {pending > 0 ? (
-          <span
-            aria-live="polite"
-            className="text-xs text-[#58a6ff]"
-          >
-            measuring — {total - pending} of {total} repositories
-          </span>
-        ) : null}
+        {/* The measuring advisory has MOVED, to after the Remove buttons
+            (#852). See the comment beside it down there -- ordering is
+            #817's actual remedy, and it was upstream of two destructive
+            buttons here. */}
         {/* Age is the more useful ordering when every row is the same
             size -- which is the normal case for node_modules. */}
         <label className="flex items-center gap-1 text-xs text-[#8b949e]">
@@ -246,40 +304,129 @@ export function ArtifactsPage() {
 
         <HelpButton topic="build-artifacts" />
 
+        {/* A SPACER, replacing `ml-auto` on the buttons below (#852).
+
+            `ml-auto` made each Remove button's position a function of
+            everything upstream of it: a variable-width advisory appearing
+            mid-scan consumed the free space the margin was absorbing and
+            pushed the button left -- and on this container, which has no
+            `flex-wrap` and no `overflow` on the desktop, off the right
+            edge entirely. #817 rejected exactly this kind of remedy
+            ("reserving a slot… only stops the two from moving rather than
+            stopping them from being neighbours") in favour of structure.
+
+            An explicit `flex-1` item is that structure: it is the ONE
+            element that absorbs slack, so it is the only thing that
+            changes width when anything else does. Upstream items size
+            from their content and downstream items keep their position
+            relative to the right edge, rather than every item inheriting
+            a margin whose value depends on all the others.
+
+            `min-w-0` so it can collapse to nothing on a narrow window
+            rather than being the thing that forces a wrap. */}
+        <span aria-hidden="true" className="min-w-0 flex-1" />
+
         {/* One click for the group, EXCLUDING anything a build may be
             writing to. Those are refused at delete time anyway, so
             selecting them would only produce a failure report the user
             did not ask for -- and the count in the label would promise
             more than the click delivers. */}
-        {removable.length > 1 && checked.size === 0 ? (
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => {
-              setChecked(new Set(removable.map((r) => r.path)));
-              setConfirming(true);
-            }}
-            className="ml-auto rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#f85149] hover:bg-[#f85149]/10 disabled:opacity-50"
+        {/* A FIXED-WIDTH action cell, so the two buttons cannot jump past
+            each other (#852).
+
+            The pair differ in width by a lot -- "Remove all 47 · 112 GB"
+            against "Remove 3 · 8 GB" -- and they swap on the first
+            checkbox tick, so ticking a row moved the button the user was
+            about to aim at. `WorktreesPage`'s row reached the same shape
+            for the same reason: "A row's layout should not depend on
+            which action it currently offers."
+
+            `justify-end` so the button hugs the right edge whichever one
+            is showing, and the cell is absent entirely when neither is --
+            a permanently reserved gap on a toolbar that is usually
+            complete without it is the cost #817 declined to pay, and here
+            there is no need: the spacer above already holds the position,
+            so removing the cell changes nothing upstream of it. */}
+        {removable.length > 1 || checked.size > 0 ? (
+          <span
+            className={
+              isMobile
+                ? "flex shrink-0 items-center justify-end"
+                : "flex w-48 shrink-0 items-center justify-end"
+            }
           >
-            Remove all {removable.length}
-            {pending > 0 ? "" : ` · ${formatSize(removableBytes)}`}
-          </button>
+            {checked.size > 0 ? (
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => setConfirming(true)}
+                className="rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#f85149] hover:bg-[#f85149]/10 disabled:opacity-50"
+              >
+                {/* The COUNT and the size in the label, so the scope is
+                    legible before the dialog rather than only inside it. */}
+                {busy
+                  ? "Removing…"
+                  : `Remove ${checked.size} · ${formatSize(selectedBytes)}`}
+              </button>
+            ) : (
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => {
+                  setChecked(new Set(removable.map((r) => r.path)));
+                  setConfirming(true);
+                }}
+                className="rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#f85149] hover:bg-[#f85149]/10 disabled:opacity-50"
+              >
+                Remove all {removable.length}
+                {pending > 0 ? "" : ` · ${formatSize(removableBytes)}`}
+              </button>
+            )}
+          </span>
         ) : null}
 
-        {checked.size > 0 ? (
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => setConfirming(true)}
-            className="ml-auto rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#f85149] hover:bg-[#f85149]/10 disabled:opacity-50"
-          >
-            {/* The COUNT and the size in the label, so the scope is
-                legible before the dialog rather than only inside it. */}
-            {busy
-              ? "Removing…"
-              : `Remove ${checked.size} · ${formatSize(selectedBytes)}`}
-          </button>
-        ) : null}
+        {/* The measuring advisory, AFTER the destructive buttons -- #817's
+            actual remedy, applied here (#852).
+
+            It used to sit upstream of both Remove buttons, and it appears
+            on its OWN schedule as each repository's measurement lands. So
+            a purely advisory element, arriving unbidden, moved a control
+            that deletes directories -- and the desktop container has no
+            `flex-wrap` and no `overflow`, so the button went off the right
+            edge rather than onto a second line.
+
+            `WorktreesPage`: "With the group after Remove, nothing upstream
+            of Remove changes width when the button appears… by
+            construction rather than by tuning." The same argument settles
+            this: nothing downstream of Remove can move it, whatever it
+            does, because the spacer above is the only item that yields.
+
+            The cost is the same one #817 accepted -- an advisory is no
+            longer where the eye first lands -- and the trade is the same:
+            this is idempotent and merely informative, Remove deletes
+            directories, and when only one of them can hold a stable
+            position it is not the advisory one.
+
+            The live region is also now ALWAYS MOUNTED, which is the other
+            half of #852. `StatusBar` states the rule: "`aria-live` on the
+            CONTAINER, which is always mounted, rather than on the message,
+            which is not. A live region has to exist before the text
+            appears or the first announcement is missed -- the one that
+            matters most, since it is the one saying work started."
+
+            This was the conditional form: the `<span>` carrying
+            `aria-live` was itself created when `pending` first went
+            positive, so the announcement it was created to make was the
+            one a screen reader never heard. The container now persists and
+            holds an empty string when idle, exactly as the status bar
+            does. It costs nothing visually -- an empty span with no
+            padding -- and it means the FIRST count is announced.
+
+            `shrink-0` still, so the advisory is never what the toolbar
+            compresses; it has nothing downstream of it to push. */}
+        <span aria-live="polite" className="shrink-0 text-xs text-[#58a6ff]">
+          {pending > 0 ? `measuring — ${total - pending} of ${total} repositories` : ""}
+        </span>
       </div>
       ) : null}
 
@@ -392,7 +539,12 @@ export function ArtifactsPage() {
         </Dialog>
       ) : null}
 
-      {showArtifacts ? (
+      {/* `!isError` as well (#846). `rows` is empty on a rejection so
+          this renders nothing either way, but an empty `<ul>` under an
+          error panel is a list asserting there are no rows -- and the
+          gate should say what it means rather than rely on the data
+          happening to be empty. */}
+      {showArtifacts && !isError ? (
       <ul className="flex flex-col gap-1">
         {rows.map((a) => (
           <ArtifactRow

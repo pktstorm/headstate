@@ -13,7 +13,19 @@ export function WorktreeSidebar({
 }: {
   viewCounts?: Partial<Record<View, number>>;
 }) {
-  const { data: repos } = useWorktrees();
+  // `isLoading` and `isError`, not just the data (#846).
+  //
+  // This column had ZERO loading or error handling. On a failed
+  // `useWorktrees`, `repos` is `undefined` -- so both guards at the
+  // bottom of the list fail (`repos !== undefined && …` and
+  // `repos?.length === 0`), `allCount` reduces over `[]`, and the column
+  // rendered exactly one thing: "All repositories  0". A failure as a
+  // confident zero, in the one place the user looks to ask where the disk
+  // went. `RepoPickerSidebar` -- the plain list this one is a decorated
+  // version of -- has always distinguished the two, and states why:
+  // "'We have not looked yet' and 'we looked and there is nothing' are
+  // opposite answers".
+  const { data: repos, isLoading, isError, refetch } = useWorktrees();
   const filters = useActiveFilters();
   const { setFilter } = useFilters();
 
@@ -21,6 +33,21 @@ export function WorktreeSidebar({
     `flex w-full items-center justify-between rounded px-3 py-2 text-sm ${
       active ? "bg-[#1f6feb] text-white" : "text-[#e6edf3] hover:bg-[#161b22]"
     }`;
+
+  /// `aria-current` for the selected row (#852). The blue was carrying the
+  /// selection alone, against the rule `StatsSidebar` states: "the
+  /// selection is navigation state, and a screen reader reading a list of
+  /// repository names has no other way to know which one is open."
+  ///
+  /// `"true"` rather than `"page"`: these rows SCOPE the worktree view
+  /// rather than navigating to a different one. `undefined` on the
+  /// inactive rows, because absence is how "not current" is spelled and
+  /// `aria-current="false"` is announced by some readers.
+  ///
+  /// It covers the Orphaned row too, which is the one that most needs it:
+  /// its only other distinguishing mark is its amber text, so a reader who
+  /// cannot see colour had nothing at all.
+  const current = (active: boolean) => (active ? ("true" as const) : undefined);
 
   // Worktree count EXCLUDING the main checkout: it is not a worktree you
   // would ever remove, and counting it inflates every repo by one.
@@ -74,6 +101,29 @@ export function WorktreeSidebar({
     <nav className="flex w-64 shrink-0 flex-col border-r border-[#30363d] p-3">
       <ViewSwitcher counts={viewCounts} />
       <div className="min-h-0 flex-1 overflow-y-auto">
+        {/* The scan's state, ABOVE the rows, and a failure is not a zero
+            (#846).
+
+            `RepoPickerSidebar`'s wording and reasoning, because this is
+            the same scan answering the same question and two phrasings of
+            it would be two claims. The retry is here rather than only on
+            the page body because this column is what a user stares at
+            when the page looks empty -- and with no error and no retry,
+            the failure was not merely unreported but reassuring. */}
+        {isLoading ? (
+          <p className="px-3 py-2 text-xs text-[#8b949e]">Looking for repositories…</p>
+        ) : isError ? (
+          <div className="px-3 py-2">
+            <p className="text-xs text-[#f85149]">Could not scan for worktrees.</p>
+            <button
+              type="button"
+              onClick={() => void refetch()}
+              className="mt-1 rounded border border-[#30363d] px-2 py-0.5 text-xs text-[#e6edf3] hover:bg-[#161b22]"
+            >
+              Try again
+            </button>
+          </div>
+        ) : null}
         {/* Missing entirely before: with no "all" entry, clearing the
             repo filter fell through to `repos?.[0]` and silently showed
             the FIRST repo -- so across 37 repos there was no way to ask
@@ -82,16 +132,29 @@ export function WorktreeSidebar({
         <button
           type="button"
           onClick={() => setFilter("repo", undefined)}
+          aria-current={current(!filters.repo)}
           className={rowClass(!filters.repo)}
         >
           <span>All repositories</span>
-          <span className="ml-2 shrink-0">{allCount}</span>
+          {/* An em dash until the scan has ANSWERED (#846). `allCount`
+              reduces over `[]` whether the scan has not run, is running,
+              or rejected -- so the row printed a confident "0" in all
+              three cases, and "All repositories  0" was the entire
+              content of this column on a failure.
+
+              The same rule the size cells on the worktree page follow: an
+              unknown renders as a dash, never as a number, because zero
+              is an ANSWER and this has none. */}
+          <span className="ml-2 shrink-0">
+            {repos === undefined ? "—" : allCount}
+          </span>
         </button>
         {withWorktrees.map((r) => (
           <button
             type="button"
             key={r.path}
             onClick={() => setFilter("repo", r.path)}
+            aria-current={current(filters.repo === r.path)}
             className={rowClass(filters.repo === r.path)}
           >
             <span className="truncate">{r.name}</span>
@@ -116,6 +179,7 @@ export function WorktreeSidebar({
             <button
               type="button"
               onClick={() => setFilter("repo", ORPHAN_FILTER)}
+              aria-current={current(filters.repo === ORPHAN_FILTER)}
               className={rowClass(filters.repo === ORPHAN_FILTER)}
             >
               <span className="truncate text-[#d29922]">Orphaned</span>
@@ -123,6 +187,16 @@ export function WorktreeSidebar({
             </button>
           </div>
         ) : null}
+        {/* `repos?.length === 0`, and the optional chain is load-bearing
+            in the OTHER direction now (#846): it is false on `undefined`,
+            so this DIAGNOSIS -- "check the scanned directories" -- is
+            correctly silent while the scan has not answered. That is the
+            `RepoPickerSidebar` rule ("sends someone to fix something that
+            is not broken"), and it was already satisfied here.
+
+            What was missing is the positive half: a silent column said
+            nothing at all on a failure. The arm at the top of this list
+            is that half, and this stays exactly as it was. */}
         {repos?.length === 0 ? (
           <p className="px-3 py-2 text-xs text-[#8b949e]">
             No repositories found. Check the scanned directories in Settings.

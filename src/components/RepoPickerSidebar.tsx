@@ -21,6 +21,17 @@ export function RepoPickerSidebar({ reviewingCount }: { reviewingCount: number }
       active ? "bg-[#1f6feb] text-white" : "text-[#e6edf3] hover:bg-[#161b22]"
     }`;
 
+  /// `aria-current` for the selected row (#852). The blue was carrying the
+  /// selection alone, against the rule `StatsSidebar` states: "the
+  /// selection is navigation state, and a screen reader reading a list of
+  /// repository names has no other way to know which one is open."
+  ///
+  /// `"true"` rather than `"page"`: these rows SCOPE the current page
+  /// rather than navigating to a different one. `undefined` on the
+  /// inactive rows, because absence is how "not current" is spelled and
+  /// `aria-current="false"` is announced by some readers.
+  const current = (active: boolean) => (active ? ("true" as const) : undefined);
+
   return (
     <nav className="flex w-64 shrink-0 flex-col border-r border-[#30363d] p-3">
       <ViewSwitcher counts={{ "to-review": reviewingCount }} />
@@ -46,6 +57,7 @@ export function RepoPickerSidebar({ reviewingCount }: { reviewingCount: number }
             type="button"
             key={r.path}
             onClick={() => setFilter("repo", r.path)}
+            aria-current={current(filters.repo === r.path)}
             className={rowClass(filters.repo === r.path)}
           >
             <span className="truncate">{r.name}</span>

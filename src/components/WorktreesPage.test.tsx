@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Lock, Worktree, WorktreeRepo } from "@/types/pr";
 import { useFilters } from "@/store/filters";
 import { stubViewport } from "@/test-utils";
+import { ORPHAN_FILTER } from "@/lib/worktrees";
 
 const state = vi.hoisted(() => ({
   repos: undefined as WorktreeRepo[] | undefined,
@@ -41,6 +42,19 @@ const state = vi.hoisted(() => ({
   // page never read `isError`, so a rejection showed skeletons and then
   // silently became an em dash.
   sizingFailed: false,
+  // The orphan confirmation's measured size (#845). An orphan's size
+  // comes from nowhere else on this page -- `sizeWorktrees` opens with
+  // `git worktree list` inside a repository that is gone -- so it is its
+  // own query and its own three fields here. `null` bytes is NOT zero:
+  // the dialog says "not known" rather than "frees 0 B", because zero
+  // reads as "this tree is empty, delete it".
+  // 2.5 GiB exactly, so the assertion can match "2.5 GB" -- `formatSize`
+  // divides by 1024, and a round decimal 2_500_000_000 renders as "2.3
+  // GB". The figure itself is the one #845 measured: 2.5 GB across three
+  // real orphans whose parent repositories had been deleted.
+  orphanBytes: 2_684_354_560 as number | null,
+  orphanMeasuring: false,
+  orphanSizeFailed: false,
 }));
 
 const toastSuccess = vi.hoisted(() => vi.fn());
@@ -80,6 +94,14 @@ vi.mock("../api/hooks", () => ({
   // open, which is why the default here is an empty list.
   usePullCheckout: () => pullFn,
   useRemoveOrphan: () => removeOrphanFn,
+  // The orphan confirmation's size (#845). Three states, because the
+  // dialog renders a different sentence for each and a mock that only
+  // ever answered with a number could not reach two of them.
+  useOrphanSize: () => ({
+    bytes: state.orphanBytes,
+    measuring: state.orphanMeasuring,
+    failed: state.orphanSizeFailed,
+  }),
   // Sizes land one repository at a time on the all-repos view, so the
   // mock carries the progress fields the page renders.
   useAllWorktreeSizes: () => ({
@@ -270,6 +292,11 @@ describe("WorktreesPage on a phone", () => {
       sizesFailed: 0,
       sizing: false,
       sizingFailed: false,
+      // #845. A leaked `orphanMeasuring` would put every orphan dialog
+      // on "Measuring…" and hide the figure the dialog exists to state.
+      orphanBytes: 2_684_354_560,
+      orphanMeasuring: false,
+      orphanSizeFailed: false,
       assessed: [],
       prs: [],
     });
@@ -359,7 +386,6 @@ describe("WorktreesPage", () => {
     useFilters.setState({
       filtersByView: { ...EMPTY, worktrees: { repo: "/code/proj" } },
       view: "worktrees",
-      panel: "list",
     });
     // Calls leak between tests otherwise, which makes "was not called"
     // assertions pass or fail depending on ordering.
@@ -1430,11 +1456,92 @@ describe("WorktreesPage", () => {
     const orphan = () =>
       wt({ path: "/code/veil-coh", safety: { kind: "orphaned" } as never });
 
+    /// Opens the confirmation and returns its confirm button (#845).
+    ///
+    /// A helper because every deletion test now goes through two
+    /// gestures, and spelling the pair out inline is how one of them
+    /// ends up omitted -- which is precisely the shape of the bug these
+    /// tests are pinning.
+    const confirmDelete = () => {
+      fireEvent.click(screen.getByRole("button", { name: /^delete…$/i }));
+      return screen.getByRole("button", { name: /delete it anyway/i });
+    };
+
     it("offers Delete rather than a disabled Remove", () => {
       state.classified = [orphan()];
       render(<WorktreesPage />);
-      const btn = screen.getByRole("button", { name: /delete/i }) as HTMLButtonElement;
+      const btn = screen.getByRole("button", { name: /^delete…$/i }) as HTMLButtonElement;
       expect(btn.disabled).toBe(false);
+    });
+
+    /// #845: the row must ASK, not delete.
+    ///
+    /// This was the only directory-deleting action in the app with no
+    /// dialog, and the only one where nothing about the contents had
+    /// been verified. The assertion that matters is the NEGATIVE one:
+    /// the click that used to destroy a directory must now destroy
+    /// nothing.
+    it("does not delete anything on the row's own click", () => {
+      state.classified = [orphan()];
+      render(<WorktreesPage />);
+      fireEvent.click(screen.getByRole("button", { name: /^delete…$/i }));
+      expect(removeOrphanFn).not.toHaveBeenCalled();
+      expect(screen.getByRole("dialog")).toBeTruthy();
+    });
+
+    /// The four things #845 requires the dialog to say, in one test
+    /// because a dialog missing any one of them is the defect.
+    it("names the path, the size, that nothing was checked, and to copy it first", () => {
+      state.classified = [orphan()];
+      render(<WorktreesPage />);
+      fireEvent.click(screen.getByRole("button", { name: /^delete…$/i }));
+      const dialog = screen.getByRole("dialog");
+      expect(within(dialog).getByText("/code/veil-coh")).toBeTruthy();
+      expect(within(dialog).getByText(/frees 2\.5 GB/i)).toBeTruthy();
+      expect(within(dialog).getByText(/nothing inside could be checked/i)).toBeTruthy();
+      // The help text's own sentence, verbatim -- the only advice that
+      // survives the click, and `title` is hover-only so the dialog is
+      // the only surface that can carry it on touch.
+      expect(
+        within(dialog).getByText(/copy the directory somewhere first/i),
+      ).toBeTruthy();
+    });
+
+    /// A size that is not known must never render as zero (#845).
+    ///
+    /// `formatSize(0)` reads as "this tree is empty, delete it", which is
+    /// the most damaging thing this dialog could say about a directory it
+    /// could not measure -- the same rule `size_worktrees` states about
+    /// flattening its own nulls.
+    it("says the size is unknown rather than claiming it frees nothing", () => {
+      state.classified = [orphan()];
+      state.orphanBytes = null;
+      state.orphanSizeFailed = true;
+      render(<WorktreesPage />);
+      fireEvent.click(screen.getByRole("button", { name: /^delete…$/i }));
+      const dialog = screen.getByRole("dialog");
+      expect(within(dialog).getByText(/could not be measured/i)).toBeTruthy();
+      expect(within(dialog).queryByText(/frees 0/i)).toBeNull();
+    });
+
+    /// "Still measuring" and "there is nothing to measure" are opposite
+    /// answers, and one value for both is how a dialog states a figure it
+    /// does not have -- the mistake `VenvSection` fixed for its own scan.
+    it("says it is still measuring rather than stating a figure it lacks", () => {
+      state.classified = [orphan()];
+      state.orphanBytes = null;
+      state.orphanMeasuring = true;
+      render(<WorktreesPage />);
+      fireEvent.click(screen.getByRole("button", { name: /^delete…$/i }));
+      expect(screen.getByText(/measuring how much is in here/i)).toBeTruthy();
+    });
+
+    it("deletes nothing when the confirmation is cancelled", () => {
+      state.classified = [orphan()];
+      render(<WorktreesPage />);
+      fireEvent.click(screen.getByRole("button", { name: /^delete…$/i }));
+      fireEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
+      expect(removeOrphanFn).not.toHaveBeenCalled();
     });
 
     /// A DIFFERENT call from the ordinary removal: git cannot remove a
@@ -1443,7 +1550,7 @@ describe("WorktreesPage", () => {
     it("deletes through the orphan path, not the worktree path", async () => {
       state.classified = [orphan()];
       render(<WorktreesPage />);
-      fireEvent.click(screen.getByRole("button", { name: /delete/i }));
+      fireEvent.click(confirmDelete());
       await waitFor(() => expect(removeOrphanFn).toHaveBeenCalledWith("/code/veil-coh"));
       expect(removeFn).not.toHaveBeenCalled();
     });
@@ -1452,11 +1559,53 @@ describe("WorktreesPage", () => {
       state.classified = [orphan()];
       removeOrphanFn.mockRejectedValueOnce("this is no longer an orphaned worktree");
       render(<WorktreesPage />);
-      fireEvent.click(screen.getByRole("button", { name: /delete/i }));
+      fireEvent.click(confirmDelete());
       await waitFor(() => expect(toastError).toHaveBeenCalled());
       expect(toastError.mock.calls[0][1]).toMatchObject({
         description: "this is no longer an orphaned worktree",
       });
+    });
+
+    /// #845's third acceptance criterion: reachable and legible ON TOUCH,
+    /// where `title` is unavailable.
+    ///
+    /// The whole justification for shipping no dialog rested on the button's
+    /// `title`, which is hover-only -- on a page that has a mobile layout.
+    /// So the confirmation has to exist at a phone width, and it has to
+    /// carry the warning in TEXT rather than in a tooltip, because on touch
+    /// a tooltip is not a surface at all.
+    it("confirms at a phone width, with the warning in text rather than a tooltip", () => {
+      stubViewport(390);
+      state.classified = [orphan()];
+      render(<WorktreesPage />);
+      const btn = screen.getByRole("button", { name: /^delete…$/i });
+      fireEvent.click(btn);
+      const dialog = screen.getByRole("dialog");
+      // The warning is READABLE, not hidden in a `title`.
+      expect(within(dialog).getByText(/nothing inside could be checked/i)).toBeTruthy();
+      expect(within(dialog).getByText(/copy the directory somewhere first/i)).toBeTruthy();
+      // And the row's own button no longer carries the warning it used to
+      // smuggle into a hover-only attribute.
+      expect(btn.getAttribute("title")).not.toMatch(/copy the directory/i);
+    });
+
+    /// The dialog has to exist on BOTH paths an orphan row renders on
+    /// (#845): the Orphaned section and a repository page that happens to
+    /// contain one. Mounting it inside one branch would leave the other
+    /// click unconfirmed, which is the split that let this ship.
+    it("confirms on the Orphaned section too, not only the repository page", () => {
+      state.repos = [
+        { identity: null, name: "veil-coh", path: "/code/veil-coh", worktrees: [orphan()] },
+      ];
+      state.classified = undefined;
+      useFilters.setState({
+        filtersByView: { ...EMPTY, worktrees: { repo: ORPHAN_FILTER } },
+        view: "worktrees",
+      } as never);
+      render(<WorktreesPage />);
+      fireEvent.click(screen.getByRole("button", { name: /^delete…$/i }));
+      expect(removeOrphanFn).not.toHaveBeenCalled();
+      expect(screen.getByRole("dialog")).toBeTruthy();
     });
 
     /// An orphan must never reach the bulk path: it is precisely the
@@ -1760,7 +1909,6 @@ describe("WorktreesPage", () => {
         filtersByView: { ...EMPTY, worktrees: {},
   branches: {} },
         view: "worktrees",
-        panel: "list",
       });
       return render(<WorktreesPage />);
     };
@@ -1801,7 +1949,6 @@ describe("WorktreesPage", () => {
         filtersByView: { ...EMPTY, worktrees: {},
   branches: {} },
         view: "worktrees",
-        panel: "list",
       });
       render(<WorktreesPage />);
       expect(screen.getByText(/at least/i)).toBeTruthy();
@@ -1826,7 +1973,6 @@ describe("WorktreesPage", () => {
       useFilters.setState({
         filtersByView: { ...EMPTY, worktrees: { repo: "/code/proj" } },
         view: "worktrees",
-        panel: "list",
       });
       return render(<WorktreesPage />);
     };
@@ -2089,7 +2235,7 @@ describe("WorktreesPage", () => {
     it("leaves an orphan to its own Delete button", () => {
       state.classified = [wt({ safety: { kind: "orphaned" } })];
       render(<WorktreesPage />);
-      expect(screen.getByRole("button", { name: /^delete$/i })).toBeTruthy();
+      expect(screen.getByRole("button", { name: /^delete…$/i })).toBeTruthy();
       openKebab();
       expect(screen.queryByRole("menuitem", { name: /remove worktree/i })).toBeNull();
     });

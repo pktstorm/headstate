@@ -47,15 +47,36 @@ export function UpdateDialog({
             {error}
           </p>
         ) : null}
-        {busy ? (
-          <p className="mt-3 text-xs text-[#8b949e]">
-            {/* A bundle is ~20 MB, long enough on a slow connection that
-                a dialog with no feedback reads as hung. */}
-            {total
+        {/* A LIVE REGION, always mounted, which this had none of (#852).
+
+            The error path beside it has `role="alert"` and this had
+            nothing -- so the operation that REPLACES AND RESTARTS THE APP
+            reported its progress to sighted users only. A bundle is ~20 MB
+            and long enough on a slow connection that a dialog with no
+            feedback reads as hung; a reader who cannot see it had no
+            feedback at all, not even the line saying the install had
+            started.
+
+            Always mounted rather than wrapped in `busy`, which is the rule
+            `StatusBar` states: "A live region has to exist before the text
+            appears or the first announcement is missed -- the one that
+            matters most, since it is the one saying work started." Here
+            that announcement is the whole point -- the user has just
+            pressed Install on something that will close the app under
+            them, and "Downloading…" is the confirmation that it took.
+
+            `polite` rather than `assertive`: a percentage must not
+            interrupt, and the same choice is made in the status bar for
+            the same reason. The error beside it keeps `role="alert"`,
+            which is assertive, and that asymmetry is correct -- a refused
+            update is news, a progressing one is not. */}
+        <p aria-live="polite" className={busy ? "mt-3 text-xs text-[#8b949e]" : "text-xs"}>
+          {busy
+            ? total
               ? `Downloading — ${Math.round((downloaded / total) * 100)}%`
-              : "Downloading…"}
-          </p>
-        ) : null}
+              : "Downloading…"
+            : ""}
+        </p>
         {/* `whitespace-nowrap` on the row, not on each button: adding
             a third action to a dialog sized for two squeezed every
             label onto two lines. The wider dialog gives them room and

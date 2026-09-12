@@ -385,9 +385,15 @@ delete it. Here it has not, and you are the only check.
 
 ### What Delete does
 
-Removes the directory outright. There is no verification that the work
-inside ever landed anywhere, because that verification is exactly what
-is impossible.
+Asks first, then removes the directory outright. There is no
+verification that the work inside ever landed anywhere, because that
+verification is exactly what is impossible.
+
+The confirmation names the path, measures how much is in there, and says
+that nothing inside could be checked — the one place that advice is
+still actionable (#845). It used to fire straight from the row, which
+made this the only deletion in the app that destroyed a directory on one
+click having verified nothing about it.
 
 If you are unsure, copy the directory somewhere first. Nothing about it
 can be recovered afterwards.`,

@@ -108,15 +108,29 @@ interface FilterStore {
   /// Worktrees, which has an entirely different repo list.
   filtersByView: Record<View, Filters>;
   view: View;
-  /// The sub-page within a view: images versus builds inside Docker. A
-  /// separate axis from `view` for the same reason it always was.
+  /// `panel` is GONE as of #852, and the axis went with it.
   ///
-  /// `"stats"` is GONE as of #794 -- Stats is the `pr-stats` view now,
-  /// not a sub-page of My PRs. Dropping the value rather than keeping it
-  /// unused is the point: a value still in the union is one a component
-  /// can set, and a `panel` nobody routes on would be a silent no-op.
-  /// The v3 migration below rewrites a persisted `"stats"`.
-  panel: "list" | "builds";
+  /// It was Docker's images-versus-builds switch. #326 removed the Builds
+  /// PAGE ("its data was diagnostic rather than actionable -- a log with no
+  /// button on it") and #794 moved Stats out to its own view, which left
+  /// the axis holding exactly one reachable value. `"builds"` was never set
+  /// by any component and `DockerPage` never read `panel` at all, so every
+  /// remaining write was `setPanel("list")` -- a no-op.
+  ///
+  /// The comment that stood here stated the rule this was breaking: "a
+  /// value still in the union is one a component can set, and a `panel`
+  /// nobody routes on would be a silent no-op." It said that about
+  /// `"stats"` while `"builds"` sat beside it in the same condition, and
+  /// two components were dressing the no-op as navigation: `DockerSidebar`
+  /// rendered one permanently-active button whose only effect was
+  /// `setPanel("list")`, and `RepoTable` called it INSTEAD of `setView`,
+  /// making its documented navigation a dead click.
+  ///
+  /// Removed rather than kept for a hypothetical second Docker sub-page:
+  /// the union is what a component can set, so an axis nothing routes on
+  /// is a trap for the next caller, and re-adding one later is a smaller
+  /// change than the two bugs this one caused. The v4 migration below drops
+  /// a persisted value.
   setFilter: <K extends keyof Filters>(key: K, value: Filters[K]) => void;
   applyPreset: (filters: Filters) => void;
   /// Pick a PR Stats scope, and optionally a person within it (#825).
@@ -141,7 +155,6 @@ interface FilterStore {
     subject: string | undefined,
   ) => void;
   setView: (view: View) => void;
-  setPanel: (panel: "list" | "builds") => void;
   /// Which System Health page is open (#687).
   ///
   /// Deliberately NOT persisted, unlike `view` and `panel`. Those
@@ -247,7 +260,6 @@ export const useFilters = create<FilterStore>()(
     (set) => ({
       filtersByView: { ...EMPTY_FILTERS },
       view: "my-prs",
-      panel: "list",
       density: "comfortable",
       setDensity: (density) => set({ density }),
       setFilter: (key, value) =>
@@ -297,10 +309,13 @@ export const useFilters = create<FilterStore>()(
       // clobbering a preference the user set deliberately. The store test
       // asserts density outlives a preset, because nothing did and that is
       // precisely why this survived.
+      // The `panel: "list"` reset here is gone with the axis (#852). It
+      // existed to drop a preset user back out of the stats sub-page, and
+      // that destination has been a view since #794 -- so by the time the
+      // axis was removed this was writing the only value anything read.
       applyPreset: (filters) =>
         set((s) => ({
           filtersByView: { ...s.filtersByView, [s.view]: filters },
-          panel: "list",
         })),
       // Selection clears with the view: a working set assembled on My
       // PRs means nothing on the review list, and carrying it across
@@ -319,7 +334,6 @@ export const useFilters = create<FilterStore>()(
           // there is a new question worth asking.
           healthPage: "overview",
         }),
-      setPanel: (panel) => set({ panel }),
       healthPage: "overview",
       setHealthPage: (healthPage) => set({ healthPage }),
       selectedPr: null,
@@ -365,12 +379,20 @@ export const useFilters = create<FilterStore>()(
       // `pr-stats` VIEW. A store written by v2 can hold
       // `panel: "stats"`, which now routes nowhere -- such a user would
       // land on the PR list with no sign their Stats page had moved.
-      version: 3,
+      //
+      // v4 (#852): `panel` is gone entirely. A v3 store carries
+      // `panel: "list"`, and `merge` below spreads the persisted object
+      // over the current one -- so without this the field would be put
+      // back onto a store whose type no longer has it, leaving a key
+      // nothing reads and `partialize` re-persisting it forever. Dropping
+      // it here is what actually ends the axis rather than just hiding it
+      // from the type.
+      version: 4,
       migrate: (persisted: unknown, from: number) => {
         // Run in ORDER and fall through, rather than one branch per
-        // starting version. A v1 store that sat unopened across both
-        // changes has to go v1 -> v2 -> v3; a chain of
-        // `if (from === n)` arms would apply one and skip the other,
+        // starting version. A v1 store that sat unopened across every
+        // change has to go v1 -> v2 -> v3 -> v4; a chain of
+        // `if (from === n)` arms would apply one and skip the others,
         // which is exactly the black-window class of bug the comment
         // below this is about.
         let state = persisted ?? {};
@@ -423,6 +445,34 @@ export const useFilters = create<FilterStore>()(
             };
           }
         }
+        if (from < 4) {
+          // v3 -> v4: drop `panel` (#852). The axis is gone, so a stored
+          // value is a key nothing reads -- and `merge` below spreads the
+          // persisted object over the current store, so leaving it would
+          // put it back on every launch and `partialize` would re-persist
+          // it forever.
+          //
+          // The two arms above deliberately still WRITE `panel`: they
+          // describe the shapes v2 and v3 actually had, and rewriting
+          // history to pretend the field never existed would make the
+          // "stats" rescue above unreadable. This arm is where it leaves,
+          // which is also why the chain has to fall through rather than
+          // branch -- a v1 store must reach here too.
+          //
+          // `delete` on a COPY, not `panel: undefined`. An explicit
+          // `undefined` is still an own property, and `merge`'s spread
+          // would write it over the default -- so the key would survive
+          // with a worse value than before. A copy rather than mutating
+          // `persisted`, which the caller still owns.
+          //
+          // `delete` rather than a rest destructure because the binding a
+          // rest pattern leaves behind is unused by construction, and this
+          // project's lint rules correctly refuse an unused variable
+          // whatever it is named.
+          const rest = { ...(state as Record<string, unknown>) };
+          delete rest.panel;
+          state = rest;
+        }
         return state as never;
       },
       // Stored state is REPLACED into the store, not merged, so adding a
@@ -451,7 +501,9 @@ export const useFilters = create<FilterStore>()(
           Object.entries(s.filtersByView).map(([k, f]) => [k, { ...f, query: undefined }]),
         ) as Record<View, Filters>,
         view: s.view,
-        panel: s.panel,
+        // `panel` is gone (#852). Left here it would re-persist the field
+        // the v4 migration drops, so the next launch would read it back
+        // and the axis would survive its own removal.
         density: s.density,
       }),
     },

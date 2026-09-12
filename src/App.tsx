@@ -71,7 +71,7 @@ export default function App() {
     dataUpdatedAt,
   } = usePullRequests();
   const filters = useActiveFilters();
-  const { view: storedView, panel, selectedPr, selectPr, applyPreset } = useFilters();
+  const { view: storedView, selectedPr, selectPr, applyPreset } = useFilters();
   const isMobile = useIsMobile();
   // A view the companion does not ship falls back to the default one.
   //
@@ -100,7 +100,14 @@ export default function App() {
   // the place it was opened from, so moving anywhere else makes it
   // closed by derivation rather than by an effect that runs a render
   // late.
-  const navKey = `${view}|${panel}|${filters.repo ?? ""}`;
+  //
+  // `panel` is gone from this key with the axis itself (#852). It had been
+  // contributing a constant since #326 removed the Builds page -- nothing
+  // ever set anything but `"list"` -- so every value of this key carried
+  // the same literal, and dropping it changes no behaviour. Kept in mind
+  // rather than silently: this key's job is to name every axis that
+  // changes WHERE you are, so a reader should know why one of them left.
+  const navKey = `${view}|${filters.repo ?? ""}`;
   const [navOpenedAt, setNavOpenedAt] = useState<string | null>(null);
   const navOpen = navOpenedAt === navKey;
   const setNavOpen = (open: boolean) => setNavOpenedAt(open ? navKey : null);
@@ -123,9 +130,12 @@ export default function App() {
   // Every axis that changes WHAT is rendered, and nothing that merely
   // changes the data within it. A poll tick refreshing the same list
   // must not scroll the user away from what they are reading.
+  // `panel` dropped here too (#852), and for the same reason as `navKey`
+  // above: it had been a constant in this string since #326, so it could
+  // never have been one of the axes this key exists to watch.
   useScrollReset(
     mainRef,
-    `${view}|${panel}|${filters.repo ?? ""}|${selectedPr ? `${selectedPr.repo}#${selectedPr.number}` : ""}`,
+    `${view}|${filters.repo ?? ""}|${selectedPr ? `${selectedPr.repo}#${selectedPr.number}` : ""}`,
   );
 
   // The tray's "Refresh now" menu item only emits `refresh-requested`; this

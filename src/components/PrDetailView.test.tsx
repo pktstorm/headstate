@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PrDetail } from "@/types/pr";
 import { stubViewport } from "@/test-utils";
+import { scopeEffect } from "@/lib/branchDelete";
 
 const state = vi.hoisted(() => ({
   data: undefined as PrDetail | undefined,
@@ -624,10 +625,92 @@ describe("PrDetailView", () => {
       expect(screen.queryByRole("button", { name: /delete branch/i })).toBeNull();
     });
 
+    /// #845: the button must ASK, not delete.
+    ///
+    /// This is a REMOTE deletion -- `deleteBranch(..., true)` -- and it
+    /// fired straight from `onClick`. `BranchesPage` states the rule for
+    /// the very same operation: "Local deletion is recoverable from the
+    /// reflog; a remote deletion is not, so it is never what a distracted
+    /// Enter press does." The negative assertion is the one that matters.
+    it("does not delete anything on the button's own click", () => {
+      state.data = { ...detail(), state: "MERGED", head_ref_id: "REF_1" };
+      render(<PrDetailView repo="o/r" number={1} onBack={() => {}} />);
+      fireEvent.click(screen.getByRole("button", { name: /delete branch/i }));
+      expect(deleteBranch).not.toHaveBeenCalled();
+      expect(screen.getByRole("dialog")).toBeTruthy();
+    });
+
+    /// The confirmation carries `BranchesPage`'s own sentence, through
+    /// `scopeEffect("remote")` rather than a second copy of the words.
+    /// Two wordings of "no local reflog can undo that" would be two
+    /// claims about one operation.
+    it("warns in the same words BranchesPage uses for a remote deletion", () => {
+      state.data = { ...detail(), state: "MERGED", head_ref_id: "REF_1" };
+      render(<PrDetailView repo="o/r" number={1} onBack={() => {}} />);
+      fireEvent.click(screen.getByRole("button", { name: /delete branch/i }));
+      const dialog = screen.getByRole("dialog");
+      expect(within(dialog).getByText(scopeEffect("remote"))).toBeTruthy();
+      // The ref is named TWICE and that is deliberate: once in the title,
+      // which is what a screen reader announces on open, and once in mono
+      // beside the repository, which is what the eye checks. A branch name
+      // in prose alone is easy to skim past, and it is the only
+      // identifier of what is about to go.
+      expect(within(dialog).getAllByText(/feature\/retry/)).toHaveLength(2);
+      expect(within(dialog).getByText(/octocat\/hello-world/)).toBeTruthy();
+    });
+
+    it("deletes nothing when the confirmation is cancelled", () => {
+      state.data = { ...detail(), state: "MERGED", head_ref_id: "REF_1" };
+      render(<PrDetailView repo="o/r" number={1} onBack={() => {}} />);
+      fireEvent.click(screen.getByRole("button", { name: /delete branch/i }));
+      fireEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
+      expect(deleteBranch).not.toHaveBeenCalled();
+    });
+
+    /// Styled as destructive, which it was not (#845).
+    ///
+    /// The old `className` was BYTE-IDENTICAL to "View on GitHub" and
+    /// "Copy for agent" beside it -- two actions that change nothing --
+    /// so the one control that destroyed a shared ref carried no warning
+    /// at all. Asserted against its NEIGHBOURS rather than against a
+    /// literal class string: the defect was the sameness, so the test has
+    /// to be about the difference.
+    it("does not look like the harmless buttons beside it", () => {
+      state.data = { ...detail(), state: "MERGED", head_ref_id: "REF_1" };
+      render(<PrDetailView repo="o/r" number={1} onBack={() => {}} />);
+      const del = screen.getByRole("button", { name: /delete branch/i });
+      const agent = screen.getByRole("button", { name: /copy for agent/i });
+      expect(del.className).not.toBe(agent.className);
+      // The red every other destructive control in the app uses.
+      expect(del.className).toContain("#f85149");
+      expect(agent.className).not.toContain("#f85149");
+    });
+
+    /// #845's third acceptance criterion: reachable and legible ON TOUCH.
+    ///
+    /// This view has a phone layout (the footer wraps), and the only thing
+    /// distinguishing the old button from the two harmless ones beside it
+    /// would have had to be a tooltip -- which does not exist on touch. Both
+    /// halves of the fix are therefore asserted at a phone width: the
+    /// confirmation, and the colour that is not a hover affordance.
+    it("confirms and reads as destructive at a phone width", () => {
+      stubViewport(390);
+      state.data = { ...detail(), state: "MERGED", head_ref_id: "REF_1" };
+      render(<PrDetailView repo="o/r" number={1} onBack={() => {}} />);
+      const del = screen.getByRole("button", { name: /delete branch/i });
+      expect(del.className).toContain("#f85149");
+      fireEvent.click(del);
+      expect(deleteBranch).not.toHaveBeenCalled();
+      expect(
+        within(screen.getByRole("dialog")).getByText(scopeEffect("remote")),
+      ).toBeTruthy();
+    });
+
     it("passes merged=true so the backend gate can agree", async () => {
       state.data = { ...detail(), state: "MERGED", head_ref_id: "REF_1" };
       render(<PrDetailView repo="o/r" number={1} onBack={() => {}} />);
       fireEvent.click(screen.getByRole("button", { name: /delete branch/i }));
+      fireEvent.click(screen.getByRole("button", { name: /delete on the remote/i }));
       await waitFor(() => expect(deleteBranch).toHaveBeenCalled());
       expect(deleteBranch.mock.calls[0][0]).toBe("REF_1");
       expect(deleteBranch.mock.calls[0][4]).toBe(true);

@@ -6,6 +6,7 @@ import { useClaudeMd, useClaudeMdText } from "@/api/hooks";
 import { useActiveFilters } from "@/store/filters";
 import { formatSize } from "@/lib/worktrees";
 import { Markdown } from "./Markdown";
+import { QueryError, errorMessage } from "./QueryError";
 import { copyText } from "@/lib/clipboard";
 import { toast } from "sonner";
 
@@ -27,7 +28,18 @@ function tokenLabel(n: number): string {
 export function ClaudeMdPage() {
   const filters = useActiveFilters();
   const repo = filters.repo;
-  const { data: files = [], isLoading } = useClaudeMd(repo);
+  // `isError`, `error` and `refetch` as well as the data (#846). The
+  // `= []` default made a REJECTED scan read as "No CLAUDE.md files in
+  // this repository" -- a confident, wrong answer to a question the app
+  // could not answer, on a page whose own doc comment above stakes its
+  // design on "a wrong render costs a confused reader".
+  const {
+    data: files = [],
+    isLoading,
+    isError,
+    error,
+    refetch,
+  } = useClaudeMd(repo);
   const [selected, setSelected] = useState<string | undefined>(undefined);
   const isMobile = useIsMobile();
 
@@ -41,7 +53,20 @@ export function ClaudeMdPage() {
   // absent. The desktop keeps the fallback: its list is beside the
   // content, and an empty pane there would just look broken.
   const showingList = isMobile && selected === undefined;
-  const { data: text, isLoading: textLoading } = useClaudeMdText(active?.path);
+  // The content read's own failure, separately from the scan's (#846).
+  //
+  // Two queries, two failures, and they are genuinely different
+  // questions: the scan failing means the LIST is unknown, the read
+  // failing means one file could not be opened while the list beside it
+  // is fine. Collapsing them would either hide a readable list behind one
+  // unreadable file or hide an unreadable file behind a list that worked.
+  const {
+    data: text,
+    isLoading: textLoading,
+    isError: textError,
+    error: textErr,
+    refetch: refetchText,
+  } = useClaudeMdText(active?.path);
 
   if (!repo) {
     return (
@@ -52,6 +77,21 @@ export function ClaudeMdPage() {
   }
   if (isLoading) {
     return <p className="p-4 text-sm text-[#8b949e]">Looking for CLAUDE.md files…</p>;
+  }
+  // BEFORE the empty state (#846). With `data = []` on a rejection the
+  // empty branch was reached first and claimed the repository had none,
+  // so an error arm placed after it would be unreachable in exactly the
+  // case it exists for.
+  if (isError) {
+    return (
+      <div className="p-4">
+        <QueryError
+          title="Could not look for CLAUDE.md files"
+          message={errorMessage(error)}
+          onRetry={() => void refetch()}
+        />
+      </div>
+    );
   }
   if (files.length === 0) {
     return <p className="p-4 text-sm text-[#8b949e]">No CLAUDE.md files in this repository.</p>;
@@ -106,14 +146,49 @@ export function ClaudeMdPage() {
             ← All files
           </button>
         ) : null}
+        {/* A chain that CANNOT end at nothing (#846).
+
+            It used to be two arms and a `null`, and on a rejected read
+            both arms failed: `textLoading` false, `text` undefined, and
+            the pane rendered completely blank. The result was the file
+            browser on the left, the correct file highlighted blue, and an
+            entirely empty pane on the right -- no error, no retry. On a
+            phone the user had navigated to a second SCREEN containing
+            only an "← All files" button. A file renamed between the scan
+            and the click (`staleTime: 30_000` makes that a real window)
+            presented as an app that had failed to draw.
+
+            The error arm is ordered BEFORE the data arm for the reason
+            the page-level one is: `text` is undefined on a rejection, so
+            a later arm could not distinguish the two. The final arm is a
+            real state rather than a fallback -- there is genuinely
+            nothing selected only when the repository has no files, which
+            the guard above has already handled, so it says what it is
+            instead of leaving the reader with a blank box. */}
         {textLoading ? (
           <p className="text-sm text-[#8b949e]">Reading…</p>
+        ) : textError ? (
+          <QueryError
+            title="Could not read this file"
+            message={errorMessage(textErr)}
+            onRetry={() => void refetchText()}
+          >
+            {/* NAMES the file, because the list beside this pane is
+                still correct and still highlighting a row: without the
+                path, an error here reads as though the whole page
+                failed rather than this one read. */}
+            <p className="mx-auto mt-2 max-w-lg break-all font-mono text-xs text-[#8b949e]">
+              {active?.path}
+            </p>
+          </QueryError>
         ) : text !== undefined ? (
           // Through the SAME sanitising renderer the rest of the app
           // uses. These files come off disk, and one containing raw HTML
           // must not be able to inject anything here.
           <Markdown>{text}</Markdown>
-        ) : null}
+        ) : (
+          <p className="text-sm text-[#8b949e]">Choose a file to read it.</p>
+        )}
       </div>
     </div>
   );
