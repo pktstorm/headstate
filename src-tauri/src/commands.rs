@@ -3811,6 +3811,29 @@ pub async fn health_alerts(app: AppHandle) -> Result<Vec<crate::health::AlertRep
                 }),
         );
 
+        // #872's oversubscription notice. Computed HERE rather than in
+        // the poll loop, unlike the watch notices below: this rule is
+        // pure over the stored series -- `runaway::oversubscribed` reads
+        // `Sample::load`, which every row already carries -- so it needs
+        // no accumulator and nothing to remember between calls. The
+        // series is the one the charts draw, which is the same property
+        // `runaway::evaluate` above relies on.
+        //
+        // `aggregate.cores` is 0 when `available_parallelism` failed, and
+        // `oversubscribed` reads that as "cannot say" and returns `None`
+        // rather than dividing -- a division would be an infinity that
+        // cleared the threshold on every machine whose core count could
+        // not be read. Absent is not zero.
+        out.extend(
+            crate::health::runaway::oversubscribed(&history, aggregate.cores)
+                .into_iter()
+                .map(|n| crate::health::AlertReport {
+                    key: n.key(),
+                    title: n.title(),
+                    body: n.body(),
+                }),
+        );
+
         // #865's watch notices: processes holding a moderate amount of
         // CPU for long enough to be worth a human glance. Read from the
         // poll loop's shared result rather than recomputed, because the
