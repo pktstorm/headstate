@@ -346,13 +346,22 @@ export function DockerPage() {
   /// its early return and the click did nothing at all, with no error.
   /// Every other destructive path on this page already uses Dialog.
   const [pendingVolume, setPendingVolume] = useState<DanglingVolume | null>(null);
-  /// Which bulk set the confirmation is for, or null when closed.
+  /// Whether the bulk confirmation is open.
   ///
-  /// "stale" is the conservative set (superseded AND merged AND unused);
-  /// "superseded" is every superseded image we can prove is unused. They
-  /// share a dialog because everything except the wording and the
-  /// membership rule is identical.
-  const [bulkOpen, setBulkOpen] = useState<null | "stale" | "superseded">(null);
+  /// A BOOLEAN, not `null | "stale" | "superseded"` (#852). It used to name
+  /// which set the dialog was for, and that is what came apart: `"stale"`
+  /// was written at its only call site, so the `"superseded"` member was
+  /// unreachable, while `bulkSet` followed the checkbox -- and the dialog's
+  /// title and reassurance keyed off this rather than off the expression
+  /// that decides the membership.
+  ///
+  /// Narrowed rather than left in place once the copy moved to
+  /// `includeWider`, for the reason the store's `panel` axis was removed in
+  /// the same issue: "a value still in the union is one a component can
+  /// set", so an unreachable member is a trap for the next caller who
+  /// believes setting it does something. WHICH set is being removed is
+  /// `includeWider`'s answer and only ever was; this is just open or closed.
+  const [bulkOpen, setBulkOpen] = useState(false);
   // Whether the confirmation is showing the WIDE set. Reset each time
   // the dialog opens, so a previous session's choice cannot silently
   // widen a later removal.
@@ -477,7 +486,7 @@ export function DockerPage() {
             disabled={busy}
             onClick={() => {
               setIncludeWider(false);
-              setBulkOpen("stale");
+              setBulkOpen(true);
             }}
             className="rounded border border-[#f85149]/40 px-2 py-0.5 text-xs text-[#f85149] hover:bg-[#f85149]/10 disabled:opacity-50"
           >
@@ -733,7 +742,7 @@ export function DockerPage() {
       ) : null}
 
       {bulkOpen ? (
-        <Dialog open onOpenChange={(o) => !o && setBulkOpen(null)}>
+        <Dialog open onOpenChange={(o) => !o && setBulkOpen(false)}>
           <DialogContent className="max-w-2xl">
             {/* Keyed off `includeWider`, NOT `bulkOpen` (#852).
 
@@ -750,11 +759,12 @@ export function DockerPage() {
                 One expression decides the membership and the words now.
                 That is the point -- `bulkSet` is `includeWider ?
                 superseded : stale`, so keying the copy off anything else
-                is how the two came apart in the first place. `bulkOpen`
-                keeps its `"stale" | "superseded"` type because it is the
-                open/closed flag and the union is what a future second
-                entry point would set; what it must not do is decide the
-                wording of a set it does not define. */}
+                is how the two came apart in the first place. `bulkOpen` is
+                now a plain boolean for the same reason the `panel` axis was
+                removed in this issue: once it stopped deciding the wording
+                it was read only for truthiness, and an unreachable union
+                member is a trap for the next caller who believes setting it
+                does something. */}
             <DialogTitle>
               Remove {bulkSet.length} {includeWider ? "superseded" : "stale"} image
               {bulkSet.length === 1 ? "" : "s"}?
@@ -799,7 +809,7 @@ export function DockerPage() {
             <div className="mt-5 flex justify-end gap-2">
               <button
                 type="button"
-                onClick={() => setBulkOpen(null)}
+                onClick={() => setBulkOpen(false)}
                 className="rounded border border-[#30363d] px-3 py-1.5 text-sm hover:bg-[#21262d]"
               >
                 Cancel
@@ -809,7 +819,7 @@ export function DockerPage() {
                 onClick={() => {
                   const targets = bulkSet.map((i) => i.id);
                   const freed = bulkBytes;
-                  setBulkOpen(null);
+                  setBulkOpen(false);
                   setBusy(true);
                   removeImages(targets).then(
                     (outcomes) => {
