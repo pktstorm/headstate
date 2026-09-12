@@ -95,6 +95,20 @@ import { MOBILE_HIDDEN_VIEWS, useActiveFilters, useFilters } from "./store/filte
 /// code rather than a charting library, and a reader comparing the chunk
 /// sizes against the issue would otherwise find them inexplicable.
 ///
+/// # The phone gets more out of this than the desktop
+///
+/// `pr-stats` is in `MOBILE_HIDDEN_VIEWS` (`store/filters.ts`), so the
+/// companion has no way to reach the Stats route at all -- which means the
+/// 382 kB StatsPage chunk, recharts included, is never fetched there
+/// rather than merely fetched late. Before the split that code was in the
+/// one chunk every phone launch parsed, for a view the phone does not
+/// ship. System Health is NOT hidden, so its chunk is still reachable on
+/// a phone; it is 51 kB and carries no charting library (see the
+/// correction below).
+///
+/// Verified on the mobile build rather than assumed: `VITE_TARGET=mobile
+/// yarn build` produces the same three chunks.
+///
 /// # Why the ROUTE boundary and not the chart components
 ///
 /// `React.lazy` needs a component boundary already gated behind a user
