@@ -935,6 +935,25 @@ export type BranchDeleteFrame =
 /// a zero that means "we could not look" reads as a real reading, and
 /// "0% CPU" and "we did not measure the CPU" are opposite claims. This
 /// is the same rule the Rust side states in its module docs.
+/// One health condition that is true right now (#864).
+///
+/// `health_alerts` returns every CURRENTLY TRUE condition, not the ones
+/// that just became true. That is deliberate on the Rust side: a
+/// transition-only answer would depend on who asked last, so two clients
+/// would each see half the alerts. It is also what lets a page render
+/// them, which is the gap #864 closes -- the command existed and was
+/// registered for both the desktop and the phone, and no TypeScript
+/// called it, so the rules evaluated into nothing.
+export interface AlertReport {
+  /// The stable condition identity, keyed on the condition and never on
+  /// the numbers -- so a standing alert keeps one identity while its
+  /// figures wander. Use it as the React key and for dismissal, never
+  /// the title.
+  key: string;
+  title: string;
+  body: string;
+}
+
 export interface HealthSample {
   /// RFC 3339, matching every other timestamp this app stores.
   sampled_at: string;
