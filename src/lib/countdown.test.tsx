@@ -21,9 +21,13 @@ describe("useCountdown", () => {
     const deadline = Date.now() + 3000;
     const { result } = renderHook(() => useCountdown(deadline));
     expect(result.current).toBe(3);
-    act(() => vi.advanceTimersByTime(1000));
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
     expect(result.current).toBe(2);
-    act(() => vi.advanceTimersByTime(5000));
+    act(() => {
+      vi.advanceTimersByTime(5000);
+    });
     expect(result.current).toBe(0);
   });
 

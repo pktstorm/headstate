@@ -149,10 +149,13 @@ export function usePullRequests() {
 
     listen<PullRequest[]>("prs-updated", (e) => {
       qc.setQueryData(["prs"], e.payload);
-    }).then((fn) => {
-      if (cancelled) safeUnlisten(fn);
-      else unlisten = fn;
-    });
+    }).then(
+      (fn) => {
+        if (cancelled) safeUnlisten(fn);
+        else unlisten = fn;
+      },
+      () => {},
+    );
 
     return () => {
       cancelled = true;
@@ -276,10 +279,13 @@ export function useRefreshRequested(): void {
       // pull-to-refresh gained the same meaning (#639); a second copy
       // would have drifted.
       void refreshFromGitHub(qc);
-    }).then((fn) => {
-      if (cancelled) safeUnlisten(fn);
-      else unlisten = fn;
-    });
+    }).then(
+      (fn) => {
+        if (cancelled) safeUnlisten(fn);
+        else unlisten = fn;
+      },
+      () => {},
+    );
 
     return () => {
       cancelled = true;
@@ -299,10 +305,13 @@ export function usePollError(): string | null {
 
     listen<string>("poll-error", (e) => {
       setLastPollError(e.payload);
-    }).then((fn) => {
-      if (cancelled) safeUnlisten(fn);
-      else unlistenError = fn;
-    });
+    }).then(
+      (fn) => {
+        if (cancelled) safeUnlisten(fn);
+        else unlistenError = fn;
+      },
+      () => {},
+    );
 
     // A later successful poll clears the error banner. `prs-updated` is
     // already listened to by `usePullRequests` (which updates the query
@@ -311,10 +320,13 @@ export function usePollError(): string | null {
     // being mounted too.
     listen<PullRequest[]>("prs-updated", () => {
       setLastPollError(null);
-    }).then((fn) => {
-      if (cancelled) safeUnlisten(fn);
-      else unlistenUpdated = fn;
-    });
+    }).then(
+      (fn) => {
+        if (cancelled) safeUnlisten(fn);
+        else unlistenUpdated = fn;
+      },
+      () => {},
+    );
 
     return () => {
       cancelled = true;
@@ -1370,10 +1382,13 @@ function useStreamingSafety(): Map<string, Worktree> {
         next.set(w.path, w);
         return next;
       });
-    }).then((fn) => {
-      if (cancelled) safeUnlisten(fn);
-      else unlisten = fn;
-    });
+    }).then(
+      (fn) => {
+        if (cancelled) safeUnlisten(fn);
+        else unlisten = fn;
+      },
+      () => {},
+    );
     return () => {
       cancelled = true;
       safeUnlisten(unlisten);
@@ -1506,10 +1521,13 @@ function useStreamingSizes(): Map<string, number | null> {
         next.set(path, bytes);
         return next;
       });
-    }).then((fn) => {
-      if (cancelled) safeUnlisten(fn);
-      else unlisten = fn;
-    });
+    }).then(
+      (fn) => {
+        if (cancelled) safeUnlisten(fn);
+        else unlisten = fn;
+      },
+      () => {},
+    );
     return () => {
       cancelled = true;
       safeUnlisten(unlisten);
@@ -2706,10 +2724,13 @@ export function usePairingRequest(): { request: PairingRequest | null; dismiss: 
       setQueue((q) =>
         q.some((r) => r.request_id === e.payload.request_id) ? q : [...q, e.payload],
       );
-    }).then((fn) => {
-      if (cancelled) safeUnlisten(fn);
-      else unlisten = fn;
-    });
+    }).then(
+      (fn) => {
+        if (cancelled) safeUnlisten(fn);
+        else unlisten = fn;
+      },
+      () => {},
+    );
     return () => {
       cancelled = true;
       if (unlisten) safeUnlisten(unlisten);
@@ -2740,10 +2761,13 @@ export function useRemovalProgress(): { done: number; total: number } | null {
       // Clears on the last one rather than leaving "106 of 106" on
       // screen after the work is over.
       setProgress(done >= total ? null : { done, total });
-    }).then((fn) => {
-      if (cancelled) safeUnlisten(fn);
-      else unlisten = fn;
-    });
+    }).then(
+      (fn) => {
+        if (cancelled) safeUnlisten(fn);
+        else unlisten = fn;
+      },
+      () => {},
+    );
     return () => {
       cancelled = true;
       safeUnlisten(unlisten);
@@ -2779,10 +2803,13 @@ export function useUpdateProgress(): { done: number; total: number } | null {
       // Cleared on the last one rather than leaving "47 of 47" up after
       // the work is over; `update-run-done` carries the outcome.
       setProgress(done >= total ? null : { done, total });
-    }).then((fn) => {
-      if (cancelled) safeUnlisten(fn);
-      else unlisten = fn;
-    });
+    }).then(
+      (fn) => {
+        if (cancelled) safeUnlisten(fn);
+        else unlisten = fn;
+      },
+      () => {},
+    );
     return () => {
       cancelled = true;
       safeUnlisten(unlisten);
@@ -3149,10 +3176,13 @@ export function useBranchScan(repoPath: string | undefined): BranchScanState {
         });
         return { ...prev, repo: repoPath, branches, classified: prev.classified + landed };
       });
-    }).then((fn) => {
-      if (cancelled) safeUnlisten(fn);
-      else unlisten = fn;
-    });
+    }).then(
+      (fn) => {
+        if (cancelled) safeUnlisten(fn);
+        else unlisten = fn;
+      },
+      () => {},
+    );
     return () => {
       cancelled = true;
       safeUnlisten(unlisten);
@@ -3237,10 +3267,13 @@ export function useBranchDeleteProgress(
               failed: f.failed,
             },
       );
-    }).then((fn) => {
-      if (cancelled) safeUnlisten(fn);
-      else unlisten = fn;
-    });
+    }).then(
+      (fn) => {
+        if (cancelled) safeUnlisten(fn);
+        else unlisten = fn;
+      },
+      () => {},
+    );
     return () => {
       cancelled = true;
       safeUnlisten(unlisten);

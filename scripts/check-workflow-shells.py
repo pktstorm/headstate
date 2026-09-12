@@ -39,7 +39,22 @@ def steps_of(text: str):
             current, in_step = [], False
             job_windows = False
 
-        if "windows-latest" in line:
+        # `runs-on`/`matrix` lines only -- NOT comments. A bare substring
+        # scan read the word out of a comment too, which made any job
+        # whose comments MENTION windows-latest look like a Windows job,
+        # and then reported every `run:` step after that comment. Found by
+        # writing exactly such a comment (#892): eleven false positives in
+        # the `lint` job, which is macos-only. That is the cry-wolf
+        # failure #853 is about, in the guard rather than in a new tool,
+        # and a guard nobody trusts is a guard that gets deleted.
+        #
+        # Stripping to the left of `#` is enough for the narrow question
+        # asked. A `#` inside a quoted string would truncate early, which
+        # can only LOSE a windows-latest and so could only produce a false
+        # negative -- except that the label never appears in a quoted
+        # string here; it is a plain YAML scalar in `runs-on` or a
+        # matrix list, neither of which needs quoting.
+        if "windows-latest" in line.split("#", 1)[0]:
             job_windows = True
 
         # Steps start with `- ` at 6 spaces inside `steps:`.

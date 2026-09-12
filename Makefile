@@ -206,7 +206,39 @@ lint-deps:
 	# rehearsal failure this script's docstring says it exists to
 	# prevent. No dependencies, so there is no reason it was not here
 	# (#848, #853).
+	# The self-test runs first, like the two guards above. #892 recorded
+	# this script as already having one; it did not, and writing it
+	# immediately surfaced a live bug -- the platform test matched
+	# `windows-latest` inside a COMMENT, so any job merely discussing
+	# Windows had every later `run:` step reported. Eleven false positives
+	# in the macos-only `lint` job, which is #853's cry-wolf failure
+	# happening inside a guard.
+	python3 scripts/check-workflow-shells.test.py
 	python3 scripts/check-workflow-shells.py
+	# actionlint, and it does NOT replace the script above it. That was
+	# checked rather than assumed (#892 claims it supersedes it, which is
+	# wrong): given a `windows-latest` job whose `run:` declares no
+	# `shell:` and whose body is a heredoc plus `${VAR#prefix}`, actionlint
+	# exits 0 -- it assumes bash and shellchecks the body as bash, so the
+	# one thing that matters here, that the runner will NOT use bash, is
+	# the thing it does not ask. The script above catches it. They overlap
+	# in appearance only.
+	#
+	# What actionlint adds instead is the rest of the class: `uses:` that
+	# cannot resolve, expression typos in `${{ }}`, unknown `runs-on`
+	# labels, and shellcheck over every `run:` body -- defects that are
+	# invisible until CI runs, which is what #848 and #853 cost.
+	#
+	# Skipped with a note when absent rather than failing: `brew install
+	# actionlint` (shellcheck comes with it) is a real install, and this
+	# target's comment promises answers in a second, not a toolchain. CI
+	# installs it, so the gate is there; this is the local feedback loop.
+	# No GitHub Action and so no new pinned SHA -- it is one binary.
+	@if command -v actionlint >/dev/null 2>&1; then \
+		actionlint; \
+	else \
+		echo "actionlint not installed; skipping (brew install actionlint). CI runs it."; \
+	fi
 	# The mobile build high-water mark drifts because nothing reads it
 	# except a Preflight check that only catches a DECREASE -- so a mark
 	# lagging by three still passes, and it went stale before six

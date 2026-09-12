@@ -760,10 +760,19 @@ mod tests {
         assert_eq!(fp.top_cpu.len(), fp.process_count.min(TOP_N));
         assert_eq!(fp.top_memory.len(), fp.process_count.min(TOP_N));
 
+        // Compared through `ordered`, the SAME total order `top_by` sorts
+        // by, rather than with `>` and `==` on the raw f64. Two reasons,
+        // one of which is the point of clippy::float_cmp landing repo-wide
+        // (#892): a float equality here was asserting on exact bit
+        // equality of a sampled measurement, and -- more to the point --
+        // raw `>`/`==` both answer FALSE for a NaN, so a NaN reading made
+        // this assertion fail with "cpu order" rather than report the
+        // ranking `ordered` actually produces. The comparator the code
+        // sorts with is the comparator the test should check.
         for pair in fp.top_cpu.windows(2) {
+            let (a, b) = (ordered(pair[0].cpu_percent), ordered(pair[1].cpu_percent));
             assert!(
-                pair[0].cpu_percent > pair[1].cpu_percent
-                    || (pair[0].cpu_percent == pair[1].cpu_percent && pair[0].pid < pair[1].pid),
+                a > b || (a == b && pair[0].pid < pair[1].pid),
                 "cpu order: {:?} before {:?}",
                 pair[0],
                 pair[1]
