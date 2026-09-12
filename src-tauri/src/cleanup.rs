@@ -339,6 +339,13 @@ pub fn propose(prefs: &CleanupPrefs, roots: &[String], now: &str) -> Vec<LedgerE
 }
 
 /// Mirrors the artifact view's rule, and the backend's delete-time one.
+///
+/// All three are now asserted equal by
+/// `src/lib/mirroredConstants.test.ts`, which reads this literal and
+/// `artifacts/mod.rs`' via Vite's `?raw` and compares both to
+/// `ArtifactsPage.tsx`' `ACTIVE_SECS`. This comment claimed the mirror
+/// while the UI's copy was an hour (#850); `artifacts/mod.rs` carries the
+/// argument for fifteen.
 const ACTIVE_WINDOW_SECS: u64 = 15 * 60;
 
 #[cfg(test)]

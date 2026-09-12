@@ -50,9 +50,15 @@ use super::Sample;
 ///
 /// MUST agree with `ABSOLUTE_GAP_MS` in `src/lib/health.ts`, which is
 /// the same rule applied to the charts. The two are separate constants
-/// in separate languages, so the agreement is stated here and asserted
-/// by `a_gap_here_is_a_gap_in_the_charts_too` below rather than left to
-/// whoever edits one of them next.
+/// in separate languages, so the agreement is asserted by
+/// `src/lib/mirroredConstants.test.ts`, which reads THIS FILE's literal
+/// via Vite's `?raw` and compares it to the TypeScript one.
+///
+/// That test is where the agreement lives because
+/// `a_gap_here_is_a_gap_in_the_charts_too` below cannot hold it: a Rust
+/// test can only compare `GAP_MS` to another Rust literal, which reads
+/// one side twice and passes at any value the other side has taken
+/// (#850).
 ///
 /// Thirty minutes is comfortably above any legitimate spacing: the
 /// sampler writes every sixty seconds, and the coarsest a stored series
@@ -840,13 +846,22 @@ mod tests {
             .is_empty());
     }
 
-    /// The gap rule here and the gap rule in the charts must agree.
+    /// This side of the gap rule is thirty minutes, deliberately.
     ///
-    /// `ABSOLUTE_GAP_MS` in `src/lib/health.ts` is the same 30 minutes.
-    /// They are separate constants in separate languages, so this is
-    /// the assertion that makes the agreement deliberate: a series the
-    /// chart draws as broken must not be one the alerts compute a rate
-    /// across, or the user is told a rate the picture refuses to draw.
+    /// NOT the cross-language assertion, which this test cannot make and
+    /// used to claim it did (#850): comparing `GAP_MS` to a Rust literal
+    /// reads the Rust side twice, and passed unchanged while
+    /// `ABSOLUTE_GAP_MS` in `src/lib/health.ts` could have held any value
+    /// at all. `src/lib/mirroredConstants.test.ts` is where the two are
+    /// actually compared -- it reads this file's literal via `?raw`.
+    ///
+    /// Kept because it is still worth pinning the VALUE here: thirty
+    /// minutes is chosen against the sampler's 60s cadence and the
+    /// 12-minute coarsest bucketing, and a change to it should be a
+    /// deliberate edit in both a test and a constant. What the agreement
+    /// protects is the inversion: a series the chart draws as broken must
+    /// not be one the alerts compute a rate across, or the user is told a
+    /// rate the picture refuses to draw.
     #[test]
     fn a_gap_here_is_a_gap_in_the_charts_too() {
         assert_eq!(

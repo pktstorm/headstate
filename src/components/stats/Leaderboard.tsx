@@ -7,6 +7,14 @@ import type { AuthorRow, StatsReviewers } from "@/types/pr";
 /// -- this is the number the HEADING quotes. Re-cutting here would produce a
 /// "top five" heading over three rows, or a top-three whose fourth place was
 /// decided by a tie-break this side never saw.
+///
+/// That equality is asserted by `src/lib/mirroredConstants.test.ts`, which
+/// reads the literal out of `github/stats/board.rs` (#850). Nothing asserted
+/// it before: `top_n_is_five` in `board.rs` only sees Rust, and every test in
+/// this directory uses `TOP_N` SYMBOLICALLY -- `expect(rows.length).toBe(TOP_N)`
+/// and `` getByText(`Top ${TOP_N} ...`) `` are self-consistent at any value,
+/// so setting this to 3 passed the whole suite while the page rendered "Top 3
+/// pull request authors" over a Rust-ranked list of five.
 export const TOP_N = 5;
 
 /// The label for the lines-changed measure, and it is load-bearing.

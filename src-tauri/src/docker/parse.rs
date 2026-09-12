@@ -365,7 +365,8 @@ mod tests {
         // rule applied to this parser.
         let mixed = format!("{short}Images   10   0   17.35GB   2.194GB (12%)\n");
         assert_eq!(
-            disk_usage(&mixed).images_bytes, 17_350_000_000,
+            disk_usage(&mixed).images_bytes,
+            17_350_000_000,
             "a short row must not stop the rows after it"
         );
     }

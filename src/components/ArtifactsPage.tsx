@@ -61,7 +61,31 @@ const LABEL: Record<ArtifactKind, string> = {
 /// gitignored -- so no git-based check can see it. Directory mtime is
 /// the only available signal, which is why this is surfaced rather than
 /// silently folded into a safety verdict.
-const ACTIVE_SECS = 60 * 60;
+///
+/// FIFTEEN minutes, matching `ACTIVE_WINDOW_SECS` in
+/// `src-tauri/src/artifacts/mod.rs` -- the value that actually decides
+/// whether a delete succeeds -- and `cleanup.rs`' copy of the same rule.
+/// This said `60 * 60` until #850. The two sides disagreeing was
+/// user-visible in three places at once: a `target/` last written 20
+/// minutes ago was one the backend WOULD remove (20 > 15), but the UI
+/// excluded it from `removable`, so the Remove button under-counted,
+/// the reclaimable-space figure under-reported, and `selectedActive`
+/// warned "something is building here" about a directory the backend
+/// did not consider active.
+///
+/// Fifteen rather than sixty because the Rust comment chose it
+/// deliberately against an hour: long enough to cover a build's quiet
+/// phases (linking a large binary writes nothing for minutes), short
+/// enough that yesterday's work is not still blocked today. The UI
+/// silently having the hour was drift, not a second opinion.
+///
+/// Exported so `src/lib/mirroredConstants.test.ts` can assert it against
+/// the Rust literal it mirrors, which it reads via Vite's `?raw`. Two
+/// constants in two languages cannot be one declaration, so the
+/// agreement has to be a test that reads BOTH sides -- which is what the
+/// comment below claiming the backend enforces the same rule was
+/// asserting on nothing but good intentions.
+export const ACTIVE_SECS = 15 * 60;
 
 /// Regenerable build output across the scanned directories.
 ///
@@ -129,7 +153,17 @@ export function ArtifactsPage() {
 
   // Everything a build is NOT currently writing to. The same rule the
   // backend enforces at delete time, applied here so the button's count
-  // matches what the click will actually remove.
+  // matches what the click will actually remove -- and the agreement is
+  // now ASSERTED (`src/lib/mirroredConstants.test.ts` reads the Rust
+  // literal), because this comment was true of the intent and false of
+  // the code for as long as ACTIVE_SECS was an hour (#850).
+  //
+  // An UNKNOWN age counts as removable here, which is deliberately the
+  // opposite of the backend's delete gate: the backend refuses what it
+  // could not measure (#841), so such a row is offered, attempted, and
+  // refused with a reason the user can read. Excluding it instead would
+  // hide the largest directories on an unmeasurable volume from the page
+  // entirely, with nothing said.
   const removable = rows.filter((r) => {
     const age = ages.get(r.path);
     return age === undefined || age >= ACTIVE_SECS;

@@ -96,6 +96,21 @@ pub struct ArtifactRemoval {
 /// Fifteen minutes rather than an hour: long enough to cover a build's
 /// quiet phases (linking a large binary writes nothing for minutes), short
 /// enough that yesterday's work is not still blocked today.
+///
+/// Mirrored by `ACTIVE_SECS` in `src/components/ArtifactsPage.tsx` and by
+/// `cleanup.rs`' copy of the same rule, and the three are asserted equal
+/// by `src/lib/mirroredConstants.test.ts`, which reads this literal via
+/// Vite's `?raw`.
+///
+/// The assertion exists because the UI had DRIFTED to `60 * 60` while
+/// both sides' comments claimed they matched (#850). For any `target/`
+/// written 15-60 minutes ago that was visible three ways at once: this
+/// gate would remove it, but the page left it out of `removable` so the
+/// Remove button under-counted, out of `removableBytes` so the
+/// reclaimable figure under-reported, and counted it as active so the
+/// dialog warned "something is building here" about a directory this
+/// gate does not consider active. Fifteen won because the choice against
+/// an hour is argued above; the hour was drift, not a second opinion.
 const ACTIVE_WINDOW_SECS: u64 = 15 * 60;
 
 /// Remove one artifact directory, refusing anything that is not provably

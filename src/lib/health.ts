@@ -38,7 +38,18 @@ const GAP_FACTOR = 2.5;
 /// the backend can produce: `MAX_POINTS` is 120 across a 24-hour
 /// retention window, so even a completely full series is bucketed at
 /// twelve minutes and nothing regular is ever wider than that.
-const ABSOLUTE_GAP_MS = 30 * 60_000;
+///
+/// MUST equal `GAP_MS` in `src-tauri/src/health/alerts.rs`, which applies
+/// the same rule on the alert path. If the chart draws a series as broken
+/// where the alerts compute a discharge rate across it, the user is told
+/// a rate the picture refuses to draw.
+///
+/// EXPORTED for that assertion (#850). It was private, so `alerts.rs`'
+/// `a_gap_here_is_a_gap_in_the_charts_too` -- the test whose own doc
+/// claims the agreement is asserted "rather than left to whoever edits
+/// one of them next" -- could only compare `GAP_MS` to a Rust literal,
+/// reading one side twice. `mirroredConstants.test.ts` now reads both.
+export const ABSOLUTE_GAP_MS = 30 * 60_000;
 
 /// One point of a series: a time, and a value that may be absent.
 export interface Point {
