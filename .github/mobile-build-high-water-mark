@@ -8,13 +8,17 @@
 # named, rather than at the store with a message that says only that the
 # number has been seen before.
 #
-# Why a committed file rather than the previous release's assets: the
-# publish job only runs when BOTH platform jobs succeed, and it has never
-# run -- the Android release secrets are not configured (#673), so
-# android-release fails Preflight and publish is skipped. There are 38
-# mobile-v tags and zero GitHub releases, so asset names cannot be the
-# record. This file does not depend on any job downstream of the upload.
+# Why a committed file rather than the previous release's assets: this
+# file does not depend on any job downstream of the upload, so it records
+# what shipped even when a later job fails.
+#
+# The note here used to say `publish` had never run because
+# android-release fails Preflight without the #673 secrets. That is no
+# longer true: android-release is SKIPPED rather than failed, so publish
+# does run, and runs 26, 27 and 28 each completed it. The file is still
+# the right record -- it is written before the upload rather than derived
+# from it -- but not for the reason previously given.
 #
 # Raise it when a build reaches TestFlight or Play. Non-contiguous is
 # correct: a rejected upload still consumes its number.
-25
+28
