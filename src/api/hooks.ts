@@ -2114,6 +2114,13 @@ function scopeKey(scope: StatsScope): string {
 /// about the window that includes today, and about not re-spending a
 /// multi-point load because the user switched tabs and came back.
 ///
+/// Since #836 this is no longer the ONLY thing holding a board. `stats_board`
+/// persists a closed window's answer through `store::stats`, so a board also
+/// survives a restart -- which is the case `staleTime` could never cover and
+/// the one that was re-spending the full ~45-point load on every cold start.
+/// The two layers answer different questions and both are wanted: this one
+/// stops a re-fetch inside a session, the store stops one across sessions.
+///
 /// `retry: false`, for `useAllWorktreeSizes`' reason rather than by default:
 /// a failed board is an expensive thing to repeat silently, and the view has
 /// an explicit retry that tells the user it is trying again.
