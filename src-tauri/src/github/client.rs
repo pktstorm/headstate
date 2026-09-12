@@ -2962,7 +2962,15 @@ mod tests {
             ("graphql_partial_ok", "the helper itself"),
         ];
 
-        let src = include_str!("client.rs");
+        // Line endings normalised before any byte pattern runs. A Windows
+        // checkout with `core.autocrlf` has CRLF, so the `"\n#[cfg(test)]"`
+        // split below finds nothing there and `prod` becomes the WHOLE
+        // file -- test code included, judged by production rules. A false
+        // positive on one platform only. `health::runaway` and
+        // `src-mobile::background` each record observing exactly this on
+        // the `platform (windows-latest)` job.
+        let src = include_str!("client.rs").replace("\r\n", "\n");
+        let src = src.as_str();
         let prod = src.split_once("\n#[cfg(test)]").map_or(src, |(p, _)| p);
         // `fn` openers at both indentations: free functions at column 0
         // and methods inside the `impl` block.

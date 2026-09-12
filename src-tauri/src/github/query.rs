@@ -1122,7 +1122,17 @@ mod tests {
     fn the_periods_query_carries_every_alias_its_reader_reads() {
         let q = periods_query(at("2026-08-20T14:00:00Z"));
         // The reader's own source, scoped to `fetch_periods`.
-        let client = include_str!("client.rs");
+        //
+        // Line endings normalised first: a Windows checkout with
+        // `core.autocrlf` has CRLF, so the `"\n    pub async fn "` scope
+        // terminator below would find nothing and the body would run to
+        // the end of the file. The `found == 6` assertion would still
+        // catch that here, but relying on a downstream count to cover a
+        // broken scope is how a guard reads the wrong region and reports
+        // a defect at a location that does not have one. Observed on the
+        // `platform (windows-latest)` job by `health::runaway`'s guard.
+        let client = include_str!("client.rs").replace("\r\n", "\n");
+        let client = client.as_str();
         let from = client
             .find("pub async fn fetch_periods(")
             .expect("fetch_periods not found in client.rs");
@@ -1235,13 +1245,25 @@ mod tests {
         let docs = crate::github::stats::budget::tests::every_query_document();
         // Every test source that could hold a guard. The guards live beside
         // the documents they check, which is where this codebase puts them.
-        let guards = [
+        //
+        // Line endings normalised: a Windows checkout with `core.autocrlf`
+        // has CRLF, so the `"\n#[cfg(test)]"` split below would find
+        // nothing, the closure would return `false` for every file, and
+        // EVERY document would be reported unguarded. A loud false
+        // positive on one platform -- which is the direction to be wrong
+        // in, but still a red job nobody can reproduce locally.
+        // `health::runaway`'s guard records observing this exact hazard on
+        // the `platform (windows-latest)` job.
+        let guards: Vec<String> = [
             include_str!("query.rs"),
             include_str!("stats/query.rs"),
             include_str!("stats/tree.rs"),
             include_str!("stats/board.rs"),
             include_str!("../poll.rs"),
-        ];
+        ]
+        .iter()
+        .map(|s| s.replace("\r\n", "\n"))
+        .collect();
 
         let mut unguarded = Vec::new();
         for (file, name, _) in &docs {

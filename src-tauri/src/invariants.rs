@@ -739,6 +739,22 @@ mod tests {
                 let Ok(src) = std::fs::read_to_string(&file) else {
                     continue;
                 };
+                // Line endings normalised before any byte pattern runs.
+                //
+                // A Windows checkout with `core.autocrlf` has CRLF, so a
+                // pattern containing a bare `\n` -- which is how
+                // `enclosing_fn` finds a function's start -- matches
+                // nothing there. It would return a body beginning at
+                // offset 0, i.e. the whole file, making every constant
+                // look covered: a silent pass, on one platform only.
+                //
+                // This hazard is not hypothetical here. `health::runaway`
+                // and `src-mobile::background` each carry a paragraph on
+                // it, both recording that it was OBSERVED on the
+                // `platform (windows-latest)` job. `production()` above
+                // normalises for the same reason, by rebuilding its
+                // output line by line.
+                let src = src.replace("\r\n", "\n");
                 let mut at = 0usize;
                 while let Some(i) = src[at..].find("include_str!") {
                     let hit = at + i;
