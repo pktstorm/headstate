@@ -10,6 +10,33 @@ inputs:
     # saved. The mobile jobs pass `src-mobile`: it is a separate crate
     # with its own lockfile (see src-mobile/Cargo.toml), so a cache keyed
     # on the desktop's lock would never hit for it.
+    #
+    # `crates/headstate-stepup` is DELIBERATELY NOT HERE, and #889 is
+    # closed on this measurement rather than fixed.
+    #
+    # It is a separate root with its own lockfile, so rust-cache never
+    # restores its target/ and 52 crates recompile in every Rust job.
+    # That diagnosis is correct. The fix does not pay for itself:
+    #
+    #   - rust-cache CLEANS the local crate's own artifacts before saving
+    #     ("... Cleaning .../crates/headstate-stepup/target ..."), so
+    #     headstate-stepup itself recompiles regardless -- 21s of the 28s
+    #     phase. Only its dependencies were ever cacheable, and they were
+    #     the cheap part. Adding the root moved the phase ~30s -> ~28s,
+    #     not the ~35s -> "under 5s" #889 predicted.
+    #
+    #   - The Windows `platform` entries are ~1.6GB APIECE, and this
+    #     repository's cache is ALREADY OVER its 10GB quota: measured at
+    #     11.66GB across 14 entries, with two live generations per job.
+    #     A second root per entry makes eviction more likely, and an
+    #     eviction costs ~900s -- turning a 562s job into 1716s. Measured
+    #     across five runs on the branch that added it: the Windows cache
+    #     hit twice and was EVICTED twice, reporting `Cache not found` for
+    #     a key that had reported `full match: true` minutes earlier.
+    #
+    # So it traded ~2s of warm time for a materially worse cold-run rate,
+    # on a quota that cannot absorb it. Revisit only after #901 brings the
+    # cache under quota; the diagnosis is recorded there and in #889.
     description: Cargo workspace roots for the Rust cache, one per line
     required: false
     # TWO roots, because this repo has two desktop-side lockfiles and a
@@ -71,9 +98,7 @@ inputs:
     # is a `make` target that runs `cd src-mobile && cargo ...`; none
     # ever enters crates/headstate-stepup, so a second root there would
     # cache a target/ directory nothing in those jobs writes.
-    default: |
-      src-tauri
-      crates/headstate-stepup
+    default: src-tauri
 runs:
   using: composite
   steps:
