@@ -123,7 +123,41 @@ query($q: String!, $first: Int!, $after: String) {
         # one verdict and names nobody.
         latestReviews(first: 5) { nodes { state author { login } } }
         labels(first: 20) { nodes { name color } }
-        reviewThreads(first: 20) { nodes { isResolved isOutdated } }
+        # 100, the connection maximum, so the badge is an exact count
+        # rather than a cap (#810). It was `first: 20`, and the mapper
+        # counts the unresolved, un-outdated threads in the window -- so a
+        # pull request with more than 20 silently understated, while the
+        # code read like an exact number.
+        #
+        # MEASURED on live data rather than inherited from #808, because
+        # the cost question here is genuinely different: this connection is
+        # nested inside this document's own 100-pull-request page and
+        # fans out across every row in the result set, where the detail
+        # query fetches ONE.
+        #
+        # Worded to avoid the search keyword followed by a paren: the
+        # cost guard in `poll.rs` counts that as a raw substring, so
+        # writing it here -- even inside a GraphQL comment, which the
+        # server never sees -- reads as a second alias and trips the
+        # one-per-document assertion. Exactly the comment-versus-code
+        # confusion #869 is about, except this one fails safe: a false
+        # positive that blocks CI, not a false negative that ships. Measured anyway free -- the whole document still costs 1
+        # point against rust-lang/rust, kubernetes/kubernetes,
+        # vercel/next.js and microsoft/vscode at 100 pull requests each,
+        # with no latency difference (~0.75s either way over three runs)
+        # and no node-limit error at 100x100.
+        #
+        # The undercount is real and not theoretical. vercel/next.js
+        # #98469 carries 33 threads: the old window reported 2 unresolved
+        # where the truth is 9. Most repositories never reach the window
+        # at all -- rust-lang/rust's busiest open pull request has 13 --
+        # which is exactly why this stayed invisible.
+        #
+        # `totalCount` is deliberately NOT used for the badge, though it
+        # is free: it counts resolved and outdated threads too, so it
+        # would overstate the unresolved ones. That is the opposite error,
+        # and #808 recorded the same trap.
+        reviewThreads(first: 100) { nodes { isResolved isOutdated } }
         # `state` alone is not enough: the rollup RANKS FAILURE above
         # PENDING, so a pull request whose checks are re-running after a
         # fix still reads as failing. Per-check `status` is what
@@ -779,6 +813,38 @@ mod tests {
     /// `totalCount` or that still asks for 20 threads. Without this guard
     /// the whole of #802 can be silently undone -- and the symptom would
     /// be a view that looks complete, which is the defect itself.
+    /// The LIST query's thread window, which the guard below does not
+    /// cover (#810).
+    ///
+    /// A separate test rather than a widened one, because the two
+    /// documents are the same shape for different reasons and a single
+    /// assertion over both would pass while one of them regressed. The
+    /// detail query needs the full page so a reviewer sees every thread;
+    /// this one needs it so a COUNT is exact. Note this query must not
+    /// select `totalCount` for the badge -- it counts resolved and
+    /// outdated threads too, so reading it would overstate the
+    /// unresolved ones -- which is why the assertion here is only about
+    /// the page size.
+    ///
+    /// Measured free before being widened: the document still costs 1
+    /// point at 100 pull requests x 100 threads. A future narrowing
+    /// would silently restore an undercount that no mapper test can see,
+    /// since the mapper is correct either way and only the window lies.
+    #[test]
+    fn the_list_query_counts_every_thread_rather_than_the_first_twenty() {
+        let q = PRS_QUERY;
+        let threads = q
+            .split_once("reviewThreads(")
+            .expect("the list query asks for review threads")
+            .1;
+        let window = threads.split_once(')').expect("the connection closes").0;
+        assert!(
+            window.contains("first: 100"),
+            "the badge is a COUNT, so its window must be the connection maximum; \
+             found `reviewThreads({window})`, which caps the number silently"
+        );
+    }
+
     #[test]
     fn the_detail_query_asks_for_every_thread_and_its_true_count() {
         let q = PR_DETAIL_QUERY;
